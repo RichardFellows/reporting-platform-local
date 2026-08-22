@@ -1,0 +1,26 @@
+.env
+seed/
+seed_clean/
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+__pycache__/
+*.pyc
+
+# artifacts from clearing stale git locks on this machine's mount
+_to_delete/
+
+# Scratch from the Nessie REST API debugging: the live
+# server's OpenAPI spec, pulled to check request shapes, plus a probe log.
+# Kept out of the tree rather than committed -- regenerate with
+# `curl -s http://localhost:19120/nessie-openapi/openapi.yaml` if needed.
+nessie-openapi.json
+nessie-openapi.yaml
+nessie-test.txt
+
+# editor
+.vscode/
+var/
+
+# Windows/msys crash dumps
+*.stackdump

@@ -1,0 +1,84 @@
+# Feed registry.
+#
+# This file is the single source of truth for what the platform ingests.
+# Adding a feed = adding a block here + a dbt source entry + prepared model.
+# No DAG file is edited: airflow/dags/feed_ingest.py generates one DAG per feed.
+#
+# Filename pattern must yield a `business_date` named group. Everything else
+# in the pattern is ignored for routing but retained in `_source_file`.
+
+defaults:
+  landing_prefix: landing
+  raw_namespace: raw
+  arrival_poke_seconds: 60
+  arrival_timeout_hours: 26      # deliberately > 24h: a feed is late, not lost
+  file_encoding: utf-8
+  delimiter: ","
+  quote_char: '"'
+  header: true
+  # 'warn' lands the file and records the drift on the row; 'fail' aborts the
+  # load, leaves the ingest branch for inspection and never touches main.
+  # Default is 'warn': we prefer to land and let dbt tests fail, because a
+  # rejected file is a file nobody looks at.
+  #
+  # 'fail' fires on an EXTRA column and on a MISSING declared one. The extra
+  # case is the obvious one; the missing case is the quieter and arguably
+  # worse one, because reconcile_schema fills it with nulls, so the load
+  # succeeds and the column reads as "no value" rather than "never arrived".
+  #
+  # Both branches have been exercised (
+  # until then nothing read this setting at all and 'fail' was silently
+  # identical to 'warn').
+  schema_drift: warn
+
+feeds:
+
+  - name: trade
+    description: Daily position-level trade extract from the front office.
+    source_system: TRADE_SRC
+    filename_pattern: 'TRADE_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    business_key: [trade_id]
+    expected_min_rows: 100
+    columns:
+      - trade_id
+      - counterparty_id
+      - book
+      - product_type
+      - notional
+      - currency
+      - trade_date
+      - maturity_date
+      - mtm_value
+
+  - name: counterparty
+    description: Counterparty reference data. Slowly changing.
+    source_system: CPTY_SRC
+    filename_pattern: 'CPTY_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    business_key: [counterparty_id]
+    expected_min_rows: 10
+    columns:
+      - counterparty_id
+      - legal_name
+      - country_code
+      - sector
+      - parent_counterparty_id
+      - is_active
+
+  - name: rating
+    description: External agency credit ratings.
+    source_system: RATING_SRC
+    filename_pattern: 'RATING_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    business_key: [counterparty_id, agency]
+    expected_min_rows: 10
+    # Agency ratings arrive weekly, not daily. Without this the completeness
+    # check infers the business calendar from the daily feeds and
+    # reports every non-delivery day as a gap -- it did exactly that on its
+    # first run, five false gaps in a ten-day window. `weekly` asks only that
+    # each week containing business dates saw at least one delivery.
+    cadence: weekly
+    columns:
+      - counterparty_id
+      - agency
+      - rating
+      - rating_date
+      - outlook

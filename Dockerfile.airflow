@@ -1,0 +1,70 @@
+# Airflow 2.x, deliberately, not 3.x.
+#
+# This was 3.0.2. Under 3.0.2 no DAG run could ever be completed on this stack:
+# a task would start, log correctly, return its value and push xcom, and the
+# scheduler would never record it as succeeded, so nothing downstream ran. That
+# survived splitting `standalone` into separate components, wiring
+# EXECUTION_API_SERVER_URL, and sharing a JWT secret
+# and the design docs.
+#
+# Airflow 3 routes every running task through an execution API served by the
+# api-server, authenticated with JWT. Airflow 2's LocalExecutor forks the task
+# in-process and writes the result straight to the metadata DB -- far fewer
+# moving parts between "task finished" and "state recorded", and no component
+# that can silently fail to acknowledge a completion.
+#
+# The DAG code was already written to run on both (`airflow.sdk` with an
+# `airflow.datasets`/`airflow.decorators` fallback, Asset aliased to Dataset),
+# so this is an infrastructure change only.
+FROM apache/airflow:2.10.5-python3.11
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-17-jre-headless curl procps \
+    && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# Nessie GC tool. There is no server-side GC endpoint and no REST call for it --
+# collecting content unreachable from ANY Nessie reference is only possible with
+# this external CLI, and docs/MAINTENANCE.md has it as step 3 of the nightly
+# chain. Published as a GitHub release asset, NOT on Maven Central under this
+# name. Pinned to the Nessie server version in docker-compose.yml; keep them
+# equal. ~128 MB, which is most of this image's size.
+ARG NESSIE_VERSION=0.99.0
+RUN mkdir -p /opt/platform/lib \
+    && curl -fsSL -o /opt/platform/lib/nessie-gc.jar \
+       "https://github.com/projectnessie/nessie/releases/download/nessie-${NESSIE_VERSION}/nessie-gc-${NESSIE_VERSION}.jar" \
+    && chown -R airflow: /opt/platform/lib
+
+USER airflow
+# Providers go in under Airflow's own constraints so pip cannot quietly drag in
+# a different airflow version to satisfy them.
+# In the corporate environment these resolve via the internal Registry mirror;
+# pip.conf / SSL cert config is injected at build time there.
+RUN pip install --no-cache-dir \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt" \
+      "apache-airflow-providers-apache-spark" \
+      "apache-airflow-providers-amazon"
+
+# dbt and pyspark are deliberately NOT constrained by Airflow's file -- their
+# pins are the ones validated against a live stack and must not move.
+#
+# EXCEPT `duckdb`, bumped 1.1.3 -> 1.5.5 for the DuckDB console. 1.1.3's
+# iceberg extension has no catalog ATTACH at all -- `ATTACH ... (TYPE ICEBERG)`
+# fails with `Binder Error: Unrecognized storage type "ICEBERG"`, which is
+# exactly that. 1.5.5 attaches to an Iceberg REST catalog and reads it,
+# which is what `scripts/duckdb_console.py` needs.
+#
+# There is NO dbt-duckdb here, on purpose. D7 briefly installed 1.9.6 to make
+# a `duckdb_local` dbt target work, and the target was then removed: DuckDB
+# cannot address a Nessie branch, so a build through it bypasses
+# write-audit-publish. With no DuckDB target left the adapter was dead weight
+# that made `dbt --version` report "duckdb: 1.9.6 - Not compatible!" at anyone
+# debugging -- a misleading signal for a package nothing used. The plain
+# `duckdb` library below is what the read-only console imports.
+RUN pip install --no-cache-dir \
+      "dbt-core==1.8.7" \
+      "dbt-spark[PyHive]==1.8.0" \
+      "duckdb==1.5.5" \
+      "pyspark==3.5.3" \
+      "pyyaml" "boto3" "pandas" "pyarrow"

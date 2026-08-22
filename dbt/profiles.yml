@@ -1,0 +1,94 @@
+# Committed to the repo deliberately: every value comes from env_var(), so
+# there is nothing secret here and no per-developer copy to drift.
+#
+# EVERY TARGET HERE IS SPARK, and that is a constraint rather than a
+# preference. A build must land on a Nessie branch -- write-audit-publish is
+# the whole safety model -- and only the Spark path can address one. Session 5
+# got dbt-duckdb building Iceberg tables into Nessie for the first time
+# and then removed the target anyway, because DuckDB fails as a
+# build engine on three independent counts: it can only ever address the
+# catalog's default branch, it silently drops `partition_by` so it cannot
+# reproduce the partition spec retention depends on, and it cannot INSERT to a
+# partitioned table without an explicit override. Any one is disqualifying.
+#1".
+#
+# DuckDB is still here, as a READER for people rather than an engine for the
+# pipeline: `scripts/duckdb_console.py` opens a read-only session against
+# published `main`. It is a script and not a dbt target on purpose -- the
+# engine macros are Spark-only now, so a DuckDB target could not compile the
+# models anyway, and a target that works for some models and not others is a
+# trap.
+
+reporting_platform:
+  target: "{{ env_var('DBT_TARGET', 'spark_local') }}"
+  outputs:
+
+    spark_local:
+      type: spark
+      method: session
+      schema: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
+      host: spark-master
+      threads: 4
+      # method: session builds its own in-process SparkSession (dbt-spark's
+      # SessionConnectionWrapper) rather than connecting to the spark-master
+      # cluster, and this container's pip-installed pyspark has none of the
+      # Iceberg/Nessie/S3A jars baked in (see context.py's spark_session() --
+      # same root cause, same fix). server_side_parameters becomes
+      # .config(k, v) on that SparkSession.builder, so the full catalog/jars
+      # wiring has to be repeated here rather than relying on
+      # conf/spark-defaults.conf, which isn't mounted into this container.
+      server_side_parameters:
+        spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        spark.sql.extensions: "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.projectnessie.spark.extensions.NessieSparkSessionExtensions"
+        spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
+        spark.sql.catalog.lakehouse.catalog-impl: org.apache.iceberg.nessie.NessieCatalog
+        spark.sql.catalog.lakehouse.uri: "{{ env_var('NESSIE_URI') }}"
+        spark.sql.catalog.lakehouse.ref: "{{ var('nessie_ref', 'main') }}"
+        spark.sql.catalog.lakehouse.authentication.type: NONE
+        spark.sql.catalog.lakehouse.warehouse: "{{ env_var('REPORTING_WAREHOUSE') }}"
+        spark.sql.catalog.lakehouse.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+        spark.sql.catalog.lakehouse.s3.endpoint: "{{ env_var('S3_ENDPOINT') }}"
+        spark.sql.catalog.lakehouse.s3.path-style-access: "true"
+        spark.hadoop.fs.s3a.endpoint: "{{ env_var('S3_ENDPOINT') }}"
+        spark.hadoop.fs.s3a.path.style.access: "true"
+        spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+        spark.sql.session.timeZone: UTC
+        spark.sql.defaultCatalog: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
+        spark.driver.memory: 3g
+
+    # The cluster target: the same in-process SparkSession as spark_local, in a
+    # driver pod that `spark-submit` created for this build.
+    #
+    # `method: session` because dbt runs INSIDE the driver pod that
+    # `spark-submit` created for this build -- one SparkSession per build, so
+    # the Nessie ref is unambiguous, identical to what every local DAG run
+    # already proves. A previous connection method here served no purpose the
+    # design documents had chosen and carried a silent-failure risk on the
+    # branch guarantee, so it does not get reinstated as a
+    # helpful-looking addition.
+    #
+    # It carries far less config than spark_local on purpose. spark_local has
+    # to repeat the whole catalog wiring because the Airflow image has no
+    # spark-defaults.conf mounted; a driver pod built from the Spark image
+    # does (`conf/spark-defaults.conf`), so only the per-run override belongs
+    # here. Duplicating the rest would be a forked copy that
+    # drifts from the original.
+    #
+    # STILL UNPROVEN: no cluster has ever run this.
+    spark_ocp:
+      type: spark
+      method: session
+      # INERT, but dbt-spark's credential validation demands it for every
+      # method: `dbt parse` fails with "Must specify `host` in profile"
+      # without it. In session mode nothing connects to a host -- the
+      # SparkSession is in-process and its master comes from spark-submit and
+      # the image's spark-defaults.conf. spark_local carries `spark-master`
+      # here for the same non-reason.
+      host: localhost
+      schema: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
+      threads: 8
+      server_side_parameters:
+        # The only value that must change per build. Everything else comes
+        # from the image's spark-defaults.conf, which defaults ref to `main`;
+        # a builder .config() call takes precedence over it.
+        spark.sql.catalog.lakehouse.ref: "{{ var('nessie_ref', 'main') }}"

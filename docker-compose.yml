@@ -1,0 +1,263 @@
+---
+# Pinned so the project name -- and therefore every container and volume
+# name -- does not depend on what the clone directory happens to be called.
+name: reporting-platform
+
+# Local approximation of the Reporting Platform platform.
+# Every service here has a counterpart in OpenShift — see docs/OPENSHIFT-MAPPING.md
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-minioadmin}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-minioadmin123}
+  AWS_REGION: ${S3_REGION:-us-east-1}
+  S3_ENDPOINT: http://minio:9000
+  REPORTING_WAREHOUSE: s3a://lakehouse/warehouse
+  REPORTING_LANDING: s3a://lakehouse/landing
+  NESSIE_URI: http://nessie:19120/api/v2
+  # The same version store, over the Iceberg REST protocol instead of the
+  # Nessie API. Everything in the pipeline uses NESSIE_URI above;
+  # scripts/duckdb_console.py uses this one, because DuckDB cannot speak the
+  # Nessie API. The REST catalog addresses a ref through the request prefix
+  # and DuckDB always takes the default branch, which is why that console is
+  # read-only and reads published `main` --1".
+  NESSIE_ICEBERG_URI: http://nessie:19120/iceberg
+  REPORTING_CATALOG: lakehouse
+  REPORTING_ENV: ${REPORTING_ENV:-local}
+
+x-airflow-common: &airflow-common
+  build: {context: ., dockerfile: Dockerfile.airflow}
+  environment:
+    <<: *s3-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Shared across webserver replicas/restarts so sessions survive. Airflow 2
+    # needs nothing like Airflow 3's execution-API URL or JWT secret: under
+    # LocalExecutor the scheduler forks the task and writes its result straight
+    # to the metadata DB, with no service in between to fail to acknowledge it.
+    AIRFLOW__WEBSERVER__SECRET_KEY: local-dev-not-a-real-secret
+    SPARK_MASTER: spark://spark-master:7077
+    DBT_PROJECT_DIR: /opt/platform/dbt
+    DBT_PROFILES_DIR: /opt/platform/dbt
+    # Every dbt target is a Spark one; this selects WHICH. Builds must land on
+    # a Nessie branch and only the Spark path can address one, so dbt_builds.py
+    # refuses a non-Spark value rather than silently writing to `main`.
+    DBT_TARGET: ${DBT_TARGET:-spark_local}
+    PYTHONPATH: /opt/platform
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./reporting_platform:/opt/platform/reporting_platform
+    - ./scripts:/opt/platform/scripts
+    - ./dbt:/opt/platform/dbt
+    - ./seed:/opt/platform/seed
+    # Optional clean restatement of the same history, produced by
+    # `generate_feeds.py --clean --version 2`. Used to demonstrate a build
+    # that PASSES its tests and can therefore be published to main.
+    - ./seed_clean:/opt/platform/seed_clean
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres: {condition: service_healthy}
+    nessie: {condition: service_healthy}
+    minio-init: {condition: service_completed_successfully}
+
+services:
+
+  # ---------------------------------------------------------------- storage
+  minio:
+    image: minio/minio:RELEASE.2024-09-22T00-33-43Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin123}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio-data:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin123};
+      mc mb --ignore-existing local/lakehouse;
+      mc mb --ignore-existing local/lakehouse/landing;
+      mc mb --ignore-existing local/lakehouse/warehouse;
+      echo 'buckets ready';
+      "
+
+  # ------------------------------------------------------- catalog + stores
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: platform
+    ports: ["5432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.99.0
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      # JDBC-backed rather than in-memory, so the local stack exercises the
+      # same version-store path as the cluster and survives a restart.
+      nessie.version.store.type: JDBC
+      quarkus.datasource.jdbc.url: jdbc:postgresql://postgres:5432/nessie
+      quarkus.datasource.username: platform
+      quarkus.datasource.password: platform
+
+      # ------------------------------------------- Iceberg REST catalog (D7)
+      # Nessie 0.99 already serves an Iceberg REST catalog at /iceberg/v1, but
+      # it answers every request with `Warehouse 'x' is not known` until a
+      # warehouse is declared here. It is a SECOND front door onto the same
+      # version store, not a second catalog: Spark keeps using the Nessie API
+      # at /api/v2 and sees exactly the same commits.
+      #
+      # This exists for `scripts/duckdb_console.py`, the read-only analyst and
+      # developer query tool. DuckDB's iceberg extension
+      # cannot speak the Nessie API; it speaks Iceberg REST, and this is what
+      # makes that endpoint usable. It is NOT used by the pipeline, which goes
+      # through NESSIE_URI.
+      #
+      # The credentials are the same MinIO ones the rest of the stack uses.
+      # They are referenced through nessie.catalog.secrets rather than inline
+      # because Nessie rejects the inline form.
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://lakehouse/warehouse
+      nessie.catalog.service.s3.default-options.region: us-east-1
+      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000
+      nessie.catalog.service.s3.default-options.path-style-access: "true"
+      nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      nessie.catalog.secrets.access-key.name: ${S3_ACCESS_KEY:-minioadmin}
+      nessie.catalog.secrets.access-key.secret: ${S3_SECRET_KEY:-minioadmin123}
+    ports: ["19120:19120"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:19120/api/v2/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------- compute
+  spark-master:
+    build: {context: ., dockerfile: Dockerfile.spark}
+    command: /opt/spark/sbin/start-master.sh
+    environment:
+      <<: *s3-env
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_MASTER_HOST: spark-master
+    ports: ["7077:7077", "8080:8080"]
+    volumes:
+      - ./reporting_platform:/opt/platform/reporting_platform:ro
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ivy-cache:/opt/spark/.ivy2
+    depends_on:
+      nessie: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+
+  spark-worker:
+    build: {context: ., dockerfile: Dockerfile.spark}
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    environment:
+      <<: *s3-env
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "4g"
+    volumes:
+      - ./reporting_platform:/opt/platform/reporting_platform:ro
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ivy-cache:/opt/spark/.ivy2
+    depends_on: [spark-master]
+
+  # ---------------------------------------------------------- orchestration
+  #
+  # Airflow 2.x, split into its real components rather than `airflow
+  # standalone`. Two separate reasons, both learned the hard way:
+  #
+  #   * `standalone` bundles everything into one supervised process and proved
+  #     too unreliable to prove scheduling on.
+  #   * Airflow 3 could never record a task completion on this stack at all
+  #     which is why this is 2.10.5. See
+  #     Dockerfile.airflow for the full reasoning.
+  #
+  # The service that runs tasks is still called `airflow`, because with
+  # LocalExecutor tasks execute inside the scheduler process and every
+  # `docker compose exec -T airflow ...` in the README, Makefile and CLAUDE.md
+  # expects to land in the container that has the code mounted.
+
+  airflow-init:
+    <<: *airflow-common
+    # Runs once: schema migration and the admin user. Everything else waits on
+    # it completing, so no component races the DB into existence. Unlike
+    # Airflow 3, `airflow users` exists here.
+    command: >
+      bash -euc "airflow db migrate && airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true"
+    restart: "no"
+
+  airflow:
+    <<: *airflow-common
+    # scheduler == task execution under LocalExecutor
+    command: airflow scheduler
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: airflow webserver
+    ports: ["8081:8080"]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: airflow triggerer
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+
+  # ------------------------------------------------------------- watchdog
+  # Deliberately NOT an Airflow service and deliberately not in
+  # depends_on with any of them: a monitor that shares the lifecycle of the
+  # thing it monitors cannot report that thing being down, which is exactly
+  # why storage_report never noticed housekeeping had not run.
+  #
+  # It uses the same image only because that is the image with the code and
+  # the drivers; it imports no airflow module and talks to Postgres, Nessie
+  # and MinIO directly. `docker compose stop airflow` leaves this running and
+  # complaining, which is the whole point.
+  watchdog:
+    <<: *airflow-common
+    command: python -m reporting_platform.monitoring.watchdog --loop 300
+    environment:
+      <<: *s3-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
+      PYTHONPATH: /opt/platform
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./reporting_platform:/opt/platform/reporting_platform
+      - ./scripts:/opt/platform/scripts
+      # Bind mount, not a named volume: a fresh named volume is created
+      # root-owned and the image runs as `airflow`, so the history file could
+      # not be written (Errno 13). A bind mount also puts the trend history
+      # somewhere a human can read it without entering a container.
+      - ./var/watchdog:/var/lib/reporting-watchdog
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  pg-data:
+  airflow-logs:
+  ivy-cache:

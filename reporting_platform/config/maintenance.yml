@@ -1,0 +1,37 @@
+# Maintenance thresholds. See docs/MAINTENANCE.md.
+#
+# Maintenance is metric-driven, not schedule-driven: we read the Iceberg
+# metadata tables and act only where a threshold is breached. Metrics are
+# emitted every run regardless, so degradation is visible before it becomes
+# a support call.
+
+defaults:
+  # Only consider partitions written in this window. An unscoped compaction
+  # would rewrite six years of month-ends every night.
+  recent_partition_days: 7
+  target_file_size_bytes: 268435456    # 256 MB
+  partial_progress: true
+
+thresholds:
+  compact_when_files_per_partition_gt: 50
+  compact_when_avg_file_size_mb_lt: 32
+  rewrite_manifests_when_manifest_count_gt: 20
+  expire_snapshots_when_snapshot_count_gt: 100
+  rewrite_deletes_when_delete_files_gt: 10
+
+layers:
+  raw:
+    strategy: binpack        # raw is append-only and rarely filtered on sort keys
+  prepared:
+    strategy: sort
+    sort_order: "business_date, counterparty_id"
+  reporting:
+    strategy: sort
+    sort_order: "business_date, counterparty_id"
+
+orphan_files:
+  # NEVER lower this. Too-recent older_than deletes files belonging to an
+  # in-flight write and corrupts the table. Absorbs driver/object-store clock
+  # skew as well as long writes.
+  min_age_days: 3
+  enabled: true

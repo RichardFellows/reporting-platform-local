@@ -1,0 +1,106 @@
+# Automated route. The manual walkthrough in README.md does the same thing
+# step by step — use that first if you want to see what each stage does.
+
+SHELL := /bin/bash
+COMPOSE := docker compose
+DBT := docker compose exec -T airflow dbt
+DBT_ARGS := --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
+
+.PHONY: help
+help:
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	 awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: env
+env: ## Create .env from the template
+	@test -f .env || cp .env.example .env
+
+.PHONY: up
+up: env ## Start the whole local stack
+	$(COMPOSE) up -d --build
+	@echo "MinIO    http://localhost:9001  (minioadmin / minioadmin123)"
+	@echo "Nessie   http://localhost:19120/api/v2/config"
+	@echo "Airflow  http://localhost:8081   (admin / admin)"
+	@echo "Spark    http://localhost:8080"
+
+.PHONY: down
+down: ## Stop the stack, keep volumes
+	$(COMPOSE) down
+
+.PHONY: nuke
+nuke: ## Stop and destroy all data
+	$(COMPOSE) down -v
+
+.PHONY: seed
+seed: ## Generate sample upstream CSVs into seed/
+	# --end is pinned, not defaulted to today: the README walkthrough names
+	# specific generated filenames, and they all derive from this date.
+	python3 scripts/generate_feeds.py --months 30 --end 2026-08-19 --out seed
+
+.PHONY: land
+land: ## Upload seed CSVs into the S3 landing prefix
+	$(COMPOSE) exec -T airflow python -m scripts.land_feeds --source /opt/platform/seed
+
+.PHONY: pools
+pools: ## Create the Airflow pool that serialises lakehouse writes
+	# ONE pool, deliberately. Ingest, dbt builds and maintenance all take this
+	# same slot -- a second one-slot pool would NOT exclude them from each
+	# other, which is exactly the bug that let remove_orphan_files run
+	# alongside a write. See the platform_housekeeping.py docstring.
+	$(COMPOSE) exec -T airflow airflow pools set lakehouse_write 1 "serialise all Iceberg writers, incl. maintenance"
+
+.PHONY: deps
+deps: ## Install dbt packages
+	$(DBT) deps $(DBT_ARGS)
+
+# NOTE: these three build on `main`, because nessie_ref defaults to main and
+# nothing here overrides it. That is convenient for a throwaway local stack but
+# it is NOT the write-audit-publish pattern the platform is built around: a
+# failed build leaves its partial output on main rather than on an abandoned
+# branch. The real orchestration (airflow/dags/dbt_builds.py) always opens a
+# branch and merges only when the test task passes, and README section 8 shows
+# the manual equivalent via scripts/_open_build_branch.py. Prefer that when the
+# state of main matters.
+.PHONY: build
+build: ## Full dbt build (run + test) -- on main, see note above
+	$(DBT) build $(DBT_ARGS)
+
+.PHONY: prepared
+prepared: ## Build the prepared layer only -- on main, see note above
+	$(DBT) build $(DBT_ARGS) --select path:models/prepared
+
+.PHONY: reporting
+reporting: ## Build the reporting layer only -- on main, see note above
+	$(DBT) build $(DBT_ARGS) --select path:models/reporting
+
+.PHONY: lineage
+lineage: ## Generate and serve the dbt lineage docs
+	$(DBT) docs generate $(DBT_ARGS)
+	@echo "run: docker compose exec airflow dbt docs serve --port 8082"
+
+# --all-managed, not a hand-written --table list. These targets used to name
+# five tables against the DAG's nine, so `make retention` silently left four
+# growing. Both now derive from context.managed_tables().
+.PHONY: retention-dry
+retention-dry: ## Show what retention WOULD expire, changing nothing
+	$(COMPOSE) exec -T airflow python -m reporting_platform.retention.retention \
+	  --all-managed --dry-run
+
+.PHONY: retention
+retention: ## Enforce retention for real
+	$(COMPOSE) exec -T airflow python -m reporting_platform.retention.retention \
+	  --all-managed
+
+.PHONY: maintenance-metrics
+maintenance-metrics: ## Collect Iceberg health metrics without acting
+	$(COMPOSE) exec -T airflow python -m reporting_platform.maintenance.maintain \
+	  --all-managed --dry-run
+
+.PHONY: maintenance
+maintenance: ## Run metric-driven maintenance
+	$(COMPOSE) exec -T airflow python -m reporting_platform.maintenance.maintain \
+	  --all-managed
+
+.PHONY: refs
+refs: ## List Nessie branches and tags
+	@curl -s http://localhost:19120/api/v2/trees | python3 -m json.tool

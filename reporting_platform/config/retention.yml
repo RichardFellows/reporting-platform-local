@@ -1,0 +1,188 @@
+# Retention policy. See docs/RETENTION.md.
+#
+# Reproduces the legacy the legacy RDBMS behaviour (10 working days + 80 month-end
+# dates, enforced nightly by partition switching) on Iceberg/Nessie.
+#
+# `keep_business_days` / `keep_month_ends` count DISTINCT business dates
+# observed in the table, not calendar days. A skipped upstream day does not
+# silently shorten the retained window.
+
+environments:
+  local:   &full
+    # THE EVIDENCE COPY. Flat age, not a keep-set: everything every feed ever
+    # delivered is kept for this many years and then removed, including
+    # superseded re-deliveries.
+    #
+    # Deliberately NOT the "10 days + 80 month-ends" rule the tables use.
+    # Landing is immutable flat CSV on the cheap tier, and its whole value is
+    # answering "what did the file we actually received say?" -- a question
+    # usually asked after a restatement, about a date the table layers no
+    # longer hold. Sampling it by keep-set would destroy exactly the evidence
+    # it exists to preserve, for a saving on the cheapest bytes in the estate.
+    #
+    # MUST BE >= the raw layer's window (keep_month_ends/12 years), or
+    # find_pending starts computing its keep-set from a landing prefix that no
+    # longer holds every date and treats live business dates as expired.
+    # landing.py warns if that is violated.
+    landing:
+      keep_years: 8
+
+    raw:
+      keep_business_days: 10
+      keep_month_ends: 80
+      snapshot_retention_days: 7
+      snapshot_retain_last: 5
+
+    prepared:
+      keep_business_days: 10
+      keep_month_ends: 80
+      snapshot_retention_days: 7
+      snapshot_retain_last: 5
+
+    reporting:
+      keep_business_days: 10
+      keep_month_ends: 80
+      # Longer: scheduled BI extracts hold snapshots open, and
+      # expiring underneath a running report produces FileNotFoundException.
+      snapshot_retention_days: 30
+      snapshot_retain_last: 10
+
+  uat: *full
+  prod: *full
+
+  # Once masking/subsetting lands, non-prod should shorten. Note this removes
+  # the ability to reproduce a production month-end issue in a lower
+  # environment without an explicit restore procedure.
+  dev:
+    landing:   {keep_years: 1}
+    raw:       {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
+    prepared:  {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
+    reporting: {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 5, snapshot_retain_last: 3}
+
+# Nessie reference retention. THIS IS DATA RETENTION: a tag pinning an old
+# commit pins every data file that commit referenced, and expire_snapshots
+# cannot reclaim it.
+references:
+  # published/<business_date>/<run_id> — cut on main after each publication
+  published_tags:
+    keep_business_days: 10
+    keep_month_ends: 80
+  # ingest/* and build/* working branches
+  working_branches:
+    # NOT READ BY ANY CODE. ingest_feed.py deletes the branch immediately
+    # after a successful merge, unconditionally; setting this false does not
+    # keep it.
+    delete_after_merge: true
+
+    # PER PURPOSE, because one number was serving two different needs and
+    # serving the more important one badly. A build that fails at 22:00 on a
+    # Friday was swept at 22:00 on Sunday under the old global 48h -- the
+    # evidence `keep_failed_branch` exists to preserve, destroyed at precisely
+    # the moment nobody had yet looked at it.
+    #
+    #   build:  120h covers a weekend with slack. A failed build is diagnosed
+    #           by a person, on a Monday, from the branch itself.
+    #   ingest: 48h. Nobody diagnoses a crashed ingest branch individually;
+    #           the feed is simply re-ingested, so holding it longer only
+    #           pins files GC would otherwise collect.
+    #
+    # A bare number is still accepted and applies to every prefix.
+    #
+    # UPPER BOUND: keep these <= the shortest snapshot_retention_days above
+    # (7d = 168h), or branch retention and snapshot retention are working
+    # against each other -- a branch outliving the snapshots its commits
+    # reference. retention.py warns if that is violated.
+    abandoned_after_hours:
+      ingest: 48
+      build: 120
+
+    # A branch under investigation is kept indefinitely by renaming it OUT of
+    # the ingest/ and build/ prefixes, into hold/. See docs/RETENTION.md.
+    #
+    # NOT READ BY ANY CODE, and it does not need to be: the sweep only ever
+    # matches WORKING_RE (^(ingest|build)/), so hold/ -- and equally any other
+    # prefix -- is exempt by construction rather than by a special case that
+    # could be forgotten. This value is documentation, not configuration;
+    # changing it does not change which branches are exempt.
+    #
+    # Holding is not free: a live branch pins every file its commits
+    # reference, so Nessie GC cannot collect them for as long as the hold
+    # lasts. That is why it is a rename a person performs deliberately.
+    hold_prefix: hold/
+
+# Nessie garbage collection. Iceberg's expire_snapshots only sees snapshots
+# reachable from the one table pointer it is handed; Nessie holds many pointers
+# (every branch, every tag). Nessie GC is what identifies content unreachable
+# from ANY live reference. See docs/MAINTENANCE.md "Nessie GC".
+#
+# Runs via the external nessie-gc tool (there is no server-side GC endpoint and
+# no REST call for this) -- baked into the Airflow image by Dockerfile.airflow.
+nessie_gc:
+  # ON, because under Nessie this is the ONLY thing that reclaims storage.
+  # `expire_snapshots` cannot: NessieCatalog sets gc.enabled=false on every
+  # table, so Iceberg refuses to delete files (correctly -- they are shared
+  # across references). With GC off, nothing is ever reclaimed and the
+  # warehouse grows without bound.
+  #
+  # This is safe to leave on because defer_deletes below means the sweep
+  # RECORDS what it would delete rather than deleting it. Actual removal stays
+  # a deliberate human act: `nessie-gc deferred-deletes`.
+  enabled: true
+
+  # How far back each reference's commit log is treated as live. Content
+  # referenced ONLY by commits older than this is collectable.
+  #
+  # SAFETY RULE: this must be >= the longest snapshot_retention_days above
+  # (currently 30, on reporting). A shorter cutoff collects files that
+  # still-valid snapshots reference, which breaks time travel and the
+  # scheduled BI extracts snapshot_retention_days exists to protect.
+  # retention.py refuses to run if this invariant is violated.
+  #
+  # Accepts: a java.time.Duration (P30D), a commit count, an ISO instant, or
+  # NONE meaning "everything is live" (a safe no-op).
+  default_cutoff: P30D
+
+  # Identified files are recorded rather than deleted, so a human can inspect
+  # them (`nessie-gc list-deferred`) before anything is removed. Setting this
+  # false makes the sweep delete immediately.
+  defer_deletes: true
+
+  # ------------------------------------------------ deferral window (D4)
+  # Deferral used to mean "a human runs `nessie-gc deferred-deletes` by hand",
+  # which in practice meant nobody did and NOTHING was ever reclaimed
+  # unattended. The window is a policy value, not a manual step: the nightly
+  # run executes the deferred deletes recorded by any live-set that is at
+  # least this old, so every file still gets a review period, and reclamation
+  # still happens without anyone remembering.
+  #
+  # The sweep that RECORDS a set never deletes it in the same run -- that is
+  # the whole point of deferral. Set to 0 only if you want same-run deletion,
+  # in which case prefer `defer_deletes: false`, which is one process instead
+  # of two.
+  #
+  # Hours, not days, to match `abandoned_after_hours` above. Per environment,
+  # because the window is really "how long a human needs to notice", and that
+  # differs: on this laptop a whole day of pipeline happens in ten minutes and
+  # the reviewer is the person at the keyboard, whereas prod needs a Friday
+  # sweep to still be reviewable on Monday morning.
+  #
+  # A bare number is also accepted and applies to every environment.
+  deferred_delete_after_hours:
+    local: 1
+    dev: 6
+    uat: 48
+    prod: 72
+
+  # Live-sets are bookkeeping rows in the GC database. A set whose deferred
+  # deletes have been executed is dropped immediately (there is nothing left
+  # to act on); one that only ever completed mark-live -- every dry run
+  # creates one -- is dropped after this long, so `nessie-gc list` stays
+  # readable. Purely cosmetic: no data files hang off it.
+  live_set_retention_hours: 168
+
+  # Live-set bookkeeping. Its own database, mirroring the separation in
+  # scripts/init-postgres.sql. In-memory storage is possible but cannot defer
+  # deletes, so it is not used here.
+  jdbc_url: jdbc:postgresql://postgres:5432/nessie_gc
+  jdbc_user: platform
+  jdbc_password: platform

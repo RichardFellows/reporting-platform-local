@@ -1,0 +1,53 @@
+name: reporting_platform
+version: '1.0.0'
+config-version: 2
+profile: reporting_platform
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths:  ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # Nessie branch the build runs on. Injected by the Airflow task; defaults to
+  # main for interactive local work.
+  nessie_ref: main
+  # Business date being built. Empty means "whatever is latest in raw".
+  business_date: ''
+  # Number of trailing business dates the incremental models reprocess.
+  # Covers late-arriving corrections without a full rebuild.
+  lookback_days: 3
+
+models:
+  reporting_platform:
+    +file_format: iceberg
+    +materialized: incremental
+    # Spark's strategy, unconditionally. This was briefly engine-conditional
+    # during D7, falling back to `delete+insert` because dbt-duckdb rejects
+    # `merge` outright. That conditional went with the rest of the
+    # second-engine support: nothing materialises through a non-Spark adapter
+    # any more, so it was a branch nothing could take. `merge` is what
+    +incremental_strategy: merge
+
+    prepared:
+      +schema: prepared
+      # business_date leads the partition spec on every table. This is a
+      # RETENTION requirement, not a performance one — see docs/RETENTION.md.
+      +partition_by: ['business_date']
+      +tags: ['prepared']
+
+    reporting:
+      +schema: reporting
+      +partition_by: ['business_date']
+      +tags: ['reporting']
+
+seeds:
+  reporting_platform:
+    +schema: reference
+
+# Fail the build if a source has not been refreshed. Freshness is how a late
+# feed becomes visible rather than silently carried forward.
+sources:
+  reporting_platform:
+    +loaded_at_field: _ingest_ts

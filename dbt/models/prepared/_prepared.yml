@@ -1,0 +1,71 @@
+version: 2
+
+models:
+  - name: prep_counterparty
+    description: >
+      Conformed counterparty reference. The single shared representation —
+      every report that needs a counterparty attribute ref()s this, so
+      divergence between apps shows up in the lineage graph instead of
+      hiding in 23 separate stored procedures.
+    columns:
+      - name: business_date
+        tests: [not_null]
+      - name: counterparty_id
+        tests: [not_null]
+      - name: country_code
+        tests:
+          - dbt_utils.not_empty_string
+      - name: is_active
+        tests:
+          - accepted_values: {values: [true, false], quote: false}
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, counterparty_id]
+
+  - name: prep_trade
+    description: Conformed, typed trade positions. No joins, no report opinions.
+    columns:
+      - name: business_date
+        tests: [not_null]
+      - name: trade_id
+        tests: [not_null]
+      - name: counterparty_id
+        tests:
+          - not_null
+          # The load never fails on a bad reference — the TEST fails, and the
+          # branch is not merged. This is the write-audit-publish payoff.
+          - relationships:
+              to: ref('prep_counterparty')
+              field: counterparty_id
+      - name: notional
+        tests:
+          - not_null
+          - dbt_utils.accepted_range: {min_value: 0, inclusive: true}
+      - name: currency
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, trade_id]
+
+  - name: prep_rating
+    description: Agency ratings with numeric rank and grade band.
+    columns:
+      - name: counterparty_id
+        tests: [not_null]
+      - name: agency
+        tests:
+          - not_null
+          - accepted_values: {values: ['MOODYS', 'SP', 'FITCH']}
+      - name: rating_rank
+        # NULL rank means an unmapped rating string — investigate rather than
+        # silently excluding the counterparty from investment-grade reporting.
+        tests:
+          - not_null:
+              config: {severity: warn}
+      - name: grade_band
+        tests:
+          - accepted_values: {values: ['INVESTMENT_GRADE', 'SUB_INVESTMENT_GRADE']}
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, counterparty_id, agency]

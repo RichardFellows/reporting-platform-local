@@ -1,0 +1,110 @@
+version: 2
+
+models:
+  - name: rpt_counterparty_exposure
+    description: >
+      The shared spine of the reporting layer. Every other mart ref()s this
+      rather than re-deriving exposure from prepared, so a change to the
+      exposure definition moves all reports together. Replaces the legacy report server's
+      "Counterparty Exposure Summary" report set.
+    columns:
+      - name: business_date
+        tests: [not_null]
+      - name: counterparty_id
+        tests: [not_null]
+      - name: legal_name
+        description: >
+          Null indicates a counterparty present in trades but absent from the
+          reference feed. Deliberately surfaced rather than dropped — silently
+          losing exposure is the more dangerous failure in a risk report.
+        tests:
+          - not_null:
+              config:
+                severity: warn
+      - name: total_notional
+        tests: [not_null]
+      - name: total_mtm
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, counterparty_id]
+
+  - name: rpt_exposure_by_country
+    description: >
+      Country rollup, derived from rpt_counterparty_exposure so it reconciles
+      to the detail by construction.
+    columns:
+      - name: country_code
+        tests: [not_null]
+      - name: counterparty_count
+        tests:
+          - dbt_utils.accepted_range: {min_value: 1, inclusive: true}
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, country_code]
+      # Reconciliation is the point of the shared lineage — assert it.
+      - dbt_utils.equality:
+          compare_model: ref('rpt_counterparty_exposure')
+          compare_columns: [business_date]
+          config:
+            severity: warn
+
+  - name: rpt_exposure_change
+    description: >
+      Day-on-day and month-on-month change in counterparty exposure. This is
+      the model the estate's reporting emphasis actually needs, and the one
+      that was expensive on the legacy RDBMS.
+    columns:
+      - name: business_date
+        tests: [not_null]
+      - name: counterparty_id
+        tests: [not_null]
+      - name: change_category
+        tests:
+          - accepted_values:
+              values: ['NEW', 'REMOVED', 'MATERIAL_CHANGE', 'CHANGED', 'UNCHANGED']
+      - name: prior_month_end_mtm
+        description: >
+          Null on the first retained month. Persistent nulls beyond that mean
+          the month-end retention rule has been shortened and the month-on-month
+          comparison has silently stopped working — which is why this is a test
+          and not a comment.
+        tests:
+          - not_null:
+              config:
+                severity: warn
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, counterparty_id]
+
+exposures:
+  - name: counterparty_exposure_report
+    label: Counterparty Exposure (the BI tool)
+    type: analysis
+    maturity: medium
+    description: >
+      First Reporting Platform proof point — replaces a set of legacy reports,
+      surfaced through the BI tool. Declared here so that `dbt ls
+      --select +exposure:counterparty_exposure_report` answers "what breaks if
+      I change this model", which is the question the legacy estate cannot
+      currently answer.
+    depends_on:
+      - ref('rpt_counterparty_exposure')
+      - ref('rpt_exposure_change')
+    owner:
+      name: Reporting
+      email: reporting@example.invalid
+
+  - name: country_exposure_dashboard
+    label: Country Exposure (Qlik)
+    type: dashboard
+    maturity: low
+    description: >
+      Retained in the near term. The serving layer must not assume this tool —
+      replaceability of the BI product is the constraint that shapes everything
+      upstream of it.
+    depends_on:
+      - ref('rpt_exposure_by_country')
+    owner:
+      name: Reporting
+      email: reporting@example.invalid
