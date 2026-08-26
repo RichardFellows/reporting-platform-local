@@ -92,6 +92,19 @@ Two corollaries worth holding on to:
   has them in order. The only one that fails silently if you skip it is
   `PREPARED_TABLES` in `common/context.py`: the table just never gets
   maintained or retained.
+- **The feed console (`reporting_platform/ui`, <http://localhost:8082>) writes
+  those six files from a form** and drives land → ingest → build. It is a
+  front end for the doc above, not a second source of truth: it round-trips
+  `feeds.yml` with ruamel so the comments survive, and the change it makes is
+  an ordinary reviewable diff, checked with `dbt parse` (~5s, no Spark) so a
+  scaffolded model that dbt cannot read is caught then rather than in the
+  build. It can also generate a delivery from the definition and run `dbt
+  build` for ONE feed on a throwaway branch — **that path never merges**, on
+  purpose: publication belongs to the Airflow builds, not to a button labelled
+  "test". See `docs/FEED-UI.md`. Because it edits config
+  a running Airflow is reading, `feeds()` and `_load()` in `common/context.py`
+  are cached on the file's **mtime** — do not put a plain `@lru_cache` back on
+  them or a new feed will never reach the DAG processor.
 - Retention and GC delete data. `dry_run` first, always. GC defers its deletes
   by design; the deferred-delete pass is the deliberate second step.
 
@@ -119,6 +132,9 @@ docker compose exec -T airflow airflow dags trigger ingest_trade
 
 # out-of-band health check (its own container, no Airflow dependency)
 docker compose logs --tail 20 watchdog
+
+# feed console -- add/edit a feed, land it, ingest it, watch the builds
+docker compose up -d feed-ui     # http://localhost:8082
 
 # read-only query console against published `main`
 docker compose exec -T airflow python -m scripts.duckdb_console --tables

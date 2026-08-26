@@ -68,3 +68,19 @@ RUN pip install --no-cache-dir \
       "duckdb==1.5.5" \
       "pyspark==3.5.3" \
       "pyyaml" "boto3" "pandas" "pyarrow"
+
+# The feed console (reporting_platform/ui) and what it needs to edit config
+# without destroying it. ruamel.yaml rather than the pyyaml already installed
+# above: feeds.yml is mostly comments explaining why each feed is configured
+# the way it is, and a pyyaml load/dump round trip deletes every one of them.
+# pyyaml stays for the read-only config loading in common/context.py.
+#
+# Installed in the same image as everything else because the console imports
+# common.context, ingest.arrival and the dbt project layout directly -- a
+# separate slimmer image would have to duplicate the platform package and
+# could then be built against a different version of it.
+RUN pip install --no-cache-dir \
+      "fastapi==0.115.6" \
+      "uvicorn[standard]==0.34.0" \
+      "python-multipart==0.0.20" \
+      "ruamel.yaml==0.18.6"

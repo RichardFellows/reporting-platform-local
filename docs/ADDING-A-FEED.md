@@ -8,6 +8,13 @@ commit, so `git show` is a second copy of this document that cannot drift.
 verifiable on its own — do not batch them and then debug the whole thing at
 once.
 
+> **There is a UI for this.** The feed console at <http://localhost:8082>
+> writes all six files from one form, with the filename pattern derived from a
+> real filename and every trap below turned into a validation message. See
+> [FEED-UI.md](FEED-UI.md). Read this document anyway: the console does what it
+> describes and the diff it produces is meant to be reviewed as an ordinary
+> change.
+
 ---
 
 ## 1. `reporting_platform/config/feeds.yml` — the registry

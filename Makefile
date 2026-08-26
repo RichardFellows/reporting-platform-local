@@ -102,5 +102,9 @@ maintenance: ## Run metric-driven maintenance
 	  --all-managed
 
 .PHONY: refs
+console: ## Start the feed console UI on http://localhost:8082
+	docker compose up -d feed-ui
+	@echo "feed console: http://localhost:8082"
+
 refs: ## List Nessie branches and tags
 	@curl -s http://localhost:19120/api/v2/trees | python3 -m json.tool

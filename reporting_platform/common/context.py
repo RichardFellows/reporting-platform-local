@@ -24,9 +24,32 @@ ENV = os.environ.get("REPORTING_ENV", "local")
 
 # --------------------------------------------------------------------- config
 @lru_cache(maxsize=None)
-def _load(name: str) -> dict[str, Any]:
+def _load_at(name: str, mtime_ns: int) -> dict[str, Any]:
+    """Parse a config file. Cached on (name, mtime) rather than name alone."""
     with open(CONFIG_DIR / name) as fh:
         return yaml.safe_load(fh)
+
+
+def _load(name: str) -> dict[str, Any]:
+    """Load a config file, re-reading it if it has changed on disk.
+
+    THE MTIME IS PART OF THE CACHE KEY ON PURPOSE. This was a plain
+    `@lru_cache` on the name, which is correct for a process whose config
+    cannot change under it -- but `reporting_platform/ui` edits feeds.yml
+    while the platform is running, and every long-lived process that had
+    already called `feeds()` would then hold the pre-edit registry until it
+    was restarted. That includes Airflow's DAG file processor, which reuses
+    its worker processes across parses: a new feed would be written, the DAG
+    file re-parsed, and no `ingest_<feed>` DAG would appear, with nothing
+    anywhere reporting an error.
+
+    Re-keying on mtime keeps the caching (a hot path still parses no YAML)
+    and makes a config edit visible everywhere within one file-process
+    interval. `st_mtime_ns` rather than `st_mtime`: two edits inside the same
+    filesystem timestamp tick are entirely possible from a web form, and a
+    coarser key would miss the second one.
+    """
+    return _load_at(name, (CONFIG_DIR / name).stat().st_mtime_ns)
 
 
 @dataclass(frozen=True)
@@ -76,8 +99,8 @@ class Feed:
         return bd, int(raw_version) if raw_version else 1
 
 
-@lru_cache(maxsize=1)
-def feeds() -> dict[str, Feed]:
+@lru_cache(maxsize=None)
+def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
     cfg = _load("feeds.yml")
     defaults = cfg.get("defaults", {})
     out: dict[str, Feed] = {}
@@ -86,6 +109,15 @@ def feeds() -> dict[str, Feed]:
         allowed = {f.name for f in Feed.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         out[block["name"]] = Feed(**{k: v for k, v in merged.items() if k in allowed})
     return out
+
+
+def feeds() -> dict[str, Feed]:
+    """The feed registry, keyed by name.
+
+    Keyed on feeds.yml's mtime for the same reason `_load` is -- see there.
+    A registry edit is picked up by every process on its next call.
+    """
+    return _feeds_at((CONFIG_DIR / "feeds.yml").stat().st_mtime_ns)
 
 
 def feed(name: str) -> Feed:
@@ -107,8 +139,7 @@ def feed(name: str) -> Feed:
 # same name, different namespace. That is legal because dbt keeps models and
 # sources in separate namespaces -- a model named `trade` and a source
 # `raw.trade` coexist without collision (verified, not assumed).
-PREPARED_TABLES = ["trade", "counterparty", "rating",
-                   "primary_limits"]
+PREPARED_TABLES = ["trade", "counterparty", "rating", "primary_limits"]
 REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
                     "exposure_change"]
 

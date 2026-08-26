@@ -38,6 +38,14 @@ x-airflow-common: &airflow-common
     # LocalExecutor the scheduler forks the task and writes its result straight
     # to the metadata DB, with no service in between to fail to acknowledge it.
     AIRFLOW__WEBSERVER__SECRET_KEY: local-dev-not-a-real-secret
+    # The stable REST API is how the feed console (port 8082) triggers DAGs.
+    # `session` alone is the 2.x default and only authenticates a browser that
+    # has logged into the web UI, so an API call from another container gets
+    # 401 with a perfectly healthy webserver -- add basic_auth, keep session so
+    # the UI itself still works. Same admin/admin as the web UI: this is the
+    # local stack, and anything shared needs a real identity layer in front of
+    # the console regardless.
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
     # Every Spark job runs on the spark-master/spark-worker cluster; the
     # calling process is only the driver. context.py's spark_session() REFUSES
     # a local[*] value here rather than quietly running the work in-process,
@@ -239,6 +247,46 @@ services:
     command: airflow triggerer
     depends_on:
       airflow-init: {condition: service_completed_successfully}
+
+  # ----------------------------------------------------------- feed console
+  # The UI for onboarding and running a feed: http://localhost:8082
+  #
+  # Same image as airflow because it imports common.context, ingest.arrival and
+  # the dbt project directly -- there is one definition of a feed and this
+  # reads it rather than describing it again.
+  #
+  # It needs its bind mounts READ-WRITE, unlike spark-master/spark-worker: the
+  # whole point is that it edits reporting_platform/config/feeds.yml, the dbt
+  # project and seed/. Those edits land in the working tree on the host and
+  # show up in `git diff`, which is what makes a feed added here reviewable as
+  # an ordinary change.
+  #
+  # No depends_on airflow: the console is useful with the scheduler down (it
+  # can still register and scaffold a feed) and says so in its header rather
+  # than refusing to start.
+  feed-ui:
+    <<: *airflow-common
+    command: python -m reporting_platform.ui
+    environment:
+      <<: *s3-env
+      PYTHONPATH: /opt/platform
+      PYTHONUNBUFFERED: "1"
+      DBT_PROJECT_DIR: /opt/platform/dbt
+      DBT_PROFILES_DIR: /opt/platform/dbt
+      REPORTING_SEED_DIR: /opt/platform/seed
+      # The console runs `dbt build` for a single feed on a throwaway branch,
+      # so it is a Spark CLIENT like every other component and must name the
+      # cluster the same way they do. Both readers of this default to the same
+      # address if it is unset -- which is exactly the silent divergence
+      # CLAUDE.md warns about, so it is set explicitly here rather than left to
+      # two defaults that could drift apart.
+      SPARK_MASTER: spark://spark-master:7077
+      DBT_TARGET: ${DBT_TARGET:-spark_local}
+      AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
+      AIRFLOW_API_USER: admin
+      AIRFLOW_API_PASSWORD: admin
+    ports: ["8082:8082"]
+    restart: unless-stopped
 
   # ------------------------------------------------------------- watchdog
   # Deliberately NOT an Airflow service and deliberately not in

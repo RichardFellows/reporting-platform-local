@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feed console</title>
+<style>
+  :root {
+    --bg: #11131a; --panel: #181b24; --panel-2: #1f232e; --line: #2b3140;
+    --ink: #e6e9f0; --muted: #97a0b5; --accent: #6ea8fe; --ok: #4ec98a;
+    --warn: #e6b455; --bad: #e8697d; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  header .links { margin-left: auto; display: flex; gap: 14px; font-size: 12px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  main { display: grid; grid-template-columns: 290px 1fr; height: calc(100vh - 49px); }
+  aside { border-right: 1px solid var(--line); overflow-y: auto; background: var(--panel); }
+  section.detail { overflow-y: auto; padding: 20px 24px 60px; }
+  .feed-item { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .feed-item:hover { background: var(--panel-2); }
+  .feed-item.active { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+  .feed-item .nm { font-weight: 600; }
+  .feed-item .sub { color: var(--muted); font-size: 12px; }
+  .newbtn { width: 100%; padding: 11px; background: none; border: 0;
+            border-bottom: 1px solid var(--line); color: var(--accent);
+            font: inherit; cursor: pointer; text-align: left; padding-left: 14px; }
+  .newbtn:hover { background: var(--panel-2); }
+  h2 { font-size: 18px; margin: 0 0 2px; }
+  h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--muted); margin: 26px 0 10px; font-weight: 600; }
+  .sub { color: var(--muted); }
+  .tabs { display: flex; gap: 4px; margin: 18px 0 0; border-bottom: 1px solid var(--line); }
+  .tabs button { background: none; border: 0; border-bottom: 2px solid transparent;
+                 color: var(--muted); padding: 8px 14px; font: inherit; cursor: pointer; }
+  .tabs button.active { color: var(--ink); border-bottom-color: var(--accent); }
+  .pane { display: none; padding-top: 4px; } .pane.active { display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px;
+       padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11.5px;
+          border: 1px solid var(--line); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: #24543c; }
+  .pill.warn { color: var(--warn); border-color: #5b4720; }
+  .pill.bad { color: var(--bad); border-color: #5e2733; }
+  button.act { background: var(--panel-2); border: 1px solid var(--line); color: var(--ink);
+               padding: 7px 13px; border-radius: 5px; font: inherit; cursor: pointer; }
+  button.act:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button.act:disabled { opacity: .45; cursor: progress; }
+  button.act.primary { background: #23407a; border-color: #2f5296; }
+  button.act.danger:hover { border-color: var(--bad); color: var(--bad); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, textarea, select { width: 100%; background: var(--bg); color: var(--ink);
+        border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px; font: inherit; }
+  input.mono, textarea.mono { font-family: var(--mono); font-size: 12.5px; }
+  .field { margin-bottom: 14px; }
+  .field .err { color: var(--bad); font-size: 12px; margin-top: 4px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .note { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+          padding: 10px 12px; border-radius: 4px; color: var(--muted); font-size: 12.5px;
+          margin: 10px 0; }
+  .note.warn { border-left-color: var(--warn); }
+  pre.log { background: #0c0e14; border: 1px solid var(--line); border-radius: 5px;
+            padding: 10px 12px; font-family: var(--mono); font-size: 12px;
+            max-height: 320px; overflow: auto; white-space: pre-wrap; margin: 10px 0; }
+  .steps li { margin-bottom: 3px; }
+  .colrow { display: grid; grid-template-columns: 1fr 130px 30px; gap: 8px; margin-bottom: 6px; }
+  .muted { color: var(--muted); }
+  .stage { display: flex; align-items: center; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+  .stage .arrow { color: var(--muted); }
+  .box { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
+         background: var(--panel); min-width: 132px; }
+  .box .t { font-size: 11.5px; color: var(--muted); text-transform: uppercase;
+            letter-spacing: .05em; }
+  .box .v { font-size: 13px; margin-top: 2px; }
+  .scroll { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+  .empty { color: var(--muted); padding: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Feed console</h1>
+  <span id="af-health" class="pill">airflow …</span>
+  <span class="links">
+    <a href="http://localhost:8081" target="_blank">Airflow</a>
+    <a href="http://localhost:8080" target="_blank">Spark</a>
+    <a href="http://localhost:9001" target="_blank">MinIO</a>
+    <a href="http://localhost:19120/api/v2/trees" target="_blank">Nessie refs</a>
+    <a href="/api/docs" target="_blank">API</a>
+  </span>
+</header>
+
+<main>
+  <aside>
+    <button class="newbtn" id="new-feed">+ New feed</button>
+    <div id="feed-list"></div>
+  </aside>
+  <section class="detail" id="detail"><div class="empty">Select a feed, or add one.</div></section>
+</main>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+const el = (t, a={}, kids=[]) => {
+  const n = document.createElement(t);
+  for (const [k, v] of Object.entries(a)) {
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) n.setAttribute(k, v);
+  }
+  for (const kid of [].concat(kids)) n.append(kid);
+  return n;
+};
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const err = new Error((body && (body.detail || JSON.stringify(body.errors))) || res.statusText);
+    err.status = res.status; err.body = body;
+    throw err;
+  }
+  return body;
+}
+const jpost = (path, body) => api(path, {
+  method: "POST", headers: {"Content-Type": "application/json"},
+  body: JSON.stringify(body ?? {})});
+
+let STATE = { feeds: [], selected: null, tab: "details", types: [] };
+
+// --------------------------------------------------------------- feed list
+async function loadFeeds(keep) {
+  const data = await api("/api/feeds");
+  STATE.feeds = data.feeds;
+  const list = $("#feed-list");
+  list.textContent = "";
+  for (const f of data.feeds) {
+    const incomplete = Object.values(f.scaffold).some(v => !v);
+    list.append(el("div", {
+      class: "feed-item" + (f.name === keep ? " active" : ""),
+      onclick: () => selectFeed(f.name),
+    }, [
+      el("div", {class: "nm"}, f.name),
+      el("div", {class: "sub"}, `${f.source_system} · ${f.columns.length} cols` +
+        (incomplete ? " · incomplete" : "")),
+    ]));
+  }
+}
+
+async function selectFeed(name, tab) {
+  STATE.selected = name;
+  STATE.tab = tab || "details";
+  await loadFeeds(name);
+  renderDetail(STATE.feeds.find(f => f.name === name));
+}
+
+// ------------------------------------------------------------ feed detail
+function scaffoldPills(s) {
+  const labels = {dbt_source: "dbt source", prepared_model: "prepared model",
+                  prepared_tests: "tests", maintained: "maintained"};
+  // These are PRESENCE checks -- the file exists, the entry is in the YAML.
+  // Whether dbt can actually read what is there is a different question, and
+  // the caption says so rather than letting four green pills imply it.
+  return el("div", {}, [
+    el("div", {class: "row"}, Object.entries(labels).map(([k, label]) =>
+      el("span", {class: "pill " + (s[k] ? "ok" : "bad")},
+         (s[k] ? "✓ " : "✗ ") + label))),
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+       "Presence only — these say the files exist, not that dbt accepts them. " +
+       "Use Validate dbt project on the Details tab for that."),
+  ]);
+}
+
+function renderDetail(f) {
+  if (!f) return;
+  const d = $("#detail");
+  d.textContent = "";
+  d.append(
+    el("h2", {}, f.name),
+    el("div", {class: "sub"}, f.description),
+    el("div", {class: "row", style: "margin-top:10px"}, [
+      el("span", {class: "pill"}, f.raw_table),
+      el("span", {class: "pill"}, f.landing_prefix),
+      el("span", {class: "pill " + (f.dag_known ? (f.dag_paused ? "warn" : "ok") : "warn")},
+         f.dag_known === null ? "DAG state unknown (Airflow unreachable)"
+           : f.dag_known ? (f.dag_paused ? "DAG paused" : "DAG live")
+           : "DAG not parsed yet"),
+      el("span", {class: "pill"}, f.cadence),
+    ]),
+    el("div", {style: "margin-top:10px", id: "scaffold-pills"},
+       [scaffoldPills(f.scaffold)]),
+  );
+
+  const tabs = el("div", {class: "tabs"});
+  const panes = el("div");
+  for (const [key, label, render] of [
+    ["details", "Details", paneDetails],
+    ["data", "Data", paneData],
+    ["run", "Run", paneRun],
+  ]) {
+    const btn = el("button", {class: STATE.tab === key ? "active" : "",
+                              onclick: () => { STATE.tab = key; renderDetail(f); }}, label);
+    tabs.append(btn);
+    const pane = el("div", {class: "pane" + (STATE.tab === key ? " active" : "")});
+    panes.append(pane);
+    if (STATE.tab === key) render(pane, f);
+  }
+  d.append(tabs, panes);
+}
+
+// --------------------------------------------------------------- details tab
+function paneDetails(pane, f) {
+  const form = feedForm(f, false);
+  pane.append(form.node);
+  pane.append(el("div", {class: "row", style: "margin-top:6px"}, [
+    el("button", {class: "act primary", onclick: async (e) => {
+      await withBusy(e.target, async () => {
+        const payload = form.read();
+        try {
+          await api(`/api/feeds/${f.name}`, {
+            method: "PUT", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)});
+          form.clearErrors();
+          toast(pane, "feeds.yml updated. Airflow picks the change up on its next parse of feed_ingest.py (~30s).");
+          selectFeed(f.name, "details");
+        } catch (err) { form.showErrors(err); }
+      });
+    }}, "Save changes"),
+    el("button", {class: "act", onclick: async (e) => {
+      await withBusy(e.target, async () => {
+        const r = await jpost(`/api/scaffold/${f.name}`, {column_types: form.readTypes()});
+        renderSteps(pane, r.steps);
+        renderValidation(pane, r.validation);
+        // Refresh the pills in place rather than re-rendering the whole
+        // detail pane, which would discard the result just rendered.
+        const pills = $("#scaffold-pills");
+        if (pills) { pills.textContent = ""; pills.append(scaffoldPills(r.scaffold)); }
+      });
+    }}, "Fill missing dbt files"),
+    el("button", {class: "act", onclick: async (e) => {
+      await withBusy(e.target, async () => {
+        renderValidation(pane, await jpost("/api/validate"));
+      });
+    }}, "Validate dbt project"),
+    el("button", {class: "act danger", onclick: () => deleteFeed(pane, f)}, "Delete feed"),
+  ]));
+
+  pane.append(el("div", {class: "note"},
+    "The name is fixed once created: it is the raw table, the DAG id, the S3 prefix, " +
+    "the dbt source, the model and the PREPARED_TABLES entry at the same time. " +
+    "To rename, delete and re-add."));
+}
+
+async function deleteFeed(pane, f) {
+  const typed = prompt(
+    `Remove ${f.name} from the registry?\n\n` +
+    `${f.raw_table} and anything built from it are LEFT IN PLACE, but stop being ` +
+    `maintained or retained.\n\nType the feed name to confirm:`);
+  if (typed !== f.name) return;
+  const alsoModel = confirm("Also delete dbt/models/prepared/" + f.name + ".sql?");
+  const r = await api(`/api/feeds/${f.name}?confirm=${encodeURIComponent(f.name)}` +
+                      `&scaffold_too=${alsoModel}`, {method: "DELETE"});
+  STATE.selected = null;
+  await loadFeeds();
+  $("#detail").textContent = "";
+  $("#detail").append(el("div", {class: "note warn"},
+    `Removed ${r.deleted}. ${r.note} ${r.files_removed.length ? "Deleted: " + r.files_removed.join(", ") : ""}`));
+}
+
+// ------------------------------------------------------------- the form
+function feedForm(f, creating) {
+  const node = el("div");
+  const errBoxes = {};
+  const field = (key, label, input, help) => {
+    const err = el("div", {class: "err"});
+    errBoxes[key] = err;
+    return el("div", {class: "field"}, [
+      el("label", {}, label), input,
+      help ? el("div", {class: "sub", style: "font-size:12px;margin-top:4px"}, help) : "",
+      err]);
+  };
+
+  const name = el("input", {value: f?.name ?? "", placeholder: "primary_limits",
+                            class: "mono", disabled: creating ? null : "disabled"});
+  const desc = el("textarea", {rows: "2", placeholder: "What this feed carries, and from where."});
+  desc.value = f?.description ?? "";
+  const src = el("input", {value: f?.source_system ?? "", placeholder: "GCIS2"});
+  const pattern = el("input", {class: "mono", value: f?.filename_pattern ?? "",
+                               placeholder: "FEED_(?P<business_date>\\d{8})\\.csv"});
+  const example = el("input", {class: "mono", placeholder: "primaryLimits_20260801.csv"});
+  const patternResult = el("div", {class: "sub", style: "font-size:12px;margin-top:6px"});
+  const minRows = el("input", {type: "number", min: "0", value: f?.expected_min_rows ?? 10});
+  const cadence = el("select", {}, ["daily", "weekly"].map(v =>
+    el("option", {value: v, selected: (f?.cadence ?? "daily") === v ? "selected" : null}, v)));
+  const drift = el("select", {}, ["warn", "fail"].map(v =>
+    el("option", {value: v, selected: (f?.schema_drift ?? "warn") === v ? "selected" : null}, v)));
+  const completeness = el("input", {type: "checkbox"});
+  completeness.checked = f ? f.completeness : true;
+
+  async function testPattern() {
+    const r = await jpost("/api/test-pattern",
+      {pattern: pattern.value, filename: example.value});
+    patternResult.textContent = r.ok
+      ? `✓ matches — business_date ${r.business_date}, version ${r.version}`
+      : `✗ ${r.reason}`;
+    patternResult.style.color = r.ok ? "var(--ok)" : "var(--bad)";
+  }
+
+  node.append(
+    field("name", "Name", name,
+      "Lowercase with underscores. Becomes lakehouse.raw.<name>, DAG ingest_<name> and landing/<name>/."),
+    field("description", "Description", desc),
+    field("source_system", "Source system", src, "Becomes the DAG's tag."),
+    el("div", {class: "field"}, [
+      el("label", {}, "Example delivered filename"),
+      el("div", {class: "row"}, [
+        el("div", {style: "flex:1"}, example),
+        el("button", {class: "act", onclick: async () => {
+          if (!example.value.trim()) return;
+          try {
+            const r = await jpost("/api/derive-pattern", {example: example.value});
+            pattern.value = r.pattern;
+            await testPattern();
+          } catch (err) { patternResult.textContent = "✗ " + err.message;
+                          patternResult.style.color = "var(--bad)"; }
+        }}, "Derive pattern"),
+        el("button", {class: "act", onclick: testPattern}, "Test"),
+      ]),
+      patternResult,
+    ]),
+    field("filename_pattern", "Filename pattern", pattern,
+      "Matched with re.fullmatch, so it must cover the whole filename, and must contain " +
+      "a (?P<business_date>\\d{8}) group. A pattern that matches nothing is silent: the feed " +
+      "simply never has anything pending."),
+  );
+
+  // ------------------------------------------------------------- columns
+  const colsBox = el("div");
+  const addColRow = (nm = "", ty = "") => {
+    const cn = el("input", {class: "mono", value: nm, placeholder: "column_name"});
+    const ct = el("select", {}, STATE.types.map(t =>
+      el("option", {value: t, selected: t === ty ? "selected" : null}, t)));
+    const row = el("div", {class: "colrow"}, [cn, ct,
+      el("button", {class: "act", onclick: () => row.remove()}, "×")]);
+    row._name = cn; row._type = ct;
+    colsBox.append(row);
+    return row;
+  };
+  for (const c of (f?.columns ?? [])) addColRow(c, (f?.column_types ?? {})[c] ?? "");
+
+  const upload = el("input", {type: "file", accept: ".csv,text/csv"});
+  upload.addEventListener("change", async () => {
+    if (!upload.files.length) return;
+    const fd = new FormData();
+    fd.append("file", upload.files[0]);
+    const r = await api("/api/infer-columns", {method: "POST", body: fd});
+    colsBox.textContent = "";
+    for (const c of r.columns) addColRow(c, r.column_types[c]);
+  });
+
+  node.append(el("div", {class: "field"}, [
+    el("label", {}, "Columns — the declared contract, in file order"),
+    el("div", {class: "sub", style: "font-size:12px;margin-bottom:8px"},
+      "Not discovered from the file: a column in the file but not here lands in " +
+      "_extra_columns; one here but not in the file lands as NULL. Both are reported " +
+      "as drift. The type is used only to scaffold the prepared model — raw stays all strings."),
+    colsBox,
+    el("div", {class: "row"}, [
+      el("button", {class: "act", onclick: () => addColRow()}, "+ column"),
+      el("span", {class: "sub", style: "font-size:12px"}, "or read the header from a CSV:"),
+      el("div", {style: "flex:1;min-width:200px"}, upload),
+    ]),
+    (errBoxes["columns"] = el("div", {class: "err"})),
+  ]));
+
+  const bkey = el("input", {class: "mono", value: (f?.business_key ?? []).join(", "),
+                            placeholder: "limit_id"});
+  node.append(
+    field("business_key", "Business key", bkey,
+      "What dedupe_rank partitions by, and what the uniqueness test is written over. " +
+      "Must be columns declared above."),
+    el("div", {class: "grid2"}, [
+      field("expected_min_rows", "Expected minimum rows", minRows,
+        "Aborts the ingest below this count, leaving main untouched. Set it to something " +
+        "an empty or truncated delivery would fail, not to the expected row count."),
+      field("cadence", "Cadence", cadence,
+        "weekly stops the completeness check reporting every non-delivery day as a gap."),
+    ]),
+    el("div", {class: "grid2"}, [
+      field("schema_drift", "Schema drift", drift,
+        "warn lands the file and records the drift; fail aborts the load. warn is usually " +
+        "right — a rejected file is a file nobody looks at."),
+      el("div", {class: "field"}, [
+        el("label", {}, "Completeness check"),
+        el("div", {class: "row"}, [completeness,
+          el("span", {class: "sub", style: "font-size:12px"},
+             "Unchecked opts the feed out of gap detection entirely (monthly or ad-hoc feeds).")]),
+      ]),
+    ]),
+  );
+
+  const readTypes = () => {
+    const out = {};
+    for (const row of colsBox.children)
+      if (row._name && row._name.value.trim()) out[row._name.value.trim()] = row._type.value;
+    return out;
+  };
+
+  return {
+    node,
+    readTypes,
+    read: () => ({
+      name: name.value.trim(),
+      description: desc.value.trim(),
+      source_system: src.value.trim(),
+      filename_pattern: pattern.value,
+      business_key: bkey.value,
+      columns: Object.keys(readTypes()),
+      column_types: readTypes(),
+      expected_min_rows: Number(minRows.value || 0),
+      cadence: cadence.value,
+      schema_drift: drift.value,
+      completeness: completeness.checked,
+    }),
+    clearErrors: () => Object.values(errBoxes).forEach(e => e.textContent = ""),
+    showErrors: (err) => {
+      Object.values(errBoxes).forEach(e => e.textContent = "");
+      const errs = err.body && err.body.errors;
+      if (!errs) { alert(err.message); return; }
+      for (const [k, v] of Object.entries(errs))
+        if (errBoxes[k]) errBoxes[k].textContent = v;
+        else alert(`${k}: ${v}`);
+    },
+  };
+}
+
+// ------------------------------------------------------------ new feed
+function newFeed() {
+  STATE.selected = null;
+  loadFeeds();
+  const d = $("#detail");
+  d.textContent = "";
+  d.append(el("h2", {}, "New feed"),
+           el("div", {class: "sub"},
+              "Writes feeds.yml, the dbt source, a prepared model, its tests, and the " +
+              "PREPARED_TABLES entry — the six files in docs/ADDING-A-FEED.md."));
+  const form = feedForm(null, true);
+  d.append(form.node);
+  const out = el("div");
+  d.append(el("div", {class: "row"}, [
+    el("button", {class: "act primary", onclick: async (e) => {
+      await withBusy(e.target, async () => {
+        try {
+          const r = await jpost("/api/feeds", form.read());
+          form.clearErrors();
+          renderSteps(out, r.steps);
+          renderValidation(out, r.validation);
+          await loadFeeds(r.feed.name);
+          out.append(el("div", {class: "note"},
+            `Registered. Airflow generates ingest_${r.feed.name} on its next parse of ` +
+            `feed_ingest.py — about 30 seconds. Then use the Data tab to upload a CSV ` +
+            `and land it, and the Run tab to ingest.`));
+          setTimeout(() => selectFeed(r.feed.name, "data"), 1200);
+        } catch (err) { form.showErrors(err); }
+      });
+    }}, "Create feed"),
+  ]), out);
+}
+
+function renderValidation(target, v) {
+  if (!v) return;
+  const old = target.querySelector(".validation");
+  if (old) old.remove();
+  const box = el("div", {class: "note validation" + (v.ok ? "" : " warn")});
+  box.append(el("div", {}, [
+    el("span", {class: "pill " + (v.ok ? "ok" : v.ran ? "bad" : "warn")},
+       v.ok ? "dbt parse ok" : v.ran ? "dbt parse failed" : "not run"),
+    " ", el("span", {}, v.summary),
+    v.seconds ? el("span", {class: "muted"}, ` (${v.seconds}s)`) : "",
+  ]));
+  if (v.detail) box.append(el("pre", {class: "log"}, v.detail));
+  if (v.ok) box.append(el("div", {class: "sub", style: "margin-top:6px"},
+    "Parsing is structural. It resolves every ref(), source() and schema entry, " +
+    "but it does not compile SQL against the catalog — a column that is not in raw, " +
+    "or a value that fails a test, still shows up first in prepared_build."));
+  target.append(box);
+}
+
+function renderSteps(target, steps) {
+  const list = el("ul", {class: "steps"});
+  for (const s of steps) {
+    const cls = s.status === "written" ? "ok" : s.status === "skipped" ? "warn" : "bad";
+    list.append(el("li", {}, [
+      el("span", {class: "pill " + cls}, s.status), " ",
+      el("code", {}, s.file.replace("/opt/platform/", "")), " — ",
+      el("span", {class: "muted"}, s.detail)]));
+  }
+  target.append(el("h3", {}, "Scaffolding"), list);
+}
+
+// ------------------------------------------------------------------ data tab
+async function paneData(pane, f) {
+  const filesBox = el("div");
+  pane.append(el("div", {class: "note"},
+    "seed/ stands in for the upstream. Upload a delivery, land it into " +
+    `${f.landing_prefix}, then ingest it on the Run tab.`));
+
+  // generate
+  const gDays = el("input", {type: "number", min: "1", max: "30", value: "3"});
+  const gRows = el("input", {type: "number", min: "1", value: ""});
+  const gOut = el("div");
+  pane.append(el("h3", {}, "Generate a delivery from the definition"),
+    el("div", {class: "row"}, [
+      el("div", {style: "flex:1;min-width:130px"},
+         [el("label", {}, "business dates"), gDays]),
+      el("div", {style: "flex:1;min-width:130px"},
+         [el("label", {}, "rows each (blank = auto)"), gRows]),
+      el("button", {class: "act primary", onclick: async (e) => {
+        await withBusy(e.target, async () => {
+          gOut.textContent = "";
+          try {
+            const r = await jpost(`/api/feeds/${f.name}/generate`, {
+              days: Number(gDays.value || 3),
+              rows: gRows.value ? Number(gRows.value) : 0});
+            const fks = Object.entries(r.foreign_keys)
+              .map(([c, n]) => `${c} (${n} real values)`).join(", ");
+            gOut.append(el("div", {class: "note"},
+              `Wrote ${r.written.length} file(s) into ${r.seed_dir}: ` +
+              `${r.dates.join(", ")}, ${r.rows_each} rows each. ` +
+              (fks ? `Foreign keys drawn from the reference feeds: ${fks}. ` : "") +
+              `Dates come from what the OTHER feeds have in seed/ — rows dated ` +
+              `where no reference data exists would fail a relationships test ` +
+              `for reasons that say nothing about this feed.`));
+            paneRefreshFiles(f, filesBox);
+          } catch (err) { gOut.append(el("div", {class: "note warn"}, err.message)); }
+        });
+      }}, "Generate"),
+    ]), gOut);
+
+  // upload
+  const file = el("input", {type: "file", accept: ".csv,text/csv"});
+  const nameIn = el("input", {class: "mono", placeholder: "override filename (optional)"});
+  const result = el("div");
+  pane.append(el("h3", {}, "Upload a delivery"),
+    el("div", {class: "row"}, [
+      el("div", {style: "flex:2;min-width:220px"}, file),
+      el("div", {style: "flex:1;min-width:180px"}, nameIn),
+      el("button", {class: "act primary", onclick: async (e) => {
+        if (!file.files.length) return;
+        await withBusy(e.target, async () => {
+          const fd = new FormData();
+          fd.append("file", file.files[0]);
+          fd.append("filename", nameIn.value.trim() || file.files[0].name);
+          result.textContent = "";
+          try {
+            const r = await api(`/api/feeds/${f.name}/upload`, {method: "POST", body: fd});
+            const drift = [];
+            if (r.missing_columns.length) drift.push("missing: " + r.missing_columns.join(", "));
+            if (r.extra_columns.length) drift.push("extra: " + r.extra_columns.join(", "));
+            result.append(el("div", {class: "note" + (drift.length ? " warn" : "")},
+              `Saved seed/${f.name}/${r.filename}${r.replaced ? " (replaced)" : ""}. ` +
+              (drift.length ? "Header drift — " + drift.join("; ") +
+                 ". It will still land; drift is reported, not fatal."
+                            : "Header matches the declared columns.")));
+            paneRefreshFiles(f, filesBox);
+          } catch (err) {
+            result.append(el("div", {class: "note warn"}, err.message));
+          }
+        });
+      }}, "Upload"),
+    ]), result);
+
+  pane.append(el("h3", {}, "seed/ and landing"), filesBox);
+  paneRefreshFiles(f, filesBox);
+}
+
+async function paneRefreshFiles(f, box) {
+  box.textContent = "Loading…";
+  const data = await api(`/api/feeds/${f.name}/files`);
+  box.textContent = "";
+  const landedNames = new Set(data.landed.map(l => l.filename));
+
+  const checks = [];
+  const table = el("table");
+  table.append(el("thead", {}, el("tr", {}, [
+    el("th", {style: "width:26px"}, ""), el("th", {}, "seed file"),
+    el("th", {}, "business date"), el("th", {}, "v"),
+    el("th", {}, "matches pattern"), el("th", {}, "landed"), el("th", {}, "")])));
+  const tbody = el("tbody");
+  for (const s of data.seed) {
+    const cb = el("input", {type: "checkbox"});
+    cb.checked = !landedNames.has(s.filename) && s.matches;
+    cb.disabled = !s.matches;
+    checks.push([cb, s.filename]);
+    tbody.append(el("tr", {}, [
+      el("td", {}, cb),
+      el("td", {class: "mono"}, s.filename),
+      el("td", {}, s.business_date || "—"),
+      el("td", {}, s.version ?? "—"),
+      el("td", {}, el("span", {class: "pill " + (s.matches ? "ok" : "bad")},
+                      s.matches ? "yes" : "no")),
+      el("td", {}, landedNames.has(s.filename)
+        ? el("span", {class: "pill ok"}, "landed") : el("span", {class: "pill"}, "—")),
+      el("td", {}, el("button", {class: "act", onclick: () => showPreview(f, s.filename, box)}, "peek")),
+    ]));
+  }
+  table.append(tbody);
+  box.append(data.seed.length ? el("div", {class: "scroll"}, table)
+    : el("div", {class: "empty"}, `Nothing under seed/${f.name}/ yet — upload a CSV above.`));
+
+  const pendingOut = el("div");
+  box.append(el("div", {class: "row", style: "margin-top:10px"}, [
+    el("button", {class: "act primary", onclick: async (e) => {
+      const picked = checks.filter(([cb]) => cb.checked).map(([, n]) => n);
+      if (!picked.length) return;
+      await withBusy(e.target, async () => {
+        const r = await jpost(`/api/feeds/${f.name}/land`, {filenames: picked});
+        pendingOut.textContent = "";
+        pendingOut.append(el("div", {class: "note"},
+          `Landed ${r.count} object(s), oldest business date first.`));
+        paneRefreshFiles(f, box);
+      });
+    }}, "Land selected"),
+    el("button", {class: "act", onclick: async (e) => {
+      await withBusy(e.target, async () => {
+        pendingOut.textContent = "";
+        const r = await api(`/api/feeds/${f.name}/pending`);
+        pendingOut.append(el("div", {class: "note"}, r.pending.length
+          ? `${r.pending.length} pending: ${r.pending.map(k => k.split("/").pop()).join(", ")}`
+          : "Nothing pending. Either everything landed is already in raw, or the " +
+            "remaining deliveries fall outside the retention keep-set — landed but " +
+            "deliberately not ingested."));
+      });
+    }}, "Check pending (runs Spark)"),
+    el("span", {class: "sub", style: "font-size:12px"},
+       `${data.landed.length} object(s) in ${f.landing_prefix}`),
+  ]), pendingOut);
+}
+
+async function showPreview(f, filename, box) {
+  const r = await api(`/api/feeds/${f.name}/preview?filename=${encodeURIComponent(filename)}`);
+  const lines = [r.header.join(" | "), "-".repeat(60),
+                 ...r.rows.map(row => row.join(" | "))];
+  const drift = [];
+  if (r.missing_columns.length) drift.push("declared but absent: " + r.missing_columns.join(", "));
+  if (r.extra_columns.length) drift.push("in file but not declared: " + r.extra_columns.join(", "));
+  const old = box.querySelector("pre.log"); if (old) old.remove();
+  const oldNote = box.querySelector(".drift"); if (oldNote) oldNote.remove();
+  box.append(el("pre", {class: "log"}, lines.join("\n")));
+  if (drift.length) box.append(el("div", {class: "note warn drift"}, drift.join(" · ")));
+}
+
+// ------------------------------------------------------------------ run tab
+function paneRun(pane, f) {
+  const out = el("div");
+  pane.append(el("div", {class: "stage"}, [
+    el("div", {class: "box"}, [el("div", {class: "t"}, "seed"), el("div", {class: "v"}, `seed/${f.name}/`)]),
+    el("span", {class: "arrow"}, "→"),
+    el("div", {class: "box"}, [el("div", {class: "t"}, "landing"), el("div", {class: "v"}, f.landing_prefix)]),
+    el("span", {class: "arrow"}, "→"),
+    el("div", {class: "box"}, [el("div", {class: "t"}, "raw"), el("div", {class: "v"}, `ingest_${f.name}`)]),
+    el("span", {class: "arrow"}, "→"),
+    el("div", {class: "box"}, [el("div", {class: "t"}, "prepared"), el("div", {class: "v"}, "prepared_build")]),
+    el("span", {class: "arrow"}, "→"),
+    el("div", {class: "box"}, [el("div", {class: "t"}, "reporting"), el("div", {class: "v"}, "reporting_build")]),
+  ]));
+
+  pane.append(el("div", {class: "note"},
+    "One run ingests ONE arrival — the platform processes a feed as it is received, so the " +
+    "unit of work is a delivery, not a batch. After landing a backfill, use “all pending”. " +
+    "Only the ingest needs triggering: the ingest DAG emits this feed's asset on success, " +
+    "prepared_build is scheduled on the OR of every raw asset, and reporting_build on " +
+    "prepared's — so the last two stages fire on their own. Every build runs on a Nessie " +
+    "branch and merges to main only if its tests pass."));
+
+  const ingest = (body) => async (e) => {
+    await withBusy(e.target, async () => {
+      out.textContent = "";
+      try {
+        const r = await jpost(`/api/feeds/${f.name}/ingest`, body);
+        if (r.unpaused) out.append(el("div", {class: "note"},
+          `${r.dag_id} was paused and has been unpaused. A generated DAG is created ` +
+          `paused: it accepts a trigger and then never runs it.`));
+        if (r.runs_already_in_flight.length) out.append(el("div", {class: "note warn"},
+          `Already in flight: ${r.runs_already_in_flight.join(", ")}. ingest DAGs are ` +
+          `max_active_runs=1, so this run waits for those to finish.`));
+        if (!r.run_ids || !r.run_ids.length) {
+          out.append(el("div", {class: "note"}, "Nothing pending — nothing triggered."));
+          return;
+        }
+        if (r.run_ids.length > 1) out.append(el("div", {class: "note"},
+          `${r.run_ids.length} runs queued, one per pending delivery. They drain in ` +
+          `order: ingest DAGs are max_active_runs=1, so re-deliveries of the same feed ` +
+          `are serialised rather than racing.`));
+        for (const id of r.run_ids) watchRun(out, r.dag_id, id);
+      } catch (err) { out.append(el("div", {class: "note warn"}, err.message)); }
+    });
+  };
+
+  pane.append(el("div", {class: "row"}, [
+    el("button", {class: "act primary",
+                  onclick: ingest({})}, "Ingest next arrival"),
+    el("button", {class: "act", onclick: ingest({all_pending: true})},
+       "Ingest all pending (runs Spark)"),
+    el("button", {class: "act", onclick: (e) => triggerBuild(e, out, "prepared")}, "Build prepared"),
+    el("button", {class: "act", onclick: (e) => triggerBuild(e, out, "reporting")}, "Build reporting"),
+  ]), out);
+
+  const testOut = el("div");
+  const downstream = el("input", {type: "checkbox"});
+  pane.append(el("h3", {}, "Prove this feed"),
+    el("div", {class: "note"},
+      "Runs dbt build — the model AND its tests — for this feed alone, on its own " +
+      "Nessie branch, outside Airflow. It NEVER merges: on success the branch is " +
+      "deleted, on failure it is kept so you can inspect exactly what the build " +
+      "produced. `main` is untouched either way. Minutes, not seconds."),
+    el("div", {class: "row"}, [
+      el("button", {class: "act primary", onclick: async (e) => {
+        await withBusy(e.target, async () => {
+          testOut.textContent = "";
+          try {
+            const r = await jpost(`/api/feeds/${f.name}/test`,
+                                  {downstream: downstream.checked});
+            testOut.append(el("div", {class: "note"},
+              `${r.label} on branch ${r.branch}. ${r.note}`));
+            watchJob(testOut, r.job_id);
+          } catch (err) {
+            if (err.status === 409 && err.body && err.body.job_id) {
+              testOut.append(el("div", {class: "note warn"},
+                "A build is already running — attaching to it. Only one at a time: " +
+                "each holds 2 of the worker's 6 cores, and more would starve the " +
+                "Airflow builds from outside their pool."));
+              watchJob(testOut, err.body.job_id);
+            } else {
+              testOut.append(el("div", {class: "note warn"}, err.message));
+            }
+          }
+        });
+      }}, "Test this feed"),
+      el("label", {style: "display:flex;gap:6px;align-items:center;margin:0"},
+         [downstream, el("span", {}, "include downstream reporting models")]),
+    ]), testOut);
+
+  const hist = el("div");
+  pane.append(el("h3", {}, "Recent runs"), hist);
+  renderHistory(hist, f);
+}
+
+async function triggerBuild(e, out, layer) {
+  await withBusy(e.target, async () => {
+    out.textContent = "";
+    try {
+      const r = await jpost(`/api/builds/${layer}`);
+      watchRun(out, r.dag_id, r.run_id);
+    } catch (err) { out.append(el("div", {class: "note warn"}, err.message)); }
+  });
+}
+
+function watchJob(target, jobId) {
+  const head = el("div", {class: "note"});
+  const log = el("pre", {class: "log"});
+  target.append(head, log);
+  let since = 0;
+  const tick = async () => {
+    let j;
+    try { j = await api(`/api/jobs/${jobId}?since=${since}`); }
+    catch (err) { head.textContent = err.message; return; }
+    if (j.lines.length) {
+      // `total` counts lines ever produced, so this keeps its place even once
+      // the server-side buffer has begun discarding from the front.
+      log.append(document.createTextNode(j.lines.join("\n") + "\n"));
+      log.scrollTop = log.scrollHeight;
+      since = j.total;
+    }
+    head.textContent = "";
+    head.append(el("span", {class: "pill " + stateClass(j.status)}, j.status),
+                " ", el("code", {}, j.label));
+    if (j.result && j.result.branch)
+      head.append(el("div", {class: "sub", style: "margin-top:6px"},
+        j.status === "failed"
+          ? `Branch ${j.result.branch} kept for inspection — main is untouched.`
+          : j.result.branch_deleted
+            ? "Branch deleted. Nothing was published: testing never merges."
+            : `Branch ${j.result.branch}`));
+    if (j.status === "running") setTimeout(tick, 2500);
+  };
+  tick();
+}
+
+const TERMINAL = new Set(["success", "failed", "skipped", "upstream_failed"]);
+
+function watchRun(target, dagId, runId) {
+  const box = el("div", {class: "note"});
+  target.append(box);
+  const tick = async () => {
+    let r;
+    try { r = await api(`/api/runs/${dagId}/${runId}`); }
+    catch (err) { box.textContent = err.message; return; }
+    box.textContent = "";
+    box.append(el("div", {}, [
+      el("strong", {}, dagId), " ",
+      el("code", {}, runId), " — ",
+      el("span", {class: "pill " + stateClass(r.state)}, r.state ?? "…"),
+    ]));
+    if (r.tasks.length) box.append(el("div", {class: "row", style: "margin-top:6px"},
+      r.tasks.map(t => el("span", {class: "pill " + stateClass(t.state)},
+                          `${t.task_id}: ${t.state ?? "—"}`))));
+    if (!TERMINAL.has(r.state)) setTimeout(tick, 4000);
+    else if (r.state === "success")
+      box.append(el("div", {class: "sub", style: "margin-top:6px"},
+        "Downstream builds fire from the asset this run emitted — watch prepared_build below."));
+  };
+  tick();
+}
+
+const stateClass = s => s === "success" ? "ok"
+  : (s === "failed" || s === "upstream_failed") ? "bad"
+  : (s === "running" || s === "queued") ? "warn" : "";
+
+async function renderHistory(target, f) {
+  target.textContent = "Loading…";
+  const dags = [`ingest_${f.name}`, "prepared_build", "reporting_build"];
+  const results = await Promise.all(dags.map(d =>
+    api(`/api/runs/${d}?limit=4`).catch(() => ({dag_id: d, runs: []}))));
+  target.textContent = "";
+  for (const r of results) {
+    const t = el("table");
+    t.append(el("thead", {}, el("tr", {}, [
+      el("th", {}, r.dag_id), el("th", {}, "state"), el("th", {}, "started"), el("th", {}, "type")])));
+    const tb = el("tbody");
+    for (const run of r.runs)
+      tb.append(el("tr", {}, [
+        el("td", {class: "mono"}, run.run_id),
+        el("td", {}, el("span", {class: "pill " + stateClass(run.state)}, run.state)),
+        el("td", {class: "muted"}, (run.start_date || "").replace("T", " ").slice(0, 19) || "—"),
+        el("td", {class: "muted"}, run.run_type || "—"),
+      ]));
+    if (!r.runs.length) tb.append(el("tr", {}, el("td", {colspan: "4", class: "muted"}, "no runs yet")));
+    t.append(tb);
+    target.append(el("div", {style: "margin-bottom:16px"}, t));
+  }
+}
+
+// ------------------------------------------------------------------ chrome
+async function withBusy(btn, fn) {
+  btn.disabled = true;
+  try { await fn(); } finally { btn.disabled = false; }
+}
+function toast(target, msg) {
+  const n = el("div", {class: "note"}, msg);
+  target.append(n);
+  setTimeout(() => n.remove(), 8000);
+}
+
+async function health() {
+  const h = await api("/api/airflow/health").catch(() => ({reachable: false}));
+  const pill = $("#af-health");
+  if (!h.reachable) { pill.className = "pill bad"; pill.textContent = "airflow unreachable"; return; }
+  const ok = h.scheduler === "healthy";
+  pill.className = "pill " + (ok ? "ok" : "warn");
+  // The scheduler is called out separately on purpose: the API is served by
+  // the webserver, so a dead scheduler answers every call perfectly while
+  // nothing anyone triggers ever starts.
+  pill.textContent = ok ? "airflow healthy" : `scheduler ${h.scheduler ?? "unknown"}`;
+}
+
+(async function init() {
+  STATE.types = (await api("/api/column-types")).types;
+  $("#new-feed").addEventListener("click", newFeed);
+  await loadFeeds();
+  health();
+  setInterval(health, 20000);
+})();
+</script>
+</body>
+</html>
