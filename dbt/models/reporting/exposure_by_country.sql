@@ -10,7 +10,7 @@
 {#
   Country-level rollup.
 
-  ref()s rpt_counterparty_exposure rather than prep_trade, deliberately. The
+  ref()s counterparty_exposure rather than trade, deliberately. The
   aggregate must reconcile to the detail report by construction — if both
   derived from prepared independently, they would eventually disagree and
   someone would spend a week finding out why.
@@ -35,6 +35,6 @@ select
     cast('{{ invocation_id }}' as string)            as dbt_invocation_id,
     {{ dbt.current_timestamp() }}                    as dbt_updated_at
 
-from {{ ref('rpt_counterparty_exposure') }}
+from {{ ref('counterparty_exposure') }}
 where {{ incremental_window('business_date') }}
 group by business_date, coalesce(country_code, 'UNKNOWN')

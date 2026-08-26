@@ -27,7 +27,7 @@
 with current_exposure as (
 
     select *
-    from {{ ref('rpt_counterparty_exposure') }}
+    from {{ ref('counterparty_exposure') }}
     where {{ incremental_window('business_date') }}
 
 ),
@@ -40,7 +40,7 @@ date_sequence as (
         business_date,
         lag(business_date) over (order by business_date) as prior_business_date
     from (
-        select distinct business_date from {{ ref('rpt_counterparty_exposure') }}
+        select distinct business_date from {{ ref('counterparty_exposure') }}
     ) d
 
 ),
@@ -53,7 +53,7 @@ month_end_dates as (
             partition by extract(year from business_date), extract(month from business_date)
             order by business_date desc
         ) as rn
-    from (select distinct business_date from {{ ref('rpt_counterparty_exposure') }}) m
+    from (select distinct business_date from {{ ref('counterparty_exposure') }}) m
 
 ),
 
@@ -62,7 +62,7 @@ prior_month_end as (
     select
         c.business_date,
         max(m.business_date) as prior_month_end_date
-    from (select distinct business_date from {{ ref('rpt_counterparty_exposure') }}) c
+    from (select distinct business_date from {{ ref('counterparty_exposure') }}) c
     left join month_end_dates m
            on m.rn = 1
           and m.business_date < c.business_date
@@ -116,13 +116,13 @@ from current_exposure cur
 join date_sequence ds
   on ds.business_date = cur.business_date
 
-left join {{ ref('rpt_counterparty_exposure') }} prev
+left join {{ ref('counterparty_exposure') }} prev
        on prev.business_date   = ds.prior_business_date
       and prev.counterparty_id = cur.counterparty_id
 
 left join prior_month_end pme
        on pme.business_date = cur.business_date
 
-left join {{ ref('rpt_counterparty_exposure') }} me
+left join {{ ref('counterparty_exposure') }} me
        on me.business_date   = pme.prior_month_end_date
       and me.counterparty_id = cur.counterparty_id

@@ -23,14 +23,14 @@
 with trades as (
 
     select *
-    from {{ ref('prep_trade') }}
+    from {{ ref('trade') }}
     where {{ incremental_window('business_date') }}
       and coalesce(is_matured, false) = false
 
 ),
 
 counterparties as (
-    select * from {{ ref('prep_counterparty') }}
+    select * from {{ ref('counterparty') }}
 ),
 
 -- One rating per counterparty per date: the most conservative (highest rank)
@@ -43,7 +43,7 @@ worst_rating as (
         counterparty_id,
         max(rating_rank)                                        as worst_rating_rank,
         min(case when grade_band = 'SUB_INVESTMENT_GRADE' then 0 else 1 end) as is_investment_grade_flag
-    from {{ ref('prep_rating') }}
+    from {{ ref('rating') }}
     group by business_date, counterparty_id
 
 ),

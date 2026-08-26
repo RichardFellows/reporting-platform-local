@@ -27,17 +27,26 @@ reporting_platform:
       type: spark
       method: session
       schema: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
+      # INERT. dbt-spark's credential validation demands `host` for every
+      # method, but in session mode nothing connects to it -- the cluster is
+      # addressed by spark.master below. See the spark_ocp note.
       host: spark-master
       threads: 4
-      # method: session builds its own in-process SparkSession (dbt-spark's
-      # SessionConnectionWrapper) rather than connecting to the spark-master
-      # cluster, and this container's pip-installed pyspark has none of the
-      # Iceberg/Nessie/S3A jars baked in (see context.py's spark_session() --
-      # same root cause, same fix). server_side_parameters becomes
-      # .config(k, v) on that SparkSession.builder, so the full catalog/jars
-      # wiring has to be repeated here rather than relying on
-      # conf/spark-defaults.conf, which isn't mounted into this container.
+      # method: session builds an in-process SparkSession (dbt-spark's
+      # SessionConnectionWrapper) and server_side_parameters becomes
+      # .config(k, v) on that SparkSession.builder. So `spark.master` here is
+      # what puts the build on the spark-master/spark-worker cluster: dbt is
+      # the DRIVER inside the Airflow container, and every task runs on
+      # spark-worker. Without it the builder defaults to local[*] and the
+      # cluster sits idle while the build quietly succeeds in-process.
+      #
+      # The rest of the catalog/jars wiring has to be repeated here rather
+      # than relying on conf/spark-defaults.conf, which isn't mounted into
+      # this container -- and the driver needs the jars regardless of what
+      # the executors have baked in (same reasoning as context.py's
+      # spark_session()).
       server_side_parameters:
+        spark.master: "{{ env_var('SPARK_MASTER', 'spark://spark-master:7077') }}"
         spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262"
         spark.sql.extensions: "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.projectnessie.spark.extensions.NessieSparkSessionExtensions"
         spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
@@ -54,7 +63,14 @@ reporting_platform:
         spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
         spark.sql.session.timeZone: UTC
         spark.sql.defaultCatalog: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
-        spark.driver.memory: 3g
+        # Driver-only heap: dbt runs no task work in this process now.
+        spark.driver.memory: 2g
+        # Same cluster-share cap as context.py's spark_session(); see the
+        # comment there. A dbt build holds its cores for the whole run, which
+        # is exactly the case that would starve everything else uncapped.
+        spark.cores.max: "2"
+        spark.executor.cores: "2"
+        spark.executor.memory: 2g
 
     # The cluster target: the same in-process SparkSession as spark_local, in a
     # driver pod that `spark-submit` created for this build.

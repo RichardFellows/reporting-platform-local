@@ -119,9 +119,11 @@ def build_feed_dag(feed):
         def ingest_task(arrival: dict, **context) -> dict:
             """Land the CSV into raw Iceberg on a Nessie branch, then merge.
 
-            Runs in-process here for the local stack. In OpenShift this becomes
-            a KubernetesPodOperator issuing spark-submit — same module, same
-            arguments, different execution wrapper.
+            The Spark work runs on the spark-master/spark-worker cluster;
+            only the DRIVER lives in the child process this task spawns. In
+            OpenShift this becomes a KubernetesPodOperator issuing
+            spark-submit — same module, same arguments, different execution
+            wrapper.
             """
             return _spark_subprocess(
                 "ingest",

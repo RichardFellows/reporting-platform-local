@@ -15,7 +15,7 @@
   collision the architecture already prevents, while breaking the layer model
   in docs/ARCHITECTURE.md: `raw` is created literally by ingest_feed.py, which
   left `lakehouse.raw.trade` sitting beside
-  `lakehouse.lakehouse_prepared.prep_trade`.
+  `lakehouse.lakehouse_prepared.trade`.
 
   Returning the custom schema verbatim gives lakehouse.raw /
   lakehouse.prepared / lakehouse.reporting -- one consistent namespace per

@@ -76,7 +76,22 @@ Two corollaries worth holding on to:
   it without moving every table reference.
 - **Anything running Spark inside an Airflow task must go through
   `scripts/_spark_task.py`** (a subprocess), or the JVM keeps the task process
-  alive, heartbeats stop, and the scheduler zombie-reaps it.
+  alive, heartbeats stop, and the scheduler zombie-reaps it. This is still
+  true on the cluster — the *driver* is what lives in that process.
+- **Every Spark job runs on the `spark-master`/`spark-worker` cluster, never
+  `local[*]`.** The master comes from `SPARK_MASTER` in two places that must
+  not diverge: `spark_session()` in `common/context.py` and `spark.master` in
+  `dbt/profiles.yml`. `spark_session()` refuses a `local` master rather than
+  quietly running the pipeline in the Airflow container with the cluster idle.
+  Each app caps itself at 2 cores/2g so one job cannot hold the whole worker —
+  standalone mode otherwise grants every free core until the session stops, and
+  the next job waits forever instead of failing. Watch it at
+  <http://localhost:8080>. See `docs/ARCHITECTURE.md` § *Where Spark actually
+  runs* for the jar-shipping and Python-version constraints.
+- **Adding a feed is six files and no DAG edit** — `docs/ADDING-A-FEED.md`
+  has them in order. The only one that fails silently if you skip it is
+  `PREPARED_TABLES` in `common/context.py`: the table just never gets
+  maintained or retained.
 - Retention and GC delete data. `dry_run` first, always. GC defers its deletes
   by design; the deferred-delete pass is the deliberate second step.
 

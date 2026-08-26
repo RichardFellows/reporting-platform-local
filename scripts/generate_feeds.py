@@ -50,6 +50,17 @@ CURRENCIES = ["GBP", "USD", "EUR", "JPY", "CHF"]
 N_COUNTERPARTIES = 60
 N_TRADES = 400
 
+LIMIT_TYPES = ["PRE_SETTLEMENT", "SETTLEMENT", "ISSUER"]
+
+# ITS OWN GENERATOR, not the module-level `random`. Every generator above
+# draws from one shared stream seeded once at import, so the numbers any of
+# them gets depend on how many were drawn before it. Adding a fourth feed to
+# the shared stream would silently change every trade notional and rating in
+# the existing seed -- the files would still be valid, and the diff would be
+# the whole seed directory. An independent Random keeps this feed's history
+# reproducible AND leaves the other three byte-identical.
+_limits_rng = random.Random(20260801)
+
 
 def business_days(start: date, end: date) -> list[date]:
     out, d = [], start
@@ -117,6 +128,54 @@ def gen_rating(bd: date, out: Path, version: int = 1) -> None:
             ])
     suffix = f"_v{version}" if version > 1 else ""
     write_csv(out / f"RATING_{bd:%Y%m%d}{suffix}.csv", header, rows)
+
+
+def gen_primary_limits(bd: date, out: Path, version: int = 1) -> None:
+    """Primary credit limits from gcis2: one row per counterparty per type.
+
+    `limit_id` is stable across business dates, because that is what the
+    upstream system does -- a limit is a standing object that gets restated,
+    not a new record each day. That is also what makes
+    (business_date, limit_id) a meaningful unique key rather than a tautology.
+    """
+    header = ["limit_id", "counterparty_id", "limit_type", "limit_amount",
+              "currency", "effective_date", "expiry_date", "status"]
+    rows = []
+    for i, cid in enumerate(counterparty_ids()):
+        for k, ltype in enumerate(LIMIT_TYPES):
+            # Not every counterparty holds every limit type.
+            if _limits_rng.random() < 0.2:
+                continue
+
+            effective = bd - timedelta(days=_limits_rng.randint(30, 1500))
+            # An open-ended limit arrives with an EMPTY expiry, not a
+            # far-future date. The prepared model treats that as "no expiry"
+            # rather than as a missing value.
+            expiry = ""
+            if _limits_rng.random() < 0.7:
+                expiry_dt = bd + timedelta(days=_limits_rng.randint(30, 2000))
+                expiry = expiry_dt.strftime("%Y-%m-%d")
+
+            amount = round(_limits_rng.uniform(1_000_000, 250_000_000), 2)
+            if version > 1:
+                amount = round(amount * _limits_rng.uniform(0.9, 1.1), 2)
+
+            rows.append([
+                f"LIM{cid[2:]}{ltype[:2]}",
+                cid,
+                # Mixed case on purpose: prepared upper()s it.
+                ltype if k % 2 else ltype.lower(),
+                f"{amount}",
+                CURRENCIES[i % len(CURRENCIES)],
+                # Mixed date formats, same as the other feeds.
+                effective.strftime("%Y-%m-%d") if i % 2 else effective.strftime("%Y%m%d"),
+                expiry,
+                _limits_rng.choice(
+                    ["ACTIVE"] * 8 + ["SUSPENDED", "EXPIRED"]),
+            ])
+
+    suffix = f"_v{version}" if version > 1 else ""
+    write_csv(out / f"primaryLimits_{bd:%Y%m%d}{suffix}.csv", header, rows)
 
 
 def gen_trade(bd: date, out: Path, version: int = 1, inject_bad: bool = False,
@@ -210,6 +269,7 @@ def main() -> int:
                              drift=bool(drift_from and d >= drift_from))
         if d.weekday() == 0 or d in sparse:      # ratings arrive weekly-ish
             gen_rating(d, a.out / "rating", version=a.version)
+        gen_primary_limits(d, a.out / "primary_limits", version=a.version)
 
     # The deliberate _v2 restatement of one date. Skipped when the whole run is
     # already a versioned redelivery, which would otherwise collide.

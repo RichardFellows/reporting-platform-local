@@ -1,7 +1,7 @@
 version: 2
 
 models:
-  - name: prep_counterparty
+  - name: counterparty
     description: >
       Conformed counterparty reference. The single shared representation —
       every report that needs a counterparty attribute ref()s this, so
@@ -22,7 +22,7 @@ models:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, counterparty_id]
 
-  - name: prep_trade
+  - name: trade
     description: Conformed, typed trade positions. No joins, no report opinions.
     columns:
       - name: business_date
@@ -35,7 +35,7 @@ models:
           # The load never fails on a bad reference — the TEST fails, and the
           # branch is not merged. This is the write-audit-publish payoff.
           - relationships:
-              to: ref('prep_counterparty')
+              to: ref('counterparty')
               field: counterparty_id
       - name: notional
         tests:
@@ -48,7 +48,7 @@ models:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, trade_id]
 
-  - name: prep_rating
+  - name: rating
     description: Agency ratings with numeric rank and grade band.
     columns:
       - name: counterparty_id
@@ -69,3 +69,41 @@ models:
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, counterparty_id, agency]
+
+  - name: primary_limits
+    description: >
+      Conformed primary credit limits from GCIS2, typed and with an
+      in-force flag. Limit vs exposure comparison belongs in reporting.
+    columns:
+      - name: business_date
+        tests: [not_null]
+      - name: limit_id
+        tests: [not_null]
+      - name: counterparty_id
+        tests:
+          - not_null
+          # Same payoff as trade: a limit against a counterparty the
+          # reference feed has never sent fails the TEST, and the branch is
+          # never merged. The load itself still succeeds.
+          - relationships:
+              to: ref('counterparty')
+              field: counterparty_id
+      - name: limit_amount
+        tests:
+          - not_null
+          - dbt_utils.accepted_range: {min_value: 0, inclusive: true}
+      - name: currency
+        tests: [not_null]
+      - name: limit_type
+        tests:
+          - not_null
+          - accepted_values: {values: ['PRE_SETTLEMENT', 'SETTLEMENT', 'ISSUER']}
+      - name: status
+        tests:
+          - accepted_values: {values: ['ACTIVE', 'SUSPENDED', 'EXPIRED']}
+      - name: is_current
+        tests:
+          - accepted_values: {values: [true, false], quote: false}
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, limit_id]

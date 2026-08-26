@@ -88,10 +88,23 @@ both of which were live defects at one point:
   `spark.sql.defaultCatalog` in `profiles.yml` rather than from a `database:`
   on the source.
 
-Table names carry their dbt model prefix, so the full names are
-`lakehouse.prepared.prep_trade`, `lakehouse.reporting.rpt_counterparty_exposure`, and so
-on. Only `raw` tables are bare (`lakehouse.raw.trade`), because ingest creates them
-rather than dbt.
+**No layer prefix on any table name.** The namespace already says which layer
+a table is in, so `prepared.prep_trade` and `reporting.rpt_exposure_change`
+were saying it twice. Full names are `lakehouse.raw.trade`,
+`lakehouse.prepared.trade`, `lakehouse.reporting.counterparty_exposure`.
+
+A feed's landed and conformed tables therefore share a name and differ only by
+namespace — `raw.trade` and `prepared.trade`. That is legal because dbt keeps
+models and sources in separate namespaces: a model named `trade` and a source
+`raw.trade` coexist without collision. Verified against a live parse before the
+rename, not assumed.
+
+The consequence to remember is in `common/context.py`: no `alias` is
+configured on any model, so **the dbt model name IS the catalog table name**.
+`PREPARED_TABLES` / `REPORTING_TABLES` must be renamed in the same commit as
+the model files, or maintenance and retention address tables that do not
+exist — silently, because `managed_tables()` never checks that its entries
+resolve.
 
 ### Why `prepared` and `reporting` are both dbt
 
@@ -191,6 +204,57 @@ how far back you can time-travel, and is a separate policy from row retention.
 
 ---
 
+## Where Spark actually runs
+
+**Every Spark job on this platform is a client of the `spark-master` /
+`spark-worker` cluster. Nothing runs `local[*]`.** The process that calls
+`spark_session()` — an Airflow task's `scripts/_spark_task.py` child, a
+`dbt build`, a manual `python -m ...` in the Airflow container — is the
+**driver**; all task work happens in executors on `spark-worker`.
+
+This is set in exactly two places, and they must not diverge:
+
+| Path | Where the master is set |
+|---|---|
+| Python (ingest, retention, maintenance, completeness, arrival checks) | `spark_session()` in `reporting_platform/common/context.py`, from `SPARK_MASTER` |
+| dbt builds | `spark.master` in `dbt/profiles.yml` (`spark_local`), from the same `SPARK_MASTER` |
+
+Three consequences worth knowing before changing any of it:
+
+- **There is no local fallback, on purpose.** `spark_session()` raises if
+  `SPARK_MASTER` names a `local` master. A misconfiguration that quietly ran
+  the whole pipeline inside the Airflow container would *complete
+  successfully* with the cluster sitting idle — the failure mode that is worth
+  a guard is the one that isn't red anywhere.
+- **The driver ships the jars.** `Dockerfile.spark` bakes the Iceberg and
+  Nessie runtimes into the executors, but `spark.jars.packages` jars are
+  served from the driver to every executor, so what the executors load is what
+  the driver resolved. That is why the package list in `context.py` and
+  `profiles.yml` must stay at `Dockerfile.spark`'s versions, and why
+  `hadoop-aws` — which the Spark image does *not* bake — reaches the executors
+  at all.
+- **Each application caps itself at 2 cores / 2g.** A standalone application
+  takes every free core by default and holds it until the session stops, so an
+  uncapped job would leave the next one waiting forever on *"Initial job has
+  not accepted any resources"* rather than failing. `SPARK_WORKER_CORES` /
+  `SPARK_WORKER_MEMORY` in `docker-compose.yml` are sized for three concurrent
+  applications: the single `lakehouse_write` slot plus the read-only jobs that
+  sit outside that pool (arrival checks, completeness, maintenance metrics).
+
+The driver still runs in-process, which is why `scripts/_spark_task.py`
+still exists: the JVM and its py4j gateway keep the calling process alive
+after the task callable returns, cluster mode or not.
+
+One live constraint: the Airflow image is Python 3.11 and the Spark image is
+Python 3.8. That mismatch is invisible today because nothing here uses a
+Python UDF or an RDD operation — everything is SQL and DataFrame work, which
+executes entirely in the JVM, so no Python worker is ever launched on an
+executor. **Introduce a Python UDF and Spark will fail the job** with a
+driver/worker version mismatch; fixing it means giving `Dockerfile.spark` a
+matching interpreter.
+
+---
+
 ## Engine strategy: Spark runs the pipeline, DuckDB serves people
 
 **Spark is the only build engine, and that is a constraint rather than a
@@ -230,7 +294,7 @@ through the same catalog.
 ```
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 docker compose exec -T airflow python -m scripts.duckdb_console \
-    "select business_date, count(*) from lakehouse.prepared.prep_trade group by 1"
+    "select business_date, count(*) from lakehouse.prepared.trade group by 1"
 ```
 
 It is a script rather than a dbt target deliberately. The engine macros are

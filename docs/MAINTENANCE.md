@@ -128,7 +128,7 @@ Only relevant for merge-on-read tables. Our `prepared` incremental models use
 data files.
 
 ```sql
-CALL lakehouse.system.rewrite_position_delete_files('prepared.prep_trade');
+CALL lakehouse.system.rewrite_position_delete_files('prepared.trade');
 ```
 
 ## Nessie GC

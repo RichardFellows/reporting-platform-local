@@ -1,7 +1,7 @@
 version: 2
 
 models:
-  - name: rpt_counterparty_exposure
+  - name: counterparty_exposure
     description: >
       The shared spine of the reporting layer. Every other mart ref()s this
       rather than re-deriving exposure from prepared, so a change to the
@@ -29,9 +29,9 @@ models:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, counterparty_id]
 
-  - name: rpt_exposure_by_country
+  - name: exposure_by_country
     description: >
-      Country rollup, derived from rpt_counterparty_exposure so it reconciles
+      Country rollup, derived from counterparty_exposure so it reconciles
       to the detail by construction.
     columns:
       - name: country_code
@@ -44,12 +44,12 @@ models:
           combination_of_columns: [business_date, country_code]
       # Reconciliation is the point of the shared lineage — assert it.
       - dbt_utils.equality:
-          compare_model: ref('rpt_counterparty_exposure')
+          compare_model: ref('counterparty_exposure')
           compare_columns: [business_date]
           config:
             severity: warn
 
-  - name: rpt_exposure_change
+  - name: exposure_change
     description: >
       Day-on-day and month-on-month change in counterparty exposure. This is
       the model the estate's reporting emphasis actually needs, and the one
@@ -89,8 +89,8 @@ exposures:
       I change this model", which is the question the legacy estate cannot
       currently answer.
     depends_on:
-      - ref('rpt_counterparty_exposure')
-      - ref('rpt_exposure_change')
+      - ref('counterparty_exposure')
+      - ref('exposure_change')
     owner:
       name: Reporting
       email: reporting@example.invalid
@@ -104,7 +104,7 @@ exposures:
       replaceability of the BI product is the constraint that shapes everything
       upstream of it.
     depends_on:
-      - ref('rpt_exposure_by_country')
+      - ref('exposure_by_country')
     owner:
       name: Reporting
       email: reporting@example.invalid

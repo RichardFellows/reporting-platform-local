@@ -221,7 +221,7 @@ docker compose exec -T airflow python -m scripts.duckdb_console --tables
 
 docker compose exec -T airflow python -m scripts.duckdb_console \
   "select business_date, count(*) as rows
-   from lakehouse.reporting.rpt_exposure_change
+   from lakehouse.reporting.exposure_change
    group by 1 order by 1 desc limit 5"
 ```
 
@@ -232,8 +232,8 @@ Expected row counts after the build:
 
 | Table | Rows |
 |---|---|
-| `prepared.prep_trade` | 16,000 |
-| `reporting.rpt_exposure_change` | 2,400 |
+| `prepared.trade` | 16,000 |
+| `reporting.exposure_change` | 2,400 |
 
 Check the catalog:
 

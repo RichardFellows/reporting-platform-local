@@ -92,13 +92,25 @@ def feed(name: str) -> Feed:
     return feeds()[name]
 
 
-# These are dbt MODEL names, and dbt materialises a model under its own name
-# unless an `alias` is configured -- none is. So the table in the catalog is
-# `prepared.prep_trade`, not `prepared.trade`. Dropping the prefix here means
-# every maintenance and retention task addresses a table that does not exist.
-PREPARED_TABLES = ["prep_trade", "prep_counterparty", "prep_rating"]
-REPORTING_TABLES = ["rpt_counterparty_exposure", "rpt_exposure_by_country",
-                    "rpt_exposure_change"]
+# These are dbt MODEL names, and because no `alias` is configured on any of
+# them, each is ALSO the table name in the catalog: model `trade` materialises
+# as `prepared.trade`. Keep it that way -- model and table must be renamed
+# TOGETHER. A mismatch in either direction points every maintenance and
+# retention task at a table that does not exist, and does so silently, because
+# managed_tables() never checks that its entries resolve.
+#
+# NO LAYER PREFIX ON ANY OF THESE. The names used to be `prep_*` and `rpt_*`;
+# the namespace already says which layer a table is in, so the prefix repeated
+# it inside the name -- `prepared.prep_trade`, `reporting.rpt_exposure_change`.
+# The layer is now the ONLY thing distinguishing a table from its upstream:
+# `raw.trade` is the landed 1:1 copy and `prepared.trade` the conformed one,
+# same name, different namespace. That is legal because dbt keeps models and
+# sources in separate namespaces -- a model named `trade` and a source
+# `raw.trade` coexist without collision (verified, not assumed).
+PREPARED_TABLES = ["trade", "counterparty", "rating",
+                   "primary_limits"]
+REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
+                    "exposure_change"]
 
 
 def managed_tables() -> list[tuple[str, str]]:
@@ -191,6 +203,11 @@ def spark_session(app_name: str, ref: str = "main"):
 
     `ref` is the Nessie branch. Ingest and dbt builds run on a working branch;
     maintenance and snapshot expiry run on main.
+
+    THE SESSION IS A CLIENT OF THE STANDALONE CLUSTER, never local[*]. The
+    caller's process is the driver; every task runs in an executor on
+    `spark-worker`. See the `master` handling below for why there is no
+    local fallback.
     """
     from pyspark.sql import SparkSession
 
@@ -198,13 +215,34 @@ def spark_session(app_name: str, ref: str = "main"):
     warehouse = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
     nessie_uri = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")
 
-    # `pyspark` here is the pip-installed local runtime baked into
-    # Dockerfile.airflow -- it has NONE of the Iceberg/Nessie/S3A jars that
-    # Dockerfile.spark curls into spark-master/spark-worker's /opt/spark/jars,
-    # and this session never actually connects to that cluster (no .master()
-    # call). So every jar the catalog needs has to be resolved here via Ivy,
-    # at the same versions Dockerfile.spark uses, or every Iceberg SQL
-    # statement fails with ClassNotFoundException before it even runs.
+    # No local[*] fallback, deliberately. A missing/blank SPARK_MASTER used to
+    # mean "run the whole job inside this container", which is a configuration
+    # error that LOOKS like success: the job completes, the cluster sits idle,
+    # and nothing anywhere is red. Fail loudly instead. The value is set on
+    # the airflow services in docker-compose.yml; the default below is the
+    # same address so a bare `python -m ...` in the container still works.
+    master = os.environ.get("SPARK_MASTER") or "spark://spark-master:7077"
+    if master.startswith("local"):
+        raise RuntimeError(
+            f"SPARK_MASTER is {master!r}. This platform runs every Spark job on "
+            f"the spark-master/spark-worker cluster; an in-process local session "
+            f"silently bypasses it. Point SPARK_MASTER at the cluster "
+            f"(spark://spark-master:7077)."
+        )
+
+    # `pyspark` here is the pip-installed runtime baked into
+    # Dockerfile.airflow, and it is the DRIVER. It has NONE of the
+    # Iceberg/Nessie/S3A jars that Dockerfile.spark curls into
+    # spark-master/spark-worker's /opt/spark/jars, so the driver still has to
+    # resolve every one of them via Ivy or the first Iceberg SQL statement
+    # fails with ClassNotFoundException before it even runs.
+    #
+    # Keep this list even though the executors already have most of it baked
+    # in. spark.jars.packages jars are shipped from the driver's file server
+    # to every executor, so what the executors actually load is what is
+    # resolved here -- which is why the versions must stay equal to
+    # Dockerfile.spark's, and why hadoop-aws (which the Spark image does NOT
+    # bake) reaches the executors at all.
     packages = ",".join([
         "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1",
         "org.apache.iceberg:iceberg-aws-bundle:1.6.1",
@@ -219,15 +257,32 @@ def spark_session(app_name: str, ref: str = "main"):
 
     builder = (
         SparkSession.builder.appName(app_name)
+        .master(master)
         .config("spark.jars.packages", packages)
-        # This session never sets .master(), so it runs Spark in local[*]
-        # mode inside whatever process calls spark_session() -- driver and
-        # executor are the same JVM, and spark.driver.memory is the only
-        # heap knob that applies. Left unset it defaults to 1g, which is
-        # tight once Iceberg/Nessie/aws-sdk-bundle classes are loaded and
-        # get exercised across repeated catalog operations.
-        .config("spark.driver.memory", "3g")
+        # The driver runs in the calling container and does no task work, so
+        # it needs far less heap than the old local[*] session did -- but not
+        # the 1g default, which is tight once Iceberg/Nessie/aws-sdk-bundle
+        # classes are loaded and exercised across repeated catalog operations.
+        .config("spark.driver.memory", "2g")
         .config("spark.driver.maxResultSize", "1g")
+        # spark.driver.host is left at its default: Spark advertises this
+        # container's hostname, and Docker's embedded DNS resolves it from
+        # spark-worker, so executors can call back. Verified live -- a task
+        # scheduled on the worker returned its result to a driver advertising
+        # the raw container id.
+        #
+        # CAP THE APP so one job cannot take the whole cluster. Standalone
+        # mode gives an application every free core by default and holds them
+        # until it stops; two overlapping jobs would leave the second waiting
+        # forever with "Initial job has not accepted any resources" rather
+        # than failing. The `lakehouse_write` pool already serialises the
+        # WRITERS -- this is what keeps the read-only jobs outside that pool
+        # (arrival checks, completeness, maintenance metrics) from colliding.
+        # Sized against SPARK_WORKER_CORES/SPARK_WORKER_MEMORY in
+        # docker-compose.yml: three concurrent applications fit.
+        .config("spark.cores.max", os.environ.get("SPARK_APP_CORES", "2"))
+        .config("spark.executor.cores", os.environ.get("SPARK_APP_CORES", "2"))
+        .config("spark.executor.memory", os.environ.get("SPARK_APP_MEMORY", "2g"))
         .config(
             # ORDER MATTERS. Each extension injects a parser that wraps the
             # previous one, so the LAST listed ends up outermost. Iceberg's

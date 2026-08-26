@@ -82,8 +82,8 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
     sort_clause = ""
     if strategy == "sort" and layer_cfg.get("sort_order"):
         # `sort_order` is configured PER LAYER, but the tables in a layer do
-        # not share a schema: `reporting` holds both `rpt_counterparty_exposure`
-        # (per counterparty) and `rpt_exposure_by_country` (aggregated, so
+        # not share a schema: `reporting` holds both `counterparty_exposure`
+        # (per counterparty) and `exposure_by_country` (aggregated, so
         # `counterparty_id` does not exist on it). Iceberg binds every sort
         # field against the table schema up front and throws
         #   ValidationException: Cannot find field 'counterparty_id' in struct

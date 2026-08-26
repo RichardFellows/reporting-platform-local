@@ -175,7 +175,7 @@ the notes in this table before moving one.
 | **dbt-core** | **1.8.7** | `Dockerfile.airflow` | Held back deliberately. It is what every DAG runs on and what has been validated; a bump needs a planned re-verification of both layers, not an opportunistic one. |
 | **dbt-spark** | **1.8.0** (`[PyHive]`) | `Dockerfile.airflow` | The only dbt adapter installed — see below. |
 | **DuckDB** | **1.5.5** | `Dockerfile.airflow` | For `scripts/duckdb_console.py` only. 1.1.3's iceberg extension has no catalog `ATTACH` at all and fails with `Binder Error: Unrecognized storage type "ICEBERG"`. |
-| **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `dbt/profiles.yml` | S3A filesystem for the in-process SparkSession. |
+| **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `dbt/profiles.yml`, `reporting_platform/common/context.py` | S3A filesystem for reading landing CSVs. Deliberately **not** baked into `Dockerfile.spark`: the driver resolves it via `spark.jars.packages` and ships it to the executors, so there is one place the version is set. |
 
 **There is no `dbt-duckdb`, on purpose.** Spark is the only build engine —
 a build has to land on a Nessie branch and only the Spark path can address one
@@ -201,6 +201,7 @@ rather than loud:
 |---|---|
 | **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands. Start here.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, Nessie write-audit-publish, per-feed DAG topology, why Spark is the only build engine |
+| **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the six files a new feed touches, in order, with the worked `primary_limits` example |
 | [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
 | [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | what changes on promotion, and the three things that genuinely differ |
@@ -447,8 +448,8 @@ In PowerShell the capture is `$branch = (docker compose exec -T airflow python
 injected a trade referencing `CP99999`, which is absent from the counterparty
 feed, and an unparseable notional. You should see:
 
-- `relationships` failing on `prep_trade.counterparty_id`
-- `not_null` failing on `prep_trade.notional`
+- `relationships` failing on `trade.counterparty_id`
+- `not_null` failing on `trade.notional`
 
 In the legacy chain the first would have been an the legacy ETL tool lookup failure that
 aborted the load, and the second a conversion error. Here the data landed, the
@@ -475,11 +476,11 @@ Then look at what shared lineage bought you:
 
 ```bash
 docker compose exec airflow dbt ls --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt \
-  --select +rpt_exposure_change
+  --select +exposure_change
 ```
 
-`rpt_exposure_by_country` and `rpt_exposure_change` both `ref()`
-`rpt_counterparty_exposure` rather than re-deriving exposure from `prepared`.
+`exposure_by_country` and `exposure_change` both `ref()`
+`counterparty_exposure` rather than re-deriving exposure from `prepared`.
 Change the exposure definition once and every report moves together. That is
 the specific thing the legacy reporting estate cannot do today, and the
 reason the metadata-catalog gap in the PoC is worth closing with dbt's manifest
@@ -510,7 +511,7 @@ Alternatively skip the merge and query at the branch instead, by appending
 ```bash
 docker compose exec spark-master /opt/spark/bin/spark-sql -e \
   "SELECT business_date, change_category, count(*), round(sum(mtm_change),0)
-   FROM lakehouse.reporting.rpt_exposure_change
+   FROM lakehouse.reporting.exposure_change
    GROUP BY 1,2 ORDER BY 1 DESC, 2 LIMIT 20"
 ```
 
@@ -611,7 +612,7 @@ Every publication tagged `main`. Query as at a tag:
 
 ```bash
 docker compose exec spark-master /opt/spark/bin/spark-sql -e \
-  "SELECT count(*) FROM lakehouse.reporting.\`rpt_counterparty_exposure@published/2026-08-13/<run_id>\`"
+  "SELECT count(*) FROM lakehouse.reporting.\`counterparty_exposure@published/2026-08-13/<run_id>\`"
 ```
 
 This is the answer to "what exactly did we publish on the 5th" — a question
@@ -745,7 +746,7 @@ published `main` answers in about a second:
 ```bash
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 docker compose exec -T airflow python -m scripts.duckdb_console \
-  "select business_date, count(*) from lakehouse.prepared.prep_trade
+  "select business_date, count(*) from lakehouse.prepared.trade
    group by 1 order by 1 desc limit 5"
 ```
 

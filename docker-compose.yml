@@ -38,6 +38,10 @@ x-airflow-common: &airflow-common
     # LocalExecutor the scheduler forks the task and writes its result straight
     # to the metadata DB, with no service in between to fail to acknowledge it.
     AIRFLOW__WEBSERVER__SECRET_KEY: local-dev-not-a-real-secret
+    # Every Spark job runs on the spark-master/spark-worker cluster; the
+    # calling process is only the driver. context.py's spark_session() REFUSES
+    # a local[*] value here rather than quietly running the work in-process,
+    # and dbt/profiles.yml threads the same address into spark.master.
     SPARK_MASTER: spark://spark-master:7077
     DBT_PROJECT_DIR: /opt/platform/dbt
     DBT_PROFILES_DIR: /opt/platform/dbt
@@ -175,8 +179,16 @@ services:
     environment:
       <<: *s3-env
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: "4g"
+      # Sized so several applications can hold cores at once. Every Spark job
+      # on this platform is now a CLIENT of this cluster -- ingest, dbt builds,
+      # maintenance, retention, arrival checks, completeness -- and a
+      # standalone application holds its cores from first job to session stop.
+      # Each one caps itself at 2 cores / 2g (spark.cores.max in
+      # context.py and dbt/profiles.yml), so this leaves room for three
+      # concurrent: the one `lakehouse_write` slot plus the read-only jobs
+      # that sit outside that pool.
+      SPARK_WORKER_CORES: "6"
+      SPARK_WORKER_MEMORY: "6g"
     volumes:
       - ./reporting_platform:/opt/platform/reporting_platform:ro
       - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
