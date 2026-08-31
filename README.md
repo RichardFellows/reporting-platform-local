@@ -342,7 +342,7 @@ One branch, `main`, at the empty hash. Everything that follows is commits
 against this — the catalog is version-controlled in exactly the way the SQL
 Server schema never was.
 
-MinIO console: http://localhost:9001 (`minioadmin` / `minioadmin123`).
+MinIO console: http://localhost:19001 (`minioadmin` / `minioadmin123`).
 
 ## 3. Start compute
 

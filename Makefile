@@ -18,7 +18,7 @@ env: ## Create .env from the template
 .PHONY: up
 up: env ## Start the whole local stack
 	$(COMPOSE) up -d --build
-	@echo "MinIO    http://localhost:9001  (minioadmin / minioadmin123)"
+	@echo "MinIO    http://localhost:19001 (minioadmin / minioadmin123)"
 	@echo "Nessie   http://localhost:19120/api/v2/config"
 	@echo "Airflow  http://localhost:8081   (admin / admin)"
 	@echo "Spark    http://localhost:8080"

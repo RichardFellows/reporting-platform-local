@@ -7,12 +7,13 @@ would be two definitions of it and the file-based one would be the one people
 read.
 
 There is no authentication. This is the local reference stack -- Airflow's own
-UI on 8081 is admin/admin and MinIO's on 9001 is minioadmin. Deploying this
+UI on 8081 is admin/admin and MinIO's on 19001 is minioadmin. Deploying this
 anywhere shared means putting a real identity layer in front of it; it writes
 source files and triggers builds.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +300,19 @@ async def api_infer_columns(file: UploadFile = File(...)):
     columns = feeddata.columns_from_csv(content)
     return {"columns": columns, "column_types": scaffold.infer_types(columns),
             "types_available": scaffold.COLUMN_TYPES}
+
+
+@app.get("/api/links")
+def api_links():
+    """Host-side URLs for the header links.
+
+    MinIO's host port is configurable (MINIO_CONSOLE_PORT) because 9000/9001
+    collide with ZScaler and friends, and a page that hardcodes 9001 sends
+    people to whatever else is on that port. Served from the API so the one
+    place that knows the mapping -- the compose file -- is the one that tells
+    the browser.
+    """
+    return {"minio": os.environ.get("MINIO_CONSOLE_URL", "http://localhost:19001")}
 
 
 @app.get("/api/column-types")

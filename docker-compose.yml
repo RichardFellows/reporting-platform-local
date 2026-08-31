@@ -83,7 +83,19 @@ services:
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin123}
-    ports: ["9000:9000", "9001:9001"]
+    # HOST side only. The container keeps 9000/9001, which is what
+    # `S3_ENDPOINT: http://minio:9000` and every other service address --
+    # container-to-container traffic never goes near the host mapping, so
+    # changing these cannot break the pipeline.
+    #
+    # Configurable, and defaulted AWAY from 9000/9001, because those collide
+    # with things people actually run: ZScaler on a corporate laptop takes
+    # them, and so do a fair number of local dev servers. A clash shows up as
+    # a container that will not start, or worse, a console that answers with
+    # something else entirely.
+    ports:
+      - "${MINIO_API_PORT:-19000}:9000"
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"
     volumes: ["minio-data:/data"]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
@@ -314,6 +326,9 @@ services:
       # two defaults that could drift apart.
       SPARK_MASTER: spark://spark-master:7077
       DBT_TARGET: ${DBT_TARGET:-spark_local}
+      # The console renders a MinIO link for the BROWSER, so it needs the
+      # host-side port, which nothing inside the network otherwise knows.
+      MINIO_CONSOLE_URL: http://localhost:${MINIO_CONSOLE_PORT:-19001}
       AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
       AIRFLOW_API_USER: admin
       AIRFLOW_API_PASSWORD: admin

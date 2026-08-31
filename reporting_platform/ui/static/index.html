@@ -97,7 +97,7 @@
   <span class="links">
     <a href="http://localhost:8081" target="_blank">Airflow</a>
     <a href="http://localhost:8080" target="_blank">Spark</a>
-    <a href="http://localhost:9001" target="_blank">MinIO</a>
+    <a href="http://localhost:19001" id="minio-link" target="_blank">MinIO</a>
     <a href="http://localhost:19120/api/v2/trees" target="_blank">Nessie refs</a>
     <a href="/api/docs" target="_blank">API</a>
   </span>
@@ -1066,6 +1066,12 @@ async function health() {
 
 (async function init() {
   STATE.types = (await api("/api/column-types")).types;
+  // MinIO's host port is configurable, so the link comes from the server
+  // rather than being baked into this page. See /api/links.
+  api("/api/links").then(l => {
+    const a = $("#minio-link");
+    if (a && l.minio) a.href = l.minio;
+  }).catch(() => { /* the hardcoded default stands */ });
   $("#new-feed").addEventListener("click", newFeed);
   await loadFeeds();
   health();

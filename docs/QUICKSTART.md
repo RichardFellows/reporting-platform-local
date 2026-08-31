@@ -73,14 +73,20 @@ both:
 | Service | URL | Credentials |
 |---|---|---|
 | **Airflow** | http://localhost:8081 | `admin` / `admin` |
-| **MinIO console** (object storage) | http://localhost:9001 | `minioadmin` / `minioadmin123` |
+| **MinIO console** (object storage) | http://localhost:19001 | `minioadmin` / `minioadmin123` |
 | **Spark master** | http://localhost:8080 | none |
 | **Nessie** (catalog API) | http://localhost:19120/api/v2/config | none |
 
 | Endpoint | Address | Credentials |
 |---|---|---|
-| MinIO S3 API | `localhost:9000` | `minioadmin` / `minioadmin123` |
+| MinIO S3 API | `localhost:19000` | `minioadmin` / `minioadmin123` |
 | Postgres | `localhost:5432` | `platform` / `platform` |
+
+MinIO's host ports are **19000 / 19001**, not the usual 9000 / 9001 — those
+collide with ZScaler on a corporate laptop and with a fair number of local dev
+servers. Override with `MINIO_API_PORT` / `MINIO_CONSOLE_PORT` in `.env` if
+something on your machine wants 19000 instead. The container still listens on
+9000/9001 internally, so nothing in the pipeline is affected either way.
 
 Postgres holds five databases, deliberately separated: `airflow` (metadata),
 `nessie` (the catalog's version store), `nessie_gc` (GC live-sets), `serving`
