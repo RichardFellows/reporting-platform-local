@@ -93,17 +93,32 @@ models:
       - name: grade_band
         tests:
           - accepted_values: {values: ['INVESTMENT_GRADE', 'SUB_INVESTMENT_GRADE']}
+      - name: effective_from
+        tests: [not_null]
+      - name: effective_to
+        tests: [not_null]
+      - name: is_current
+        tests: [not_null]
     tests:
+      # SCD2: the grain is one row per (counterparty, agency) VERSION.
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, counterparty_id, agency]
+          combination_of_columns: [counterparty_id, agency, effective_from]
+      # See the counterparty block: this is the test that catches a failed
+      # close, which as_of() would otherwise turn into silently doubled rows.
+      # gaps: allowed because effective_to is an INCLUSIVE upper bound.
+      - dbt_utils.mutually_exclusive_ranges:
+          lower_bound_column: effective_from
+          upper_bound_column: effective_to
+          partition_by: counterparty_id || '|' || agency
+          gaps: allowed
+
 
   - name: primary_limits
     description: >
-      Conformed primary credit limits from GCIS2, typed and with an
-      in-force flag. Limit vs exposure comparison belongs in reporting.
+      Conformed primary credit limits from GCIS2, typed, one row per limit
+      version. Use limit_in_force() to ask whether a limit applies on a date.
+      Limit vs exposure comparison belongs in reporting.
     columns:
-      - name: business_date
-        tests: [not_null]
       - name: limit_id
         tests: [not_null]
       - name: counterparty_id
@@ -128,12 +143,28 @@ models:
       - name: status
         tests:
           - accepted_values: {values: ['ACTIVE', 'SUSPENDED', 'EXPIRED']}
+      # The business `is_current` ("in force on the delivered date") is gone --
+      # it was a function of business_date, which an SCD2 row has not got, and
+      # the name now means "the live VERSION of this record". Its definition
+      # lives on as the limit_in_force() macro; see the model docstring.
+      - name: effective_from
+        tests: [not_null]
+      - name: effective_to
+        tests: [not_null]
       - name: is_current
-        tests:
-          - accepted_values: {values: [true, false], quote: false}
+        tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, limit_id]
+          combination_of_columns: [limit_id, effective_from]
+      # See the counterparty block: this is the test that catches a failed
+      # close, which as_of() would otherwise turn into silently doubled rows.
+      # gaps: allowed because effective_to is an INCLUSIVE upper bound.
+      - dbt_utils.mutually_exclusive_ranges:
+          lower_bound_column: effective_from
+          upper_bound_column: effective_to
+          partition_by: limit_id
+          gaps: allowed
+
   - name: collateral
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.

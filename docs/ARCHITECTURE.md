@@ -249,22 +249,41 @@ the project files, so it is paid again only when a model actually changes.
 
 ## Slowly-changing dimensions in `prepared`
 
-`prepared.counterparty` stores **one row per version**, not one per business
-date. Everything else stays a daily snapshot.
+`prepared.counterparty`, `prepared.rating` and `prepared.primary_limits`
+store **one row per version**, not one per business date. `trade` and
+`collateral` stay daily snapshots.
 
 The split is measured, not stylistic. Against 40 retained business dates:
 
-| table | snapshot rows | as SCD2 | redundancy |
-|---|---|---|---|
-| `counterparty` | 2,400 | **70** | 97% |
-| `rating` | 5,580 | ~1,335 | 76% |
-| `primary_limits` | 5,680 | ~940 | 84% |
-| `trade` | 16,000 | 14,443 | **10%** |
+Measured, built:
 
-`trade` is why this is per-table rather than a layer-wide rule: it is a
-persisting book whose marks genuinely move, so versioning it costs complexity
-and saves a tenth. Reference data restates an unchanged value every morning;
-transaction data does not.
+| table | snapshot rows | as SCD2 | saved |
+|---|---|---|---|
+| `counterparty` | 2,400 | **71** | 97% |
+| `primary_limits` | 5,680 | **940** | 83% |
+| `rating` | 5,580 | **1,402** | 75% |
+| **reference total** | **13,660** | **2,413** | **82%** |
+| `trade` | 16,000 | 14,443 | 10% — *not converted* |
+| `collateral` | 650 | 219 | *not converted, see below* |
+
+`trade` is why this is per-table rather than a layer-wide rule: a persisting
+book whose marks genuinely move, so versioning it costs complexity and saves a
+tenth. Reference data restates an unchanged value every morning; transaction
+data does not.
+
+`collateral` is **not** converted, and that is a semantic call rather than a
+measurement one. Its 66% is an artefact of the sample generator holding values
+still; a real collateral feed revalues `market_value` and `haircut_pct` daily,
+which makes it a position feed like `trade`. Convert it if your upstream
+actually restates unchanged positions — measure first.
+
+### Grain is per business key, not per table
+
+`rating` versions per **(counterparty_id, agency)**: Moody's downgrading must
+not close the S&P version. `primary_limits` versions per `limit_id`. Getting
+this wrong interleaves two independent histories into one chain, and the
+`mutually_exclusive_ranges` test is partitioned on the same key so it catches
+exactly that.
 
 ### How consumers read it
 
@@ -281,12 +300,28 @@ would have dropped the one consumer that cannot be changed by editing a model.
 
 ### Three consequences worth knowing
 
+**`primary_limits.is_current` is gone.** It meant "in force on the business
+date delivered for" — a function of `business_date`, which an SCD2 row has
+not got, and the name now means "the live version of this record". Its
+definition survives as the `limit_in_force(alias, date)` macro, so the single
+shared definition the column existed to provide is intact; only its shape
+changed. Note the table now carries two unrelated date ranges:
+`effective_date`/`expiry_date` (when the **limit** applies, a business fact)
+and `effective_from`/`effective_to` (when the **record version** applied).
+
 **A late feed is now carried forward, not nulled.** A version's range spans a
 missing delivery, so a point-in-time join finds the counterparty on a day its
 file never arrived. This is what this document and README have always
 promised; the snapshot implementation did the opposite and emitted NULLs.
 `counterparty_exposure.reference_carried_forward` keeps the gap visible — more
 usefully than a NULL, which could not say how stale the value was.
+
+The same effect on `rating` is larger and more clearly a fix: rating is a
+**weekly** feed, so under the snapshot 420 of 2,400 exposure rows (17.5%) had
+no rating at all on the days it did not deliver. Point-in-time joining carries
+the last known rating forward and that count is now **zero**. It is not
+flagged as "carried forward", because for a weekly feed that is the design
+rather than a gap — `rating_as_of` says how old the rating is instead.
 
 **Retention stops being a partition drop.** There is no `business_date`
 column, so `retention.py` uses a row-level delete for these tables. See

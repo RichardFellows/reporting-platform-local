@@ -64,15 +64,36 @@ delivered as (
 -- One rating per counterparty per date: the most conservative (highest rank)
 -- across agencies. Documented here because it is a business rule, not a
 -- technical one, and report owners need to be able to find it.
+--
+-- `rating` is SCD2 now, so there is no business_date to group by: the dates
+-- come from the exposure side and the ratings are joined point-in-time onto
+-- them. `dates` is the set of (business_date, counterparty_id) pairs the
+-- report is being built for, taken from the trades themselves so that a
+-- counterparty with no trades on a date contributes no rating row -- which is
+-- what the old equality join did implicitly.
+dates as (
+    select distinct business_date, counterparty_id from trades
+),
+
 worst_rating as (
 
     select
-        business_date,
-        counterparty_id,
-        max(rating_rank)                                        as worst_rating_rank,
-        min(case when grade_band = 'SUB_INVESTMENT_GRADE' then 0 else 1 end) as is_investment_grade_flag
-    from {{ ref('rating') }}
-    group by business_date, counterparty_id
+        d.business_date,
+        d.counterparty_id,
+        max(r.rating_rank)                                      as worst_rating_rank,
+        min(case when r.grade_band = 'SUB_INVESTMENT_GRADE' then 0 else 1 end) as is_investment_grade_flag,
+        -- How recent the ratings behind this row are. NOT flagged as
+        -- "carried forward" the way counterparty is: rating is a WEEKLY feed
+        -- (cadence: weekly in feeds.yml), so a business date with no delivery
+        -- is the design rather than a gap, and flagging it would be noise on
+        -- three days in four. A date is still useful -- it distinguishes a
+        -- rating set last week from one set two years ago.
+        max(r.effective_from)                                   as rating_as_of
+    from dates d
+    join {{ ref('rating') }} r
+      on r.counterparty_id = d.counterparty_id
+     and {{ as_of('r', 'd.business_date') }}
+    group by d.business_date, d.counterparty_id
 
 ),
 
@@ -123,6 +144,7 @@ select
     c.effective_from                                            as reference_effective_from,
 
     r.worst_rating_rank,
+    r.rating_as_of,
     case when r.is_investment_grade_flag = 1 then true
          when r.is_investment_grade_flag = 0 then false
          else null end                                          as is_investment_grade,

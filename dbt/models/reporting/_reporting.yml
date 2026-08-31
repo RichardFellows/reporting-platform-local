@@ -34,6 +34,12 @@ models:
           forward (which is what README and ARCHITECTURE always promised) and
           this column is what keeps the gap visible.
         tests: [not_null]
+      - name: rating_as_of
+        description: >
+          When the most recently-changed agency rating behind this row took
+          effect. Rating is a weekly feed, so most business dates legitimately
+          carry forward the last known rating; this says how old it is without
+          flagging normal weekly behaviour as a gap.
       - name: reference_effective_from
         description: >
           The date the counterparty attributes in force on this row began.

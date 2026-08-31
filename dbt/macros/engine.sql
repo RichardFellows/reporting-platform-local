@@ -184,3 +184,114 @@
       order by {{ order_column }}), 1),
     DATE '9999-12-31')
 {% endmacro %}
+
+{% macro scd2_incremental_scope(source_relation, key_columns) %}
+  {#
+    The two CTEs every SCD2 model needs on its incremental path, so the logic
+    exists once rather than once per reference table.
+
+    `replay_from` IS THE LOAD-BEARING HALF. A touched entity's currently-open
+    version can have begun months or years before the lookback window, and the
+    whole of it must be re-derived for lead() to see the new value and CLOSE
+    it. Replaying only the last few business dates appends a new version and
+    leaves the previous one still claiming effective_to = 9999-12-31 -- two
+    versions in force at once, which as_of() then matches BOTH of, silently
+    doubling every joined row. The mutually_exclusive_ranges test is what
+    catches that, and is not optional on any table using this.
+  #}
+  {%- set keys = key_columns | join(', ') -%}
+  touched as (
+
+      select distinct {{ keys }}
+      from {{ source_relation }}
+      where _business_date >= (
+          select coalesce(max(_inc.effective_from), date '1900-01-01')
+                 - interval {{ var('lookback_days', 3) }} day
+          from {{ this }} as _inc
+      )
+
+  ),
+
+  replay_from as (
+
+      select {{ keys }}, min(effective_from) as from_date
+      from {{ this }}
+      where is_current
+      group by {{ keys }}
+
+  ),
+{% endmacro %}
+
+
+{% macro scd2_changes(source_cte, key_columns) %}
+  {#
+    Collapse a per-business-date stream into one row per CHANGE. A delivery
+    that restates an unchanged entity produces nothing, which is the point.
+    Expects `{{ source_cte }}` to carry `_row_hash` and `business_date`.
+  #}
+  changes as (
+
+      select
+          *,
+          lag(_row_hash) over (partition by {{ key_columns | join(', ') }}
+                               order by business_date)          as _prev_hash
+      from {{ source_cte }}
+
+  ),
+
+  kept as (
+      select * from changes
+      where _prev_hash is null or _prev_hash <> _row_hash
+  ),
+{% endmacro %}
+
+
+{% macro scd2_columns(key_columns) %}
+  {#
+    The four columns that make a row a VERSION. One definition, so the three
+    reference tables cannot drift in how they express validity -- as_of()
+    depends on all of them meaning the same thing everywhere.
+  #}
+  business_date                                             as effective_from,
+  {{ scd2_effective_to('business_date', key_columns) }}     as effective_to,
+  lead(business_date) over (partition by {{ key_columns | join(', ') }}
+                            order by business_date) is null  as is_current,
+  {#
+    business_date is gone as a column, so it cannot be the partition column.
+    Retention deletes by a range predicate against this instead of dropping a
+    partition -- see docs/RETENTION.md.
+  #}
+  trunc(business_date, 'MM')                                as effective_from_month
+{% endmacro %}
+
+
+{% macro limit_in_force(alias, business_date_expr) %}
+  {#
+    Is this limit in force on the given date?
+
+    THIS USED TO BE AN `is_current` COLUMN ON prepared.primary_limits, and it
+    could not survive SCD2: it is a function of business_date, and an SCD2 row
+    has no business_date. Two names would also have collided, since `is_current`
+    now means "this is the live VERSION of the record" on every SCD2 table.
+
+    It is a macro rather than nothing, because the model's docstring was right
+    about why it existed: "it is computed here so that every consumer asks the
+    question the same way -- the alternative is each report writing its own
+    BETWEEN, which is precisely how the legacy estate ended up with limits that
+    disagreed between screens." A macro keeps that single definition; only its
+    shape moved from a column to a call.
+
+    Note the limit's OWN effective_date/expiry_date are business facts about
+    the limit, entirely separate from the record's effective_from/effective_to.
+  #}
+  case
+      when {{ alias }}.status is null then null
+      when {{ alias }}.status <> 'ACTIVE' then false
+      when {{ alias }}.effective_date is not null
+           and {{ business_date_expr }} < {{ alias }}.effective_date then false
+      -- A null expiry is an open-ended limit, not a missing value.
+      when {{ alias }}.expiry_date is not null
+           and {{ business_date_expr }} > {{ alias }}.expiry_date then false
+      else true
+  end
+{% endmacro %}

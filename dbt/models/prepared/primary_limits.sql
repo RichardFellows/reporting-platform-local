@@ -1,9 +1,9 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'limit_id'],
-    partition_by=['business_date'],
-    tags=['prepared', 'reference']
+    unique_key=['limit_id', 'effective_from'],
+    partition_by=['effective_from_month'],
+    tags=['prepared', 'reference', 'scd2']
   )
 }}
 
@@ -15,21 +15,52 @@
   normalised once. Utilisation, headroom and breach flags belong in
   `reporting`, where they can be joined to exposure.
 
-  `is_current` is the one derivation, and it is a restatement of what the feed
-  already says rather than new logic: the limit is in force on the business
-  date it was delivered for. It is computed here so that every consumer asks
-  the question the same way -- the alternative is each report writing its own
-  BETWEEN, which is precisely how the legacy estate ended up with limits that
-  disagreed between screens.
+  SCD2, one row per limit VERSION. A limit is a standing object that gets
+  restated, not a new record each day -- 5,680 rows expressed roughly 940
+  versions. Consumers join point-in-time with as_of().
+
+  THE `is_current` COLUMN IS GONE, and that needs explaining because it was
+  load-bearing. It meant "this limit is in force on the business date it was
+  delivered for", and it cannot survive this change for two reasons: it is a
+  function of business_date, which an SCD2 row does not have, and the name now
+  means something else entirely -- on every SCD2 table `is_current` marks the
+  live VERSION of the record.
+
+  Its reason for existing was right, though: "computed here so that every
+  consumer asks the question the same way -- the alternative is each report
+  writing its own BETWEEN, which is precisely how the legacy estate ended up
+  with limits that disagreed between screens." So the definition survives as
+  the `limit_in_force(alias, date)` macro in macros/engine.sql. It moved from
+  a column to a call; it did not become each report's problem.
+
+  TWO SEPARATE DATE RANGES NOW SIT ON THIS ROW and they are not the same thing:
+
+    * effective_date / expiry_date -- when the LIMIT applies. A business fact
+      the upstream sends, and what limit_in_force() reads.
+    * effective_from / effective_to -- when this VERSION of the record was the
+      one being reported. Platform bookkeeping, and what as_of() reads.
+
+  A limit can be recorded (effective_from) long before it applies
+  (effective_date). Conflating them is the obvious way to get this wrong.
 #}
 
-with raw_rows as (
+with
+
+{% if is_incremental() %}
+{{ scd2_incremental_scope(source('raw', 'primary_limits'), ['limit_id']) }}
+{% endif %}
+
+raw_rows as (
 
     select
-        *,
-        {{ dedupe_rank(['limit_id']) }} as _rn
-    from {{ source('raw', 'primary_limits') }}
-    where {{ incremental_window('_business_date', 'business_date') }}
+        r.*,
+        {{ dedupe_rank(['r.limit_id']) }} as _rn
+    from {{ source('raw', 'primary_limits') }} r
+    {% if is_incremental() %}
+    join touched t on t.limit_id = r.limit_id
+    left join replay_from p on p.limit_id = r.limit_id
+    where r._business_date >= coalesce(p.from_date, date '1900-01-01')
+    {% endif %}
 
 ),
 
@@ -67,16 +98,44 @@ cleaned as (
 
     from deduped
 
+),
+
+versioned as (
+
+    select
+        *,
+        {{ scd2_hash(['counterparty_id', 'limit_type', 'limit_amount',
+                      'currency', 'effective_date', 'expiry_date',
+                      'status']) }}                           as _row_hash
+    from cleaned
+
+),
+
+{{ scd2_changes('versioned', ['limit_id']) }}
+
+ranged as (
+
+    select
+        limit_id,
+        counterparty_id,
+        limit_type,
+        limit_amount,
+        currency,
+        effective_date,
+        expiry_date,
+        status,
+
+        source_file,
+        source_file_version,
+        source_batch_id,
+        dbt_invocation_id,
+        nessie_ref,
+        dbt_updated_at,
+
+        {{ scd2_columns(['limit_id']) }}
+
+    from kept
+
 )
 
-select
-    *,
-    case
-        when status is null then null
-        when status <> 'ACTIVE' then false
-        when effective_date is not null and business_date < effective_date then false
-        -- A null expiry is an open-ended limit, not a missing value.
-        when expiry_date is not null and business_date > expiry_date then false
-        else true
-    end                                                     as is_current
-from cleaned
+select * from ranged

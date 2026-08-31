@@ -16,7 +16,8 @@ operation, the analogue of partition switching. It rewrites no data files.
 This is why `partition_by=['business_date']` is described throughout this
 document as a retention requirement.
 
-**SCD2 tables** (`prepared.counterparty`) — that requirement does not apply,
+**SCD2 tables** (`prepared.counterparty`, `prepared.rating`,
+`prepared.primary_limits`) — that requirement does not apply,
 because there is no `business_date` to partition by. Instead:
 
 - a **current** version is never expired, however old — it is the answer to
@@ -28,10 +29,11 @@ This is a **row-level delete**: it produces delete files, and reclaiming them
 is `rewrite_data_files` in the maintenance job rather than a metadata drop.
 That is the real cost of SCD2 and it is deliberately not hidden.
 
-In exchange the problem is much smaller. `prepared.counterparty` holds 70 rows
-where the snapshot held 2,400, and a dry run currently expires **none** of
-them: the keep-set reaches back 80 month-ends and the entire version history
-fits inside it. Retention on an SCD2 dimension bounds history, not volume.
+In exchange the problem is much smaller. The three reference tables hold 2,413
+rows where the snapshots held 13,660, and a dry run currently expires **none**
+of them: the keep-set reaches back 80 month-ends and the entire version
+history fits inside it. Retention on an SCD2 dimension bounds history, not
+volume.
 
 ## What we are replacing
 
