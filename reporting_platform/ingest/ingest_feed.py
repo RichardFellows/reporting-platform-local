@@ -34,13 +34,39 @@ from reporting_platform.common.context import (
 log = logging.getLogger("ingest")
 
 
+def _at_branch(table: str, branch: str | None) -> str:
+    """Address `table` on a Nessie branch WITHOUT rebinding the session.
+
+    `lakehouse.raw.trade` on branch `ingest/trade/...` becomes
+    `lakehouse.raw.`trade@ingest/trade/...``.
+
+    THIS IS WHAT LETS ONE SPARK SESSION SERVE A WHOLE CHUNK OF FILES. The
+    branch used to be session-level config (spark.sql.catalog.lakehouse.ref),
+    so every file needed its own SparkSession -- 127 Spark applications for
+    183 files, each paying executor acquisition and catalog init before doing
+    a few seconds of actual work. Per-file branch isolation is unchanged; only
+    how the branch is named changed.
+
+    Backticks are required: branch names contain `/` and `-`.
+
+    Verified against the live catalog that all three operations this module
+    performs work through it -- CREATE TABLE IF NOT EXISTS, the MAX(_file_version)
+    read, and DataFrameWriterV2.append() -- and that a write lands on the
+    branch with `main` untouched.
+    """
+    if not branch or branch == "main":
+        return table
+    catalog, namespace, name = table.split(".")
+    return f"{catalog}.{namespace}.`{name}@{branch}`"
+
+
 def _landing_uri(object_key: str) -> str:
     bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
     root = bucket.rsplit("/", 1)[0] if bucket.endswith("/landing") else bucket
     return f"{root}/{object_key}" if not object_key.startswith("s3a://") else object_key
 
 
-def ensure_raw_table(spark, fd) -> None:
+def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     """Create the raw table if absent.
 
     business_date is the LEADING partition field on every table. This is not a
@@ -52,7 +78,7 @@ def ensure_raw_table(spark, fd) -> None:
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{fd.raw_namespace}")
     spark.sql(
         f"""
-        CREATE TABLE IF NOT EXISTS {fd.raw_table} (
+        CREATE TABLE IF NOT EXISTS {table or fd.raw_table} (
         {cols},
         _extra_columns MAP<STRING, STRING>,
         _business_date DATE,
@@ -117,10 +143,11 @@ def reconcile_schema(df, fd) -> tuple:
     return df, {"missing_columns": missing, "extra_columns": extra}
 
 
-def next_file_version(spark, fd, business_date: date) -> int:
+def next_file_version(spark, fd, business_date: date,
+                      table: str | None = None) -> int:
     try:
         row = spark.sql(
-            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {fd.raw_table} "
+            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {table or fd.raw_table} "
             f"WHERE _business_date = DATE '{business_date:%Y-%m-%d}'"
         ).collect()[0]
         return int(row["v"]) + 1
@@ -156,7 +183,22 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd) -> None:
 
 
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
-           business_date: date | None = None, dry_run: bool = False) -> dict:
+           business_date: date | None = None, dry_run: bool = False,
+           spark=None) -> dict:
+    """Land one delivery into `raw` on its own Nessie branch, then merge.
+
+    `spark` is an OPTIONAL session to reuse. Pass one when ingesting several
+    files in a row -- `scripts/_ingest_chunk.py` does -- and the caller owns
+    stopping it. Without it, one is created and stopped here as before, which
+    is what the single-file CLI path still does.
+
+    Reusing it is worth real time: a Spark application costs roughly 22s of
+    executor acquisition and catalog initialisation before it does any work,
+    and the per-file work here is a few seconds. The branch is addressed with
+    _at_branch() rather than by binding the session, so nothing about the
+    isolation changes -- every file still gets its own branch, and `main` is
+    still only touched by the merge.
+    """
     from pyspark.sql import functions as F
     from pyspark.sql.window import Window
 
@@ -179,10 +221,16 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     nessie.create_branch(branch)
     log.info("created branch %s", branch)
 
-    spark = spark_session(f"ingest-{fd.name}-{run_id}", ref=branch)
+    # The session is bound to `main` and the BRANCH is named per statement, so
+    # one session can serve many files. Writers hold the lakehouse_write pool
+    # and are alone on the cluster, hence the larger core budget.
+    owns_session = spark is None
+    if owns_session:
+        spark = spark_session(f"ingest-{fd.name}-{run_id}", ref="main")
+    raw_at_branch = _at_branch(fd.raw_table, branch)
     try:
-        ensure_raw_table(spark, fd)
-        version = next_file_version(spark, fd, bdate)
+        ensure_raw_table(spark, fd, raw_at_branch)
+        version = next_file_version(spark, fd, bdate, raw_at_branch)
 
         df = read_landing(spark, fd, _landing_uri(object_key))
         df, drift = reconcile_schema(df, fd)
@@ -233,9 +281,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             )
 
         if dry_run:
-            log.info("dry run: would append %s rows to %s", row_count, fd.raw_table)
+            log.info("dry run: would append %s rows to %s", row_count, raw_at_branch)
         else:
-            df.writeTo(fd.raw_table).append()
+            df.writeTo(raw_at_branch).append()
             nessie.merge(branch, into="main")
             nessie.delete_reference(branch)
             log.info("merged %s into main and deleted branch", branch)
@@ -255,7 +303,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             log.warning("schema drift on %s: %s", fd.name, json.dumps(drift))
         return result
     finally:
-        spark.stop()
+        # Only if we made it. A caller that passed one in owns its lifetime.
+        if owns_session:
+            spark.stop()
 
 
 def main(argv=None) -> int:
