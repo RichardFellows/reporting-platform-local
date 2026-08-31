@@ -259,10 +259,10 @@ Measured, built:
 
 | table | snapshot rows | as SCD2 | saved |
 |---|---|---|---|
-| `counterparty` | 2,400 | **71** | 97% |
+| `counterparty` | 2,400 | **70** | 97% |
 | `primary_limits` | 5,680 | **940** | 83% |
 | `rating` | 5,580 | **1,402** | 75% |
-| **reference total** | **13,660** | **2,413** | **82%** |
+| **reference total** | **13,660** | **2,412** | **82%** |
 | `trade` | 16,000 | 14,443 | 10% — *not converted* |
 | `collateral` | 650 | 219 | *not converted, see below* |
 

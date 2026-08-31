@@ -155,7 +155,7 @@ def next_file_version(spark, fd, business_date: date,
         return 1
 
 
-def _bootstrap_main_if_empty(nessie: Nessie, fd) -> None:
+def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
     """Give `main` one real commit before the first branch+merge ever runs.
 
     Nessie's "no ancestor" hash is a boundary marker (no logEntry of its own),
@@ -175,11 +175,25 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd) -> None:
     if history.get("logEntries"):
         return
     log.info("main has no commits yet; bootstrapping directly (one-time)")
-    spark = spark_session(f"bootstrap-main-{fd.name}", ref="main")
+    # REUSE THE CALLER'S SESSION IF THERE IS ONE, and never stop what we did
+    # not start. This unconditionally built its own session and called
+    # spark.stop() in a finally -- which stops the whole SparkContext, not just
+    # this handle, so it silently killed the shared session that
+    # `_ingest_chunk` had passed into ingest(). Every subsequent read failed
+    # with a Py4JJavaError on the next spark.read.csv.
+    #
+    # It only fires when `main` has no commits, so a warm stack never reaches
+    # it: the failure appeared exactly once, on the first ingest of a cold
+    # rebuild, which is the one path a session-reuse change most needed to be
+    # tested against.
+    owns = spark is None
+    if owns:
+        spark = spark_session(f"bootstrap-main-{fd.name}", ref="main")
     try:
         ensure_raw_table(spark, fd)
     finally:
-        spark.stop()
+        if owns:
+            spark.stop()
 
 
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
@@ -215,15 +229,14 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     bdate = business_date or parsed[0]
 
     nessie = Nessie()
-    _bootstrap_main_if_empty(nessie, fd)
+    _bootstrap_main_if_empty(nessie, fd, spark)
 
     branch = branch_name("ingest", fd.name, bdate, run_id)
     nessie.create_branch(branch)
     log.info("created branch %s", branch)
 
     # The session is bound to `main` and the BRANCH is named per statement, so
-    # one session can serve many files. Writers hold the lakehouse_write pool
-    # and are alone on the cluster, hence the larger core budget.
+    # one session can serve many files.
     owns_session = spark is None
     if owns_session:
         spark = spark_session(f"ingest-{fd.name}-{run_id}", ref="main")

@@ -16,10 +16,15 @@
   in prepared and referencing it with ref() is that divergence becomes visible
   in the lineage graph.
 
-  ONE ROW PER VERSION, NOT PER BUSINESS DATE. This table held 2,400 rows
-  expressing 68 distinct attribute versions: 60 counterparties that changed 8
-  times between them across 40 retained business dates, restated in full every
-  day. Consumers join point-in-time with `as_of()` instead of on equality.
+  ONE ROW PER VERSION, NOT PER BUSINESS DATE. This table held 2,400 rows to
+  express 70 versions: 60 counterparties that changed 10 times between them
+  across 40 retained business dates, restated in full every day. Consumers
+  join point-in-time with `as_of()` instead of on equality.
+
+  (70, not the 68 distinct attribute tuples the table contains: two names
+  reverted to an earlier value, which is a third version rather than a
+  duplicate of the first. `count(distinct ...)` is a lower bound on an SCD2
+  row count, never the answer.)
 
   Two things this deliberately does NOT change:
 

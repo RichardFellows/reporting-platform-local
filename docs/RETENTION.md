@@ -29,7 +29,7 @@ This is a **row-level delete**: it produces delete files, and reclaiming them
 is `rewrite_data_files` in the maintenance job rather than a metadata drop.
 That is the real cost of SCD2 and it is deliberately not hidden.
 
-In exchange the problem is much smaller. The three reference tables hold 2,413
+In exchange the problem is much smaller. The three reference tables hold 2,412
 rows where the snapshots held 13,660, and a dry run currently expires **none**
 of them: the keep-set reaches back 80 month-ends and the entire version
 history fits inside it. Retention on an SCD2 dimension bounds history, not
