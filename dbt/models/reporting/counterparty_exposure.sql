@@ -33,6 +33,34 @@ counterparties as (
     select * from {{ ref('counterparty') }}
 ),
 
+{#
+  WHICH COUNTERPARTIES WERE ACTUALLY DELIVERED ON EACH DATE.
+
+  This reads `raw` from the reporting layer, which is unusual here and is the
+  point: `prepared.counterparty` is SCD2 now and deliberately holds no record
+  of a delivery that restated an unchanged value. The delivery record still
+  exists exactly once, in raw, and copying it into prepared to avoid this join
+  would rebuild the 2,400-row table SCD2 just removed.
+
+  It exists because SCD2 silently HEALS a missing delivery: a version's range
+  spans the gap, so the point-in-time join finds the counterparty on a day its
+  feed never arrived. That is what README:186 and ARCHITECTURE:153 promise
+  ("carries forward the last good version"), and it is the opposite of what
+  the LEFT JOIN comment below used to promise. Carrying forward silently is
+  the part nobody wants -- so it is carried forward and FLAGGED.
+
+  Narrow and grouped: two columns, no attributes, so this is a cheap scan.
+#}
+delivered as (
+
+    select
+        _business_date                          as business_date,
+        {{ clean_string('counterparty_id') }}   as counterparty_id
+    from {{ source('raw', 'counterparty') }}
+    group by 1, 2
+
+),
+
 -- One rating per counterparty per date: the most conservative (highest rank)
 -- across agencies. Documented here because it is a business rule, not a
 -- technical one, and report owners need to be able to find it.
@@ -85,6 +113,15 @@ select
     a.earliest_trade_date,
     a.latest_maturity_date,
 
+    {#
+      The gap, as data rather than as absence. NULL attributes used to be the
+      only signal that a reference feed had not arrived; this says so
+      explicitly, and `reference_valid_from` says how old the value in force
+      is, which a NULL could never express.
+    #}
+    (d.counterparty_id is null)                             as reference_carried_forward,
+    c.valid_from                                            as reference_valid_from,
+
     r.worst_rating_rank,
     case when r.is_investment_grade_flag = 1 then true
          when r.is_investment_grade_flag = 0 then false
@@ -95,12 +132,25 @@ select
 from aggregated a
 
 -- LEFT JOIN, not INNER: a counterparty missing from the reference feed must
--- still appear in the exposure report with nulls, so the gap is visible.
--- An INNER JOIN would silently drop exposure, which is the more dangerous
--- failure in a risk report.
+-- still appear in the exposure report. An INNER JOIN would silently drop
+-- exposure, which is the more dangerous failure in a risk report.
+--
+-- This used to say "with nulls, so the gap is visible", which was true of the
+-- snapshot and contradicted README:186 and ARCHITECTURE:153, both of which
+-- promise the last good version is carried forward. Under SCD2 it IS carried
+-- forward -- and `reference_carried_forward` above is what keeps the gap
+-- visible, more usefully than a NULL did.
+-- POINT-IN-TIME, not equality: `counterparty` is SCD2 now, holding one row
+-- per version rather than one per business date. as_of() expands to a
+-- `between valid_from and valid_to` predicate; valid_to is 9999-12-31 on the
+-- open version, so the current row matches every date at or after its
+-- valid_from with no null-handling branch here.
 left join counterparties c
-       on c.business_date    = a.business_date
-      and c.counterparty_id  = a.counterparty_id
+       on c.counterparty_id  = a.counterparty_id
+      and {{ as_of('c', 'a.business_date') }}
+left join delivered d
+       on d.counterparty_id  = a.counterparty_id
+      and d.business_date    = a.business_date
 left join worst_rating r
        on r.business_date    = a.business_date
       and r.counterparty_id  = a.counterparty_id

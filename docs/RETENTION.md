@@ -1,5 +1,38 @@
 # Data Retention
 
+## Two delete modes
+
+Retention has two paths, chosen per table by **detecting** whether it carries
+`valid_from`/`valid_to`/`is_current` (`retention.is_scd2`). Detected rather
+than configured: this file already records a hand-maintained table list that
+drifted to five tables against the DAG's nine, and a list of which tables are
+SCD2 would drift the same way — except the failure would be worse, since
+retention would run the wrong delete against a table it believed was a
+snapshot. The chosen mode is reported in the result JSON, so it is visible.
+
+**Snapshot tables** — `DELETE ... WHERE business_date IN (...)`. Because
+`business_date` leads the partition spec this is an Iceberg metadata
+operation, the analogue of partition switching. It rewrites no data files.
+This is why `partition_by=['business_date']` is described throughout this
+document as a retention requirement.
+
+**SCD2 tables** (`prepared.counterparty`) — that requirement does not apply,
+because there is no `business_date` to partition by. Instead:
+
+- a **current** version is never expired, however old — it is the answer to
+  "what is this now", and dropping it would empty the dimension
+- a **closed** version is expired only once its whole range sits before the
+  oldest retained business date
+
+This is a **row-level delete**: it produces delete files, and reclaiming them
+is `rewrite_data_files` in the maintenance job rather than a metadata drop.
+That is the real cost of SCD2 and it is deliberately not hidden.
+
+In exchange the problem is much smaller. `prepared.counterparty` holds 70 rows
+where the snapshot held 2,400, and a dry run currently expires **none** of
+them: the keep-set reaches back 80 month-ends and the entire version history
+fits inside it. Retention on an SCD2 dimension bounds history, not volume.
+
 ## What we are replacing
 
 The legacy the legacy RDBMS reporting layer kept **10 working days plus 80 month-end

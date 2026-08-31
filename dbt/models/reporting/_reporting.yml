@@ -25,6 +25,23 @@ models:
         tests: [not_null]
       - name: total_mtm
         tests: [not_null]
+      - name: reference_carried_forward
+        description: >
+          True when the counterparty reference feed did not deliver this
+          counterparty on this business date and its attributes were carried
+          forward from the last version in force. Under the old daily-snapshot
+          model this case surfaced as NULL attributes instead; SCD2 carries
+          forward (which is what README and ARCHITECTURE always promised) and
+          this column is what keeps the gap visible.
+        tests: [not_null]
+      - name: reference_valid_from
+        description: >
+          The date the counterparty attributes in force on this row began.
+          Note this is when the VALUE last changed, not when it was last
+          delivered — a counterparty delivered daily but unchanged for two
+          years has an old valid_from and is not stale. Use
+          reference_carried_forward for delivery gaps.
+        tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, counterparty_id]

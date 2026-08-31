@@ -7,7 +7,7 @@
   here on three independent counts -- it cannot address a Nessie branch (so no
   write-audit-publish), it silently drops `partition_by` (so it cannot
   reproduce the partition spec retention depends on), and it cannot INSERT to
-  a partitioned table without an explicit override.1".
+  a partitioned table without an explicit override.
 
   So the DuckDB branches were dead code carrying a promise nothing tested, and
   an untested promise in this repo is a liability rather than optionality.
@@ -121,4 +121,66 @@
     PARTITION BY _business_date, {{ partition_keys | join(', ') }}
     ORDER BY _file_version DESC, _row_number DESC
   )
+{% endmacro %}
+
+{#
+  ---------------------------------------------------------------- SCD2
+  Slowly-changing-dimension helpers. Used by the prepared reference models
+  that store one row per VERSION rather than one row per business date, and
+  by the reporting models that join to them point-in-time.
+
+  See docs/ARCHITECTURE.md for why only reference tables are shaped this way:
+  `trade` measured 9.7% redundancy against `counterparty`'s 97%, so versioning
+  a transaction table costs complexity and saves nothing.
+#}
+
+{% macro as_of(alias, business_date_expr) %}
+  {#
+    Point-in-time join predicate against an SCD2 table.
+
+    `valid_to` is DATE '9999-12-31' on the open version rather than NULL, so
+    this needs no `or valid_to is null` branch -- which every consumer would
+    otherwise have to remember, and which is silently wrong when forgotten
+    (the current version simply stops matching and exposure loses its
+    reference data).
+  #}
+  {{ business_date_expr }} between {{ alias }}.valid_from and {{ alias }}.valid_to
+{% endmacro %}
+
+
+{% macro scd2_hash(columns) %}
+  {#
+    The change detector: a hash over the BUSINESS attributes only.
+
+    A macro rather than an inline expression specifically so the column list is
+    a deliberate argument at the call site. Include `_source_file`, `_batch_id`,
+    `dbt_invocation_id` or `dbt_updated_at` -- all of which sit right beside
+    the business columns in these models -- and the hash changes on every
+    delivery and every build, minting a new version daily and rebuilding the
+    exact duplication the model exists to remove. It would look like it was
+    working.
+
+    coalesce to '' so a NULL is a value rather than poisoning the whole hash,
+    and cast everything so booleans and dates compare stably.
+  #}
+  sha2(concat_ws('||'
+    {%- for c in columns %},
+    coalesce(cast({{ c }} as string), '')
+    {%- endfor %}), 256)
+{% endmacro %}
+
+
+{% macro scd2_valid_to(order_column, partition_columns) %}
+  {#
+    Close each version at the day before the next one starts.
+
+    `date_sub`, NOT `- INTERVAL 1 DAY`: the interval form returns a TIMESTAMP
+    in Spark, and the column has to stay a DATE or `as_of()` compares a date to
+    a timestamp on every joined row.
+  #}
+  coalesce(
+    date_sub(lead({{ order_column }}) over (
+      partition by {{ partition_columns | join(', ') }}
+      order by {{ order_column }}), 1),
+    DATE '9999-12-31')
 {% endmacro %}

@@ -669,8 +669,101 @@ def iceberg_gc_enabled(spark, table: str) -> bool:
         return True
 
 
+def is_scd2(spark, table: str) -> bool:
+    """Does this table store one row per VERSION rather than per business date?
+
+    DETECTED, not configured. The alternative was a per-table flag in
+    retention.yml, and this file already carries the scar of a hand-maintained
+    table list that drifted -- five tables against the DAG's nine, silently
+    leaving four unretained. A list of which tables are SCD2 would drift the
+    same way, and the failure would be worse: retention would run the WRONG
+    delete against a table it believed was a snapshot.
+
+    Reading the columns asks the table what it actually is. All three columns
+    are required so an unrelated table with a `valid_from` cannot be mistaken
+    for one of these. Which mode was chosen is reported in the result JSON, so
+    the detection is visible rather than silent.
+    """
+    try:
+        cols = {f.name for f in spark.table(table).schema.fields}
+    except Exception:
+        return False
+    return {"valid_from", "valid_to", "is_current"} <= cols
+
+
+def apply_scd2_retention(spark, table: str, layer: str,
+                         dry_run: bool = False) -> dict:
+    """Expire CLOSED versions that no retained business date falls inside.
+
+    Two rules, and the first is absolute:
+
+      * A CURRENT version is never expired, however old. It is the answer to
+        "what is this counterparty now", and its valid_from can predate the
+        keep-set by years -- 60 of the 70 rows here start on 2024-02-29. A
+        cutoff that dropped them would empty the dimension and every
+        point-in-time join with it.
+      * A closed version is expired only once the whole of its validity range
+        sits before the oldest retained business date. Conservative on
+        purpose: a version straddling the cutoff is still in force for a
+        retained date and must stay.
+
+    AND THIS IS NOT A PARTITION DROP. The snapshot path below deletes whole
+    `business_date` partitions as an Iceberg metadata operation. There is no
+    business_date here, so this is a row-level delete producing delete files,
+    and reclaiming them is `rewrite_data_files` in the maintenance job. That is
+    the real cost of SCD2 and it belongs in the open -- see docs/RETENTION.md.
+
+    In exchange the problem is much smaller: this table holds 70 rows where the
+    snapshot held 2,400, so row retention on an SCD2 dimension is nearly moot.
+    It exists to bound history, not volume.
+    """
+    policy = retention_policy(layer)
+    observed = sorted({r["bd"] for r in spark.sql(
+        f"SELECT DISTINCT valid_from AS bd FROM {table} WHERE valid_from IS NOT NULL"
+    ).collect()})
+    if not observed:
+        return {"table": table, "skipped": "no data"}
+
+    retained = sorted(set(observed) - expire_set(observed, policy))
+    if not retained:
+        return {"table": table, "layer": layer, "mode": "scd2",
+                "skipped": "keep-set covers nothing; refusing to empty the table"}
+    cutoff = min(retained)
+
+    counts = spark.sql(f"""
+        SELECT
+          SUM(CASE WHEN is_current THEN 1 ELSE 0 END)                      AS current_rows,
+          SUM(CASE WHEN NOT is_current AND valid_to < DATE '{cutoff:%Y-%m-%d}'
+                   THEN 1 ELSE 0 END)                                      AS expiring_rows,
+          COUNT(*)                                                         AS total_rows
+        FROM {table}""").collect()[0]
+
+    result = {
+        "table": table,
+        "layer": layer,
+        "mode": "scd2",
+        "total_rows": counts["total_rows"],
+        "current_rows_never_expired": counts["current_rows"],
+        "expiring_rows": counts["expiring_rows"],
+        "cutoff": cutoff,
+        "delete_style": "row-level (not a partition drop) -- reclaimed by "
+                        "rewrite_data_files in maintenance",
+    }
+
+    if counts["expiring_rows"] and not dry_run:
+        spark.sql(f"DELETE FROM {table} "
+                  f"WHERE NOT is_current AND valid_to < DATE '{cutoff:%Y-%m-%d}'")
+        log.info("%s: expired %d closed version(s) ending before %s",
+                 table, counts["expiring_rows"], cutoff)
+    return result
+
+
 def apply_table_retention(spark, table: str, layer: str, date_column: str,
                           dry_run: bool = False) -> dict:
+    # An SCD2 dimension has no business_date to delete by; see is_scd2().
+    if is_scd2(spark, table):
+        return apply_scd2_retention(spark, table, layer, dry_run=dry_run)
+
     policy = retention_policy(layer)
     observed = observed_dates(spark, table, date_column)
     if not observed:

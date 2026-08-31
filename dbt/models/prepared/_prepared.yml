@@ -8,9 +8,15 @@ models:
       divergence between apps shows up in the lineage graph instead of
       hiding in 23 separate stored procedures.
     columns:
-      - name: business_date
-        tests: [not_null]
+      # SCD2: there is no business_date on this table any more. One row per
+      # VERSION, addressed point-in-time with the as_of() macro.
       - name: counterparty_id
+        tests: [not_null]
+      - name: valid_from
+        tests: [not_null]
+      - name: valid_to
+        tests: [not_null]
+      - name: is_current
         tests: [not_null]
       - name: country_code
         tests:
@@ -19,8 +25,29 @@ models:
         tests:
           - accepted_values: {values: [true, false], quote: false}
     tests:
+      # Replaces [business_date, counterparty_id]. valid_from is in the key and
+      # valid_to is NOT, which is also what lets the incremental merge close an
+      # open row in place instead of inserting a second one beside it.
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, counterparty_id]
+          combination_of_columns: [counterparty_id, valid_from]
+
+      # THE LOAD-BEARING TEST. The incremental path re-derives each touched
+      # entity from its currently-open version so that lead() can close it; if
+      # that replay window is ever wrong, the result is two versions in force
+      # at once, and as_of() then matches both and silently DOUBLES every
+      # exposure row for that counterparty. Nothing inside the model can see
+      # that state. This is what sees it.
+      #
+      # gaps: allowed, deliberately. valid_to is an INCLUSIVE upper bound
+      # (next valid_from minus one day), so contiguous versions look like a
+      # one-day gap to this test's arithmetic and `not_allowed` would fail on
+      # correct data. `allowed` still fails on any OVERLAP, which is the
+      # condition that actually matters.
+      - dbt_utils.mutually_exclusive_ranges:
+          lower_bound_column: valid_from
+          upper_bound_column: valid_to
+          partition_by: counterparty_id
+          gaps: allowed
 
   - name: trade
     description: Conformed, typed trade positions. No joins, no report opinions.
@@ -107,3 +134,26 @@ models:
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, limit_id]
+  - name: collateral
+    description: Collateral positions held against counterparty exposure, from the collateral management
+      system.
+    # SCAFFOLDED MINIMUM: not_null on the business key, uniqueness
+    # over [business_date, <business key>], and relationships on any
+    # foreign key. That is enough to prove dedupe_rank works and that
+    # references resolve -- it is NOT enough to prove the values are
+    # right. Add accepted_values / accepted_range for this feed's
+    # domain, or it will publish whatever it is given.
+    columns:
+      - name: business_date
+        tests: [not_null]
+      - name: collateral_id
+        tests: [not_null]
+      - name: counterparty_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('counterparty')
+              field: counterparty_id
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, collateral_id]

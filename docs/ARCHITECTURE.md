@@ -204,6 +204,102 @@ how far back you can time-travel, and is a separate policy from row retention.
 
 ---
 
+## How the dbt builds become Airflow tasks
+
+The two build DAGs do not run dbt as one opaque command. **Astronomer Cosmos**
+reads the dbt project at DAG-parse time and renders it into Airflow tasks —
+one per model, in the models' own `ref()` order — with `open_branch` in front
+and `publish` behind:
+
+```
+open_branch ─┬─► dbt.counterparty_run ────┐
+             ├─► dbt.rating_run           │
+             ├─► dbt.trade_run            ├─► dbt.dbt_test ─┬─► publish
+             └─► dbt.primary_limits_run ──┘                 └─► keep_failed_branch
+```
+
+Write-audit-publish is unchanged by this — the branch is still opened once,
+the whole layer still lands on it, the tests still run before the merge, and a
+failure still leaves `main` untouched with the branch retained. What changes is
+**resolution**: a failing model is a red task with that model's name on it, and
+a retry starts from that model rather than from the top of the layer.
+
+**The graph is derived, not declared.** A new `.sql` under `models/prepared/`
+becomes a task on the next DAG parse with no edit to `dbt_builds.py`, which is
+the same property `feeds.yml` already gave the ingest DAGs. Between them, the
+two things a developer adds to this platform — a feed and a model — both
+appear in Airflow by themselves.
+
+### The four decisions that make it work here
+
+Each of these was chosen against a specific failure, and the reasoning is
+repeated in the `dbt_builds.py` docstring next to the code it governs.
+
+| Decision | What it prevents |
+|---|---|
+| `InvocationMode.SUBPROCESS` | Cosmos defaults to running dbt **in the calling process**. Our target is `method: session`, so dbt builds a SparkSession — an in-process JVM with non-daemon threads would stop the task heartbeating and the scheduler would zombie-reap it ~300s after the work had already succeeded. Same constraint that puts every other Spark call behind `scripts/_spark_task.py`. |
+| `pool="lakehouse_write"` on every rendered task | One dbt invocation is one Spark application, capped at 2 cores against a 6-core worker. Per-model tasks would otherwise start several at once, and standalone mode hands out free cores and holds them until the session stops — so the losers wait forever rather than failing. The single slot serialises them exactly as the old monolithic `dbt run` did by holding it for its whole duration. |
+| `LoadMode.DBT_LS` | `LoadMode.CUSTOM` (Cosmos's own parser) is faster and needs no dbt, but on this project it emits **every test twice** — once bare, once `test.dbt.`-prefixed — which collides as Airflow task ids, and it misses model-level tests entirely, including the `unique_combination_of_columns` blocks that are the only proof `dedupe_rank` works. `dbt ls` finds all 51 tests, and does not open a Spark session. |
+| `TestBehavior.AFTER_ALL` | The `AFTER_EACH` default renders one task per *test* — 51 JVM starts for a layer that has four models. `BUILD` is wrong for a different reason: under eager indirect selection a `relationships` test is pulled in with the model it is declared on, but its other parent may not be built yet (`primary_limits` → `counterparty` is a dependency of the *test*, not the model), and under cautious selection that test is silently dropped instead. Testing the whole layer once, after it is whole, has neither problem. |
+
+`dbt ls` costs about 5s per parse; Cosmos caches the result against a hash of
+the project files, so it is paid again only when a model actually changes.
+
+---
+
+## Slowly-changing dimensions in `prepared`
+
+`prepared.counterparty` stores **one row per version**, not one per business
+date. Everything else stays a daily snapshot.
+
+The split is measured, not stylistic. Against 40 retained business dates:
+
+| table | snapshot rows | as SCD2 | redundancy |
+|---|---|---|---|
+| `counterparty` | 2,400 | **70** | 97% |
+| `rating` | 5,580 | ~1,335 | 76% |
+| `primary_limits` | 5,680 | ~940 | 84% |
+| `trade` | 16,000 | 14,443 | **10%** |
+
+`trade` is why this is per-table rather than a layer-wide rule: it is a
+persisting book whose marks genuinely move, so versioning it costs complexity
+and saves a tenth. Reference data restates an unchanged value every morning;
+transaction data does not.
+
+### How consumers read it
+
+`{{ as_of('c', 'a.business_date') }}` — a `between valid_from and valid_to`
+predicate. `valid_to` is `DATE '9999-12-31'` on the open version rather than
+NULL, so no consumer needs an `or valid_to is null` branch, which is silently
+wrong when forgotten.
+
+No snapshot-shaped VIEW is offered over it. Iceberg views do work in this
+catalog (verified: created, queried, survives a session, `SHOW VIEWS` lists
+it) — but they are **invisible to `scripts/duckdb_console.py`**, which reads
+the Iceberg REST endpoint. A view exists to keep consumers unchanged, and it
+would have dropped the one consumer that cannot be changed by editing a model.
+
+### Three consequences worth knowing
+
+**A late feed is now carried forward, not nulled.** A version's range spans a
+missing delivery, so a point-in-time join finds the counterparty on a day its
+file never arrived. This is what this document and README have always
+promised; the snapshot implementation did the opposite and emitted NULLs.
+`counterparty_exposure.reference_carried_forward` keeps the gap visible — more
+usefully than a NULL, which could not say how stale the value was.
+
+**Retention stops being a partition drop.** There is no `business_date`
+column, so `retention.py` uses a row-level delete for these tables. See
+RETENTION.md.
+
+**Restatement provenance moves to `raw`.** A version row names the delivery
+that first carried the value, and closed versions are never rewritten — their
+`source_file` and `dbt_invocation_id` are frozen at the build that created
+them (verified). Which files restated an unchanged value is still recorded,
+once, in `raw`, which this change does not touch.
+
+---
+
 ## Where Spark actually runs
 
 **Every Spark job on this platform is a client of the `spark-master` /
