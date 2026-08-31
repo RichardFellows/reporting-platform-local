@@ -156,12 +156,8 @@ from aggregated a
 -- LEFT JOIN, not INNER: a counterparty missing from the reference feed must
 -- still appear in the exposure report. An INNER JOIN would silently drop
 -- exposure, which is the more dangerous failure in a risk report.
---
--- This used to say "with nulls, so the gap is visible", which was true of the
--- snapshot and contradicted README:186 and ARCHITECTURE:153, both of which
--- promise the last good version is carried forward. Under SCD2 it IS carried
--- forward -- and `reference_carried_forward` above is what keeps the gap
--- visible, more usefully than a NULL did.
+-- The last good version IS carried forward under SCD2, and
+-- `reference_carried_forward` above is what keeps that gap visible.
 -- POINT-IN-TIME, not equality: `counterparty` is SCD2 now, holding one row
 -- per version rather than one per business date. as_of() expands to a
 -- `between effective_from and effective_to` predicate; effective_to is 9999-12-31 on the

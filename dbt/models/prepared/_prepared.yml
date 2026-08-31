@@ -143,10 +143,9 @@ models:
       - name: status
         tests:
           - accepted_values: {values: ['ACTIVE', 'SUSPENDED', 'EXPIRED']}
-      # The business `is_current` ("in force on the delivered date") is gone --
-      # it was a function of business_date, which an SCD2 row has not got, and
-      # the name now means "the live VERSION of this record". Its definition
-      # lives on as the limit_in_force() macro; see the model docstring.
+      # `is_current` means "the live VERSION of this record", not "in force on
+      # the delivered date" -- that business meaning is the limit_in_force()
+      # macro. See docs/DECISIONS.md#scd2-is-current
       - name: effective_from
         tests: [not_null]
       - name: effective_to

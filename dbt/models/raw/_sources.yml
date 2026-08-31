@@ -1,27 +1,11 @@
-# THIS DIRECTORY DELIBERATELY CONTAINS NO MODELS.
+# THIS DIRECTORY DELIBERATELY CONTAINS NO MODELS. dbt does not build the raw
+# layer and cannot: ingest_feed.py creates and writes those tables per file,
+# driven by arrival rather than by a build, so in dbt's terms raw is a SOURCE.
+# dbt still reads and tests it -- the not_null tests below run against the
+# landed strings, and source freshness is what makes a late feed visible.
 #
-# dbt does not build the raw layer and cannot: `ingest_feed.py` creates the
-# table (ensure_raw_table) and writes it (`df.writeTo(...).append()`), per
-# file, on its own Nessie branch, driven by arrival rather than by a build.
-# The load is imperative -- schema reconciliation into `_extra_columns`, a
-# MAX+1 `_file_version` lookup, `_row_number` over file order, an abort below
-# `expected_min_rows` -- not a SELECT, so there is nothing here for dbt to
-# materialise. In dbt's terms raw is a SOURCE: data that arrived by other
-# means.
-#
-# It lives in its own folder anyway so the file tree mirrors the layer model
-# in docs/ARCHITECTURE.md (raw -> prepared -> reporting) rather than filing
-# raw under the layer that happens to consume it. dbt scans every path under
-# `model-paths` for YAML, and source config in dbt_project.yml is keyed by
-# project name rather than by directory, so the location is free.
-#
-# Do NOT add a `raw:` key under `models:` in dbt_project.yml to match the
-# other two layers. That key configures MODELS in a directory; with none here
-# it applies to nothing and dbt warns about it on every invocation.
-#
-# dbt still reads and tests raw -- the not_null tests below run against the
-# landed strings, before any modelling, and source freshness is what makes a
-# late feed visible instead of silently carried forward.
+# Do NOT add a `raw:` key under `models:` in dbt_project.yml.
+# See docs/DECISIONS.md#raw-is-a-source
 
 version: 2
 

@@ -8,54 +8,15 @@ macro-paths: ["macros"]
 test-paths:  ["tests"]
 clean-targets: ["target", "dbt_packages"]
 
-# dbt_packages, OFF the ./dbt bind mount, for the same reason as logs and
-# target: the mount's ownership comes from the host, and where the checkout is
-# not owned by uid 50000, `dbt deps` in airflow-init dies with
-#     Permission denied: 'dbt_packages/dbt_utils'
-# before anything else can run. Two wrong answers were tried first, and both
-# are worth recording because each looks correct until it runs:
-#
-#   * A named volume mounted AT ./dbt/dbt_packages. `dbt deps` rmtree's the
-#     packages directory before reinstalling and a mount point cannot be
-#     removed -- OSError: [Errno 16] Device or resource busy: 'dbt_packages',
-#     on every `docker compose up`.
-#   * A plain image directory. /opt/platform/run is copy-on-write per
-#     container, so airflow-init installed into a layer that was discarded when
-#     it exited and every other service reported `0 package(s) installed`.
-#
-# What works is a named volume mounted one level ABOVE, on
-# /opt/platform/run/packages -- shared by every service, with dbt_packages an
-# ordinary removable subdirectory inside it. See docker-compose.yml.
-#
-# ABSOLUTE on purpose: dbt resolves a relative value against the project root,
-# which is the mount. Cosmos reads this same key to find the packages when it
-# builds its per-task temporary project (cosmos/dbt/project.py,
-# get_dbt_packages_subpath), so the two agree by construction rather than by
-# coincidence -- but joining a folder with an absolute path yields the absolute
-# path, which would make its copy_dbt_packages a copy onto itself. Hence
-# copy_dbt_packages=False in dbt_builds.py; see the comment there.
-#
-# The trade-off: a bare `dbt` run outside the containers installs packages to a
-# path that does not exist on the host. Use the containers, or override with
-# DBT_PACKAGES_INSTALL_PATH.
+# No `target-path:` here -- dbt 1.8 deprecates it in favour of DBT_TARGET_PATH,
+# which docker-compose.yml sets to a path outside the ./dbt bind mount.
+# Packages go the same way, and are ABSOLUTE on purpose.
+# See docs/DECISIONS.md#dbt-working-directories and #dbt-packages-volume
 packages-install-path: "{{ env_var('DBT_PACKAGES_INSTALL_PATH', '/opt/platform/run/packages/dbt_packages') }}"
 
-# NO `target-path:` here any more. dbt 1.8 deprecates it in favour of
-# --target-path / DBT_TARGET_PATH, and docker-compose.yml sets that env var to
-# a path OUTSIDE the ./dbt bind mount, so dbt is not writing build scratch into
-# a directory whose ownership comes from the host. Keeping both would be two
-# answers to the same question plus a deprecation warning on every invocation
-# -- including once per Cosmos-rendered task, which is how a warning nobody
-# reads gets made. Removing it changes nothing for a bare `dbt` run outside the
-# containers: "target" is dbt's own default, and what `clean-targets` above
-# still refers to.
-
 flags:
-  # Stops dbt writing `.user.yml` into the profiles directory -- which is the
-  # project directory here, i.e. the bind mount -- on first invocation, and
-  # stops the tracking call that goes with it. The file is committed, so the
-  # write is normally skipped; on a host where that mount is not writable by
-  # uid 50000 it is one more thing that can fail before any model runs.
+  # Stops dbt writing .user.yml into the profiles directory, which is the bind
+  # mount. See docs/DECISIONS.md#dbt-working-directories
   send_anonymous_usage_stats: false
 
 vars:
@@ -64,25 +25,20 @@ vars:
   nessie_ref: main
   # Business date being built. Empty means "whatever is latest in raw".
   business_date: ''
-  # Number of trailing business dates the incremental models reprocess.
-  # Covers late-arriving corrections without a full rebuild.
+  # Trailing business dates the incremental models reprocess, covering
+  # late-arriving corrections without a full rebuild.
   lookback_days: 3
 
 models:
   reporting_platform:
     +file_format: iceberg
     +materialized: incremental
-    # Spark's strategy, unconditionally. This was briefly engine-conditional
-    # during D7, falling back to `delete+insert` because dbt-duckdb rejects
-    # `merge` outright. That conditional went with the rest of the
-    # second-engine support: nothing materialises through a non-Spark adapter
-    # any more, so it was a branch nothing could take. `merge` is what
     +incremental_strategy: merge
 
     prepared:
       +schema: prepared
       # business_date leads the partition spec on every table. This is a
-      # RETENTION requirement, not a performance one — see docs/RETENTION.md.
+      # RETENTION requirement, not a performance one -- see docs/RETENTION.md.
       +partition_by: ['business_date']
       +tags: ['prepared']
 
@@ -91,18 +47,10 @@ models:
       +partition_by: ['business_date']
       +tags: ['reporting']
 
-# NO `seeds:` BLOCK, for the same reason ADDING-A-FEED.md says not to add a
-# `raw:` one under `models:`. There is no seeds/ directory and no .csv in this
-# project -- reference data arrives as a feed like everything else -- so a
-# `seeds: {reporting_platform: {+schema: reference}}` block configured nothing
-# and made dbt print
-#     [WARNING]: Configuration paths exist in your dbt_project.yml file which
-#     do not apply to any resources. There are 1 unused configuration paths:
-#     - seeds.reporting_platform
-# on EVERY invocation -- `parse`, `ls`, `run`, `test`, and now once per
-# Cosmos-rendered task. A warning that is always there is a warning nobody
-# reads, including the next real one. Add the block back in the same commit
-# that adds the first seed file.
+# No `seeds:` block, and no `raw:` one under `models:` -- there are no seed
+# files or raw models in this project, and a block that configures nothing makes
+# dbt warn on every invocation.
+# See docs/DECISIONS.md#no-unused-config-paths
 
 # Fail the build if a source has not been refreshed. Freshness is how a late
 # feed becomes visible rather than silently carried forward.

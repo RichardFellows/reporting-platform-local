@@ -437,3 +437,88 @@ DuckDB remains as a **reader for people**, not an engine for the pipeline:
 It is a script rather than a dbt target on purpose -- the engine macros are
 Spark-only, so a DuckDB target could not compile the models anyway, and a target
 that works for some models and not others is a trap.
+
+## dbt-spark-session-mode
+
+Both dbt targets use `method: session`, which builds an in-process SparkSession
+via dbt-spark's `SessionConnectionWrapper`, and turns `server_side_parameters`
+into `.config(k, v)` calls on that builder.
+
+For `spark_local` that is what puts the build on the cluster: dbt is the
+*driver* inside the Airflow container, and every task runs on `spark-worker`.
+Without `spark.master` the builder defaults to `local[*]` and the cluster sits
+idle while the build quietly succeeds in-process.
+
+The rest of the catalog and jar wiring has to be repeated in that target rather
+than relying on `conf/spark-defaults.conf`, which is not mounted into the
+Airflow container -- and the driver needs the jars regardless of what the
+executors have baked in.
+
+For `spark_ocp`, dbt runs inside the driver pod that `spark-submit` created for
+the build, so there is one SparkSession per build and the Nessie ref is
+unambiguous. That target carries far less config on purpose: a driver pod built
+from the Spark image does have `spark-defaults.conf`, so only the per-run
+override belongs there. Duplicating the rest would be a forked copy that drifts.
+
+A connection method other than `session` was tried there and removed: it served
+no purpose the design had chosen and carried a silent-failure risk on the branch
+guarantee.
+
+`host` is inert in session mode but dbt-spark's credential validation demands it
+for every method -- `dbt parse` fails with "Must specify `host` in profile"
+without it.
+
+## no-unused-config-paths
+
+`dbt_project.yml` has no `seeds:` block, and `docs/ADDING-A-FEED.md` says not to
+add a `raw:` one under `models:`, for the same reason: there is no `seeds/`
+directory and no `.csv` in this project -- reference data arrives as a feed like
+everything else -- so a `seeds: {reporting_platform: ...}` block configured
+nothing and made dbt print
+
+```
+[WARNING]: Configuration paths exist in your dbt_project.yml file which do not
+apply to any resources. There are 1 unused configuration paths: - seeds...
+```
+
+on EVERY invocation: `parse`, `ls`, `run`, `test`, and once per Cosmos-rendered
+task. A warning that is always there is a warning nobody reads, including the
+next real one.
+
+Add the block back in the same commit that adds the first seed file.
+
+## raw-is-a-source
+
+`dbt/models/raw/` deliberately contains no models. dbt does not build the raw
+layer and cannot: `ingest_feed.py` creates the table (`ensure_raw_table`) and
+writes it (`df.writeTo(...).append()`), per file, on its own Nessie branch,
+driven by arrival rather than by a build. The load is imperative -- schema
+reconciliation into `_extra_columns`, a `MAX+1` `_file_version` lookup,
+`_row_number` over file order, an abort below `expected_min_rows` -- not a
+SELECT, so there is nothing there for dbt to materialise. In dbt's terms raw is
+a **source**: data that arrived by other means.
+
+It lives in its own folder anyway so the file tree mirrors the layer model in
+`docs/ARCHITECTURE.md` (raw -> prepared -> reporting) rather than filing raw
+under the layer that happens to consume it. dbt scans every path under
+`model-paths` for YAML, and source config in `dbt_project.yml` is keyed by
+project name rather than by directory, so the location is free.
+
+**Do not add a `raw:` key under `models:`** in `dbt_project.yml` to match the
+other two layers. That key configures *models* in a directory; with none there
+it applies to nothing and dbt warns about it on every invocation -- see
+[no-unused-config-paths](#no-unused-config-paths).
+
+There is also no `database:` on the source on purpose. dbt-spark's
+`SparkRelation` raises `Cannot set database in spark!` whenever `database` is
+set and differs from `schema` -- it only supports a two-level `schema.table`
+namespace. `spark.sql.defaultCatalog=lakehouse`, set in `profiles.yml`, makes
+unqualified `raw.trade` resolve against the lakehouse/Nessie catalog instead.
+
+## scd2-is-current
+
+`is_current` on the prepared SCD2 tables means "the live **version** of this
+record", not the older business meaning of "in force on the delivered date".
+
+The business version was a function of `business_date`, which an SCD2 row does
+not have. That definition lives on as the `limit_in_force()` macro.
