@@ -131,3 +131,47 @@ ARG MARIMO_VERSION=0.24.0
 RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
     && dbt --version >/dev/null \
     && python -c "import marimo, duckdb; print('marimo', marimo.__version__)"
+
+# ---------------------------------------------------------------------------
+USER root
+# Writable working directories for dbt, created HERE rather than left to the
+# runtime, because none of them can be created by the process that needs them:
+# /opt/platform is root-owned and this image runs as uid 50000.
+#
+# Two separate problems, and they need different fixes:
+#
+#   * /opt/platform/run/dbt/{logs,target} are dbt's purely-ephemeral outputs,
+#     pointed at by DBT_LOG_PATH / DBT_TARGET_PATH in docker-compose.yml. They
+#     live OUTSIDE the ./dbt bind mount on purpose. A bind mount takes its
+#     ownership from the HOST, so nothing done to /opt/platform/dbt in this
+#     image survives into the container -- on Docker Desktop for Windows the
+#     host side fakes 0777 and hides that, on a Linux host it does not, and
+#     `dbt deps` in airflow-init then fails on a directory the image looks
+#     like it prepared. Paths that are never mounted over cannot fail that way.
+#
+#   * /opt/platform/dbt/{logs,target,dbt_packages} exist here only so that a
+#     NAMED VOLUME mounted at one of them is seeded correctly: Docker
+#     initialises an empty named volume from the image's content and ownership
+#     at that path. Note "empty" -- a volume that already exists is never
+#     re-seeded, so a volume created before this line was added stays
+#     root-owned no matter how often the image is rebuilt. Remove the volume,
+#     do not rebuild. Under the bind mount these directories are invisible;
+#     that is the point.
+#
+# chown to airflow:0 and chmod g+rwX, NOT chown to uid 50000 alone and not
+# chmod 777. The container already runs uid=50000 gid=0 (verified with `id`
+# inside the running scheduler), and group 0 is what stays writable when the
+# platform assigns an arbitrary uid -- which is exactly what OpenShift does.
+# See docs/OPENSHIFT-MAPPING.md.
+RUN mkdir -p /opt/platform/run/dbt/logs /opt/platform/run/dbt/target \
+             /opt/platform/dbt/logs /opt/platform/dbt/target \
+             /opt/platform/dbt/dbt_packages \
+    && chown -R airflow:0 /opt/platform/run /opt/platform/dbt \
+    && chmod -R g+rwX /opt/platform/run /opt/platform/dbt
+USER airflow
+
+# Last in the file ON PURPOSE. This layer changes far more often than the pip
+# installs above it, and Docker invalidates every layer after the one that
+# changed -- put it higher and editing a directory list costs a full
+# reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
+# whatever registry mirror is in front of pip. Nothing below depends on it.

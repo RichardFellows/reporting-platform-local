@@ -53,6 +53,27 @@ x-airflow-common: &airflow-common
     SPARK_MASTER: spark://spark-master:7077
     DBT_PROJECT_DIR: /opt/platform/dbt
     DBT_PROFILES_DIR: /opt/platform/dbt
+    # dbt's logs and target directories, moved OFF the ./dbt bind mount and
+    # onto image-owned paths (created in Dockerfile.airflow, airflow:0,
+    # g+rwX). Both are pure build scratch -- logs are a rolling dbt.log,
+    # target is manifest/run_results/compiled SQL -- and both are gitignored,
+    # so nothing on the host reads them.
+    #
+    # The reason is permissions. A bind mount takes its ownership from the
+    # host, so `chown` in the image cannot reach ./dbt/logs and ./dbt/target;
+    # on Docker Desktop for Windows the host side presents 0777 and it works
+    # by accident, on a Linux host `dbt deps` in airflow-init fails with
+    # Errno 13 on a directory that looks prepared. Mounting a named volume at
+    # each of them fixes it too, but only for a volume that does not yet exist
+    # -- Docker seeds ownership from the image once, at creation, and never
+    # again. Not mounting anything over them removes the whole class.
+    #
+    # dbt_packages is deliberately NOT moved: Cosmos's copy_dbt_packages
+    # (airflow/dags/dbt_builds.py) finds it relative to the project path, and
+    # a `packages-install-path` elsewhere would leave every rendered task
+    # without dbt_utils.
+    DBT_LOG_PATH: /opt/platform/run/dbt/logs
+    DBT_TARGET_PATH: /opt/platform/run/dbt/target
     # Every dbt target is a Spark one; this selects WHICH. Builds must land on
     # a Nessie branch and only the Spark path can address one, so dbt_builds.py
     # refuses a non-Spark value rather than silently writing to `main`.
@@ -319,6 +340,13 @@ services:
       PYTHONUNBUFFERED: "1"
       DBT_PROJECT_DIR: /opt/platform/dbt
       DBT_PROFILES_DIR: /opt/platform/dbt
+      # Repeated from x-airflow-common because a service's own `environment:`
+      # REPLACES the anchored one wholesale -- YAML's merge key is shallow, so
+      # every value this block does not restate is simply absent here. Without
+      # these two the console's `dbt build` writes its log back into the ./dbt
+      # bind mount, which is the case the image cannot chown.
+      DBT_LOG_PATH: /opt/platform/run/dbt/logs
+      DBT_TARGET_PATH: /opt/platform/run/dbt/target
       REPORTING_SEED_DIR: /opt/platform/seed
       # The console runs `dbt build` for a single feed on a throwaway branch,
       # so it is a Spark CLIENT like every other component and must name the
