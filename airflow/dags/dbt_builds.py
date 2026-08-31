@@ -190,14 +190,22 @@ PROFILE_CONFIG = ProfileConfig(
 
 PROJECT_CONFIG = ProjectConfig(
     dbt_project_path=DBT_DIR,
-    # dbt_packages/ is gitignored and installed once by `airflow-init`, not per
-    # task: install_dbt_deps here would make every rendered task run `dbt deps`
-    # against the network before doing any work. copy_dbt_packages carries the
-    # already-installed copy into the temporary project directory Cosmos builds
-    # for each task -- without it, that directory has no dbt_utils and every
-    # dbt_utils test fails to compile.
+    # dbt packages are installed ONCE by `airflow-init`, not per task:
+    # install_dbt_deps here would make every rendered task run `dbt deps`
+    # against the network before doing any work.
     install_dbt_deps=False,
-    copy_dbt_packages=True,
+    # copy_dbt_packages was True while packages lived in the project directory,
+    # to carry them into the temporary project Cosmos builds for each task --
+    # without them that directory has no dbt_utils and every dbt_utils test
+    # fails to compile. It is False now because dbt_project.yml's
+    # `packages-install-path` is ABSOLUTE (/opt/platform/run/dbt/dbt_packages,
+    # off the bind mount -- see the comment there). Cosmos resolves that key
+    # against the project folder to find what to copy, and joining a folder
+    # with an absolute path yields the absolute path itself, so the copy would
+    # have the same source and destination. Nothing needs copying: the path is
+    # absolute and identical inside every process in this container, so the dbt
+    # subprocess in the temporary project resolves it directly.
+    copy_dbt_packages=False,
     # Render-time vars only. The vars that reach the RUNNING dbt come from
     # operator_args below, which is where the per-run Nessie branch is injected;
     # `dbt ls` has no opinion about which branch it is describing.
@@ -279,7 +287,10 @@ def _operator_args(branch_task_id: str) -> dict:
         # environment or dbt fails to resolve the profile.
         "append_env": True,
         "install_deps": False,
-        "copy_dbt_packages": True,
+        # False for the same reason as ProjectConfig above: the packages live
+        # at an absolute path outside the project directory, so there is
+        # nothing to copy and a copy would be source-onto-itself.
+        "copy_dbt_packages": False,
     }
 
 

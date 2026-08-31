@@ -8,6 +8,38 @@ macro-paths: ["macros"]
 test-paths:  ["tests"]
 clean-targets: ["target", "dbt_packages"]
 
+# dbt_packages, OFF the ./dbt bind mount, for the same reason as logs and
+# target: the mount's ownership comes from the host, and where the checkout is
+# not owned by uid 50000, `dbt deps` in airflow-init dies with
+#     Permission denied: 'dbt_packages/dbt_utils'
+# before anything else can run. Two wrong answers were tried first, and both
+# are worth recording because each looks correct until it runs:
+#
+#   * A named volume mounted AT ./dbt/dbt_packages. `dbt deps` rmtree's the
+#     packages directory before reinstalling and a mount point cannot be
+#     removed -- OSError: [Errno 16] Device or resource busy: 'dbt_packages',
+#     on every `docker compose up`.
+#   * A plain image directory. /opt/platform/run is copy-on-write per
+#     container, so airflow-init installed into a layer that was discarded when
+#     it exited and every other service reported `0 package(s) installed`.
+#
+# What works is a named volume mounted one level ABOVE, on
+# /opt/platform/run/packages -- shared by every service, with dbt_packages an
+# ordinary removable subdirectory inside it. See docker-compose.yml.
+#
+# ABSOLUTE on purpose: dbt resolves a relative value against the project root,
+# which is the mount. Cosmos reads this same key to find the packages when it
+# builds its per-task temporary project (cosmos/dbt/project.py,
+# get_dbt_packages_subpath), so the two agree by construction rather than by
+# coincidence -- but joining a folder with an absolute path yields the absolute
+# path, which would make its copy_dbt_packages a copy onto itself. Hence
+# copy_dbt_packages=False in dbt_builds.py; see the comment there.
+#
+# The trade-off: a bare `dbt` run outside the containers installs packages to a
+# path that does not exist on the host. Use the containers, or override with
+# DBT_PACKAGES_INSTALL_PATH.
+packages-install-path: "{{ env_var('DBT_PACKAGES_INSTALL_PATH', '/opt/platform/run/packages/dbt_packages') }}"
+
 # NO `target-path:` here any more. dbt 1.8 deprecates it in favour of
 # --target-path / DBT_TARGET_PATH, and docker-compose.yml sets that env var to
 # a path OUTSIDE the ./dbt bind mount, so dbt is not writing build scratch into

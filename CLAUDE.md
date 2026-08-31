@@ -111,7 +111,20 @@ Two corollaries worth holding on to:
   manual steps that broke the platform silently when skipped — and `dbt deps`
   is no longer optional at all, because Cosmos renders the build DAGs by
   running `dbt ls`, which cannot compile a `dbt_utils` test without the
-  package. No `dbt_packages/` now means those two DAGs do not *import*.
+  package. No installed packages now means those two DAGs do not *import*.
+- **dbt's three working directories all live under `/opt/platform/run`, not in
+  the `./dbt` bind mount** — `DBT_LOG_PATH` and `DBT_TARGET_PATH` in
+  `docker-compose.yml`, `packages-install-path` in `dbt_project.yml`. A bind
+  mount takes its ownership from the host, so no `chown` in the image can reach
+  it and `dbt deps` fails with `Permission denied` wherever the checkout is not
+  owned by uid 50000. Packages are the awkward one and the comments in those
+  files say why: they must be **shared** between `airflow-init` and everything
+  that reads them, so they cannot be a plain image path (copy-on-write per
+  container — the init container's install is discarded when it exits), and the
+  named volume that shares them has to be mounted one level **above**
+  `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
+  cannot be removed. If packages ever come back missing or root-owned, remove
+  the volume — rebuilding the image will not re-seed one that already exists.
 - **Adding a feed is six files and no DAG edit** — `docs/ADDING-A-FEED.md`
   has them in order. The only one that fails silently if you skip it is
   `PREPARED_TABLES` in `common/context.py`: the table just never gets

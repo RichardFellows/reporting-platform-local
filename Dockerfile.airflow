@@ -135,28 +135,38 @@ RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
 # ---------------------------------------------------------------------------
 USER root
 # Writable working directories for dbt, created HERE rather than left to the
-# runtime, because none of them can be created by the process that needs them:
+# runtime, because the process that needs them cannot create them:
 # /opt/platform is root-owned and this image runs as uid 50000.
 #
-# Two separate problems, and they need different fixes:
+# All three of dbt's working directories -- logs, target and dbt_packages --
+# live under /opt/platform/run, OUTSIDE the ./dbt bind mount, and are pointed
+# at from docker-compose.yml (DBT_LOG_PATH, DBT_TARGET_PATH) and
+# dbt/dbt_project.yml (packages-install-path). A bind mount takes its ownership
+# from the HOST, so nothing done to /opt/platform/dbt in this image survives
+# into the container: on Docker Desktop for Windows the host side presents 0777
+# and it works by accident, on a host where the checkout is not owned by uid
+# 50000 `airflow-init` dies before it can run `dbt deps`. A path that is never
+# mounted over cannot fail that way.
 #
-#   * /opt/platform/run/dbt/{logs,target} are dbt's purely-ephemeral outputs,
-#     pointed at by DBT_LOG_PATH / DBT_TARGET_PATH in docker-compose.yml. They
-#     live OUTSIDE the ./dbt bind mount on purpose. A bind mount takes its
-#     ownership from the HOST, so nothing done to /opt/platform/dbt in this
-#     image survives into the container -- on Docker Desktop for Windows the
-#     host side fakes 0777 and hides that, on a Linux host it does not, and
-#     `dbt deps` in airflow-init then fails on a directory the image looks
-#     like it prepared. Paths that are never mounted over cannot fail that way.
+# logs and target are per-container: image paths with nothing mounted over
+# them, so each service gets its own and two dbt processes cannot interleave
+# their output. dbt_packages CANNOT work that way -- airflow-init installs it
+# and the scheduler, webserver, triggerer and feed console all read it, while
+# an image path is copy-on-write PER CONTAINER, so the init container's install
+# lands in a layer discarded when it exits. That presents as `dbt deps`
+# succeeding and then, from every process that needed them,
+#     dbt found 1 package(s) specified in packages.yml, but only 0 package(s)
+#     installed in ...
+# So /opt/platform/run/packages exists to have a named volume mounted ON it,
+# shared by every service.
 #
-#   * /opt/platform/dbt/{logs,target,dbt_packages} exist here only so that a
-#     NAMED VOLUME mounted at one of them is seeded correctly: Docker
-#     initialises an empty named volume from the image's content and ownership
-#     at that path. Note "empty" -- a volume that already exists is never
-#     re-seeded, so a volume created before this line was added stays
-#     root-owned no matter how often the image is rebuilt. Remove the volume,
-#     do not rebuild. Under the bind mount these directories are invisible;
-#     that is the point.
+# The volume goes one level ABOVE the packages directory, not on it, and that
+# is not cosmetic: `dbt deps` rmtree's the packages directory before
+# reinstalling, and a mount point cannot be removed --
+#     OSError: [Errno 16] Device or resource busy: 'dbt_packages'
+# -- which is what a volume mounted directly at dbt_packages gives you, on
+# every `up`, on every host. One level up, dbt_packages is an ordinary
+# subdirectory inside the volume and removes cleanly.
 #
 # chown to airflow:0 and chmod g+rwX, NOT chown to uid 50000 alone and not
 # chmod 777. The container already runs uid=50000 gid=0 (verified with `id`
@@ -164,10 +174,9 @@ USER root
 # platform assigns an arbitrary uid -- which is exactly what OpenShift does.
 # See docs/OPENSHIFT-MAPPING.md.
 RUN mkdir -p /opt/platform/run/dbt/logs /opt/platform/run/dbt/target \
-             /opt/platform/dbt/logs /opt/platform/dbt/target \
-             /opt/platform/dbt/dbt_packages \
-    && chown -R airflow:0 /opt/platform/run /opt/platform/dbt \
-    && chmod -R g+rwX /opt/platform/run /opt/platform/dbt
+             /opt/platform/run/packages \
+    && chown -R airflow:0 /opt/platform/run \
+    && chmod -R g+rwX /opt/platform/run
 USER airflow
 
 # Last in the file ON PURPOSE. This layer changes far more often than the pip

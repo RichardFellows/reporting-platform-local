@@ -90,6 +90,27 @@ x-airflow-common: &airflow-common
     # that PASSES its tests and can therefore be published to main.
     - ./seed_clean:/opt/platform/seed_clean
     - airflow-logs:/opt/airflow/logs
+    # dbt's installed packages, SHARED. airflow-init runs `dbt deps` once and
+    # the scheduler, webserver, triggerer and feed console all read the result,
+    # so this can be neither an image path (copy-on-write per container -- the
+    # init container's install is discarded when it exits and everything else
+    # reports `0 package(s) installed`) nor the ./dbt bind mount (host
+    # ownership -- `Permission denied: 'dbt_packages/dbt_utils'`).
+    #
+    # Mounted one level ABOVE dbt_packages, deliberately. `dbt deps` rmtree's
+    # the packages directory before reinstalling and a mount point cannot be
+    # removed, so a volume mounted directly at dbt_packages fails every `up`
+    # with `Errno 16 Device or resource busy`. Here dbt_packages is an ordinary
+    # subdirectory inside the volume, named by `packages-install-path` in
+    # dbt/dbt_project.yml.
+    #
+    # Seeded ONCE, at creation, from the image's ownership of
+    # /opt/platform/run/packages (airflow:0, g+rwX -- see Dockerfile.airflow).
+    # An existing volume is NEVER re-seeded, so if this ever comes back
+    # root-owned the fix is `docker volume rm reporting-platform_dbt-packages`,
+    # not another rebuild. The contents are disposable: airflow-init
+    # reinstalls them on the next `up`.
+    - dbt-packages:/opt/platform/run/packages
   depends_on:
     postgres: {condition: service_healthy}
     nessie: {condition: service_healthy}
@@ -447,3 +468,4 @@ volumes:
   pg-data:
   airflow-logs:
   ivy-cache:
+  dbt-packages:
