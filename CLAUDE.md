@@ -126,7 +126,12 @@ Two corollaries worth holding on to:
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
 - **Adding a feed is six files and no DAG edit** — `docs/ADDING-A-FEED.md`
-  has them in order. The only one that fails silently if you skip it is
+  has them in order. `generate_feeds.py` is not one of them: it hand-writes
+  generators for the four original feeds, whose pathologies are the point, and
+  generates every *other* feed in `feeds.yml` from its definition via the
+  console's `ui/sampledata.py`. Pass `types=` when calling that directly — from
+  the column name alone it re-guesses, and a `decimal` column gets a string
+  that `safe_cast` silently nulls. The only one that fails silently if you skip it is
   `PREPARED_TABLES` in `common/context.py`: the table just never gets
   maintained or retained.
 - **The feed console (`reporting_platform/ui`, <http://localhost:8082>) writes
