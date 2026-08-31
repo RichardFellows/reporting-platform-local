@@ -88,6 +88,22 @@ Two corollaries worth holding on to:
   the next job waits forever instead of failing. Watch it at
   <http://localhost:8080>. See `docs/ARCHITECTURE.md` § *Where Spark actually
   runs* for the jar-shipping and Python-version constraints.
+- **The Iceberg and Nessie jar versions live in `.env`, and there are THREE of
+  them.** `ICEBERG_VERSION` has to be identical in the Spark image (baked into
+  `/opt/spark/jars`) and in *both* drivers — `spark_session()` in
+  `common/context.py` and `spark.jars.packages` in `dbt/profiles.yml` — because
+  every process that submits work runs a pip-installed pyspark with no jars of
+  its own, and `spark.jars.packages` ships the driver's jars to every executor.
+  Diverge and you get two Iceberg versions in one application, surfacing as
+  `NoSuchMethodError` on the first write rather than as anything saying
+  "version". `NESSIE_SPARK_EXT_VERSION` tracks **Iceberg, not the server** — the
+  extensions jar is compiled against a specific Iceberg (0.103.3 against 1.8.1,
+  0.108.1 against 1.11.0) and running one built against a *newer* Iceberg than
+  you have is the failing direction. `NESSIE_SERVER_VERSION` sets the server
+  image and the `nessie-gc` jar, which must be equal to each other, and is
+  allowed to be newer than the extensions. `.env.example` has the reasoning and
+  a known-good alternative set. `docker compose exec spark-worker env | grep
+  VERSION` says what is actually baked into the image you are running.
 - **The dbt build DAGs are rendered by Astronomer Cosmos**, one Airflow task
   per model, derived from the dbt project on every parse — so **adding a model
   needs no DAG edit either** — `docs/ADDING-A-MODEL.md` has the two files it

@@ -296,10 +296,18 @@ def spark_session(app_name: str, ref: str = "main"):
     # resolved here -- which is why the versions must stay equal to
     # Dockerfile.spark's, and why hadoop-aws (which the Spark image does NOT
     # bake) reaches the executors at all.
+    # From the environment, set once in docker-compose.yml from .env, so this
+    # and `spark.jars.packages` in dbt/profiles.yml cannot drift from each
+    # other or from the jars Dockerfile.spark baked into the executors. The
+    # defaults repeat theirs: a process started outside compose still gets the
+    # combination this stack was validated against.
+    iceberg = os.environ.get("ICEBERG_VERSION", "1.6.1")
+    nessie_ext = os.environ.get("NESSIE_SPARK_EXT_VERSION", "0.99.0")
     packages = ",".join([
-        "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1",
-        "org.apache.iceberg:iceberg-aws-bundle:1.6.1",
-        "org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0",
+        f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{iceberg}",
+        f"org.apache.iceberg:iceberg-aws-bundle:{iceberg}",
+        "org.projectnessie.nessie-integrations:"
+        f"nessie-spark-extensions-3.5_2.12:{nessie_ext}",
         # Needed separately from iceberg-aws-bundle: reading landing CSVs via
         # spark.read.csv("s3a://...") goes through Hadoop's S3A connector,
         # not Iceberg's own S3FileIO, and Spark's official binaries don't

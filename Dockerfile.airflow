@@ -28,12 +28,18 @@ ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 # collecting content unreachable from ANY Nessie reference is only possible with
 # this external CLI, and docs/MAINTENANCE.md has it as step 3 of the nightly
 # chain. Published as a GitHub release asset, NOT on Maven Central under this
-# name. Pinned to the Nessie server version in docker-compose.yml; keep them
-# equal. ~128 MB, which is most of this image's size.
-ARG NESSIE_VERSION=0.99.0
+# name. ~128 MB, which is most of this image's size.
+# NESSIE_SERVER_VERSION, passed from docker-compose.yml so one .env value
+# sets the server image tag and this jar together. They must be equal: there is
+# no server-side GC endpoint, so this CLI is the only thing that decides what
+# is unreachable and deletes it, and a CLI that disagrees with the server about
+# the repository format is the one component here that can quietly delete the
+# wrong thing. It needs Java 17 from Nessie 0.107.0 onward; the JRE installed
+# above is 17.
+ARG NESSIE_SERVER_VERSION=0.99.0
 RUN mkdir -p /opt/platform/lib \
     && curl -fsSL -o /opt/platform/lib/nessie-gc.jar \
-       "https://github.com/projectnessie/nessie/releases/download/nessie-${NESSIE_VERSION}/nessie-gc-${NESSIE_VERSION}.jar" \
+       "https://github.com/projectnessie/nessie/releases/download/nessie-${NESSIE_SERVER_VERSION}/nessie-gc-${NESSIE_SERVER_VERSION}.jar" \
     && chown -R airflow: /opt/platform/lib
 
 USER airflow

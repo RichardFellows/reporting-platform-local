@@ -2,8 +2,38 @@ FROM apache/spark:3.5.3-python3
 
 USER root
 
-ENV ICEBERG_VERSION=1.6.1
-ENV NESSIE_VERSION=0.99.0
+# ARG, not ENV, so docker-compose.yml can pass these in from .env -- and
+# re-exported as ENV below so `docker compose exec spark-worker env | grep
+# VERSION` tells you what is actually baked into the image you are running.
+# Guessing that from a Dockerfile you have not rebuilt is how versions drift.
+#
+# THREE version values, not two, and the split is the point:
+#
+#   ICEBERG_VERSION            the Iceberg runtime on the EXECUTORS. Must equal
+#                              what the drivers resolve in common/context.py
+#                              and dbt/profiles.yml -- spark.jars.packages jars
+#                              are shipped from the driver to every executor,
+#                              so a mismatch means two Iceberg versions in one
+#                              application.
+#   NESSIE_SPARK_EXT_VERSION   the Nessie Spark SQL extensions. Tracks ICEBERG,
+#                              NOT the server: the extensions jar is compiled
+#                              against a specific Iceberg, and running one
+#                              compiled against a NEWER Iceberg than you have
+#                              is the direction that throws NoSuchMethodError.
+#                              (Nessie 0.103.3 is built against Iceberg 1.8.1;
+#                              0.108.1 against 1.11.0.)
+#   NESSIE_SERVER_VERSION      the server image tag in docker-compose.yml and
+#                              the nessie-gc jar in Dockerfile.airflow. It is
+#                              allowed to be NEWER than the extensions: the
+#                              REST API v2 is stable across that range.
+#
+# Defaults are the combination this stack has actually been run against. If
+# your base image bakes different jars, set them in .env rather than editing
+# here -- see .env.example.
+ARG ICEBERG_VERSION=1.6.1
+ARG NESSIE_SPARK_EXT_VERSION=0.99.0
+ENV ICEBERG_VERSION=${ICEBERG_VERSION}
+ENV NESSIE_SPARK_EXT_VERSION=${NESSIE_SPARK_EXT_VERSION}
 ENV SCALA_VERSION=2.12
 
 # Pre-bake the jars rather than resolving --packages at submit time.
@@ -16,7 +46,7 @@ RUN set -eux; \
     curl -fsSL -o $JARS/iceberg-aws-bundle.jar \
       $M2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar; \
     curl -fsSL -o $JARS/nessie-spark-extensions.jar \
-      $M2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_${SCALA_VERSION}/${NESSIE_VERSION}/nessie-spark-extensions-3.5_${SCALA_VERSION}-${NESSIE_VERSION}.jar
+      $M2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_${SCALA_VERSION}/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_${SCALA_VERSION}-${NESSIE_SPARK_EXT_VERSION}.jar
 
 RUN pip install --no-cache-dir pyyaml boto3 pynessie==0.65.0 || pip install --no-cache-dir pyyaml boto3
 

@@ -46,7 +46,13 @@ reporting_platform:
       # spark_session()).
       server_side_parameters:
         spark.master: "{{ env_var('SPARK_MASTER', 'spark://spark-master:7077') }}"
-        spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.99.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        # Versions from the environment, set once in docker-compose.yml from
+        # .env. This list and the one in common/context.py's spark_session()
+        # are the two DRIVER-side readers and must not diverge -- nor from the
+        # jars Dockerfile.spark baked into the executors, which receive
+        # whatever the driver resolves. hadoop-aws and aws-java-sdk-bundle are
+        # NOT parameterised: they track Spark 3.5's Hadoop, not Iceberg.
+        spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{{ env_var('ICEBERG_VERSION', '1.6.1') }},org.apache.iceberg:iceberg-aws-bundle:{{ env_var('ICEBERG_VERSION', '1.6.1') }},org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:{{ env_var('NESSIE_SPARK_EXT_VERSION', '0.99.0') }},org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262"
         spark.sql.extensions: "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.projectnessie.spark.extensions.NessieSparkSessionExtensions"
         spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
         spark.sql.catalog.lakehouse.catalog-impl: org.apache.iceberg.nessie.NessieCatalog

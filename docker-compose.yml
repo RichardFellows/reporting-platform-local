@@ -24,10 +24,24 @@ x-s3-env: &s3-env
   REPORTING_CATALOG: lakehouse
   REPORTING_ENV: ${REPORTING_ENV:-local}
 
+# One place per version, read from .env -- see .env.example for what each one
+# means and why there are two Nessie values. Defaults here repeat the
+# Dockerfiles' defaults so a clone with no .env builds the combination this
+# stack was validated against.
+x-versions: &versions
+  ICEBERG_VERSION: ${ICEBERG_VERSION:-1.6.1}
+  NESSIE_SPARK_EXT_VERSION: ${NESSIE_SPARK_EXT_VERSION:-0.99.0}
+
 x-airflow-common: &airflow-common
-  build: {context: ., dockerfile: Dockerfile.airflow}
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+    args:
+      NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.99.0}
   environment:
-    <<: *s3-env
+    # A sequence, because YAML allows only ONE merge key per mapping and this
+    # block needs both anchors. Neither defines a key the other does.
+    <<: [*s3-env, *versions]
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
@@ -51,6 +65,16 @@ x-airflow-common: &airflow-common
     # a local[*] value here rather than quietly running the work in-process,
     # and dbt/profiles.yml threads the same address into spark.master.
     SPARK_MASTER: spark://spark-master:7077
+    # The DRIVER-side jar versions. Every process here runs a pip-installed
+    # pyspark with no Iceberg/Nessie jars at all, so both readers --
+    # `spark_session()` in common/context.py and `spark.jars.packages` in
+    # dbt/profiles.yml -- resolve them through Ivy at session start, from
+    # these. They must equal what Dockerfile.spark baked into the executors:
+    # packages jars are shipped from the driver to every executor, so a
+    # mismatch puts two Iceberg versions in one application and surfaces as
+    # NoSuchMethodError on the first write, not as anything saying "version".
+    # Both defaults are the same value, which is the point of setting it here.
+    # (Merged at the top of this block via [*s3-env, *versions].)
     DBT_PROJECT_DIR: /opt/platform/dbt
     DBT_PROFILES_DIR: /opt/platform/dbt
     # dbt's logs and target directories, moved OFF the ./dbt bind mount and
@@ -176,7 +200,11 @@ services:
       retries: 20
 
   nessie:
-    image: ghcr.io/projectnessie/nessie:0.99.0
+    # Kept equal to Dockerfile.airflow's nessie-gc jar by NESSIE_SERVER_VERSION.
+    # May be NEWER than the Spark extensions (NESSIE_SPARK_EXT_VERSION): REST
+    # API v2 is stable across that range, while the extensions jar is bound to
+    # an Iceberg version instead. See .env.example.
+    image: ghcr.io/projectnessie/nessie:${NESSIE_SERVER_VERSION:-0.99.0}
     depends_on:
       postgres: {condition: service_healthy}
     environment:
@@ -220,7 +248,10 @@ services:
 
   # ---------------------------------------------------------------- compute
   spark-master:
-    build: {context: ., dockerfile: Dockerfile.spark}
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+      args: *versions
     command: /opt/spark/sbin/start-master.sh
     environment:
       <<: *s3-env
@@ -238,7 +269,10 @@ services:
       minio-init: {condition: service_completed_successfully}
 
   spark-worker:
-    build: {context: ., dockerfile: Dockerfile.spark}
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+      args: *versions
     command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
     environment:
       <<: *s3-env
@@ -356,7 +390,7 @@ services:
     <<: *airflow-common
     command: python -m reporting_platform.ui
     environment:
-      <<: *s3-env
+      <<: [*s3-env, *versions]
       PYTHONPATH: /opt/platform
       PYTHONUNBUFFERED: "1"
       DBT_PROJECT_DIR: /opt/platform/dbt
@@ -368,6 +402,10 @@ services:
       # bind mount, which is the case the image cannot chown.
       DBT_LOG_PATH: /opt/platform/run/dbt/logs
       DBT_TARGET_PATH: /opt/platform/run/dbt/target
+      # The console runs `dbt build`, so profiles.yml resolves the jar
+      # versions in this container too -- merged via [*s3-env, *versions] at
+      # the top of this block, since a service's own `environment:` replaces
+      # the anchored one wholesale.
       REPORTING_SEED_DIR: /opt/platform/seed
       # The console runs `dbt build` for a single feed on a throwaway branch,
       # so it is a Spark CLIENT like every other component and must name the
