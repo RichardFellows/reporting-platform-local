@@ -1,10 +1,11 @@
 ---
-# Pinned so the project name -- and therefore every container and volume
-# name -- does not depend on what the clone directory happens to be called.
+# Local approximation of the Reporting Platform. Every service here has a
+# counterpart in OpenShift -- see docs/OPENSHIFT-MAPPING.md, and
+# docs/DECISIONS.md for why each is shaped the way it is.
+#
+# Project name is pinned so container and volume names do not depend on what the
+# clone directory happens to be called.
 name: reporting-platform
-
-# Local approximation of the Reporting Platform platform.
-# Every service here has a counterpart in OpenShift — see docs/OPENSHIFT-MAPPING.md
 
 x-s3-env: &s3-env
   AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-minioadmin}
@@ -14,20 +15,13 @@ x-s3-env: &s3-env
   REPORTING_WAREHOUSE: s3a://lakehouse/warehouse
   REPORTING_LANDING: s3a://lakehouse/landing
   NESSIE_URI: http://nessie:19120/api/v2
-  # The same version store, over the Iceberg REST protocol instead of the
-  # Nessie API. Everything in the pipeline uses NESSIE_URI above;
-  # scripts/duckdb_console.py uses this one, because DuckDB cannot speak the
-  # Nessie API. The REST catalog addresses a ref through the request prefix
-  # and DuckDB always takes the default branch, which is why that console is
-  # read-only and reads published `main`.
+  # The same version store over Iceberg REST instead of the Nessie API, for
+  # scripts/duckdb_console.py. See docs/DECISIONS.md#nessie-iceberg-rest
   NESSIE_ICEBERG_URI: http://nessie:19120/iceberg
   REPORTING_CATALOG: lakehouse
   REPORTING_ENV: ${REPORTING_ENV:-local}
 
-# One place per version, read from .env -- see .env.example for what each one
-# means and why there are two Nessie values. Defaults here repeat the
-# Dockerfiles' defaults so a clone with no .env builds the combination this
-# stack was validated against.
+# One place per jar version, from .env. See docs/DECISIONS.md#jar-versions
 x-versions: &versions
   ICEBERG_VERSION: ${ICEBERG_VERSION:-1.6.1}
   NESSIE_SPARK_EXT_VERSION: ${NESSIE_SPARK_EXT_VERSION:-0.99.0}
@@ -39,68 +33,29 @@ x-airflow-common: &airflow-common
     args:
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.99.0}
   environment:
-    # A sequence, because YAML allows only ONE merge key per mapping and this
-    # block needs both anchors. Neither defines a key the other does.
+    # A sequence: YAML allows only one merge key per mapping and this block
+    # needs both anchors. Neither defines a key the other does.
     <<: [*s3-env, *versions]
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-    # Shared across webserver replicas/restarts so sessions survive. Airflow 2
-    # needs nothing like Airflow 3's execution-API URL or JWT secret: under
-    # LocalExecutor the scheduler forks the task and writes its result straight
-    # to the metadata DB, with no service in between to fail to acknowledge it.
     AIRFLOW__WEBSERVER__SECRET_KEY: local-dev-not-a-real-secret
-    # The stable REST API is how the feed console (port 8082) triggers DAGs.
-    # `session` alone is the 2.x default and only authenticates a browser that
-    # has logged into the web UI, so an API call from another container gets
-    # 401 with a perfectly healthy webserver -- add basic_auth, keep session so
-    # the UI itself still works. Same admin/admin as the web UI: this is the
-    # local stack, and anything shared needs a real identity layer in front of
-    # the console regardless.
+    # basic_auth as well as session, or the feed console's API calls 401 against
+    # a healthy webserver. See docs/DECISIONS.md#airflow-api-auth
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
-    # Every Spark job runs on the spark-master/spark-worker cluster; the
-    # calling process is only the driver. context.py's spark_session() REFUSES
-    # a local[*] value here rather than quietly running the work in-process,
-    # and dbt/profiles.yml threads the same address into spark.master.
+    # Must not diverge from spark.master in dbt/profiles.yml.
+    # See docs/DECISIONS.md#spark-master-single-source
     SPARK_MASTER: spark://spark-master:7077
-    # The DRIVER-side jar versions. Every process here runs a pip-installed
-    # pyspark with no Iceberg/Nessie jars at all, so both readers --
-    # `spark_session()` in common/context.py and `spark.jars.packages` in
-    # dbt/profiles.yml -- resolve them through Ivy at session start, from
-    # these. They must equal what Dockerfile.spark baked into the executors:
-    # packages jars are shipped from the driver to every executor, so a
-    # mismatch puts two Iceberg versions in one application and surfaces as
-    # NoSuchMethodError on the first write, not as anything saying "version".
-    # Both defaults are the same value, which is the point of setting it here.
-    # (Merged at the top of this block via [*s3-env, *versions].)
     DBT_PROJECT_DIR: /opt/platform/dbt
     DBT_PROFILES_DIR: /opt/platform/dbt
-    # dbt's logs and target directories, moved OFF the ./dbt bind mount and
-    # onto image-owned paths (created in Dockerfile.airflow, airflow:0,
-    # g+rwX). Both are pure build scratch -- logs are a rolling dbt.log,
-    # target is manifest/run_results/compiled SQL -- and both are gitignored,
-    # so nothing on the host reads them.
-    #
-    # The reason is permissions. A bind mount takes its ownership from the
-    # host, so `chown` in the image cannot reach ./dbt/logs and ./dbt/target;
-    # on Docker Desktop for Windows the host side presents 0777 and it works
-    # by accident, on a Linux host `dbt deps` in airflow-init fails with
-    # Errno 13 on a directory that looks prepared. Mounting a named volume at
-    # each of them fixes it too, but only for a volume that does not yet exist
-    # -- Docker seeds ownership from the image once, at creation, and never
-    # again. Not mounting anything over them removes the whole class.
-    #
-    # dbt_packages is deliberately NOT moved: Cosmos's copy_dbt_packages
-    # (airflow/dags/dbt_builds.py) finds it relative to the project path, and
-    # a `packages-install-path` elsewhere would leave every rendered task
-    # without dbt_utils.
+    # Off the ./dbt bind mount, whose ownership comes from the host.
+    # See docs/DECISIONS.md#dbt-working-directories
     DBT_LOG_PATH: /opt/platform/run/dbt/logs
     DBT_TARGET_PATH: /opt/platform/run/dbt/target
-    # Every dbt target is a Spark one; this selects WHICH. Builds must land on
-    # a Nessie branch and only the Spark path can address one, so dbt_builds.py
-    # refuses a non-Spark value rather than silently writing to `main`.
+    # Every dbt target is a Spark one; this selects which. dbt_builds.py refuses
+    # a non-Spark value. See docs/DECISIONS.md#duckdb-is-not-an-engine
     DBT_TARGET: ${DBT_TARGET:-spark_local}
     PYTHONPATH: /opt/platform
   volumes:
@@ -109,31 +64,12 @@ x-airflow-common: &airflow-common
     - ./scripts:/opt/platform/scripts
     - ./dbt:/opt/platform/dbt
     - ./seed:/opt/platform/seed
-    # Optional clean restatement of the same history, produced by
-    # `generate_feeds.py --clean --version 2`. Used to demonstrate a build
-    # that PASSES its tests and can therefore be published to main.
+    # Clean restatement of the same history, for a build that passes its tests
+    # and can be published. See docs/DECISIONS.md#seed-clean
     - ./seed_clean:/opt/platform/seed_clean
     - airflow-logs:/opt/airflow/logs
-    # dbt's installed packages, SHARED. airflow-init runs `dbt deps` once and
-    # the scheduler, webserver, triggerer and feed console all read the result,
-    # so this can be neither an image path (copy-on-write per container -- the
-    # init container's install is discarded when it exits and everything else
-    # reports `0 package(s) installed`) nor the ./dbt bind mount (host
-    # ownership -- `Permission denied: 'dbt_packages/dbt_utils'`).
-    #
-    # Mounted one level ABOVE dbt_packages, deliberately. `dbt deps` rmtree's
-    # the packages directory before reinstalling and a mount point cannot be
-    # removed, so a volume mounted directly at dbt_packages fails every `up`
-    # with `Errno 16 Device or resource busy`. Here dbt_packages is an ordinary
-    # subdirectory inside the volume, named by `packages-install-path` in
-    # dbt/dbt_project.yml.
-    #
-    # Seeded ONCE, at creation, from the image's ownership of
-    # /opt/platform/run/packages (airflow:0, g+rwX -- see Dockerfile.airflow).
-    # An existing volume is NEVER re-seeded, so if this ever comes back
-    # root-owned the fix is `docker volume rm reporting-platform_dbt-packages`,
-    # not another rebuild. The contents are disposable: airflow-init
-    # reinstalls them on the next `up`.
+    # dbt's installed packages, shared by every service. Mounted one level ABOVE
+    # dbt_packages on purpose. See docs/DECISIONS.md#dbt-packages-volume
     - dbt-packages:/opt/platform/run/packages
   depends_on:
     postgres: {condition: service_healthy}
@@ -149,16 +85,8 @@ services:
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin123}
-    # HOST side only. The container keeps 9000/9001, which is what
-    # `S3_ENDPOINT: http://minio:9000` and every other service address --
-    # container-to-container traffic never goes near the host mapping, so
-    # changing these cannot break the pipeline.
-    #
-    # Configurable, and defaulted AWAY from 9000/9001, because those collide
-    # with things people actually run: ZScaler on a corporate laptop takes
-    # them, and so do a fair number of local dev servers. A clash shows up as
-    # a container that will not start, or worse, a console that answers with
-    # something else entirely.
+    # Host side only, and defaulted away from 9000/9001 because those collide
+    # with ZScaler and friends. See docs/DECISIONS.md#minio-host-ports
     ports:
       - "${MINIO_API_HOST_PORT:-19000}:9000"
       - "${MINIO_CONSOLE_HOST_PORT:-19001}:9001"
@@ -200,37 +128,19 @@ services:
       retries: 20
 
   nessie:
-    # Kept equal to Dockerfile.airflow's nessie-gc jar by NESSIE_SERVER_VERSION.
-    # May be NEWER than the Spark extensions (NESSIE_SPARK_EXT_VERSION): REST
-    # API v2 is stable across that range, while the extensions jar is bound to
-    # an Iceberg version instead. See .env.example.
+    # Kept equal to Dockerfile.airflow's nessie-gc jar; may be newer than the
+    # Spark extensions. See docs/DECISIONS.md#jar-versions
     image: ghcr.io/projectnessie/nessie:${NESSIE_SERVER_VERSION:-0.99.0}
     depends_on:
       postgres: {condition: service_healthy}
     environment:
-      # JDBC-backed rather than in-memory, so the local stack exercises the
-      # same version-store path as the cluster and survives a restart.
       nessie.version.store.type: JDBC
       quarkus.datasource.jdbc.url: jdbc:postgresql://postgres:5432/nessie
       quarkus.datasource.username: platform
       quarkus.datasource.password: platform
 
-      # ------------------------------------------- Iceberg REST catalog (D7)
-      # Nessie 0.99 already serves an Iceberg REST catalog at /iceberg/v1, but
-      # it answers every request with `Warehouse 'x' is not known` until a
-      # warehouse is declared here. It is a SECOND front door onto the same
-      # version store, not a second catalog: Spark keeps using the Nessie API
-      # at /api/v2 and sees exactly the same commits.
-      #
-      # This exists for `scripts/duckdb_console.py`, the read-only analyst and
-      # developer query tool. DuckDB's iceberg extension
-      # cannot speak the Nessie API; it speaks Iceberg REST, and this is what
-      # makes that endpoint usable. It is NOT used by the pipeline, which goes
-      # through NESSIE_URI.
-      #
-      # The credentials are the same MinIO ones the rest of the stack uses.
-      # They are referenced through nessie.catalog.secrets rather than inline
-      # because Nessie rejects the inline form.
+      # Iceberg REST: a second front door onto the same version store, for the
+      # DuckDB console only. See docs/DECISIONS.md#nessie-iceberg-rest
       nessie.catalog.default-warehouse: warehouse
       nessie.catalog.warehouses.warehouse.location: s3://lakehouse/warehouse
       nessie.catalog.service.s3.default-options.region: us-east-1
@@ -277,14 +187,8 @@ services:
     environment:
       <<: *s3-env
       SPARK_NO_DAEMONIZE: "true"
-      # Sized so several applications can hold cores at once. Every Spark job
-      # on this platform is now a CLIENT of this cluster -- ingest, dbt builds,
-      # maintenance, retention, arrival checks, completeness -- and a
-      # standalone application holds its cores from first job to session stop.
-      # Each one caps itself at 2 cores / 2g (spark.cores.max in
-      # context.py and dbt/profiles.yml), so this leaves room for three
-      # concurrent: the one `lakehouse_write` slot plus the read-only jobs
-      # that sit outside that pool.
+      # Sized so three capped applications can hold cores at once.
+      # See docs/DECISIONS.md#spark-worker-sizing
       SPARK_WORKER_CORES: "6"
       SPARK_WORKER_MEMORY: "6g"
     volumes:
@@ -294,53 +198,14 @@ services:
     depends_on: [spark-master]
 
   # ---------------------------------------------------------- orchestration
-  #
   # Airflow 2.x, split into its real components rather than `airflow
-  # standalone`. Two separate reasons, both learned the hard way:
-  #
-  #   * `standalone` bundles everything into one supervised process and proved
-  #     too unreliable to prove scheduling on.
-  #   * Airflow 3 could never record a task completion on this stack at all
-  #     which is why this is 2.10.5. See
-  #     Dockerfile.airflow for the full reasoning.
-  #
-  # The service that runs tasks is still called `airflow`, because with
-  # LocalExecutor tasks execute inside the scheduler process and every
-  # `docker compose exec -T airflow ...` in the README, Makefile and CLAUDE.md
-  # expects to land in the container that has the code mounted.
+  # standalone`. See docs/DECISIONS.md#airflow-2-not-3
 
   airflow-init:
     <<: *airflow-common
-    # Runs once, and everything else waits on it COMPLETING, so no component
-    # races the DB into existence. Four things, in order, each of which was
-    # once a manual step in QUICKSTART that silently broke the platform when it
-    # was skipped:
-    #
-    #   1. db migrate            -- the metadata schema. (Unlike Airflow 3,
-    #                               `airflow users` exists here.)
-    #   2. users create          -- admin/admin for the web UI and the REST API
-    #                               the feed console calls.
-    #   3. pools set             -- ONE pool, deliberately, at one slot. Ingest,
-    #                               dbt model tasks and maintenance all take
-    #                               this same slot; a second one-slot pool would
-    #                               NOT exclude them from each other, which is
-    #                               the bug that once let remove_orphan_files
-    #                               run alongside a write. Without it every task
-    #                               sits `queued` forever with nothing to say
-    #                               why. See platform_housekeeping.py.
-    #   4. dbt deps              -- dbt/dbt_packages/ is gitignored, and
-    #                               packages.yml requires dbt_utils. This is no
-    #                               longer merely "the build fails until you run
-    #                               it": Cosmos renders prepared_build and
-    #                               reporting_build by running `dbt ls`, which
-    #                               cannot compile a dbt_utils test without the
-    #                               package, so on a fresh clone those two DAGs
-    #                               would not IMPORT. Installing here makes the
-    #                               clone self-sufficient.
-    #
-    # `|| true` on the user and the pool: both are idempotent in intent but
-    # noisy on a second `docker compose up` against existing volumes, and this
-    # container failing would block the whole stack.
+    # Runs once; everything else waits on it COMPLETING. Four steps, each of
+    # which once broke the platform silently when skipped.
+    # See docs/DECISIONS.md#airflow-init-four-things
     command: >
       bash -euc "
       airflow db migrate &&
@@ -371,56 +236,27 @@ services:
       airflow-init: {condition: service_completed_successfully}
 
   # ----------------------------------------------------------- feed console
-  # The UI for onboarding and running a feed: http://localhost:8082
-  #
-  # Same image as airflow because it imports common.context, ingest.arrival and
-  # the dbt project directly -- there is one definition of a feed and this
-  # reads it rather than describing it again.
-  #
-  # It needs its bind mounts READ-WRITE, unlike spark-master/spark-worker: the
-  # whole point is that it edits reporting_platform/config/feeds.yml, the dbt
-  # project and seed/. Those edits land in the working tree on the host and
-  # show up in `git diff`, which is what makes a feed added here reviewable as
-  # an ordinary change.
-  #
-  # No depends_on airflow: the console is useful with the scheduler down (it
-  # can still register and scaffold a feed) and says so in its header rather
-  # than refusing to start.
+  # Add/edit a feed, land it, ingest it, watch the builds: http://localhost:8082
+  # See docs/FEED-UI.md and docs/DECISIONS.md#feed-ui-same-image
   feed-ui:
     <<: *airflow-common
     command: python -m reporting_platform.ui
     environment:
+      # A service's own `environment:` REPLACES the anchored one wholesale --
+      # YAML's merge key is shallow -- so everything this block needs is
+      # restated here.
       <<: [*s3-env, *versions]
       PYTHONPATH: /opt/platform
       PYTHONUNBUFFERED: "1"
       DBT_PROJECT_DIR: /opt/platform/dbt
       DBT_PROFILES_DIR: /opt/platform/dbt
-      # Repeated from x-airflow-common because a service's own `environment:`
-      # REPLACES the anchored one wholesale -- YAML's merge key is shallow, so
-      # every value this block does not restate is simply absent here. Without
-      # these two the console's `dbt build` writes its log back into the ./dbt
-      # bind mount, which is the case the image cannot chown.
       DBT_LOG_PATH: /opt/platform/run/dbt/logs
       DBT_TARGET_PATH: /opt/platform/run/dbt/target
-      # The console runs `dbt build`, so profiles.yml resolves the jar
-      # versions in this container too -- merged via [*s3-env, *versions] at
-      # the top of this block, since a service's own `environment:` replaces
-      # the anchored one wholesale.
       REPORTING_SEED_DIR: /opt/platform/seed
-      # The console runs `dbt build` for a single feed on a throwaway branch,
-      # so it is a Spark CLIENT like every other component and must name the
-      # cluster the same way they do. Both readers of this default to the same
-      # address if it is unset -- which is exactly the silent divergence
-      # CLAUDE.md warns about, so it is set explicitly here rather than left to
-      # two defaults that could drift apart.
       SPARK_MASTER: spark://spark-master:7077
       DBT_TARGET: ${DBT_TARGET:-spark_local}
-      # The console renders a MinIO link for the BROWSER, so it needs the
-      # host-side port, which nothing inside the network otherwise knows.
-      # Host-side URLs for the header links. The console renders these for
-      # the BROWSER, so they must be the host mapping, which nothing inside
-      # the network otherwise knows. Hardcoding them in index.html meant a
-      # changed port sent people to whatever else was listening.
+      # Host-side URLs, rendered for the BROWSER -- nothing inside the network
+      # otherwise knows the host mapping.
       MINIO_CONSOLE_URL: http://localhost:${MINIO_CONSOLE_HOST_PORT:-19001}
       AIRFLOW_UI_URL: http://localhost:${AIRFLOW_HOST_PORT:-8081}
       SPARK_UI_URL: http://localhost:${SPARK_UI_HOST_PORT:-8080}
@@ -432,28 +268,13 @@ services:
     restart: unless-stopped
 
   # ------------------------------------------------------------- notebook
-  # Marimo exploration notebook: http://localhost:8083
-  #
-  # A developer sandbox for "what is actually in these tables" -- landing CSVs,
-  # raw, prepared and reporting, all through ONE read-only DuckDB connection
-  # (scripts/duckdb_console.connect), so a question costs a second rather than
-  # a 22s SparkSession.
-  #
-  # Same image as airflow because it imports that connect() rather than
-  # restating the catalog wiring, and reads the same feeds.yml. It writes
-  # NOTHING: the attach is READ_ONLY and DuckDB can only ever see the
-  # catalog's default branch, so this cannot touch a build in flight.
-  #
-  # ./notebooks is mounted READ-WRITE on purpose -- a developer editing the
-  # notebook is editing a file in the working tree, and that edit shows up in
-  # `git diff` like any other change.
+  # Marimo exploration notebook, read-only: http://localhost:8083
+  # See docs/DECISIONS.md#notebook-service
   notebook:
     <<: *airflow-common
-    # `python -m marimo`, not `marimo`. The airflow image's entrypoint execs a
-    # short list of commands directly (python, bash, ...) and assumes anything
-    # else is an airflow subcommand -- a bare `marimo` becomes `airflow marimo`
-    # and dies with "invalid choice: 'marimo'". Same reason feed-ui runs
-    # `python -m reporting_platform.ui`.
+    # `python -m marimo`, not `marimo`: the image's entrypoint would read a bare
+    # `marimo` as an airflow subcommand.
+    # See docs/DECISIONS.md#marimo-not-jupyter
     command: >
       python -m marimo edit /opt/platform/notebooks
       --host 0.0.0.0 --port 8083 --headless --no-token
@@ -461,9 +282,6 @@ services:
       <<: *s3-env
       PYTHONPATH: /opt/platform
       PYTHONUNBUFFERED: "1"
-      # The Iceberg ATTACH vends credentials for the catalog's own data files
-      # but NOT for a direct s3:// read, so landing CSVs 403 without this.
-      # See connect()'s docstring in scripts/duckdb_console.py.
       REPORTING_DUCKDB_S3_SECRET: "1"
     volumes:
       - ./reporting_platform:/opt/platform/reporting_platform:ro
@@ -474,15 +292,8 @@ services:
     restart: unless-stopped
 
   # ------------------------------------------------------------- watchdog
-  # Deliberately NOT an Airflow service and deliberately not in
-  # depends_on with any of them: a monitor that shares the lifecycle of the
-  # thing it monitors cannot report that thing being down, which is exactly
-  # why storage_report never noticed housekeeping had not run.
-  #
-  # It uses the same image only because that is the image with the code and
-  # the drivers; it imports no airflow module and talks to Postgres, Nessie
-  # and MinIO directly. `docker compose stop airflow` leaves this running and
-  # complaining, which is the whole point.
+  # Deliberately NOT an Airflow service and in no depends_on with one.
+  # See docs/DECISIONS.md#watchdog-independent
   watchdog:
     <<: *airflow-common
     command: python -m reporting_platform.monitoring.watchdog --loop 300
@@ -494,10 +305,8 @@ services:
     volumes:
       - ./reporting_platform:/opt/platform/reporting_platform
       - ./scripts:/opt/platform/scripts
-      # Bind mount, not a named volume: a fresh named volume is created
-      # root-owned and the image runs as `airflow`, so the history file could
-      # not be written (Errno 13). A bind mount also puts the trend history
-      # somewhere a human can read it without entering a container.
+      # Bind mount, not a named volume: a fresh named volume is root-owned and
+      # this runs as `airflow`. Also readable without entering a container.
       - ./var/watchdog:/var/lib/reporting-watchdog
     restart: unless-stopped
 

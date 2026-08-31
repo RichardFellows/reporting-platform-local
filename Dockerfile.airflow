@@ -1,21 +1,4 @@
-# Airflow 2.x, deliberately, not 3.x.
-#
-# This was 3.0.2. Under 3.0.2 no DAG run could ever be completed on this stack:
-# a task would start, log correctly, return its value and push xcom, and the
-# scheduler would never record it as succeeded, so nothing downstream ran. That
-# survived splitting `standalone` into separate components, wiring
-# EXECUTION_API_SERVER_URL, and sharing a JWT secret
-# and the design docs.
-#
-# Airflow 3 routes every running task through an execution API served by the
-# api-server, authenticated with JWT. Airflow 2's LocalExecutor forks the task
-# in-process and writes the result straight to the metadata DB -- far fewer
-# moving parts between "task finished" and "state recorded", and no component
-# that can silently fail to acknowledge a completion.
-#
-# The DAG code was already written to run on both (`airflow.sdk` with an
-# `airflow.datasets`/`airflow.decorators` fallback, Asset aliased to Dataset),
-# so this is an infrastructure change only.
+# Airflow 2.x, deliberately, not 3.x. See docs/DECISIONS.md#airflow-2-not-3
 FROM apache/airflow:2.10.5-python3.11
 
 USER root
@@ -24,18 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
-# Nessie GC tool. There is no server-side GC endpoint and no REST call for it --
-# collecting content unreachable from ANY Nessie reference is only possible with
-# this external CLI, and docs/MAINTENANCE.md has it as step 3 of the nightly
-# chain. Published as a GitHub release asset, NOT on Maven Central under this
-# name. ~128 MB, which is most of this image's size.
-# NESSIE_SERVER_VERSION, passed from docker-compose.yml so one .env value
-# sets the server image tag and this jar together. They must be equal: there is
-# no server-side GC endpoint, so this CLI is the only thing that decides what
-# is unreachable and deletes it, and a CLI that disagrees with the server about
-# the repository format is the one component here that can quietly delete the
-# wrong thing. It needs Java 17 from Nessie 0.107.0 onward; the JRE installed
-# above is 17.
+# Nessie GC tool. The only way to collect content unreachable from any Nessie
+# reference; version tracks the server. ~128 MB, most of this image's size.
+# See docs/DECISIONS.md#nessie-gc-jar
 ARG NESSIE_SERVER_VERSION=0.99.0
 RUN mkdir -p /opt/platform/lib \
     && curl -fsSL -o /opt/platform/lib/nessie-gc.jar \
@@ -43,31 +17,18 @@ RUN mkdir -p /opt/platform/lib \
     && chown -R airflow: /opt/platform/lib
 
 USER airflow
-# Providers go in under Airflow's own constraints so pip cannot quietly drag in
-# a different airflow version to satisfy them.
-# In the corporate environment these resolve via the internal Registry mirror;
-# pip.conf / SSL cert config is injected at build time there.
+# Providers under Airflow's own constraints, so pip cannot drag in a different
+# airflow version to satisfy them. In the corporate environment these resolve
+# via the internal registry mirror; pip.conf / SSL cert config is injected at
+# build time there. See docs/DECISIONS.md#airflow-provider-constraints
 RUN pip install --no-cache-dir \
       --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt" \
       "apache-airflow-providers-apache-spark" \
       "apache-airflow-providers-amazon"
 
-# dbt and pyspark are deliberately NOT constrained by Airflow's file -- their
-# pins are the ones validated against a live stack and must not move.
-#
-# EXCEPT `duckdb`, bumped 1.1.3 -> 1.5.5 for the DuckDB console. 1.1.3's
-# iceberg extension has no catalog ATTACH at all -- `ATTACH ... (TYPE ICEBERG)`
-# fails with `Binder Error: Unrecognized storage type "ICEBERG"`, which is
-# exactly that. 1.5.5 attaches to an Iceberg REST catalog and reads it,
-# which is what `scripts/duckdb_console.py` needs.
-#
-# There is NO dbt-duckdb here, on purpose. D7 briefly installed 1.9.6 to make
-# a `duckdb_local` dbt target work, and the target was then removed: DuckDB
-# cannot address a Nessie branch, so a build through it bypasses
-# write-audit-publish. With no DuckDB target left the adapter was dead weight
-# that made `dbt --version` report "duckdb: 1.9.6 - Not compatible!" at anyone
-# debugging -- a misleading signal for a package nothing used. The plain
-# `duckdb` library below is what the read-only console imports.
+# dbt and pyspark are deliberately NOT constrained by Airflow's file; duckdb is
+# 1.5.5 because 1.1.3 cannot ATTACH an Iceberg catalog at all. There is no
+# dbt-duckdb on purpose. See docs/DECISIONS.md#airflow-provider-constraints
 RUN pip install --no-cache-dir \
       "dbt-core==1.8.7" \
       "dbt-spark[PyHive]==1.8.0" \
@@ -75,64 +36,32 @@ RUN pip install --no-cache-dir \
       "pyspark==3.5.3" \
       "pyyaml" "boto3" "pandas" "pyarrow"
 
-# The feed console (reporting_platform/ui) and what it needs to edit config
-# without destroying it. ruamel.yaml rather than the pyyaml already installed
-# above: feeds.yml is mostly comments explaining why each feed is configured
-# the way it is, and a pyyaml load/dump round trip deletes every one of them.
-# pyyaml stays for the read-only config loading in common/context.py.
-#
-# Installed in the same image as everything else because the console imports
-# common.context, ingest.arrival and the dbt project layout directly -- a
-# separate slimmer image would have to duplicate the platform package and
-# could then be built against a different version of it.
+# The feed console. ruamel.yaml rather than the pyyaml above because feeds.yml
+# is mostly comments and a pyyaml round trip deletes every one of them; pyyaml
+# stays for the read-only config loading in common/context.py.
+# See docs/DECISIONS.md#feed-ui-same-image
 RUN pip install --no-cache-dir \
       "fastapi==0.115.6" \
       "uvicorn[standard]==0.34.0" \
       "python-multipart==0.0.20" \
       "ruamel.yaml==0.18.6"
 
-# Astronomer Cosmos: renders the dbt project into Airflow tasks -- one task per
-# model, one per test -- instead of the single opaque `dbt run` subprocess the
-# build DAGs used to shell out to. A failing model is then a red task with that
-# model's name on it, and a rerun starts from the model that failed rather than
-# from the top of the layer.
+# Astronomer Cosmos: renders the dbt project into one Airflow task per model.
 #
-# --no-deps, AND THAT IS NOT AN OPTIMISATION. Installing this the way the
-# providers above are installed -- under Airflow's constraint file -- BREAKS
-# DBT. The 2.10.5 constraints pin `typing_extensions==4.12.2`; the dbt layer
-# above resolves `mashumaro` 3.22, whose `pack.py` imports
-# `evaluate_forward_ref` from typing_extensions 4.13+. Cosmos depends on
-# typing-extensions, so the constrained install DOWNGRADES 4.16.0 -> 4.12.2 and
-# every subsequent `dbt` invocation dies at import with
-#   ImportError: cannot import name 'evaluate_forward_ref' from 'typing_extensions'
-# -- in dbt, not in cosmos, and not until something runs dbt. Verified by
-# building this image both ways and running `dbt --version`.
-#
-# So: install cosmos alone and add its two genuinely-new dependencies by hand.
-# `pip install --dry-run` against this image showed the whole delta was
-# `aenum` + `deprecation` (plus that typing_extensions downgrade); everything
-# else cosmos wants -- airflow, attrs, packaging, msgpack, pydantic, virtualenv
-# -- is already present at a version it accepts. Re-run that dry run before
-# moving COSMOS_VERSION.
-#
-# Cosmos invokes the `dbt` EXECUTABLE installed above (see
-# ExecutionConfig.dbt_executable_path in airflow/dags/dbt_builds.py) rather
-# than importing dbt-core, so the validated dbt-core==1.8.7 /
-# dbt-spark==1.8.0 pins stay authoritative.
+# --no-deps, AND THAT IS NOT AN OPTIMISATION -- installing it under Airflow's
+# constraint file breaks every subsequent dbt invocation. Re-run
+# `pip install --dry-run` before moving COSMOS_VERSION. The `dbt --version`
+# smoke check below is what stops that shipping silently.
+# See docs/DECISIONS.md#cosmos-no-deps
 ARG COSMOS_VERSION=1.15.1
-RUN pip install --no-cache-dir --no-deps "astronomer-cosmos==${COSMOS_VERSION}"     && pip install --no-cache-dir "aenum" "deprecation"     && dbt --version >/dev/null     && python -c "import cosmos; print('cosmos', cosmos.__version__)"
+RUN pip install --no-cache-dir --no-deps "astronomer-cosmos==${COSMOS_VERSION}" \
+    && pip install --no-cache-dir "aenum" "deprecation" \
+    && dbt --version >/dev/null \
+    && python -c "import cosmos; print('cosmos', cosmos.__version__)"
 
-# Marimo, for the developer exploration notebook (notebooks/explore.py, served
-# by the `notebook` service on 8083). Marimo rather than Jupyter because its
-# notebooks ARE Python files -- they diff, review and merge like any other
-# source in this repo, where a Jupyter .ipynb is a JSON blob carrying outputs
-# and execution counts that make every save a conflict.
-#
-# Installed unpinned deps but marimo itself pinned: `pip install --dry-run`
-# against this image showed it adds only new packages (jedi, msgspec,
-# narwhals, pyzmq and friends) and moves nothing already here -- notably NOT
-# typing_extensions, which is the one that broke dbt when cosmos went in under
-# a constraint file. Re-run that dry run before moving this pin.
+# Marimo, for notebooks/explore.py. Pinned; its deps are not, because they move
+# nothing already installed. Re-run that dry run before moving the pin.
+# See docs/DECISIONS.md#marimo-not-jupyter
 ARG MARIMO_VERSION=0.24.0
 RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
     && dbt --version >/dev/null \
@@ -140,53 +69,15 @@ RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
 
 # ---------------------------------------------------------------------------
 USER root
-# Writable working directories for dbt, created HERE rather than left to the
-# runtime, because the process that needs them cannot create them:
-# /opt/platform is root-owned and this image runs as uid 50000.
+# dbt's working directories, outside the ./dbt bind mount because a bind mount
+# takes its ownership from the host. airflow:0 with g+rwX, so an arbitrary
+# assigned uid in group 0 can still write.
+# See docs/DECISIONS.md#dbt-working-directories
 #
-# All three of dbt's working directories -- logs, target and dbt_packages --
-# live under /opt/platform/run, OUTSIDE the ./dbt bind mount, and are pointed
-# at from docker-compose.yml (DBT_LOG_PATH, DBT_TARGET_PATH) and
-# dbt/dbt_project.yml (packages-install-path). A bind mount takes its ownership
-# from the HOST, so nothing done to /opt/platform/dbt in this image survives
-# into the container: on Docker Desktop for Windows the host side presents 0777
-# and it works by accident, on a host where the checkout is not owned by uid
-# 50000 `airflow-init` dies before it can run `dbt deps`. A path that is never
-# mounted over cannot fail that way.
-#
-# logs and target are per-container: image paths with nothing mounted over
-# them, so each service gets its own and two dbt processes cannot interleave
-# their output. dbt_packages CANNOT work that way -- airflow-init installs it
-# and the scheduler, webserver, triggerer and feed console all read it, while
-# an image path is copy-on-write PER CONTAINER, so the init container's install
-# lands in a layer discarded when it exits. That presents as `dbt deps`
-# succeeding and then, from every process that needed them,
-#     dbt found 1 package(s) specified in packages.yml, but only 0 package(s)
-#     installed in ...
-# So /opt/platform/run/packages exists to have a named volume mounted ON it,
-# shared by every service.
-#
-# The volume goes one level ABOVE the packages directory, not on it, and that
-# is not cosmetic: `dbt deps` rmtree's the packages directory before
-# reinstalling, and a mount point cannot be removed --
-#     OSError: [Errno 16] Device or resource busy: 'dbt_packages'
-# -- which is what a volume mounted directly at dbt_packages gives you, on
-# every `up`, on every host. One level up, dbt_packages is an ordinary
-# subdirectory inside the volume and removes cleanly.
-#
-# chown to airflow:0 and chmod g+rwX, NOT chown to uid 50000 alone and not
-# chmod 777. The container already runs uid=50000 gid=0 (verified with `id`
-# inside the running scheduler), and group 0 is what stays writable when the
-# platform assigns an arbitrary uid -- which is exactly what OpenShift does.
-# See docs/OPENSHIFT-MAPPING.md.
+# Last in the file so it cannot invalidate the pip layers above.
+# See docs/DECISIONS.md#image-permissions-layer
 RUN mkdir -p /opt/platform/run/dbt/logs /opt/platform/run/dbt/target \
              /opt/platform/run/packages \
     && chown -R airflow:0 /opt/platform/run \
     && chmod -R g+rwX /opt/platform/run
 USER airflow
-
-# Last in the file ON PURPOSE. This layer changes far more often than the pip
-# installs above it, and Docker invalidates every layer after the one that
-# changed -- put it higher and editing a directory list costs a full
-# reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
-# whatever registry mirror is in front of pip. Nothing below depends on it.
