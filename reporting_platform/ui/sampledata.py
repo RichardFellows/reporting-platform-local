@@ -40,6 +40,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from reporting_platform.common.volatility import (
+    epoch, epoch_start, hold_for_type, stable_rng)
 from reporting_platform.common.context import Feed, feeds
 
 from .feeddata import SEED_DIR, seed_dir
@@ -249,6 +251,33 @@ def _value(column: str, kind: str, row: int, business_date: date,
     return f"{_prefix(column)}-{rng.randint(1000, 9999)}"
 
 
+def _row_rng(entity: str, column: str, kind: str, business_date: date,
+             version: int | None):
+    """The stream one cell is drawn from: stable while its epoch is."""
+    return stable_rng(entity, column, version or 1,
+                      epoch(f"{entity}|{column}", business_date,
+                            hold_for_type(kind)))
+
+
+def _row_anchor(entity: str, column: str, kind: str, business_date: date) -> date:
+    """What a generated `date` column is measured FROM.
+
+    The business date would be the obvious anchor and is wrong: `_value` emits
+    `anchor + offset`, so anchoring on `bd` slides the result forward one day
+    per delivery and a date column changes every single day however stable its
+    epoch is -- which quietly defeats the whole point for any feed that has
+    one. Anchoring on the epoch start makes the date hold still with everything
+    else and move when the value genuinely changes.
+
+    The cost is that a column that really should track the business date (a
+    valuation date, say) now does not. That is the right way round: the
+    platform already records the delivery date as `_business_date`, so a feed
+    needing "as of today" has it, whereas nothing can recover a stable
+    effective_date from one that moves.
+    """
+    return epoch_start(f"{entity}|{column}", business_date, hold_for_type(kind))
+
+
 # ---------------------------------------------------------------- generation
 def generate(feed: Feed, *, days: int = 3, rows: int = 0,
              end: date | None = None, version: int | None = None,
@@ -284,12 +313,27 @@ def generate(feed: Feed, *, days: int = 3, rows: int = 0,
     target.mkdir(parents=True, exist_ok=True)
     for bd in chosen:
         name = filename_for(feed, bd, version)
-        seed_value = zlib.crc32(f"{feed.name}|{bd:%Y%m%d}|{version or 1}".encode())
-        rng = random.Random(seed_value)
         out_rows = []
         for i in range(1, rows + 1):
+            # One RNG per (row, column, EPOCH) rather than one per FILE.
+            #
+            # It used to be `random.Random(crc32(feed|date|version))` -- a new
+            # stream for every business date -- so every value in every row
+            # changed on every delivery. A feed generated here looked like the
+            # most volatile market data imaginable rather than like the
+            # reference data most new feeds are, and the change-detection the
+            # prepared layer exists to do had nothing to detect but noise.
+            #
+            # Keying on the epoch instead holds a value still for its type's
+            # hold period (volatility.HOLD_BY_TYPE) and changes it when that
+            # period rolls. `version` stays in the key so a _v2 redelivery is a
+            # genuine restatement, which is what the console's version field is
+            # for.
+            entity = f"{feed.name}#{i:05d}"
             out_rows.append([
-                _value(col, types.get(col, "string"), i, bd, rng,
+                _value(col, types.get(col, "string"), i,
+                       _row_anchor(entity, col, types.get(col, "string"), bd),
+                       _row_rng(entity, col, types.get(col, "string"), bd, version),
                        is_key=col in key, fk=fk_cache.get(col) or [])
                 for col in feed.columns
             ])

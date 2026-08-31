@@ -133,9 +133,30 @@ def check_orchestrator(now: datetime) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT is_paused, is_active FROM dag WHERE dag_id = %s",
-                (WATCHED_DAG,))
+            try:
+                cur.execute(
+                    "SELECT is_paused, is_active FROM dag WHERE dag_id = %s",
+                    (WATCHED_DAG,))
+            except psycopg2.errors.UndefinedTable:
+                # THE STACK IS STILL COMING UP. This container deliberately has
+                # no depends_on airflow-init -- a monitor that shares the
+                # lifecycle of the thing it monitors cannot report that thing
+                # being down -- so on a cold start it wins the race against
+                # `airflow db migrate` and there is no `dag` table to read yet.
+                #
+                # That is not "housekeeping is broken", and calling it an ALERT
+                # meant every single fresh clone opened with a red watchdog
+                # before anything had had a chance to go wrong. A monitor that
+                # cries wolf on first boot is a monitor people learn to skip,
+                # which costs more than the check is worth. WARN, with a
+                # message that says which of the two it is; it clears on the
+                # next pass once airflow-init has finished.
+                return [Finding(
+                    "metadata_db", WARN,
+                    "the Airflow metadata schema does not exist yet — "
+                    "airflow-init has not finished `db migrate`. Normal for "
+                    "the first minute of a cold start; if it persists, check "
+                    "`docker compose logs airflow-init`.")], facts
             row = cur.fetchone()
             if row is None:
                 findings.append(Finding(
@@ -401,13 +422,37 @@ def check_deferred_backlog(
 
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT s.live_set_id, s.identify_started, COUNT(*) "
-                "FROM gc_live_sets s "
-                "JOIN gc_file_deletions d ON d.live_set_id = s.live_set_id "
-                "WHERE s.set_status = 'EXPIRY_SUCCESS' "
-                "GROUP BY s.live_set_id, s.identify_started"
-            )
+            try:
+                cur.execute(
+                    "SELECT s.live_set_id, s.identify_started, COUNT(*) "
+                    "FROM gc_live_sets s "
+                    "JOIN gc_file_deletions d ON d.live_set_id = s.live_set_id "
+                    "WHERE s.set_status = 'EXPIRY_SUCCESS' "
+                    "GROUP BY s.live_set_id, s.identify_started"
+                )
+            except psycopg2.errors.UndefinedTable:
+                # `nessie_gc` is created empty by scripts/init-postgres.sql;
+                # the TABLES in it are created by the nessie-gc tool the first
+                # time housekeeping runs. So on any stack where housekeeping
+                # has never run, these tables are legitimately absent and the
+                # honest answer is "nothing has been deferred yet" -- not an
+                # alert. This fired on every fresh clone.
+                #
+                # But absent tables AFTER a successful housekeeping run is a
+                # real fault: the GC step did not do what the DAG says it did.
+                # So the same missing table is a fact or an alert depending on
+                # whether anything should have created it yet, which is exactly
+                # the distinction the rest of this check is built around --
+                # eligible is not the same as overdue.
+                if last_success_at is None:
+                    return [], {"deferred_backlog":
+                                "n/a (GC has never run; no tables yet)"}
+                return [Finding(
+                    "deferred_backlog", ALERT,
+                    "the Nessie GC tables do not exist even though "
+                    f"{WATCHED_DAG} last succeeded at {last_success_at} — the "
+                    "GC step cannot have run, so nothing is being "
+                    "reclaimed")], {}
             rows = cur.fetchall()
     finally:
         conn.close()

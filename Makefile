@@ -35,14 +35,21 @@ nuke: ## Stop and destroy all data
 seed: ## Generate sample upstream CSVs into seed/
 	# --end is pinned, not defaulted to today: the README walkthrough names
 	# specific generated filenames, and they all derive from this date.
-	python3 scripts/generate_feeds.py --months 30 --end 2026-08-19 --out seed
+	# Runs in the container, not on the host: seed/ is a bind mount so the
+	# files land on your disk either way, and QUICKSTART promises you do not
+	# need Python installed. --clean omits the two deliberate data-quality
+	# failures, so the build that follows can actually publish.
+	$(COMPOSE) exec -T airflow python /opt/platform/scripts/generate_feeds.py --months 30 --end 2026-08-19 --out /opt/platform/seed --clean
 
 .PHONY: land
 land: ## Upload seed CSVs into the S3 landing prefix
 	$(COMPOSE) exec -T airflow python -m scripts.land_feeds --source /opt/platform/seed
 
+# `pools` and `deps` both run automatically in `airflow-init` now. They are
+# kept because re-running them by hand is the first thing you do when a task is
+# stuck `queued` or dbt cannot find dbt_utils, and neither is destructive.
 .PHONY: pools
-pools: ## Create the Airflow pool that serialises lakehouse writes
+pools: ## Re-create the write pool (airflow-init already did this)
 	# ONE pool, deliberately. Ingest, dbt builds and maintenance all take this
 	# same slot -- a second one-slot pool would NOT exclude them from each
 	# other, which is exactly the bug that let remove_orphan_files run
@@ -50,7 +57,7 @@ pools: ## Create the Airflow pool that serialises lakehouse writes
 	$(COMPOSE) exec -T airflow airflow pools set lakehouse_write 1 "serialise all Iceberg writers, incl. maintenance"
 
 .PHONY: deps
-deps: ## Install dbt packages
+deps: ## Re-install dbt packages (airflow-init already did this)
 	$(DBT) deps $(DBT_ARGS)
 
 # NOTE: these three build on `main`, because nessie_ref defaults to main and
@@ -76,7 +83,8 @@ reporting: ## Build the reporting layer only -- on main, see note above
 .PHONY: lineage
 lineage: ## Generate and serve the dbt lineage docs
 	$(DBT) docs generate $(DBT_ARGS)
-	@echo "run: docker compose exec airflow dbt docs serve --port 8082"
+	@echo "run: docker compose exec airflow dbt docs serve --port 8083"
+	@echo "(NOT 8082 -- that is the feed console)"
 
 # --all-managed, not a hand-written --table list. These targets used to name
 # five tables against the DAG's nine, so `make retention` silently left four
@@ -101,10 +109,15 @@ maintenance: ## Run metric-driven maintenance
 	$(COMPOSE) exec -T airflow python -m reporting_platform.maintenance.maintain \
 	  --all-managed
 
-.PHONY: refs
+# `.PHONY: refs` used to sit here, immediately above `console:` -- so `console`
+# was never declared phony and `refs` was declared before the recipe it names.
+# A file called `console` in the repo root would have made `make console` a
+# silent no-op.
+.PHONY: console
 console: ## Start the feed console UI on http://localhost:8082
 	docker compose up -d feed-ui
 	@echo "feed console: http://localhost:8082"
 
+.PHONY: refs
 refs: ## List Nessie branches and tags
 	@curl -s http://localhost:19120/api/v2/trees | python3 -m json.tool

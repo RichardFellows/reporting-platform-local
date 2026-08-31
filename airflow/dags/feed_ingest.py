@@ -28,10 +28,24 @@ except ImportError:                     # Airflow 2.x
     from airflow.decorators import dag, task       # type: ignore
     _AF3 = False
 
+# Retry delay: SECONDS, not the five minutes this used to be.
+#
+# Five minutes is a sensible production number -- it waits out a transient
+# cluster or catalog blip without hammering it. On a laptop it is simply dead
+# time: the whole prepared build is about three minutes, so one retried task
+# doubled the wall clock of the thing you were watching, and a mid-graph
+# failure left the rest of the graph parked behind the pool for longer than the
+# build itself takes.
+#
+# Env-var'd rather than hard-coded so the OpenShift deployment can put its own
+# number back without a code change; the default is the local-stack one,
+# because this repo IS the local stack.
+RETRY_DELAY = timedelta(seconds=int(os.environ.get("AIRFLOW_RETRY_DELAY_SECONDS", "10")))
+
 DEFAULT_ARGS = {
     "owner": "data-platform",
     "retries": 2,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": RETRY_DELAY,
     "email_on_failure": False,
 }
 

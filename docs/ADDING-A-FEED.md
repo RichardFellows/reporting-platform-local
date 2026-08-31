@@ -63,6 +63,7 @@ Optional, and worth a thought rather than a default:
 | `cadence: weekly` | The feed does not deliver every business date. Without it the completeness check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
 | `completeness: false` | Monthly or ad-hoc. Opts out of the gap check entirely. |
 | `schema_drift: fail` | Abort the load on an extra *or* missing column instead of landing and warning. The default `warn` is usually right — a rejected file is a file nobody looks at. |
+| `column_types:` | A column whose prepared-layer treatment is not what its *name* implies. `haircut_pct` reads as a string to the inference but should be `decimal`; `settlement_ccy` is a code, not free text. Only list the disagreements — anything absent falls back to the inference. It is what the feed console writes when you change a type on the form, and what the sample-data generator reads, so the two cannot drift apart. Raw is still all strings; this describes the **prepared** model. |
 
 Verify before moving on:
 
@@ -215,10 +216,27 @@ back to binpack, so that is not a failure either.
 Local-stack only, but skip it and the feed has nothing to run against, and
 anyone regenerating the seed loses it.
 
-**Use a dedicated `random.Random(seed)`, not the module-level `random`.** All
-the existing generators draw from one stream seeded once at import, so adding
-a fourth consumer to it changes every trade notional and rating already in
-`seed/` — still valid data, and a diff covering the entire directory. Prove it
+**Draw values from `common/volatility.py`, not from a module-level
+`random`.** Two rules, and the second is the one that bites:
+
+*Never the shared stream.* Every generator drawing from one `random` seeded at
+import means the numbers any of them gets depend on how many draws came
+before, so adding a feed silently changes every trade notional and rating
+already in `seed/` — still valid data, and a diff covering the whole
+directory. `stable_rng(...)` seeds from the entity key instead, so generation
+order stops mattering at all.
+
+*A value is a function of (entity, epoch), not of (entity, date).* Reference
+data holds still. Generators here used to redraw every attribute on every
+business date, which made `primary_limits` carry 35 different amounts for one
+limit across its 35 delivered dates and gave `trade` a brand-new set of 400
+trade_ids every morning. Use `epoch()` to pick the block a value holds for and
+`epoch_start()` for any `*_date` that should say when the current value came
+into force. Keep the result a pure function of the business date — the seed is
+generated sparse for old history and dense for the tail, and anything walking
+from "yesterday's value" makes those two disagree.
+
+Prove it
 either way:
 
 ```powershell
@@ -250,6 +268,10 @@ docker compose exec -T airflow airflow dags unpause ingest_primary_limits
 
 Step 5 is the one that gets forgotten. `airflow dags list` shows a paused DAG
 identically to a running one except for a single boolean column.
+
+> **Adding a dbt model on its own** — a new mart with no new feed behind it —
+> is [ADDING-A-MODEL.md](ADDING-A-MODEL.md): two files, and no DAG edit either,
+> because Cosmos renders the build graph from the dbt project.
 
 ## What you did not have to touch
 

@@ -11,7 +11,7 @@ This table is the contract that keeps that true.
 | Nessie version store | Postgres container | existing Postgres/CockroachDB | JDBC URL |
 | Orchestration | Airflow LocalExecutor | Airflow KubernetesExecutor | executor config, pod template |
 | Spark | standalone master+worker | `spark-submit` in-cluster, or Spark Operator | `--master`, image ref |
-| dbt | runs in Airflow container | same image, KubernetesPodOperator | none |
+| dbt | Cosmos `ExecutionMode.LOCAL`, one task per model in the Airflow container | Cosmos `ExecutionMode.KUBERNETES`, same image, one pod per model | `ExecutionConfig` in `dbt_builds.py`; the rendered graph is unchanged |
 | Serving DB | Postgres container | an enterprise RDBMS | dbt/export target profile |
 | Secrets | `.env` | OpenShift Secrets / Vault | injection mechanism |
 | DAG deployment | bind mount | Forge CI → image → Helm | packaging only |
@@ -45,6 +45,36 @@ S3 directly.
 It is not free — it keeps a Windows footprint alive for longer and needs its own
 monitoring — so it is a trade, not an obvious win. But it is a smaller and more
 contained trade than in-cluster cross-domain Kerberos.
+
+### 1b. dbt execution mode
+
+The build DAGs are rendered by Astronomer Cosmos, and **the render is
+deployment-independent**: `LoadMode.DBT_LS` reads the dbt project the same way
+wherever it runs, so the task graph in OpenShift is the same graph as on a
+laptop. What changes is one field.
+
+`ExecutionConfig(execution_mode=ExecutionMode.LOCAL)` runs each model as a dbt
+subprocess inside the Airflow container. `ExecutionMode.KUBERNETES` runs each
+one as a pod instead, which is the same substitution the ingest tasks make when
+`_spark_task.py` becomes a KubernetesPodOperator issuing `spark-submit` — same
+module, same arguments, a different execution wrapper.
+
+Two things carry over rather than being re-decided:
+
+- **`InvocationMode.SUBPROCESS` stays**, for the local mode. It is not a
+  laptop concession: the dbt target is `method: session`, so dbt builds a
+  SparkSession in-process, and Cosmos's default `DBT_RUNNER` would leave that
+  JVM inside the task process to be zombie-reaped. Under
+  `ExecutionMode.KUBERNETES` the pod boundary supplies the same isolation and
+  the setting stops applying.
+- **The `lakehouse_write` pool is a local capacity guard**, sized against one
+  6-core standalone worker. In the cluster the constraint is different — the
+  serialisation that still matters is *writer* exclusion (maintenance must not
+  run alongside a write), not core starvation, so keep the pool but revisit
+  the slot count alongside the Spark execution model below.
+
+**UNPROVEN: no cluster has ever run this.** The same caveat as the `spark_ocp`
+dbt target it would use.
 
 ### 2. Spark execution model
 

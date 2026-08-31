@@ -10,7 +10,6 @@
 # catalog's default branch, it silently drops `partition_by` so it cannot
 # reproduce the partition spec retention depends on, and it cannot INSERT to a
 # partitioned table without an explicit override. Any one is disqualifying.
-#1".
 #
 # DuckDB is still here, as a READER for people rather than an engine for the
 # pipeline: `scripts/duckdb_console.py` opens a read-only session against

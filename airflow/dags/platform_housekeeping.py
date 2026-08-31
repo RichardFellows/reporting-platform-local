@@ -59,8 +59,15 @@ try:
 except ImportError:
     from airflow.decorators import dag, task  # type: ignore
 
+# 3x the base delay (30s locally, and still the longest of the three DAGs).
+# Housekeeping's tasks are the slow destructive ones, so retrying one straight
+# away is more likely to collide with whatever it collided with the first time.
+# See the RETRY_DELAY note in dbt_builds.py for why this is no longer minutes.
+RETRY_DELAY = timedelta(
+    seconds=3 * int(os.environ.get("AIRFLOW_RETRY_DELAY_SECONDS", "10")))
+
 DEFAULT_ARGS = {"owner": "data-platform", "retries": 1,
-                "retry_delay": timedelta(minutes=15)}
+                "retry_delay": RETRY_DELAY}
 
 
 

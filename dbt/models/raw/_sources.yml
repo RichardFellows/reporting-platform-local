@@ -75,3 +75,9 @@ sources:
             tests: [not_null]
           - name: counterparty_id
             tests: [not_null]
+      - name: collateral
+        description: Collateral positions held against counterparty exposure, from the collateral management
+          system (COLL_SRC).
+        columns:
+          - name: collateral_id
+            tests: [not_null]

@@ -88,6 +88,30 @@ Two corollaries worth holding on to:
   the next job waits forever instead of failing. Watch it at
   <http://localhost:8080>. See `docs/ARCHITECTURE.md` § *Where Spark actually
   runs* for the jar-shipping and Python-version constraints.
+- **The dbt build DAGs are rendered by Astronomer Cosmos**, one Airflow task
+  per model, derived from the dbt project on every parse — so **adding a model
+  needs no DAG edit either** — `docs/ADDING-A-MODEL.md` has the two files it
+  does touch. Four settings in `dbt_builds.py` are load-bearing
+  and the docstring says why each one is there: `InvocationMode.SUBPROCESS`
+  (a `method: session` target builds a JVM in-process and the task gets
+  zombie-reaped), the `lakehouse_write` pool on *every* rendered task (one dbt
+  invocation is one Spark app; standalone mode holds cores until the session
+  stops), `LoadMode.DBT_LS` (Cosmos's own CUSTOM parser double-emits every test
+  and misses model-level ones), and `TestBehavior.AFTER_ALL` (AFTER_EACH is 51
+  JVM starts; BUILD drops or misorders cross-model `relationships` tests).
+- **`astronomer-cosmos` is installed `--no-deps`, and that is not an
+  optimisation.** Installing it under Airflow's constraint file pins
+  `typing_extensions==4.12.2`, dbt's `mashumaro` needs `evaluate_forward_ref`
+  from 4.13+, and **every dbt invocation then dies at import** — in dbt, not in
+  cosmos, and not until something runs dbt. `Dockerfile.airflow` runs
+  `dbt --version` as a build-time smoke check so that cannot ship silently
+  again. Re-run `pip install --dry-run` before moving `COSMOS_VERSION`.
+- **`airflow-init` now does four things, not two**: db migrate, admin user,
+  `airflow pools set lakehouse_write 1`, and `dbt deps`. The last two were
+  manual steps that broke the platform silently when skipped — and `dbt deps`
+  is no longer optional at all, because Cosmos renders the build DAGs by
+  running `dbt ls`, which cannot compile a `dbt_utils` test without the
+  package. No `dbt_packages/` now means those two DAGs do not *import*.
 - **Adding a feed is six files and no DAG edit** — `docs/ADDING-A-FEED.md`
   has them in order. The only one that fails silently if you skip it is
   `PREPARED_TABLES` in `common/context.py`: the table just never gets
@@ -125,6 +149,14 @@ docker compose exec -T airflow python -m reporting_platform.maintenance.maintain
 # DAGs
 docker compose exec -T airflow airflow dags list-runs -d prepared_build -o plain
 docker compose exec -T airflow airflow dags trigger ingest_trade
+
+# what Cosmos rendered -- one *_run task per dbt model, plus dbt_test
+docker compose exec -T airflow airflow tasks list prepared_build
+
+# unpause everything (derive the list; a written-down one goes stale per feed)
+docker compose exec -T airflow airflow dags list -o plain | ForEach-Object {
+  ($_ -split '\s+')[0] } | Select-Object -Skip 1 | ForEach-Object {
+  docker compose exec -T airflow airflow dags unpause $_ }
 
 # housekeeping -- the conf JSON needs bash, PowerShell mangles the quoting
 #   MSYS_NO_PATHCONV=1 docker compose exec -T airflow airflow dags trigger \

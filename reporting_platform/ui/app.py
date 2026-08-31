@@ -94,11 +94,14 @@ def _summary(fd) -> dict[str, Any]:
         "filename_pattern": fd.filename_pattern,
         "business_key": list(fd.business_key),
         "columns": list(fd.columns),
-        # Scaffolding defaults only. Types are NOT part of the registry -- raw
-        # is all strings by design -- so these are inferred from the column
-        # names each time, and describe what a re-scaffold would emit rather
-        # than what the existing prepared model actually does.
-        "column_types": scaffold.infer_types(list(fd.columns)),
+        # Stored overrides first, inference only as the fallback. This USED to
+        # be a bare `infer_types(fd.columns)`, which meant the endpoint the
+        # edit form is populated from re-guessed every type on every read --
+        # so a type the user chose was shown back to them as whatever the
+        # column name suggested, and `readTypes()` then posted that guess
+        # back. The choice survived exactly one scaffold call. See
+        # Feed.column_types in common/context.py for what that cost.
+        "column_types": scaffold.resolve_types(fd),
         "expected_min_rows": fd.expected_min_rows,
         "cadence": fd.cadence,
         "completeness": fd.completeness,
@@ -139,10 +142,15 @@ def api_create_feed(payload: dict):
     feeds -- would fail to parse.
     """
     spec = FeedSpec.from_payload(payload)
+    # Reduce the form's full type map to just the genuine disagreements, and
+    # PERSIST them: that is what makes the choice outlive this request. The
+    # scaffold below then builds from the same resolved map the generator will
+    # read later, rather than from a value only this call can see.
+    spec.column_types = scaffold.overrides_only(spec.columns, spec.column_types)
     registry.validate(spec, existing=set(feeds()))
     registry.add(spec)
 
-    types = payload.get("column_types") or scaffold.infer_types(spec.columns)
+    types = scaffold.resolve_types(feeds()[spec.name])
     steps = scaffold.scaffold(spec, {c: types.get(c, "string") for c in spec.columns})
     return {"feed": _summary(feeds()[spec.name]),
             "steps": [s.__dict__ for s in steps],
@@ -161,6 +169,10 @@ def api_update_feed(name: str, payload: dict):
     """
     payload = {**payload, "name": name}
     spec = FeedSpec.from_payload(payload)
+    # Same reduction as create, or an edit would drop the overrides: the form
+    # posts a full type map, and anything not persisted here reverts to the
+    # name-based guess on the next read.
+    spec.column_types = scaffold.overrides_only(spec.columns, spec.column_types)
     registry.validate(spec, existing=set(feeds()), updating=True)
     registry.update(spec)
     return _summary(feeds()[name])
@@ -198,7 +210,7 @@ def api_rescaffold(name: str, payload: dict | None = None):
     """Re-run steps 2-5 for an existing feed. Fills gaps; overwrites nothing."""
     fd = _feed_or_404(name)
     spec = registry.spec_from_feed(fd)
-    types = (payload or {}).get("column_types") or scaffold.infer_types(spec.columns)
+    types = (payload or {}).get("column_types") or scaffold.resolve_types(fd)
     steps = scaffold.scaffold(spec, {c: types.get(c, "string") for c in spec.columns})
     return {"steps": [s.__dict__ for s in steps], "scaffold": scaffold.status(name),
             "validation": _validate_after(steps, payload or {})}
@@ -294,6 +306,21 @@ def api_column_types():
     return {"types": scaffold.COLUMN_TYPES}
 
 
+@app.post("/api/infer-types")
+def api_infer_types(payload: dict):
+    """Guess types for column names typed by hand, not read from a CSV.
+
+    `/api/infer-columns` has always done this, but only for an uploaded file,
+    so a column added with "+ column" defaulted to `string` while the same
+    column read from a header got `decimal`. That gap mattered little when the
+    type was used once to scaffold and thrown away; now that it is persisted
+    and drives the sample-data generator too, a silently wrong default is the
+    exact divergence `Feed.column_types` exists to stop.
+    """
+    columns = [str(c).strip() for c in (payload.get("columns") or []) if str(c).strip()]
+    return {"column_types": scaffold.infer_types(columns)}
+
+
 # --------------------------------------------------------------------- data
 @app.get("/api/feeds/{name}/files")
 def api_files(name: str):
@@ -341,12 +368,19 @@ def api_generate(name: str, payload: dict | None = None):
     fd = _feed_or_404(name)
     p = payload or {}
     from datetime import date as _date
+    # types= is NOT optional here, and leaving it off was the bug. Without it
+    # `sampledata.generate` falls back to `infer_types(feed.columns)` and
+    # re-guesses from the column name -- so a column the prepared model
+    # safe_casts to DECIMAL got a non-numeric sample value, landed 100% NULL,
+    # and the build passed because safe_cast is meant to null and nothing
+    # tested it. Same resolved map the scaffold used.
     return sampledata.generate(
         fd,
         days=int(p.get("days") or 3),
         rows=int(p.get("rows") or 0),
         end=_date.fromisoformat(p["end"]) if p.get("end") else None,
         version=int(p["version"]) if p.get("version") else None,
+        types=scaffold.resolve_types(fd),
     )
 
 
@@ -466,6 +500,33 @@ def api_run(dag_id: str, run_id: str):
 @app.get("/api/runs/{dag_id}")
 def api_runs(dag_id: str, limit: int = 5):
     return {"dag_id": dag_id, "runs": orchestration.recent_runs(dag_id, limit)}
+
+
+@app.get("/api/feeds/{name}/state")
+def api_feed_state(name: str):
+    """Cheap per-feed pipeline state for the stage strip. NO Spark.
+
+    Deliberately does not call `feeddata.pending()`, which starts a Spark job:
+    this is rendered every time the Run tab opens and after every run, and a
+    strip that cost 30s of cluster time to draw would simply be turned off.
+    Counts of seed and landed objects come from the filesystem and S3 listing;
+    the three DAG stages come from the metadata DB.
+    """
+    fd = _feed_or_404(name)
+    out: dict = {"seed": len(feeddata.list_seed(fd)),
+                 "landed": len(feeddata.list_landed(fd))}
+    for stage, dag_id in (("raw", f"ingest_{fd.name}"),
+                          ("prepared", orchestration.PREPARED_BUILD_DAG),
+                          ("reporting", orchestration.REPORTING_BUILD_DAG)):
+        try:
+            runs = orchestration.recent_runs(dag_id, 1)
+            out[stage] = {"state": runs[0]["state"] if runs else None,
+                          "run_id": runs[0]["run_id"] if runs else None}
+        except orchestration.AirflowError:
+            # Airflow down must not blank the strip -- the seed/landing halves
+            # are still true and still worth showing.
+            out[stage] = {"state": "unknown", "run_id": None}
+    return out
 
 
 @app.get("/api/pipeline")

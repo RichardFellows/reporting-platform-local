@@ -6,12 +6,13 @@ This is the short path. [`README.md`](../README.md)'s numbered walkthrough is
 the long one and explains *why* at each step — read that when you want to
 understand the platform rather than start it.
 
-**Budget an hour for a cold start**, almost all of it downloads. Measured on a
-`docker compose down -v` rebuild: stack up in **42s**, seed **2s**, land
-**4s**, and the ingest about **half an hour** — that one is dominated by a
-one-off ~200 MB Iceberg/Nessie/S3A jar resolution on the first Spark call.
-Builds are a couple of minutes. Add time on the very first run for the Airflow
-image build, which was already cached when this was measured.
+**Budget about 40 minutes for a cold start**, almost all of it the ingest.
+Measured end to end from `docker compose down -v` with every gitignored
+artefact deleted: stack up **53s**, seed **2s**, land **6s**, ingest
+**29min**, then the two builds a few minutes. The ingest is dominated by a
+one-off ~200 MB Iceberg/Nessie/S3A jar resolution on the first Spark call and
+by starting a fresh JVM per ten-file chunk. Add time on the very first run for
+the Airflow image build, which was already cached when this was measured.
 
 ---
 
@@ -47,13 +48,25 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Eleven services are defined; **nine stay running**: `minio`, `postgres`,
+Twelve services are defined; **ten stay running**: `minio`, `postgres`,
 `nessie`, `spark-master`, `spark-worker`, `airflow` (scheduler *and* task
-execution), `airflow-webserver`, `airflow-triggerer` and `watchdog`.
+execution), `airflow-webserver`, `airflow-triggerer`, `feed-ui` and
+`watchdog`. (This page said eleven and nine until `feed-ui` was added and the
+count was not updated with it.)
 
-The other two are one-shot and **exiting is the correct outcome** for both:
-`minio-init` creates the buckets, and `airflow-init` migrates the metadata DB
-and creates the admin user.
+The other two are one-shot and **exiting `(0)` is the correct outcome** for
+both:
+
+- `minio-init` creates the buckets.
+- `airflow-init` migrates the metadata DB, creates the admin user, **creates
+  the `lakehouse_write` pool and runs `dbt deps`**. The last two used to be
+  manual steps later in this guide; both are done for you now, because
+  forgetting either broke the platform without saying so. Worth a glance the
+  first time:
+
+  ```bash
+  docker compose logs airflow-init | tail -20
+  ```
 
 ### Where everything lives
 
@@ -154,44 +167,36 @@ loss.
 
 From the seed generated above, expect roughly:
 
-| Table | Rows | Files |
-|---|---|---|
-| `raw.trade` | 16,400 | 41 of 55 landed |
-| `raw.counterparty` | 2,400 | 40 of 53 landed |
-| `raw.rating` | 5,500 | 36 of 36 landed |
+| Table | Files |
+|---|---|
+| `raw.trade` | 41 of 55 landed |
+| `raw.counterparty` | 40 of 53 landed |
+| `raw.rating` | 36 of 36 landed |
+| `raw.primary_limits` | 40 of 53 landed |
+
+157 files in total. (`primary_limits` was missing from this table until the
+cold run above counted them.)
 
 ---
 
 ## 5. Build and publish `prepared` and `reporting`
 
-Two things are needed before Airflow will run anything.
-
-**The write pool** — without it every task sits queued forever:
-
-```bash
-docker compose exec -T airflow airflow pools set lakehouse_write 1 \
-  "serialise all Iceberg writers, incl. maintenance"
-```
-
 **Unpause the DAGs.** Airflow pauses every DAG at creation and this repo does
-not override that, so on a fresh clone all six are paused and no build will
-ever fire:
+not override that, so on a fresh clone they are all paused and no build will
+ever fire. Ask Airflow what exists rather than naming them — the DAG set is
+derived from `feeds.yml`, so a hard-coded list here goes stale the first time
+anyone adds a feed. It already had: it named six, and `ingest_primary_limits`
+made seven.
 
 ```bash
-for d in ingest_trade ingest_counterparty ingest_rating \
-         prepared_build reporting_build platform_housekeeping; do
-  docker compose exec -T airflow airflow dags unpause $d
-done
+docker compose exec -T airflow airflow dags list -o plain | awk 'NR>1 {print $1}' |
+  xargs -n1 docker compose exec -T airflow airflow dags unpause
 ```
 
-Now install the dbt package dependency and trigger a build. `dbt deps` is
-mandatory — `dbt/dbt_packages/` is not committed and `packages.yml` requires
-`dbt_utils`:
+The write pool and `dbt deps` were both manual steps here and are now run by
+`airflow-init` — see step 1. Nothing else to set up, so trigger the build:
 
 ```bash
-docker compose exec -T airflow dbt deps \
-  --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
-
 docker compose exec -T airflow airflow dags trigger prepared_build -r first_build
 ```
 
@@ -225,14 +230,18 @@ docker compose exec -T airflow python -m scripts.duckdb_console \
    group by 1 order by 1 desc limit 5"
 ```
 
-Nine tables across `raw`, `prepared` and `reporting` means the whole chain
-landed.
+**Eleven** tables across `raw`, `prepared` and `reporting` means the whole
+chain landed — four `raw`, four `prepared`, three `reporting`. (This page said
+nine until the `primary_limits` feed added one to each of the first two
+layers.)
 
 Expected row counts after the build:
 
 | Table | Rows |
 |---|---|
 | `prepared.trade` | 16,000 |
+| `prepared.primary_limits` | 5,755 |
+| `reporting.counterparty_exposure` | 2,400 |
 | `reporting.exposure_change` | 2,400 |
 
 Check the catalog:
@@ -280,9 +289,11 @@ Exit code 0 is healthy; non-zero means at least one ALERT.
 
 | Symptom | Cause |
 |---|---|
-| Tasks stay `queued` forever | The `lakehouse_write` pool does not exist — step 5. |
+| Tasks stay `queued` forever | The `lakehouse_write` pool does not exist. `airflow-init` creates it — check `docker compose logs airflow-init`, then `make pools`. |
 | Nothing happens when you land a file | The DAGs are paused. Airflow does that at creation; step 5 unpauses them. |
-| `dbt found 1 package(s) specified in packages.yml, but only 0 installed` | `dbt deps` — step 5. |
+| `dbt found 1 package(s) specified in packages.yml, but only 0 installed` | `dbt deps` did not run. `airflow-init` does it; re-run with `make deps`. |
+| `prepared_build` / `reporting_build` are missing, with an import error in the UI | Same cause. Cosmos renders those two DAGs by running `dbt ls`, which cannot compile a `dbt_utils` test without `dbt_packages/`, so the DAG file fails to import rather than the build failing later. `make deps`, then wait one parse interval. |
+| One dbt model task is red and a `build/*` branch survived | Working as intended: `main` is untouched and the branch holds the exact bad data. `build/*` is swept after 120h, `ingest/*` after 48h. |
 | The DAG `--conf` flag errors on Windows | PowerShell mangles single-quoted JSON. Use Git Bash. |
 | `dbt_test` fails and nothing publishes | Expected if you generated **without** `--clean`: two data-quality failures are injected on purpose. The branch is kept for inspection and `main` is correctly untouched. |
 | First Spark command takes many minutes | One-off Maven jar resolution. Cached under `~/.ivy2` in the container afterwards. |
@@ -310,16 +321,29 @@ docker compose down -v      # destroys all data and volumes
 | | |
 |---|---|
 | [`README.md`](../README.md) | The same journey, step by step, with the reasoning. Section 14 covers the scheduler in more depth. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, write-audit-publish, why Spark is the only build engine |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, write-audit-publish, why Spark is the only build engine, how Cosmos renders the builds |
+| [`ADDING-A-FEED.md`](ADDING-A-FEED.md) | Onboard a new feed — six files, no DAG edit |
+| [`ADDING-A-MODEL.md`](ADDING-A-MODEL.md) | Add a dbt model — two files, no DAG edit |
 | [`RETENTION.md`](RETENTION.md) | Why tag retention *is* data retention |
 | [`MAINTENANCE.md`](MAINTENANCE.md) | The Iceberg procedures and their ordering |
 
 ---
 
 *Executed end to end from `docker compose down -v` with every gitignored
-artefact removed, on 2026-08-22 — stack up in 42s, seed in 2s, land in 4s,
-ingest ~30min cold, build and asset-triggered reporting build both green,
-nine tables queryable. Two errors in an earlier draft of this page were found
-by that run and corrected: it claimed `published/*` tags would exist (they are
-cut by the ingest DAG, which this path bypasses) and it did not explain why
-fewer files are ingested than landed.*
+artefact removed, on 2026-08-30 — stack up **53s**, seed **2s**, land **6s**,
+ingest **28m56s** (157 files), `prepared_build` **3m18s** and the
+asset-triggered `reporting_build` **2m56s**, both green, eleven tables
+queryable at the documented row counts. Then a single new delivery landed and
+run through `ingest_trade`: it cut `published/2026-08-20/demo2`, and
+`prepared_build` and `reporting_build` each fired themselves off the asset
+below them, ending with `2026-08-20` in `reporting.exposure_change` and the
+catalog holding `main` and that one tag — no surviving `build/*` branch. The
+nightly housekeeping DAG was also run as a dry run (5/5 tasks green) and the
+watchdog exits 0.*
+
+*Corrections that run forced into this page: the service count (eleven/nine →
+twelve/ten, stale since `feed-ui` was added), the table count (nine → eleven,
+stale since the `primary_limits` feed), a hard-coded six-DAG unpause list that
+had never included `ingest_primary_limits`, and the manual pool/`dbt deps`
+steps, which are now done by `airflow-init` because forgetting either failed
+silently.*

@@ -90,6 +90,33 @@ def infer_types(columns: list[str]) -> dict[str, str]:
     return {c: infer_type(c) for c in columns}
 
 
+def resolve_types(feed) -> dict[str, str]:
+    """The authoritative per-column treatment: stored overrides beat the guess.
+
+    ONE function, called by everything that needs to know what a column is --
+    the API summary, the scaffold, and the sample-data generator. They used to
+    each call `infer_types` separately, which is only the same answer while
+    nobody disagrees with the guess. The moment someone did, the scaffold used
+    their choice and the generator used the guess, and the two artefacts no
+    longer described the same column.
+
+    Sparse by design: `feed.column_types` holds only genuine overrides, so a
+    feed nobody has corrected resolves exactly as it always did.
+    """
+    return {**infer_types(list(feed.columns)), **(feed.column_types or {})}
+
+
+def overrides_only(columns: list[str], chosen: dict[str, str]) -> dict[str, str]:
+    """Reduce a full type map to just what disagrees with the inference.
+
+    What gets persisted. Writing all of them would put eight lines of mostly
+    redundant YAML in every feed block and bury the one line that is a
+    decision; writing none of them is the bug this exists to fix.
+    """
+    return {c: t for c in columns
+            if (t := chosen.get(c)) and t != infer_type(c)}
+
+
 @dataclass
 class Step:
     """What one scaffolding step did, for the UI to report honestly."""

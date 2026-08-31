@@ -153,6 +153,36 @@ flowchart TB
     class AT,AC,AR,AP,ARP asset
 ```
 
+#### Inside a build: one task per dbt model
+
+`prepared_build` and `reporting_build` are not two `dbt run` / `dbt test`
+shell-outs any more. [Astronomer Cosmos](https://astronomer.github.io/astronomer-cosmos/)
+reads the dbt project and **renders one Airflow task per model**, wired in the
+models' own `ref()` order, with a test task closing the layer:
+
+```
+open_branch ─► dbt.counterparty_run ─┐
+            ├─► dbt.rating_run       ├─► dbt.dbt_test ─┬─► publish
+            ├─► dbt.trade_run        │                 └─► keep_failed_branch
+            └─► dbt.primary_limits_run ─┘
+```
+
+The shape of the build is unchanged — branch, build, test, merge only if clean
+— but a broken model is now a red task **carrying that model's name**, and a
+clear-and-retry restarts from the model that failed rather than from the top of
+the layer.
+
+The graph is derived from the dbt project on every DAG parse, so **a new
+`.sql` file under `models/prepared/` becomes a new task by itself**, with no
+DAG edit — the same property `feeds.yml` already had for ingest DAGs. Verified
+live: a model added to the project appeared as a task within one parse
+interval.
+
+Three settings in `dbt_builds.py` are load-bearing rather than stylistic
+(`InvocationMode.SUBPROCESS`, the `lakehouse_write` pool on every rendered
+task, and `LoadMode.DBT_LS`); the module docstring explains what each one
+prevents and what went wrong without it.
+
 A late feed does not block the feeds that did arrive — the reporting layer
 carries forward the last good version of that dimension and a freshness test
 flags it. That is a deliberate behavioural change from the legacy scheduler's gated model
@@ -174,6 +204,7 @@ the notes in this table before moving one.
 | **MinIO** | `RELEASE.2024-09-22T00-33-43Z` | `docker-compose.yml` | Stand-in for the on-prem S3-compatible store. `mc` is pinned separately for the bucket-init job. |
 | **dbt-core** | **1.8.7** | `Dockerfile.airflow` | Held back deliberately. It is what every DAG runs on and what has been validated; a bump needs a planned re-verification of both layers, not an opportunistic one. |
 | **dbt-spark** | **1.8.0** (`[PyHive]`) | `Dockerfile.airflow` | The only dbt adapter installed — see below. |
+| **astronomer-cosmos** | **1.15.1** | `Dockerfile.airflow` | Renders the dbt project into Airflow tasks. Installed `--no-deps`, and that is **not** an optimisation: installing it under Airflow's constraint file downgrades `typing_extensions` 4.16 -> 4.12, and dbt's `mashumaro` needs `evaluate_forward_ref` from 4.13+, so **every dbt invocation dies at import** — in dbt, not in cosmos, and not until something runs dbt. The image build now runs `dbt --version` as a smoke check so that can never ship silently again. |
 | **DuckDB** | **1.5.5** | `Dockerfile.airflow` | For `scripts/duckdb_console.py` only. 1.1.3's iceberg extension has no catalog `ATTACH` at all and fails with `Binder Error: Unrecognized storage type "ICEBERG"`. |
 | **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `dbt/profiles.yml`, `reporting_platform/common/context.py` | S3A filesystem for reading landing CSVs. Deliberately **not** baked into `Dockerfile.spark`: the driver resolves it via `spark.jars.packages` and ships it to the executors, so there is one place the version is set. |
 
@@ -202,6 +233,7 @@ rather than loud:
 | **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands. Start here.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, Nessie write-audit-publish, per-feed DAG topology, why Spark is the only build engine |
 | **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the six files a new feed touches, in order, with the worked `primary_limits` example |
+| **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same six files through a form, plus land/ingest/build buttons |
 | [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
@@ -224,7 +256,8 @@ reporting_platform/            the platform library (NOT named `platform` — th
   retention/              branch/tag/row/snapshot/orphan expiry, in order
 airflow/dags/
   feed_ingest.py          one DAG per feed, generated from feeds.yml
-  dbt_builds.py           asset-triggered prepared and reporting builds
+  dbt_builds.py           asset-triggered prepared and reporting builds;
+                          the dbt tasks inside them are rendered by Cosmos
   platform_housekeeping.py  nightly maintenance then retention
 dbt/                      prepared + reporting models, tests, exposures
 docs/                     architecture, retention, maintenance, OpenShift
@@ -630,37 +663,49 @@ above is actually claiming. This section is how you see it.
 ### First: unpause the DAGs
 
 **Airflow pauses every DAG at creation.** Nothing in this repo overrides that,
-so on a fresh clone all six sit paused and no asset cascade can fire, however
-much data you land. This is the single easiest way to conclude the platform
-does not work.
+so on a fresh clone every DAG sits paused and no asset cascade can fire,
+however much data you land. This is the single easiest way to conclude the
+platform does not work.
+
+Unpause them by asking Airflow what exists rather than by naming them:
 
 ```bash
-for d in ingest_trade ingest_counterparty ingest_rating \
-         prepared_build reporting_build platform_housekeeping; do
-  docker compose exec -T airflow airflow dags unpause $d
-done
+docker compose exec -T airflow airflow dags list -o plain | awk 'NR>1 {print $1}' |
+  xargs -n1 docker compose exec -T airflow airflow dags unpause
 docker compose exec -T airflow airflow dags list -o plain
 ```
 
-The last column is `is_paused`; all six should read `False`. In the UI
+That loop used to be a hard-coded list of six DAG ids, and **it had already
+gone stale**: adding the `primary_limits` feed made a seventh,
+`ingest_primary_limits`, which the list did not name — so anyone following this
+page left one feed paused and had no reason to suspect it. The set of DAGs is
+derived from `feeds.yml`, so any list written down beside it is a copy waiting
+to drift.
+
+The last column is `is_paused`; every row should read `False`. In the UI
 (http://localhost:8081, `admin` / `admin`) it is the toggle on the left of each
 row.
 
-The three `ingest_*` DAGs are `schedule=None` — they run only when triggered
-or when a file arrives — so unpausing them starts nothing on a timer.
+The `ingest_*` DAGs are `schedule=None` — they run only when triggered or when
+a file arrives — so unpausing them starts nothing on a timer.
 `platform_housekeeping` is nightly at 22:00.
 
-You also need the write pool, or every task will sit queued forever:
+You do **not** need to create the write pool by hand any more. `airflow-init`
+runs `airflow pools set lakehouse_write 1` on every `docker compose up`, along
+with `dbt deps`. Both were manual steps whose omission broke the platform
+*silently*: no pool meant every task sat `queued` forever with nothing
+anywhere saying why, and no `dbt_packages` now means `prepared_build` and
+`reporting_build` do not even **import**, because Cosmos renders them by
+running `dbt ls`. Confirm it landed:
 
 ```bash
-docker compose exec -T airflow airflow pools set lakehouse_write 1   "serialise all Iceberg writers, incl. maintenance"
 docker compose exec -T airflow airflow pools list -o plain
 ```
 
-(`make pools` is the same command.) **One pool, deliberately** — ingest, dbt
-builds and maintenance all take the same slot. Two one-slot pools would not
-exclude each other, which is exactly the bug that once let
-`remove_orphan_files` run alongside a write.
+**One pool, deliberately** — ingest, dbt model tasks and maintenance all take
+the same slot. Two one-slot pools would not exclude each other, which is
+exactly the bug that once let `remove_orphan_files` run alongside a write.
+`make pools` re-runs it by hand if you ever need to.
 
 ### Then: land one file and watch the chain
 

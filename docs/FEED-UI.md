@@ -74,11 +74,33 @@ file: a column in the file but not declared lands in `_extra_columns`, one
 declared but absent lands as NULL, and both are reported as drift. Upload a
 CSV next to the column list to read its header, then edit.
 
-The per-column type is used **only to scaffold the prepared model** — raw is
-all strings by design and the registry holds no types. The type is inferred
-from the column name (`*_date` → `parse_date`, `*_type`/`*_code`/`currency` →
-uppercased, `is_*` → the Y/N/1/0/true normalisation, money words →
-`safe_cast(..., DECIMAL(18,2))`) and every one is editable before you create.
+The per-column type says what the **prepared model** should do with the
+column — raw stays all strings by design. It is inferred from the column name
+(`*_date` → `parse_date`, `*_type`/`*_code`/`currency` → uppercased, `is_*` →
+the Y/N/1/0/true normalisation, money words → `safe_cast(..., DECIMAL(18,2))`)
+and every one is editable, before you create and afterwards.
+
+**A type you change is recorded in `feeds.yml`**, under an optional
+`column_types:` key, and only where it disagrees with the inference:
+
+```yaml
+    column_types:
+      haircut_pct: decimal
+```
+
+A feed nobody has corrected has no such key and no diff. That sparseness is
+the point: the block records *decisions*, not restatements of the default.
+
+This used to say "the registry holds no types", and the type was thrown away
+the moment it had been used to scaffold the model — the API re-inferred from
+the column name on every read. The cost was not theoretical. A column typed
+`decimal` in the form got `safe_cast(..., DECIMAL(18,2))` in the model, while
+**Generate**, re-inferring `string` from the name `haircut_pct`, produced
+values that could not cast. The column published as 100% NULL, and the build
+went green — `safe_cast` is *meant* to land NULL rather than fail, and the
+scaffolded tests deliberately do not cover a column's domain. Measured before
+the fix: 75 rows, 0 non-null. One resolved map (`scaffold.resolve_types`) now
+feeds the API, the scaffold and the generator, so they cannot disagree.
 
 ### What the scaffold deliberately does not generate
 
@@ -135,6 +157,64 @@ anything already present. The derivations that make a prepared model worth
 reading are hand-written, and a regenerate that clobbered them would destroy
 exactly the work the scaffold is asking for.
 
+## What the page keeps up to date
+
+**Every panel that can go stale is re-read when a run or job finishes.** It did
+not used to be: the feed pills and the run history were rendered once, so the
+console would sit showing an amber `DAG not parsed yet` directly above three
+successful runs *of that very DAG*, and `no runs yet` in the history table
+below them. Both were true when drawn and false a minute later, and a page that
+contradicts itself on one screen teaches you to disbelieve the pills that are
+right. `refreshFeedViews()` now re-reads the DAG pill, the scaffold pills, the
+stage strip and the history whenever a watched run or job reaches a terminal
+state, coalescing a burst of them into one refresh.
+
+**The stage strip is state, not decoration.** `seed → landing → raw → prepared
+→ reporting` used to be five fixed labels. Each box now carries this feed's
+actual position — file and object counts, and the last run state of each DAG —
+and is coloured accordingly, so "where am I in the loop?" is answered without
+reading anything else on the page. It comes from
+`GET /api/feeds/<name>/state`, which is deliberately **Spark-free**: it is
+redrawn after every run, and a strip that cost thirty seconds of cluster time
+to draw would just get switched off.
+
+**All output renders below all controls.** Job and run output used to appear
+directly under the button that produced it, which reads better right up until
+three run cards render and push *Test this feed* 75px down the page mid-click.
+Everything now lands in one **Output** region beneath every control on the tab,
+capped and scrolling, so nothing you are about to click moves.
+
+## Adding columns quickly
+
+Three ways, and the type is guessed in all of them:
+
+| | |
+|---|---|
+| **paste a header row** | Comma or space separated, then Enter. Existing columns are left alone. |
+| **read the header from a CSV** | Uploads the file and reads its first line. |
+| **+ column** | One row at a time. |
+
+`+ column` used to be the only one that did **not** guess: hand-typed columns
+stayed `string` while the identical list read from a CSV came back correctly
+typed. The guess now runs on blur for any column name however it arrived — and
+a type *you* set is never overwritten by it.
+
+## Deleting a feed
+
+Type-the-name to confirm, and a **checkbox next to the button** for whether the
+prepared model goes too.
+
+That checkbox used to be a second `confirm()` dialog, raised *after* the
+type-the-name gate had already passed — and Cancel or Escape there returned
+`false`, which did not cancel anything: it deleted the feed and kept the file.
+The one key a hesitant person reaches for was the one that committed. The
+choice is now visible before you commit, and the confirmation prompt states
+which way it is set.
+
+Deleting never touches data. `lakehouse.raw.<name>` and everything built from
+it stay exactly where they are — but they leave `managed_tables()`, so
+retention and maintenance stop covering them and they grow untended.
+
 ## Generating sample data
 
 A feed defined five minutes ago has nothing to test against, and
@@ -158,8 +238,24 @@ difference between a file that tests something and one that does not:
   would leave `parse_date` and the boolean CASE — the code most likely to be
   wrong — untested.
 
-Output is deterministic: the RNG is seeded from a CRC of (feed, date,
-version), so the same inputs give the same file across restarts.
+**Values hold still.** A generated cell is drawn from its own
+(row, column, epoch, version) stream, not from a per-file one, so a row keeps
+its values across deliveries and changes only when its epoch rolls — months,
+for most column types. Generate five days of a feed and you get five files
+that differ in name and little else, which is what reference data looks like.
+
+That is a fix, not a feature: it used to seed one RNG per business date, so
+every value in every row changed on every delivery. A feed created here looked
+like the most volatile market data imaginable rather than like the reference
+data most new feeds are, and the change detection the prepared layer exists to
+do had nothing to detect but noise. Date columns are anchored to the epoch
+start for the same reason — anchoring them on the business date slid them
+forward a day per delivery and defeated the whole thing for any feed with a
+date in it. See `reporting_platform/common/volatility.py`.
+
+Output is still fully deterministic: the same inputs give the same file across
+restarts, and `version` remains part of the key so a `_v2` is a genuine
+restatement.
 
 ## Proving a feed
 

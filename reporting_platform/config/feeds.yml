@@ -101,3 +101,22 @@ feeds:
       - effective_date
       - expiry_date
       - status
+
+  - name: collateral
+    description: Collateral positions held against counterparty exposure, from the collateral management
+      system.
+    source_system: COLL_SRC
+    filename_pattern: 'COLLATERAL_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    business_key: [collateral_id]
+    expected_min_rows: 10
+    columns:
+      - collateral_id
+      - counterparty_id
+      - collateral_type
+      - market_value
+      - currency
+      - valuation_date
+      - haircut_pct
+      - is_eligible
+    column_types:
+      haircut_pct: decimal

@@ -70,6 +70,27 @@ class Feed:
     header: bool = True
     file_encoding: str = "utf-8"
     schema_drift: str = "warn"
+    # Per-column prepared-layer treatment, e.g. {"haircut_pct": "decimal"}.
+    #
+    # OPTIONAL AND SPARSE: only columns whose treatment differs from what
+    # ui/scaffold.infer_type() guesses from the name are recorded, so an
+    # existing feed that never needed an override has no entry here and no
+    # diff. Everything else falls back to that inference.
+    #
+    # It exists because the guess and the human disagreed and the human's
+    # answer was being thrown away. The feed console let you set a type, used
+    # it once to scaffold the prepared model, and then discarded it -- the API
+    # re-inferred from the column name on every read. So a column typed
+    # `decimal` in the form got `safe_cast(..., DECIMAL(18,2))` in the model
+    # while the sample-data generator, re-inferring `string`, produced values
+    # that could not cast. The column published as 100% NULL and the build
+    # went green, because safe_cast is *meant* to land NULL and no test
+    # covered it. Verified end to end: 75 rows, 0 non-null.
+    #
+    # Raw is still all strings -- this does not type the raw table. It records
+    # what the PREPARED model should do with the column, which is the one
+    # thing the scaffold and the generator both need to agree on.
+    column_types: dict[str, str] = field(default_factory=dict)
     # Whether this feed is expected to deliver on every business date. False
     # opts it out of the completeness check, which infers the
     # business calendar from what other feeds delivered -- a feed that does
@@ -139,7 +160,8 @@ def feed(name: str) -> Feed:
 # same name, different namespace. That is legal because dbt keeps models and
 # sources in separate namespaces -- a model named `trade` and a source
 # `raw.trade` coexist without collision (verified, not assumed).
-PREPARED_TABLES = ["trade", "counterparty", "rating", "primary_limits"]
+PREPARED_TABLES = ["trade", "counterparty", "rating", "primary_limits",
+                   "collateral"]
 REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
                     "exposure_change"]
 

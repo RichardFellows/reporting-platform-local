@@ -75,6 +75,11 @@
   .colrow { display: grid; grid-template-columns: 1fr 130px 30px; gap: 8px; margin-bottom: 6px; }
   .muted { color: var(--muted); }
   .stage { display: flex; align-items: center; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+  /* Job and run output is bounded and scrolls rather than growing without
+     limit. Combined with putting every output BELOW the controls (see
+     paneRun), this is what stops a button moving out from under the pointer
+     while an async result renders above it. */
+  .outbox { max-height: 320px; overflow-y: auto; }
   .stage .arrow { color: var(--muted); }
   .box { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
          background: var(--panel); min-width: 132px; }
@@ -189,7 +194,8 @@ function renderDetail(f) {
     el("div", {class: "row", style: "margin-top:10px"}, [
       el("span", {class: "pill"}, f.raw_table),
       el("span", {class: "pill"}, f.landing_prefix),
-      el("span", {class: "pill " + (f.dag_known ? (f.dag_paused ? "warn" : "ok") : "warn")},
+      el("span", {id: "dag-pill",
+                  class: "pill " + (f.dag_known ? (f.dag_paused ? "warn" : "ok") : "warn")},
          f.dag_known === null ? "DAG state unknown (Airflow unreachable)"
            : f.dag_known ? (f.dag_paused ? "DAG paused" : "DAG live")
            : "DAG not parsed yet"),
@@ -250,6 +256,13 @@ function paneDetails(pane, f) {
         renderValidation(pane, await jpost("/api/validate"));
       });
     }}, "Validate dbt project"),
+    // The checkbox is a child of the LABEL only. Listing it as a direct child
+    // of the row as well moved it out of the label (a node has one parent),
+    // which rendered a stray checkbox on one line and its text on another.
+    el("label", {style: "display:flex;gap:6px;align-items:center;margin:0",
+                 class: "sub"},
+       [(DEL_MODEL = el("input", {type: "checkbox"})),
+        el("span", {}, `also delete dbt/models/prepared/${f.name}.sql`)]),
     el("button", {class: "act danger", onclick: () => deleteFeed(pane, f)}, "Delete feed"),
   ]));
 
@@ -259,13 +272,32 @@ function paneDetails(pane, f) {
     "To rename, delete and re-add."));
 }
 
+let DEL_MODEL = null;
+
 async function deleteFeed(pane, f) {
+  // ONE dialog, and the secondary choice is a checkbox on the page rather than
+  // a second confirm(). It used to be `confirm("Also delete ....sql?")` AFTER
+  // the type-the-name gate had already passed -- and Cancel or Escape there
+  // returns false, which did NOT cancel the delete: it deleted the feed and
+  // kept the file. Escape means "get me out of this" everywhere else, so the
+  // one key a hesitant person reaches for was the one that committed. The
+  // checkbox is visible before you commit, and the prompt now states which
+  // way it is set so the confirmation describes what will actually happen.
+  const alsoModel = !!(DEL_MODEL && DEL_MODEL.checked);
   const typed = prompt(
-    `Remove ${f.name} from the registry?\n\n` +
+    `Remove ${f.name} from the registry?
+
+` +
     `${f.raw_table} and anything built from it are LEFT IN PLACE, but stop being ` +
-    `maintained or retained.\n\nType the feed name to confirm:`);
+    `maintained or retained.
+
+` +
+    (alsoModel ? `dbt/models/prepared/${f.name}.sql WILL be deleted.`
+               : `dbt/models/prepared/${f.name}.sql will be kept.`) +
+    `
+
+Type the feed name to confirm:`);
   if (typed !== f.name) return;
-  const alsoModel = confirm("Also delete dbt/models/prepared/" + f.name + ".sql?");
   const r = await api(`/api/feeds/${f.name}?confirm=${encodeURIComponent(f.name)}` +
                       `&scaffold_too=${alsoModel}`, {method: "DELETE"});
   STATE.selected = null;
@@ -348,8 +380,28 @@ function feedForm(f, creating) {
     const cn = el("input", {class: "mono", value: nm, placeholder: "column_name"});
     const ct = el("select", {}, STATE.types.map(t =>
       el("option", {value: t, selected: t === ty ? "selected" : null}, t)));
+    // A type the PERSON picked is never overwritten by the inference below.
+    // Without this flag, typing a column name after choosing its type would
+    // silently undo the choice -- which is the same class of bug as the API
+    // re-inferring on every read.
+    ct._touched = !!ty;
+    ct.addEventListener("change", () => { ct._touched = true; });
+    // Infer on blur, not just on CSV upload. "+ column" rows used to default
+    // to `string` forever, so eight hand-typed columns produced eight wrong
+    // types while the same eight read from a header produced six right ones.
+    cn.addEventListener("blur", async () => {
+      const v = cn.value.trim();
+      if (!v || ct._touched) return;
+      try {
+        const r = await jpost("/api/infer-types", {columns: [v]});
+        const guess = r.column_types[v];
+        if (guess) ct.value = guess;     // still not _touched: a later edit wins
+      } catch (_) { /* inference is a convenience; never block typing */ }
+      refreshKeyChoices();
+    });
+    cn.addEventListener("input", refreshKeyChoices);
     const row = el("div", {class: "colrow"}, [cn, ct,
-      el("button", {class: "act", onclick: () => row.remove()}, "×")]);
+      el("button", {class: "act", onclick: () => { row.remove(); refreshKeyChoices(); }}, "×")]);
     row._name = cn; row._type = ct;
     colsBox.append(row);
     return row;
@@ -364,6 +416,29 @@ function feedForm(f, creating) {
     const r = await api("/api/infer-columns", {method: "POST", body: fd});
     colsBox.textContent = "";
     for (const c of r.columns) addColRow(c, r.column_types[c]);
+    refreshKeyChoices();
+  });
+
+  // Paste a header row instead of clicking "+ column" once per column. The
+  // API has accepted a comma/whitespace-separated STRING for `columns` all
+  // along (FeedSpec.from_payload._list splits one); only this form insisted on
+  // a row at a time, which made eight columns eight clicks plus eight
+  // focus-and-type cycles.
+  const paste = el("input", {class: "mono",
+    placeholder: "paste a header row: collateral_id, counterparty_id, market_value, ..."});
+  const applyPaste = async () => {
+    const names = paste.value.split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+    if (!names.length) return;
+    let guessed = {};
+    try { guessed = (await jpost("/api/infer-types", {columns: names})).column_types; }
+    catch (_) { guessed = {}; }
+    const existing = new Set(Object.keys(readTypes()));
+    for (const n of names) if (!existing.has(n)) addColRow(n, guessed[n] || "");
+    paste.value = "";
+    refreshKeyChoices();
+  };
+  paste.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); applyPaste(); }
   });
 
   node.append(el("div", {class: "field"}, [
@@ -371,22 +446,59 @@ function feedForm(f, creating) {
     el("div", {class: "sub", style: "font-size:12px;margin-bottom:8px"},
       "Not discovered from the file: a column in the file but not here lands in " +
       "_extra_columns; one here but not in the file lands as NULL. Both are reported " +
-      "as drift. The type is used only to scaffold the prepared model — raw stays all strings."),
+      "as drift. The type says what the PREPARED model does with the column — raw " +
+      "stays all strings — and a type you change is recorded in feeds.yml, so the " +
+      "sample-data generator uses the same one."),
     colsBox,
     el("div", {class: "row"}, [
-      el("button", {class: "act", onclick: () => addColRow()}, "+ column"),
+      el("button", {class: "act", onclick: () => { addColRow(); refreshKeyChoices(); }}, "+ column"),
       el("span", {class: "sub", style: "font-size:12px"}, "or read the header from a CSV:"),
       el("div", {style: "flex:1;min-width:200px"}, upload),
     ]),
+    el("div", {class: "row", style: "margin-top:6px"}, [
+      el("div", {style: "flex:1;min-width:240px"}, paste),
+      el("button", {class: "act", onclick: applyPaste}, "add list"),
+    ]),
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+       "Paste a whole header row (comma or space separated) and press Enter. Types are " +
+       "guessed from each name; existing columns are left alone."),
     (errBoxes["columns"] = el("div", {class: "err"})),
   ]));
 
-  const bkey = el("input", {class: "mono", value: (f?.business_key ?? []).join(", "),
-                            placeholder: "limit_id"});
+  // Business key: chosen FROM the declared columns rather than retyped. It has
+  // to be a subset of them -- dedupe_rank partitions by it -- and that was
+  // enforced server-side with a good message, which is still one round trip
+  // and one re-read of the form to discover something the page already knew.
+  const bkeyBox = el("div", {class: "row"});
+  const bkeyExtra = el("div", {class: "sub", style: "font-size:12px;margin-top:4px"});
+  let bkeySelected = new Set(f?.business_key ?? []);
+  function refreshKeyChoices() {
+    const cols = Object.keys(readTypes());
+    bkeyBox.textContent = "";
+    for (const c of cols) {
+      const cb = el("input", {type: "checkbox"});
+      cb.checked = bkeySelected.has(c);
+      cb.addEventListener("change", () => {
+        if (cb.checked) bkeySelected.add(c); else bkeySelected.delete(c);
+      });
+      bkeyBox.append(el("label", {class: "sub",
+        style: "display:flex;gap:6px;align-items:center;margin:0"},
+        [cb, el("span", {class: "mono"}, c)]));
+    }
+    if (!cols.length) bkeyBox.append(el("span", {class: "sub"}, "declare a column first"));
+    // A key naming a column that no longer exists is shown rather than quietly
+    // dropped: it is the state that makes dedupe_rank reference a column the
+    // raw table does not have, and it should be visible, not tidied away.
+    const orphans = [...bkeySelected].filter(k => !cols.includes(k));
+    bkeyExtra.textContent = orphans.length
+      ? `not in columns any more: ${orphans.join(", ")} — untick or re-add the column`
+      : "";
+    bkeyExtra.style.color = orphans.length ? "var(--bad)" : "";
+  }
+
   node.append(
-    field("business_key", "Business key", bkey,
-      "What dedupe_rank partitions by, and what the uniqueness test is written over. " +
-      "Must be columns declared above."),
+    field("business_key", "Business key", el("div", {}, [bkeyBox, bkeyExtra]),
+      "What dedupe_rank partitions by, and what the uniqueness test is written over."),
     el("div", {class: "grid2"}, [
       field("expected_min_rows", "Expected minimum rows", minRows,
         "Aborts the ingest below this count, leaving main untouched. Set it to something " +
@@ -414,6 +526,8 @@ function feedForm(f, creating) {
     return out;
   };
 
+  refreshKeyChoices();
+
   return {
     node,
     readTypes,
@@ -422,7 +536,7 @@ function feedForm(f, creating) {
       description: desc.value.trim(),
       source_system: src.value.trim(),
       filename_pattern: pattern.value,
-      business_key: bkey.value,
+      business_key: [...bkeySelected],
       columns: Object.keys(readTypes()),
       column_types: readTypes(),
       expected_min_rows: Number(minRows.value || 0),
@@ -660,18 +774,16 @@ async function showPreview(f, filename, box) {
 
 // ------------------------------------------------------------------ run tab
 function paneRun(pane, f) {
-  const out = el("div");
-  pane.append(el("div", {class: "stage"}, [
-    el("div", {class: "box"}, [el("div", {class: "t"}, "seed"), el("div", {class: "v"}, `seed/${f.name}/`)]),
-    el("span", {class: "arrow"}, "→"),
-    el("div", {class: "box"}, [el("div", {class: "t"}, "landing"), el("div", {class: "v"}, f.landing_prefix)]),
-    el("span", {class: "arrow"}, "→"),
-    el("div", {class: "box"}, [el("div", {class: "t"}, "raw"), el("div", {class: "v"}, `ingest_${f.name}`)]),
-    el("span", {class: "arrow"}, "→"),
-    el("div", {class: "box"}, [el("div", {class: "t"}, "prepared"), el("div", {class: "v"}, "prepared_build")]),
-    el("span", {class: "arrow"}, "→"),
-    el("div", {class: "box"}, [el("div", {class: "t"}, "reporting"), el("div", {class: "v"}, "reporting_build")]),
-  ]));
+  const out = el("div", {class: "outbox"});
+  // The strip used to be five static labels: a picture of the pipeline that
+  // never said anything about THIS feed. Everything needed to make it answer
+  // "where am I in the loop?" was already being fetched and displayed further
+  // down the same page, just never joined up. It now colours each stage from
+  // /api/feeds/<name>/state, which is deliberately Spark-free (see the
+  // endpoint's docstring) so it can be redrawn after every run.
+  const strip = el("div", {class: "stage", id: "stage-strip"});
+  pane.append(strip);
+  renderStage(strip, f);
 
   pane.append(el("div", {class: "note"},
     "One run ingests ONE arrival — the platform processes a feed as it is received, so the " +
@@ -712,9 +824,9 @@ function paneRun(pane, f) {
        "Ingest all pending (runs Spark)"),
     el("button", {class: "act", onclick: (e) => triggerBuild(e, out, "prepared")}, "Build prepared"),
     el("button", {class: "act", onclick: (e) => triggerBuild(e, out, "reporting")}, "Build reporting"),
-  ]), out);
+  ]));
 
-  const testOut = el("div");
+  const testOut = el("div", {class: "outbox"});
   const downstream = el("input", {type: "checkbox"});
   pane.append(el("h3", {}, "Prove this feed"),
     el("div", {class: "note"},
@@ -747,11 +859,86 @@ function paneRun(pane, f) {
       }}, "Test this feed"),
       el("label", {style: "display:flex;gap:6px;align-items:center;margin:0"},
          [downstream, el("span", {}, "include downstream reporting models")]),
-    ]), testOut);
+    ]));
 
-  const hist = el("div");
+  // EVERY output goes here, below every control on this tab. It used to sit
+  // directly under the buttons that produced it, which reads better right up
+  // until three run cards render and shove "Test this feed" 75px down the page
+  // mid-click. Nothing below this point is clickable.
+  pane.append(el("h3", {}, "Output"), out, testOut);
+
+  const hist = el("div", {id: "run-history"});
   pane.append(el("h3", {}, "Recent runs"), hist);
   renderHistory(hist, f);
+}
+
+async function renderStage(strip, f) {
+  const box = (title, value, cls) =>
+    el("div", {class: "box " + (cls || "")},
+       [el("div", {class: "t"}, title), el("div", {class: "v"}, value)]);
+  // Draw the labels immediately, then colour them when state arrives: the
+  // strip is the first thing on the tab and should never be a spinner.
+  const draw = (st) => {
+    strip.textContent = "";
+    const runCls = (r) => !r || r.state === "unknown" ? ""
+      : r.state === "success" ? "ok"
+      : (r.state === "failed" || r.state === "upstream_failed") ? "bad"
+      : (r.state === "running" || r.state === "queued") ? "warn" : "";
+    const runVal = (dag, r) => !r ? dag
+      : r.state === "unknown" ? `${dag} · airflow unreachable`
+      : r.state ? `${dag} · ${r.state}` : `${dag} · never run`;
+    const parts = st ? [
+      box("seed", `${st.seed} file(s)`, st.seed ? "ok" : ""),
+      box("landing", `${st.landed} object(s)`, st.landed ? "ok" : ""),
+      box("raw", runVal(`ingest_${f.name}`, st.raw), runCls(st.raw)),
+      box("prepared", runVal("prepared_build", st.prepared), runCls(st.prepared)),
+      box("reporting", runVal("reporting_build", st.reporting), runCls(st.reporting)),
+    ] : [
+      box("seed", `seed/${f.name}/`), box("landing", f.landing_prefix),
+      box("raw", `ingest_${f.name}`), box("prepared", "prepared_build"),
+      box("reporting", "reporting_build"),
+    ];
+    parts.forEach((p, i) => {
+      if (i) strip.append(el("span", {class: "arrow"}, "→"));
+      strip.append(p);
+    });
+  };
+  draw(null);
+  try { draw(await api(`/api/feeds/${f.name}/state`)); } catch (_) { /* labels stand */ }
+}
+
+// ONE place that re-reads everything a completed run can have changed. The
+// console used to render the feed pills and the run history exactly once and
+// never again, so it would sit there showing "DAG not parsed yet" above three
+// successful runs of that very DAG, and "no runs yet" in the history table
+// directly below them. Both were true when drawn and false within a minute,
+// and a page that contradicts itself teaches you to disbelieve the pills that
+// ARE right. Called whenever a watched run or job reaches a terminal state.
+let REFRESH_TIMER = null;
+function refreshFeedViews() {
+  clearTimeout(REFRESH_TIMER);            // coalesce a burst of terminal runs
+  REFRESH_TIMER = setTimeout(async () => {
+    const name = STATE.selected;
+    if (!name) return;
+    try {
+      const f = await api(`/api/feeds/${name}`);
+      const i = STATE.feeds.findIndex(x => x.name === name);
+      if (i >= 0) STATE.feeds[i] = f;
+      const dag = $("#dag-pill");
+      if (dag) {
+        dag.className = "pill " + (f.dag_known ? (f.dag_paused ? "warn" : "ok") : "warn");
+        dag.textContent = f.dag_known === null ? "DAG state unknown (Airflow unreachable)"
+          : f.dag_known ? (f.dag_paused ? "DAG paused" : "DAG live")
+          : "DAG not parsed yet";
+      }
+      const pills = $("#scaffold-pills");
+      if (pills) { pills.textContent = ""; pills.append(scaffoldPills(f.scaffold)); }
+      const strip = $("#stage-strip");
+      if (strip) renderStage(strip, f);
+      const hist = $("#run-history");
+      if (hist) renderHistory(hist, f);
+    } catch (_) { /* a refresh failing must not disturb what is on screen */ }
+  }, 1200);
 }
 
 async function triggerBuild(e, out, layer) {
@@ -791,6 +978,7 @@ function watchJob(target, jobId) {
             ? "Branch deleted. Nothing was published: testing never merges."
             : `Branch ${j.result.branch}`));
     if (j.status === "running") setTimeout(tick, 2500);
+    else refreshFeedViews();
   };
   tick();
 }
@@ -813,8 +1001,12 @@ function watchRun(target, dagId, runId) {
     if (r.tasks.length) box.append(el("div", {class: "row", style: "margin-top:6px"},
       r.tasks.map(t => el("span", {class: "pill " + stateClass(t.state)},
                           `${t.task_id}: ${t.state ?? "—"}`))));
-    if (!TERMINAL.has(r.state)) setTimeout(tick, 4000);
-    else if (r.state === "success")
+    if (!TERMINAL.has(r.state)) { setTimeout(tick, 4000); return; }
+    // Terminal: the DAG pill, the scaffold pills, the stage strip and the run
+    // history are all now potentially stale. This is the hook that stops the
+    // page contradicting itself.
+    refreshFeedViews();
+    if (r.state === "success")
       box.append(el("div", {class: "sub", style: "margin-top:6px"},
         "Downstream builds fire from the asset this run emitted — watch prepared_build below."));
   };

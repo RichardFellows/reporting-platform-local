@@ -84,3 +84,34 @@ RUN pip install --no-cache-dir \
       "uvicorn[standard]==0.34.0" \
       "python-multipart==0.0.20" \
       "ruamel.yaml==0.18.6"
+
+# Astronomer Cosmos: renders the dbt project into Airflow tasks -- one task per
+# model, one per test -- instead of the single opaque `dbt run` subprocess the
+# build DAGs used to shell out to. A failing model is then a red task with that
+# model's name on it, and a rerun starts from the model that failed rather than
+# from the top of the layer.
+#
+# --no-deps, AND THAT IS NOT AN OPTIMISATION. Installing this the way the
+# providers above are installed -- under Airflow's constraint file -- BREAKS
+# DBT. The 2.10.5 constraints pin `typing_extensions==4.12.2`; the dbt layer
+# above resolves `mashumaro` 3.22, whose `pack.py` imports
+# `evaluate_forward_ref` from typing_extensions 4.13+. Cosmos depends on
+# typing-extensions, so the constrained install DOWNGRADES 4.16.0 -> 4.12.2 and
+# every subsequent `dbt` invocation dies at import with
+#   ImportError: cannot import name 'evaluate_forward_ref' from 'typing_extensions'
+# -- in dbt, not in cosmos, and not until something runs dbt. Verified by
+# building this image both ways and running `dbt --version`.
+#
+# So: install cosmos alone and add its two genuinely-new dependencies by hand.
+# `pip install --dry-run` against this image showed the whole delta was
+# `aenum` + `deprecation` (plus that typing_extensions downgrade); everything
+# else cosmos wants -- airflow, attrs, packaging, msgpack, pydantic, virtualenv
+# -- is already present at a version it accepts. Re-run that dry run before
+# moving COSMOS_VERSION.
+#
+# Cosmos invokes the `dbt` EXECUTABLE installed above (see
+# ExecutionConfig.dbt_executable_path in airflow/dags/dbt_builds.py) rather
+# than importing dbt-core, so the validated dbt-core==1.8.7 /
+# dbt-spark==1.8.0 pins stay authoritative.
+ARG COSMOS_VERSION=1.15.1
+RUN pip install --no-cache-dir --no-deps "astronomer-cosmos==${COSMOS_VERSION}"     && pip install --no-cache-dir "aenum" "deprecation"     && dbt --version >/dev/null     && python -c "import cosmos; print('cosmos', cosmos.__version__)"

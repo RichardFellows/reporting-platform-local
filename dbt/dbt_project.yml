@@ -42,9 +42,18 @@ models:
       +partition_by: ['business_date']
       +tags: ['reporting']
 
-seeds:
-  reporting_platform:
-    +schema: reference
+# NO `seeds:` BLOCK, for the same reason ADDING-A-FEED.md says not to add a
+# `raw:` one under `models:`. There is no seeds/ directory and no .csv in this
+# project -- reference data arrives as a feed like everything else -- so a
+# `seeds: {reporting_platform: {+schema: reference}}` block configured nothing
+# and made dbt print
+#     [WARNING]: Configuration paths exist in your dbt_project.yml file which
+#     do not apply to any resources. There are 1 unused configuration paths:
+#     - seeds.reporting_platform
+# on EVERY invocation -- `parse`, `ls`, `run`, `test`, and now once per
+# Cosmos-rendered task. A warning that is always there is a warning nobody
+# reads, including the next real one. Add the block back in the same commit
+# that adds the first seed file.
 
 # Fail the build if a source has not been refreshed. Freshness is how a late
 # feed becomes visible rather than silently carried forward.

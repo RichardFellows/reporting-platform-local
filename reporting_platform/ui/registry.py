@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ COLUMN_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 # `arrival_timeout_hours` set by hand survives an edit through the UI.
 BLOCK_ORDER = ["name", "description", "source_system", "filename_pattern",
                "business_key", "expected_min_rows", "cadence", "completeness",
-               "schema_drift", "columns"]
+               "schema_drift", "columns", "column_types"]
 
 # Values that live in `defaults:`. A feed block repeating the default value is
 # noise in the diff, so these are only written when they differ from it.
@@ -70,6 +70,11 @@ class FeedSpec:
     cadence: str = "daily"
     completeness: bool = True
     schema_drift: str = "warn"
+    # Sparse: ONLY the columns whose type disagrees with what infer_type()
+    # guesses. The caller reduces it (scaffold.overrides_only) before handing
+    # it over, so this module stays ignorant of how a type is guessed -- it
+    # writes what it is told and nothing else.
+    column_types: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "FeedSpec":
@@ -89,6 +94,8 @@ class FeedSpec:
             cadence=str(payload.get("cadence") or "daily").strip(),
             completeness=bool(payload.get("completeness", True)),
             schema_drift=str(payload.get("schema_drift") or "warn").strip(),
+            column_types={str(k): str(v) for k, v in
+                          (payload.get("column_types") or {}).items() if v},
         )
 
 
@@ -197,6 +204,12 @@ def _block(spec: FeedSpec) -> CommentedMap:
             # Single-quoted so the regex backslashes stay literal and the block
             # keeps looking like the ones around it.
             block[key] = SQ(value)
+        elif key == "column_types":
+            # Omitted entirely when there is nothing to override, which is the
+            # normal case -- an empty mapping in the diff would be noise.
+            if not value:
+                continue
+            block[key] = CommentedMap(value)
         elif key in ("business_key", "columns"):
             seq = CommentedSeq(value)
             if key == "business_key":
@@ -313,5 +326,5 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         filename_pattern=fd.filename_pattern, business_key=list(fd.business_key),
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
         cadence=fd.cadence, completeness=fd.completeness,
-        schema_drift=fd.schema_drift,
+        schema_drift=fd.schema_drift, column_types=dict(fd.column_types or {}),
     )

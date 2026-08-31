@@ -19,7 +19,7 @@ x-s3-env: &s3-env
   # scripts/duckdb_console.py uses this one, because DuckDB cannot speak the
   # Nessie API. The REST catalog addresses a ref through the request prefix
   # and DuckDB always takes the default branch, which is why that console is
-  # read-only and reads published `main` --1".
+  # read-only and reads published `main`.
   NESSIE_ICEBERG_URI: http://nessie:19120/iceberg
   REPORTING_CATALOG: lakehouse
   REPORTING_ENV: ${REPORTING_ENV:-local}
@@ -221,11 +221,43 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    # Runs once: schema migration and the admin user. Everything else waits on
-    # it completing, so no component races the DB into existence. Unlike
-    # Airflow 3, `airflow users` exists here.
+    # Runs once, and everything else waits on it COMPLETING, so no component
+    # races the DB into existence. Four things, in order, each of which was
+    # once a manual step in QUICKSTART that silently broke the platform when it
+    # was skipped:
+    #
+    #   1. db migrate            -- the metadata schema. (Unlike Airflow 3,
+    #                               `airflow users` exists here.)
+    #   2. users create          -- admin/admin for the web UI and the REST API
+    #                               the feed console calls.
+    #   3. pools set             -- ONE pool, deliberately, at one slot. Ingest,
+    #                               dbt model tasks and maintenance all take
+    #                               this same slot; a second one-slot pool would
+    #                               NOT exclude them from each other, which is
+    #                               the bug that once let remove_orphan_files
+    #                               run alongside a write. Without it every task
+    #                               sits `queued` forever with nothing to say
+    #                               why. See platform_housekeeping.py.
+    #   4. dbt deps              -- dbt/dbt_packages/ is gitignored, and
+    #                               packages.yml requires dbt_utils. This is no
+    #                               longer merely "the build fails until you run
+    #                               it": Cosmos renders prepared_build and
+    #                               reporting_build by running `dbt ls`, which
+    #                               cannot compile a dbt_utils test without the
+    #                               package, so on a fresh clone those two DAGs
+    #                               would not IMPORT. Installing here makes the
+    #                               clone self-sufficient.
+    #
+    # `|| true` on the user and the pool: both are idempotent in intent but
+    # noisy on a second `docker compose up` against existing volumes, and this
+    # container failing would block the whole stack.
     command: >
-      bash -euc "airflow db migrate && airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true"
+      bash -euc "
+      airflow db migrate &&
+      { airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true; } &&
+      { airflow pools set lakehouse_write 1 'serialise all Iceberg writers, incl. maintenance' || true; } &&
+      dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
+      "
     restart: "no"
 
   airflow:
