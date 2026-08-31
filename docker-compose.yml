@@ -94,8 +94,8 @@ services:
     # a container that will not start, or worse, a console that answers with
     # something else entirely.
     ports:
-      - "${MINIO_API_PORT:-19000}:9000"
-      - "${MINIO_CONSOLE_PORT:-19001}:9001"
+      - "${MINIO_API_HOST_PORT:-19000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-19001}:9001"
     volumes: ["minio-data:/data"]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
@@ -123,7 +123,7 @@ services:
       POSTGRES_USER: platform
       POSTGRES_PASSWORD: platform
       POSTGRES_DB: platform
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
     volumes:
       - pg-data:/var/lib/postgresql/data
       - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
@@ -169,7 +169,7 @@ services:
       nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
       nessie.catalog.secrets.access-key.name: ${S3_ACCESS_KEY:-minioadmin}
       nessie.catalog.secrets.access-key.secret: ${S3_SECRET_KEY:-minioadmin123}
-    ports: ["19120:19120"]
+    ports: ["${NESSIE_HOST_PORT:-19120}:19120"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:19120/api/v2/config"]
       interval: 10s
@@ -184,7 +184,9 @@ services:
       <<: *s3-env
       SPARK_NO_DAEMONIZE: "true"
       SPARK_MASTER_HOST: spark-master
-    ports: ["7077:7077", "8080:8080"]
+    ports:
+      - "${SPARK_MASTER_HOST_PORT:-7077}:7077"
+      - "${SPARK_UI_HOST_PORT:-8080}:8080"
     volumes:
       - ./reporting_platform:/opt/platform/reporting_platform:ro
       - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
@@ -282,7 +284,7 @@ services:
   airflow-webserver:
     <<: *airflow-common
     command: airflow webserver
-    ports: ["8081:8080"]
+    ports: ["${AIRFLOW_HOST_PORT:-8081}:8080"]
     depends_on:
       airflow-init: {condition: service_completed_successfully}
 
@@ -328,11 +330,18 @@ services:
       DBT_TARGET: ${DBT_TARGET:-spark_local}
       # The console renders a MinIO link for the BROWSER, so it needs the
       # host-side port, which nothing inside the network otherwise knows.
-      MINIO_CONSOLE_URL: http://localhost:${MINIO_CONSOLE_PORT:-19001}
+      # Host-side URLs for the header links. The console renders these for
+      # the BROWSER, so they must be the host mapping, which nothing inside
+      # the network otherwise knows. Hardcoding them in index.html meant a
+      # changed port sent people to whatever else was listening.
+      MINIO_CONSOLE_URL: http://localhost:${MINIO_CONSOLE_HOST_PORT:-19001}
+      AIRFLOW_UI_URL: http://localhost:${AIRFLOW_HOST_PORT:-8081}
+      SPARK_UI_URL: http://localhost:${SPARK_UI_HOST_PORT:-8080}
+      NESSIE_UI_URL: http://localhost:${NESSIE_HOST_PORT:-19120}
       AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
       AIRFLOW_API_USER: admin
       AIRFLOW_API_PASSWORD: admin
-    ports: ["8082:8082"]
+    ports: ["${FEED_UI_HOST_PORT:-8082}:8082"]
     restart: unless-stopped
 
   # ------------------------------------------------------------- watchdog

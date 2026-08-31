@@ -306,13 +306,19 @@ async def api_infer_columns(file: UploadFile = File(...)):
 def api_links():
     """Host-side URLs for the header links.
 
-    MinIO's host port is configurable (MINIO_CONSOLE_PORT) because 9000/9001
-    collide with ZScaler and friends, and a page that hardcodes 9001 sends
-    people to whatever else is on that port. Served from the API so the one
-    place that knows the mapping -- the compose file -- is the one that tells
-    the browser.
+    Every host port is overridable (*_HOST_PORT in .env) because the defaults
+    collide with things people actually run -- 8080 with almost anything,
+    5432 with a local Postgres, 9000/9001 with ZScaler. A page that hardcodes
+    them sends people to whatever else is listening, which looks like a
+    working link. Served from the API so the one place that knows the host
+    mapping -- the compose file -- is what tells the browser.
     """
-    return {"minio": os.environ.get("MINIO_CONSOLE_URL", "http://localhost:19001")}
+    return {
+        "minio": os.environ.get("MINIO_CONSOLE_URL", "http://localhost:19001"),
+        "airflow": os.environ.get("AIRFLOW_UI_URL", "http://localhost:8081"),
+        "spark": os.environ.get("SPARK_UI_URL", "http://localhost:8080"),
+        "nessie": os.environ.get("NESSIE_UI_URL", "http://localhost:19120"),
+    }
 
 
 @app.get("/api/column-types")

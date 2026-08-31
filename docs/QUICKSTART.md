@@ -82,11 +82,17 @@ both:
 | MinIO S3 API | `localhost:19000` | `minioadmin` / `minioadmin123` |
 | Postgres | `localhost:5432` | `platform` / `platform` |
 
-MinIO's host ports are **19000 / 19001**, not the usual 9000 / 9001 — those
-collide with ZScaler on a corporate laptop and with a fair number of local dev
-servers. Override with `MINIO_API_PORT` / `MINIO_CONSOLE_PORT` in `.env` if
-something on your machine wants 19000 instead. The container still listens on
-9000/9001 internally, so nothing in the pipeline is affected either way.
+**Every port above is overridable**, via `*_HOST_PORT` in `.env` —
+`AIRFLOW_HOST_PORT`, `SPARK_UI_HOST_PORT`, `POSTGRES_HOST_PORT`,
+`NESSIE_HOST_PORT`, `MINIO_API_HOST_PORT`, `MINIO_CONSOLE_HOST_PORT`,
+`FEED_UI_HOST_PORT`, `SPARK_MASTER_HOST_PORT`. They are the **host side only**:
+containers keep their own fixed ports and address each other by service name,
+so nothing in the pipeline is affected by changing them.
+
+MinIO already defaults off the usual 9000/9001, which collide with ZScaler on
+a corporate laptop. The rest keep conventional defaults — but 8080 and 5432
+are the usual suspects if a container refuses to start, or a URL answers with
+something that isn't this stack.
 
 Postgres holds five databases, deliberately separated: `airflow` (metadata),
 `nessie` (the catalog's version store), `nessie_gc` (GC live-sets), `serving`

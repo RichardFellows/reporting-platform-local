@@ -95,10 +95,10 @@
   <h1>Feed console</h1>
   <span id="af-health" class="pill">airflow …</span>
   <span class="links">
-    <a href="http://localhost:8081" target="_blank">Airflow</a>
-    <a href="http://localhost:8080" target="_blank">Spark</a>
-    <a href="http://localhost:19001" id="minio-link" target="_blank">MinIO</a>
-    <a href="http://localhost:19120/api/v2/trees" target="_blank">Nessie refs</a>
+    <a href="http://localhost:8081" id="link-airflow" target="_blank">Airflow</a>
+    <a href="http://localhost:8080" id="link-spark" target="_blank">Spark</a>
+    <a href="http://localhost:19001" id="link-minio" target="_blank">MinIO</a>
+    <a href="http://localhost:19120/api/v2/trees" id="link-nessie" target="_blank">Nessie refs</a>
     <a href="/api/docs" target="_blank">API</a>
   </span>
 </header>
@@ -1066,12 +1066,16 @@ async function health() {
 
 (async function init() {
   STATE.types = (await api("/api/column-types")).types;
-  // MinIO's host port is configurable, so the link comes from the server
-  // rather than being baked into this page. See /api/links.
+  // Host ports are overridable, so these come from the server rather than
+  // being baked into this page -- a stale hardcoded port is a link that looks
+  // fine and goes somewhere else. See /api/links.
   api("/api/links").then(l => {
-    const a = $("#minio-link");
-    if (a && l.minio) a.href = l.minio;
-  }).catch(() => { /* the hardcoded default stands */ });
+    const suffix = {nessie: "/api/v2/trees"};
+    for (const k of ["airflow", "spark", "minio", "nessie"]) {
+      const a = $("#link-" + k);
+      if (a && l[k]) a.href = l[k] + (suffix[k] || "");
+    }
+  }).catch(() => { /* the hardcoded defaults stand */ });
   $("#new-feed").addEventListener("click", newFeed);
   await loadFeeds();
   health();
