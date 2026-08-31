@@ -3,7 +3,7 @@
 ## Two delete modes
 
 Retention has two paths, chosen per table by **detecting** whether it carries
-`valid_from`/`valid_to`/`is_current` (`retention.is_scd2`). Detected rather
+`effective_from`/`effective_to`/`is_current` (`retention.is_scd2`). Detected rather
 than configured: this file already records a hand-maintained table list that
 drifted to five tables against the DAG's nine, and a list of which tables are
 SCD2 would drift the same way — except the failure would be worse, since

@@ -138,13 +138,13 @@
   {#
     Point-in-time join predicate against an SCD2 table.
 
-    `valid_to` is DATE '9999-12-31' on the open version rather than NULL, so
-    this needs no `or valid_to is null` branch -- which every consumer would
+    `effective_to` is DATE '9999-12-31' on the open version rather than NULL, so
+    this needs no `or effective_to is null` branch -- which every consumer would
     otherwise have to remember, and which is silently wrong when forgotten
     (the current version simply stops matching and exposure loses its
     reference data).
   #}
-  {{ business_date_expr }} between {{ alias }}.valid_from and {{ alias }}.valid_to
+  {{ business_date_expr }} between {{ alias }}.effective_from and {{ alias }}.effective_to
 {% endmacro %}
 
 
@@ -170,7 +170,7 @@
 {% endmacro %}
 
 
-{% macro scd2_valid_to(order_column, partition_columns) %}
+{% macro scd2_effective_to(order_column, partition_columns) %}
   {#
     Close each version at the day before the next one starts.
 

@@ -268,9 +268,9 @@ transaction data does not.
 
 ### How consumers read it
 
-`{{ as_of('c', 'a.business_date') }}` — a `between valid_from and valid_to`
-predicate. `valid_to` is `DATE '9999-12-31'` on the open version rather than
-NULL, so no consumer needs an `or valid_to is null` branch, which is silently
+`{{ as_of('c', 'a.business_date') }}` — a `between effective_from and effective_to`
+predicate. `effective_to` is `DATE '9999-12-31'` on the open version rather than
+NULL, so no consumer needs an `or effective_to is null` branch, which is silently
 wrong when forgotten.
 
 No snapshot-shaped VIEW is offered over it. Iceberg views do work in this

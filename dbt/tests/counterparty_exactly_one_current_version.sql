@@ -7,7 +7,7 @@
     * MORE than one open version -- the incremental replay failed to close the
       previous one. `as_of()` matches both and doubles the row downstream.
     * ZERO open versions -- every version has been closed, so the counterparty
-      simply vanishes from any point-in-time join after its last valid_to,
+      simply vanishes from any point-in-time join after its last effective_to,
       with no error anywhere. `where is_current` alone would not see this,
       because the entity has no row to group.
 

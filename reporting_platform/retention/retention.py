@@ -680,7 +680,7 @@ def is_scd2(spark, table: str) -> bool:
     delete against a table it believed was a snapshot.
 
     Reading the columns asks the table what it actually is. All three columns
-    are required so an unrelated table with a `valid_from` cannot be mistaken
+    are required so an unrelated table with a `effective_from` cannot be mistaken
     for one of these. Which mode was chosen is reported in the result JSON, so
     the detection is visible rather than silent.
     """
@@ -688,7 +688,7 @@ def is_scd2(spark, table: str) -> bool:
         cols = {f.name for f in spark.table(table).schema.fields}
     except Exception:
         return False
-    return {"valid_from", "valid_to", "is_current"} <= cols
+    return {"effective_from", "effective_to", "is_current"} <= cols
 
 
 def apply_scd2_retention(spark, table: str, layer: str,
@@ -698,11 +698,11 @@ def apply_scd2_retention(spark, table: str, layer: str,
     Two rules, and the first is absolute:
 
       * A CURRENT version is never expired, however old. It is the answer to
-        "what is this counterparty now", and its valid_from can predate the
+        "what is this counterparty now", and its effective_from can predate the
         keep-set by years -- 60 of the 70 rows here start on 2024-02-29. A
         cutoff that dropped them would empty the dimension and every
         point-in-time join with it.
-      * A closed version is expired only once the whole of its validity range
+      * A closed version is expired only once the whole of its effective range
         sits before the oldest retained business date. Conservative on
         purpose: a version straddling the cutoff is still in force for a
         retained date and must stay.
@@ -719,7 +719,7 @@ def apply_scd2_retention(spark, table: str, layer: str,
     """
     policy = retention_policy(layer)
     observed = sorted({r["bd"] for r in spark.sql(
-        f"SELECT DISTINCT valid_from AS bd FROM {table} WHERE valid_from IS NOT NULL"
+        f"SELECT DISTINCT effective_from AS bd FROM {table} WHERE effective_from IS NOT NULL"
     ).collect()})
     if not observed:
         return {"table": table, "skipped": "no data"}
@@ -733,7 +733,7 @@ def apply_scd2_retention(spark, table: str, layer: str,
     counts = spark.sql(f"""
         SELECT
           SUM(CASE WHEN is_current THEN 1 ELSE 0 END)                      AS current_rows,
-          SUM(CASE WHEN NOT is_current AND valid_to < DATE '{cutoff:%Y-%m-%d}'
+          SUM(CASE WHEN NOT is_current AND effective_to < DATE '{cutoff:%Y-%m-%d}'
                    THEN 1 ELSE 0 END)                                      AS expiring_rows,
           COUNT(*)                                                         AS total_rows
         FROM {table}""").collect()[0]
@@ -752,7 +752,7 @@ def apply_scd2_retention(spark, table: str, layer: str,
 
     if counts["expiring_rows"] and not dry_run:
         spark.sql(f"DELETE FROM {table} "
-                  f"WHERE NOT is_current AND valid_to < DATE '{cutoff:%Y-%m-%d}'")
+                  f"WHERE NOT is_current AND effective_to < DATE '{cutoff:%Y-%m-%d}'")
         log.info("%s: expired %d closed version(s) ending before %s",
                  table, counts["expiring_rows"], cutoff)
     return result

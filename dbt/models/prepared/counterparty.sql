@@ -1,8 +1,8 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['counterparty_id', 'valid_from'],
-    partition_by=['valid_from_month'],
+    unique_key=['counterparty_id', 'effective_from'],
+    partition_by=['effective_from_month'],
     tags=['prepared', 'reference', 'scd2']
   )
 }}
@@ -32,9 +32,9 @@
       renaming this to `counterparty_history` would have meant touching every
       one of them to express nothing.
 
-  The unique key is (counterparty_id, valid_from) and NOT valid_to, which is
-  what lets the incremental merge UPDATE a previously-open row to close it
-  rather than inserting a second one alongside.
+  The unique key is (counterparty_id, effective_from) and NOT effective_to,
+  which is what lets the incremental merge UPDATE a previously-open row to
+  close it rather than inserting a second one alongside.
 #}
 
 with
@@ -50,7 +50,7 @@ touched as (
     select distinct counterparty_id
     from {{ source('raw', 'counterparty') }}
     where _business_date >= (
-        select coalesce(max(_inc.valid_from), date '1900-01-01')
+        select coalesce(max(_inc.effective_from), date '1900-01-01')
                - interval {{ var('lookback_days', 3) }} day
         from {{ this }} as _inc
     )
@@ -64,8 +64,8 @@ touched as (
   lookback window, and the whole of it has to be re-derived so that lead() can
   see the new value and CLOSE it. Replaying only the last few business dates
   would append a new version and leave the previous one still claiming
-  valid_to = 9999-12-31 -- two versions in force at once, and `as_of()` would
-  then match both and silently DOUBLE every exposure row for that counterparty.
+  effective_to = 9999-12-31 -- two versions in force at once, and `as_of()`
+  would then match both and silently DOUBLE every exposure row for it.
 
   Nothing inside this model can detect that state. The
   dbt_utils.mutually_exclusive_ranges test in _prepared.yml is what catches it,
@@ -77,7 +77,7 @@ touched as (
 #}
 replay_from as (
 
-    select counterparty_id, min(valid_from) as from_date
+    select counterparty_id, min(effective_from) as from_date
     from {{ this }}
     where is_current
     group by counterparty_id
@@ -185,8 +185,9 @@ ranged as (
         nessie_ref,
         dbt_updated_at,
 
-        business_date                                               as valid_from,
-        {{ scd2_valid_to('business_date', ['counterparty_id']) }}    as valid_to,
+        business_date                                               as effective_from,
+        {{ scd2_effective_to('business_date', ['counterparty_id']) }}
+                                                                    as effective_to,
         lead(business_date) over (partition by counterparty_id
                                   order by business_date) is null    as is_current,
 
@@ -196,7 +197,7 @@ ranged as (
           against this instead of dropping a partition -- the one genuinely
           invasive consequence of this change. See docs/RETENTION.md.
         #}
-        trunc(business_date, 'MM')                                  as valid_from_month
+        trunc(business_date, 'MM')                                  as effective_from_month
 
     from kept
 

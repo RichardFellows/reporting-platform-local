@@ -116,11 +116,11 @@ select
     {#
       The gap, as data rather than as absence. NULL attributes used to be the
       only signal that a reference feed had not arrived; this says so
-      explicitly, and `reference_valid_from` says how old the value in force
+      explicitly, and `reference_effective_from` says how old the value in force
       is, which a NULL could never express.
     #}
     (d.counterparty_id is null)                             as reference_carried_forward,
-    c.valid_from                                            as reference_valid_from,
+    c.effective_from                                            as reference_effective_from,
 
     r.worst_rating_rank,
     case when r.is_investment_grade_flag = 1 then true
@@ -142,9 +142,9 @@ from aggregated a
 -- visible, more usefully than a NULL did.
 -- POINT-IN-TIME, not equality: `counterparty` is SCD2 now, holding one row
 -- per version rather than one per business date. as_of() expands to a
--- `between valid_from and valid_to` predicate; valid_to is 9999-12-31 on the
+-- `between effective_from and effective_to` predicate; effective_to is 9999-12-31 on the
 -- open version, so the current row matches every date at or after its
--- valid_from with no null-handling branch here.
+-- effective_from with no null-handling branch here.
 left join counterparties c
        on c.counterparty_id  = a.counterparty_id
       and {{ as_of('c', 'a.business_date') }}

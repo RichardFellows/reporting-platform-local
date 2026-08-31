@@ -34,12 +34,12 @@ models:
           forward (which is what README and ARCHITECTURE always promised) and
           this column is what keeps the gap visible.
         tests: [not_null]
-      - name: reference_valid_from
+      - name: reference_effective_from
         description: >
           The date the counterparty attributes in force on this row began.
           Note this is when the VALUE last changed, not when it was last
           delivered — a counterparty delivered daily but unchanged for two
-          years has an old valid_from and is not stale. Use
+          years has an old effective_from and is not stale. Use
           reference_carried_forward for delivery gaps.
         tests: [not_null]
     tests:
