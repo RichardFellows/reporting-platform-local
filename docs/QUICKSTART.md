@@ -73,6 +73,7 @@ both:
 | Service | URL | Credentials |
 |---|---|---|
 | **Airflow** | http://localhost:8081 | `admin` / `admin` |
+| **Notebook** (explore the data) | http://localhost:8083 | none |
 | **MinIO console** (object storage) | http://localhost:19001 | `minioadmin` / `minioadmin123` |
 | **Spark master** | http://localhost:8080 | none |
 | **Nessie** (catalog API) | http://localhost:19120/api/v2/config | none |

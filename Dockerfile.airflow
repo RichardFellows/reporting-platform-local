@@ -115,3 +115,19 @@ RUN pip install --no-cache-dir \
 # dbt-spark==1.8.0 pins stay authoritative.
 ARG COSMOS_VERSION=1.15.1
 RUN pip install --no-cache-dir --no-deps "astronomer-cosmos==${COSMOS_VERSION}"     && pip install --no-cache-dir "aenum" "deprecation"     && dbt --version >/dev/null     && python -c "import cosmos; print('cosmos', cosmos.__version__)"
+
+# Marimo, for the developer exploration notebook (notebooks/explore.py, served
+# by the `notebook` service on 8083). Marimo rather than Jupyter because its
+# notebooks ARE Python files -- they diff, review and merge like any other
+# source in this repo, where a Jupyter .ipynb is a JSON blob carrying outputs
+# and execution counts that make every save a conflict.
+#
+# Installed unpinned deps but marimo itself pinned: `pip install --dry-run`
+# against this image showed it adds only new packages (jedi, msgspec,
+# narwhals, pyzmq and friends) and moves nothing already here -- notably NOT
+# typing_extensions, which is the one that broke dbt when cosmos went in under
+# a constraint file. Re-run that dry run before moving this pin.
+ARG MARIMO_VERSION=0.24.0
+RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
+    && dbt --version >/dev/null \
+    && python -c "import marimo, duckdb; print('marimo', marimo.__version__)"

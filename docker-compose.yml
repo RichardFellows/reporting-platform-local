@@ -344,6 +344,48 @@ services:
     ports: ["${FEED_UI_HOST_PORT:-8082}:8082"]
     restart: unless-stopped
 
+  # ------------------------------------------------------------- notebook
+  # Marimo exploration notebook: http://localhost:8083
+  #
+  # A developer sandbox for "what is actually in these tables" -- landing CSVs,
+  # raw, prepared and reporting, all through ONE read-only DuckDB connection
+  # (scripts/duckdb_console.connect), so a question costs a second rather than
+  # a 22s SparkSession.
+  #
+  # Same image as airflow because it imports that connect() rather than
+  # restating the catalog wiring, and reads the same feeds.yml. It writes
+  # NOTHING: the attach is READ_ONLY and DuckDB can only ever see the
+  # catalog's default branch, so this cannot touch a build in flight.
+  #
+  # ./notebooks is mounted READ-WRITE on purpose -- a developer editing the
+  # notebook is editing a file in the working tree, and that edit shows up in
+  # `git diff` like any other change.
+  notebook:
+    <<: *airflow-common
+    # `python -m marimo`, not `marimo`. The airflow image's entrypoint execs a
+    # short list of commands directly (python, bash, ...) and assumes anything
+    # else is an airflow subcommand -- a bare `marimo` becomes `airflow marimo`
+    # and dies with "invalid choice: 'marimo'". Same reason feed-ui runs
+    # `python -m reporting_platform.ui`.
+    command: >
+      python -m marimo edit /opt/platform/notebooks
+      --host 0.0.0.0 --port 8083 --headless --no-token
+    environment:
+      <<: *s3-env
+      PYTHONPATH: /opt/platform
+      PYTHONUNBUFFERED: "1"
+      # The Iceberg ATTACH vends credentials for the catalog's own data files
+      # but NOT for a direct s3:// read, so landing CSVs 403 without this.
+      # See connect()'s docstring in scripts/duckdb_console.py.
+      REPORTING_DUCKDB_S3_SECRET: "1"
+    volumes:
+      - ./reporting_platform:/opt/platform/reporting_platform:ro
+      - ./scripts:/opt/platform/scripts:ro
+      - ./dbt:/opt/platform/dbt:ro
+      - ./notebooks:/opt/platform/notebooks
+    ports: ["${NOTEBOOK_HOST_PORT:-8083}:8083"]
+    restart: unless-stopped
+
   # ------------------------------------------------------------- watchdog
   # Deliberately NOT an Airflow service and deliberately not in
   # depends_on with any of them: a monitor that shares the lifecycle of the
