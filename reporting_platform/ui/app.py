@@ -306,11 +306,31 @@ async def api_infer_columns(file: UploadFile = File(...),
     malformed file rather than like a wrong setting.
     """
     content = await file.read()
-    columns = feeddata.columns_from_csv(
+    headers = feeddata.columns_from_csv(
         content, encoding=file_encoding,
         delimiter=registry.unescape_char(delimiter))
-    return {"columns": columns, "column_types": scaffold.infer_types(columns),
+    return _columns_from_headers(headers)
+
+
+def _columns_from_headers(headers: list[str]) -> dict:
+    """Real header names -> suggested platform names, sources and types.
+
+    ONE function behind both the file upload and the pasted header row, so the
+    two cannot disagree about what `Notional (USD)` should be called. Types are
+    inferred from the PLATFORM name, which is the name the prepared model will
+    use.
+    """
+    columns, sources = registry.platform_names(headers)
+    return {"columns": columns, "source_columns": sources,
+            "column_types": scaffold.infer_types(columns),
             "types_available": scaffold.COLUMN_TYPES}
+
+
+@app.post("/api/columns-from-header")
+def api_columns_from_header(payload: dict):
+    """The same, for a header row pasted into the form rather than uploaded."""
+    headers = [h for h in (payload.get("headers") or []) if str(h).strip()]
+    return _columns_from_headers([str(h).strip() for h in headers])
 
 
 @app.get("/api/links")
@@ -370,6 +390,46 @@ async def api_upload(name: str, file: UploadFile = File(...),
     fd = _feed_or_404(name)
     content = await file.read()
     return feeddata.save_to_seed(fd, filename or file.filename or "", content)
+
+
+@app.post("/api/feeds/{name}/deliver")
+async def api_deliver(name: str, files: list[UploadFile] = File(...),
+                      ingest: bool = Form(False)):
+    """Upload deliveries STRAIGHT INTO LANDING, optionally ingesting after.
+
+    The other upload path writes into `seed/`, which is the sample-data
+    directory: useful for a feed you are inventing, and the wrong shape for one
+    you are onboarding. Real files are real deliveries -- they belong in
+    landing, and going through seed/ meant upload, then land, then ingest,
+    three actions for the thing people do most, which is why they ended up in
+    MinIO's own console instead.
+
+    Many files at once, because onboarding a feed means a month of history, not
+    one file. Each is checked against the feed's filename pattern BEFORE
+    anything is uploaded: a file whose name does not match would sit in landing
+    forever, never pending, never ingested and never reported.
+    """
+    fd = _feed_or_404(name)
+    payloads = [(f.filename or "", await f.read()) for f in files]
+    landed = feeddata.deliver(fd, payloads)
+    result = {"landed": landed, "count": len(landed)}
+    if ingest and landed:
+        result["ingest"] = _trigger_ingest(fd)
+    return result
+
+
+def _trigger_ingest(fd) -> dict:
+    """Drain the pending set after a delivery.
+
+    Reuses api_ingest rather than repeating it, so the unpause and the
+    one-run-per-arrival rule stay in one place. A DAG Airflow has not parsed
+    yet is reported, not raised: the files DID land, and failing the upload
+    over the trigger would leave the caller thinking they had not.
+    """
+    try:
+        return api_ingest(fd.name, {"all_pending": True})
+    except HTTPException as exc:
+        return {"triggered": False, "reason": str(exc.detail)}
 
 
 @app.post("/api/feeds/{name}/land")

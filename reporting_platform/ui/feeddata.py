@@ -144,6 +144,56 @@ def columns_from_csv(content: bytes, encoding: str = "utf-8",
     return [h.strip() for h in next(reader, [])]
 
 
+def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any]]:
+    """Upload real deliveries STRAIGHT INTO LANDING, skipping seed/.
+
+    seed/ is the sample-data directory. A file you actually received is a
+    delivery, and putting it through seed/ meant upload, then land, then
+    ingest -- three actions for the commonest thing anyone does with this
+    console, which is why people used MinIO's own UI instead.
+
+    EVERY FILE IS CHECKED BEFORE ANY IS UPLOADED. A name the feed's pattern
+    does not match would sit in landing forever: never pending, never ingested,
+    never reported. Rejecting the batch is better than landing half of it and
+    leaving the caller to work out which half.
+    """
+    import boto3
+
+    checked = []
+    for filename, content in payloads:
+        if not SAFE_FILENAME.match(filename):
+            raise DataError(f"unusable filename: {filename!r} -- letters, "
+                            f"digits, dot, dash and underscore only")
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise DataError(f"{filename} is larger than "
+                            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+        parsed = feed.parse_filename(filename)
+        if parsed is None:
+            raise DataError(
+                f"{filename} does not match {feed.name}'s filename pattern "
+                f"({feed.filename_pattern}), so it would land and never be "
+                f"ingested. Rename it, or fix the pattern.")
+        checked.append((filename, content, parsed[0]))
+
+    # Oldest business date first, for the same reason land() does it: the
+    # prepared layer's relationships tests compare against whatever reference
+    # data has arrived.
+    checked.sort(key=lambda t: (t[2], t[0]))
+
+    s3 = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT"))
+    bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
+    bucket = bucket.split("//", 1)[-1].split("/", 1)[0]
+    out = []
+    for filename, content, business_date in checked:
+        key = f"{feed.landing_prefix}/{feed.name}/{filename}"
+        s3.put_object(Bucket=bucket, Key=key, Body=content)
+        out.append({"filename": filename, "key": key,
+                    "business_date": business_date.isoformat(),
+                    "bytes": len(content),
+                    **compare_header(feed, header_of(content, feed))})
+    return out
+
+
 def _seed_path(feed: Feed, filename: str) -> Path:
     if not SAFE_FILENAME.match(filename):
         raise DataError(f"unusable filename: {filename!r}")

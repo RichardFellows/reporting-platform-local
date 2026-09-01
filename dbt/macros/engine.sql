@@ -41,7 +41,8 @@
 
     Column names reaching the prepared layer are normally ordinary identifiers
     anyway, because `feeds.yml` maps awkward source headers to clean names at
-    ingest -- see docs/DECISIONS.md#source-column-names. This is the second
+    ingest -- see docs/DECISIONS.md#source-column-names and
+    docs/DECISIONS.md#identifiers-in-macros. This is the second
     line of defence, for a name that is still awkward and for the models that
     read raw directly.
 

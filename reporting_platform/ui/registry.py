@@ -26,6 +26,45 @@ FEEDS_YML = Path(CONFIG_DIR) / "feeds.yml"
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 COLUMN_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+# A source header may be anything the upstream felt like. It only has to be
+# something that can appear in a CSV header and be matched against it.
+BAD_SOURCE = re.compile(r"[\r\n]")
+
+
+def platform_name(header: str) -> str:
+    """`Notional (USD)` -> `notional_usd`. The name the platform will use.
+
+    Real headers are title-cased, spaced and parenthesised; the platform needs
+    an identifier, because a column name reaches SQL through dbt macros. The
+    original is kept as the column's `source` -- see
+    docs/DECISIONS.md#source-column-names -- so this is a suggestion the person
+    can overrule, not a rename that loses anything.
+    """
+    out = re.sub(r"[^a-z0-9]+", "_", header.strip().lower()).strip("_")
+    if not out:
+        return "column"
+    return out if COLUMN_RE.match(out) else f"c_{out}"
+
+
+def platform_names(headers: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Suggested identifiers for a real header row, plus the source mapping.
+
+    Collisions are resolved rather than allowed: `Trade Id` and `Trade-Id`
+    both normalise to `trade_id`, and two columns of the same name would fail
+    validation with a message about duplicates rather than about the headers
+    that caused them.
+    """
+    names: list[str] = []
+    sources: dict[str, str] = {}
+    for header in headers:
+        base = platform_name(header)
+        name, n = base, 2
+        while name in names:
+            name, n = f"{base}_{n}", n + 1
+        names.append(name)
+        if name != header:
+            sources[name] = header
+    return names, sources
 
 # Keys the UI writes into a feed block, in the order docs/ADDING-A-FEED.md
 # presents them. Anything not listed here is left alone -- a per-feed
@@ -99,6 +138,9 @@ class FeedSpec:
     # it over, so this module stays ignorant of how a type is guessed -- it
     # writes what it is told and nothing else.
     column_types: dict[str, str] = field(default_factory=dict)
+    # Platform name -> the name in the FILE, for the columns that differ.
+    # Sparse, like column_types. See docs/DECISIONS.md#source-column-names
+    source_columns: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "FeedSpec":
@@ -124,6 +166,9 @@ class FeedSpec:
             file_encoding=str(payload.get("file_encoding") or "utf-8").strip(),
             column_types={str(k): str(v) for k, v in
                           (payload.get("column_types") or {}).items() if v},
+            source_columns={str(k): str(v) for k, v in
+                            (payload.get("source_columns") or {}).items()
+                            if v and str(v) != str(k)},
         )
 
 
@@ -185,6 +230,23 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
             errors["business_key"] = (
                 f"not in columns: {', '.join(missing)} -- the key is what "
                 f"dedupe_rank partitions by, so it must be a declared column")
+
+    unknown = sorted(set(spec.source_columns) - set(spec.columns))
+    if unknown:
+        errors["source_columns"] = (
+            f"not declared columns: {', '.join(unknown)} -- a source name maps "
+            f"ONTO a platform column, so the column has to exist")
+    bad_source = sorted(k for k, v in spec.source_columns.items()
+                        if not str(v).strip() or BAD_SOURCE.search(str(v)))
+    if bad_source:
+        errors["source_columns"] = (
+            f"unusable source name for: {', '.join(bad_source)} -- it has to be "
+            f"something that can appear in a header row")
+    clashes = sorted({v for v in spec.source_columns.values()
+                      if list(spec.source_columns.values()).count(v) > 1})
+    if clashes:
+        errors["source_columns"] = (
+            f"two columns claim the same source name: {', '.join(clashes)}")
 
     if spec.expected_min_rows < 0:
         errors["expected_min_rows"] = "cannot be negative"
@@ -254,10 +316,25 @@ def _block(spec: FeedSpec) -> CommentedMap:
             if not value:
                 continue
             block[key] = CommentedMap(value)
-        elif key in ("business_key", "columns"):
+        elif key == "columns":
+            # Mixed list: a bare name where the file header is already usable,
+            # `{name: source}` where it is not. Most columns need no mapping,
+            # and a uniform mapping form would double the length of every feed
+            # block to say nothing.
+            # See docs/DECISIONS.md#source-column-names
+            seq = CommentedSeq()
+            for col in value:
+                source = spec.source_columns.get(col)
+                if source:
+                    entry = CommentedMap({col: source})
+                    entry.fa.set_flow_style()
+                    seq.append(entry)
+                else:
+                    seq.append(col)
+            block[key] = seq
+        elif key == "business_key":
             seq = CommentedSeq(value)
-            if key == "business_key":
-                seq.fa.set_flow_style()      # [trade_id], as the others have
+            seq.fa.set_flow_style()          # [trade_id], as the others have
             block[key] = seq
         else:
             block[key] = value
@@ -372,4 +449,5 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
         cadence=fd.cadence, completeness=fd.completeness,
         schema_drift=fd.schema_drift, column_types=dict(fd.column_types or {}),
+        source_columns=dict(fd.source_columns or {}),
     )

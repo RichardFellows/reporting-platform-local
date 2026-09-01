@@ -48,6 +48,14 @@ Four things that are easy to get wrong:
   a duplicate. The pattern is per-feed precisely so a source system with its
   own naming convention (`marginCalls_`, lowerCamelCase, unlike the other
   three feeds) does not force that convention on anyone else.
+- **A column can declare the name it has in the FILE.** Real deliveries are
+  headed `Trade Id`, `Cpty Ref`, `Notional (USD)`; the platform needs
+  identifiers, because column names reach SQL through dbt macros. Write
+  `- trade_id: "Trade Id"` and the rename happens once, at ingest, so raw
+  onwards sees only identifiers. A bare `- notional` means the header is
+  already usable, which is most columns. Drift is still reported in the
+  file's names. See
+  [DECISIONS.md#source-column-names](DECISIONS.md#source-column-names).
 - **`columns` is the declared contract, and it is *not* discovered from the
   file.** It becomes the raw DDL, all `STRING`. A column in the file but not
   here lands in the `_extra_columns` map; a column here but not in the file

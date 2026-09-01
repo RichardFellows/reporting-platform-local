@@ -141,6 +141,11 @@ Two corollaries worth holding on to:
   `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
+- **A column may be named differently in the file than in the platform.**
+  `- trade_id: "Trade Id"` in `feeds.yml` renames at ingest, so raw onwards is
+  ordinary identifiers and dbt macros never have to quote one. Drift is
+  reported in the file's names. See `docs/DECISIONS.md#source-column-names`,
+  and `#identifiers-in-macros` for which macros quote and which must not.
 - **Adding a feed is five files and no DAG edit** — `docs/ADDING-A-FEED.md`
   has them in order. `generate_feeds.py` is not one of them: it hand-writes
   generators for the four original feeds, whose pathologies are the point, and

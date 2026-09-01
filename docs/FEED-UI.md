@@ -33,6 +33,23 @@ could disagree with that one, so there isn't one.
 minioadmin on this stack. It writes source files and triggers builds, so
 anything shared needs a real identity layer in front of it.
 
+## Getting files in
+
+The **Data** tab has two paths, and they are not the same thing:
+
+- **Deliver real files** uploads straight into `landing/<feed>/`, several at
+  once, oldest business date first, and can trigger the ingest in the same
+  action. Each filename is checked against the feed's pattern *before* anything
+  is uploaded, because a name that does not match would land and never be
+  ingested. This is the path for a feed you are onboarding.
+- **Generate a delivery** writes synthetic files into `seed/<feed>/`, which
+  then need landing. That is for a feed you are inventing, and it is why
+  `seed/` exists.
+
+Going through `seed/` for a real file meant upload, then land, then ingest --
+three actions for the commonest thing anyone does here, which is why people
+used MinIO's own console instead.
+
 ## Adding a feed
 
 The **New feed** form writes all five files:
@@ -43,7 +60,7 @@ The **New feed** form writes all five files:
 | 2 | `dbt/models/raw/_sources.yml` | `ui/scaffold.py` |
 | 3 | `dbt/models/prepared/<feed>.sql` | `ui/scaffold.py` |
 | 4 | `dbt/models/prepared/_prepared.yml` | `ui/scaffold.py` |
-| 5 | sample data | the **Data** tab, by upload |
+| 5 | sample data, or the real deliveries | the **Data** tab |
 
 There is no step registering the table for maintenance. There used to be, and
 it was the one with no error if it was skipped — the table just never got

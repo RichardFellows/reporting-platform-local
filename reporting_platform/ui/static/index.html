@@ -401,8 +401,13 @@ function feedForm(f, creating) {
 
   // ------------------------------------------------------------- columns
   const colsBox = el("div");
-  const addColRow = (nm = "", ty = "") => {
+  const addColRow = (nm = "", ty = "", src = "") => {
     const cn = el("input", {class: "mono", value: nm, placeholder: "column_name"});
+    // The name this column has IN THE FILE, when that is not a usable
+    // identifier. Blank means they are the same, which is most columns.
+    // See docs/DECISIONS.md#source-column-names
+    const cs = el("input", {class: "mono", value: src,
+                            placeholder: "source header (if different)"});
     const ct = el("select", {}, STATE.types.map(t =>
       el("option", {value: t, selected: t === ty ? "selected" : null}, t)));
     // A type the PERSON picked is never overwritten by the inference below.
@@ -425,13 +430,14 @@ function feedForm(f, creating) {
       refreshKeyChoices();
     });
     cn.addEventListener("input", refreshKeyChoices);
-    const row = el("div", {class: "colrow"}, [cn, ct,
+    const row = el("div", {class: "colrow"}, [cn, cs, ct,
       el("button", {class: "act", onclick: () => { row.remove(); refreshKeyChoices(); }}, "×")]);
-    row._name = cn; row._type = ct;
+    row._name = cn; row._type = ct; row._source = cs;
     colsBox.append(row);
     return row;
   };
-  for (const c of (f?.columns ?? [])) addColRow(c, (f?.column_types ?? {})[c] ?? "");
+  for (const c of (f?.columns ?? []))
+    addColRow(c, (f?.column_types ?? {})[c] ?? "", (f?.source_columns ?? {})[c] ?? "");
 
   const upload = el("input", {type: "file", accept: ".csv,.txt,.dat,text/csv,text/plain"});
   upload.addEventListener("change", async () => {
@@ -444,7 +450,8 @@ function feedForm(f, creating) {
     fd.append("file_encoding", encoding.value.trim() || "utf-8");
     const r = await api("/api/infer-columns", {method: "POST", body: fd});
     colsBox.textContent = "";
-    for (const c of r.columns) addColRow(c, r.column_types[c]);
+    for (const c of r.columns)
+      addColRow(c, r.column_types[c], (r.source_columns || {})[c] || "");
     refreshKeyChoices();
   });
 
@@ -454,15 +461,28 @@ function feedForm(f, creating) {
   // a row at a time, which made eight columns eight clicks plus eight
   // focus-and-type cycles.
   const paste = el("input", {class: "mono",
-    placeholder: "paste a header row: collateral_id, counterparty_id, market_value, ..."});
+    placeholder: "paste the file's header row: Trade Id|Cpty Ref|Notional (USD)"});
   const applyPaste = async () => {
-    const names = paste.value.split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
-    if (!names.length) return;
-    let guessed = {};
-    try { guessed = (await jpost("/api/infer-types", {columns: names})).column_types; }
-    catch (_) { guessed = {}; }
+    // Split on the feed's DELIMITER first. Splitting on whitespace turns a
+    // real header — `Trade Id|Cpty Ref` — into four columns, which is the
+    // shape of every header worth pasting. Comma next, whitespace only when
+    // neither is present, which is the "type me a list of clean names" case
+    // this box was originally for.
+    const raw = paste.value;
+    const d = readDelim() === "\\t" ? "\t" : readDelim();
+    let parts;
+    if (d && raw.includes(d)) parts = raw.split(d);
+    else if (raw.includes(",")) parts = raw.split(",");
+    else parts = raw.split(/\s+/);
+    const headers = parts.map(x => x.trim()).filter(Boolean);
+    if (!headers.length) return;
+    let r;
+    try { r = await jpost("/api/columns-from-header", {headers}); }
+    catch (_) { return; }
     const existing = new Set(Object.keys(readTypes()));
-    for (const n of names) if (!existing.has(n)) addColRow(n, guessed[n] || "");
+    for (const c of r.columns)
+      if (!existing.has(c))
+        addColRow(c, r.column_types[c] || "", (r.source_columns || {})[c] || "");
     paste.value = "";
     refreshKeyChoices();
   };
@@ -565,6 +585,17 @@ function feedForm(f, creating) {
     ]),
   );
 
+  // Only the columns whose file header differs -- sparse, like the types, so
+  // an ordinary feed writes no source_columns at all.
+  const readSources = () => {
+    const out = {};
+    for (const row of colsBox.children) {
+      const n = row._name.value.trim(), s = (row._source.value || "").trim();
+      if (n && s && s !== n) out[n] = s;
+    }
+    return out;
+  };
+
   const readTypes = () => {
     const out = {};
     for (const row of colsBox.children)
@@ -585,6 +616,7 @@ function feedForm(f, creating) {
       business_key: [...bkeySelected],
       columns: Object.keys(readTypes()),
       column_types: readTypes(),
+      source_columns: readSources(),
       expected_min_rows: Number(minRows.value || 0),
       cadence: cadence.value,
       schema_drift: drift.value,
@@ -674,8 +706,8 @@ function renderSteps(target, steps) {
 async function paneData(pane, f) {
   const filesBox = el("div");
   pane.append(el("div", {class: "note"},
-    "seed/ stands in for the upstream. Upload a delivery, land it into " +
-    `${f.landing_prefix}, then ingest it on the Run tab.`));
+    "Real files go straight to landing below. seed/ is for generated sample " +
+    "data — generate it, land it, then ingest on the Run tab."));
 
   // generate
   const gDays = el("input", {type: "number", min: "1", max: "30", value: "3"});
@@ -741,6 +773,57 @@ async function paneData(pane, f) {
         });
       }}, "Upload"),
     ]), result);
+
+  // ---------------------------------------------- deliver straight to landing
+  const drop = el("input", {type: "file", multiple: "multiple",
+                            accept: ".csv,.txt,.dat,text/csv,text/plain"});
+  const alsoIngest = el("input", {type: "checkbox"});
+  alsoIngest.checked = true;
+  const dOut = el("div");
+  pane.append(el("h3", {}, "Deliver real files"),
+    el("div", {class: "sub", style: "font-size:12px;margin-bottom:8px"},
+       `Uploads straight into ${f.landing_prefix}/${f.name}/, skipping seed/ — ` +
+       "which is for generated sample data. Many files at once; each is checked " +
+       "against the filename pattern before any is uploaded, because a file that " +
+       "does not match would land and never be ingested."),
+    el("div", {class: "row"}, [
+      el("div", {style: "flex:2;min-width:220px"}, drop),
+      el("div", {class: "row", style: "flex:1;min-width:170px"},
+         [alsoIngest, el("span", {class: "sub", style: "font-size:12px"},
+                         "ingest after uploading")]),
+      el("button", {class: "act primary", onclick: async (e) => {
+        if (!drop.files.length) return;
+        await withBusy(e.target, async () => {
+          dOut.textContent = "";
+          const fd = new FormData();
+          for (const file of drop.files) fd.append("files", file);
+          fd.append("ingest", alsoIngest.checked ? "true" : "false");
+          try {
+            const r = await api(`/api/feeds/${f.name}/deliver`, {method: "POST", body: fd});
+            const drifted = r.landed.filter(l => l.missing_columns.length || l.extra_columns.length);
+            dOut.append(el("div", {class: "note" + (drifted.length ? " warn" : "")},
+              `Landed ${r.count} file(s) into ${f.landing_prefix}/${f.name}/.` +
+              (drifted.length
+                 ? ` Header drift on ${drifted.length}: ` + drifted.map(l =>
+                     `${l.filename} (${[l.missing_columns.length ? "missing " + l.missing_columns.join(", ") : "",
+                                        l.extra_columns.length ? "extra " + l.extra_columns.join(", ") : ""]
+                                        .filter(Boolean).join("; ")})`).join(", ") +
+                   ". They still land; drift is reported, not fatal."
+                 : " Headers match the declared source names.")));
+            if (r.ingest && r.ingest.run_ids)
+              dOut.append(el("div", {class: "note"},
+                `Triggered ${r.ingest.run_ids.length} ingest run(s)` +
+                (r.ingest.unpaused ? " (unpaused the DAG first)" : "") + "."));
+            else if (r.ingest && r.ingest.reason)
+              dOut.append(el("div", {class: "note warn"},
+                "Files landed, but the ingest was not triggered: " + r.ingest.reason));
+            paneRefreshFiles(f, filesBox);
+          } catch (err) {
+            dOut.append(el("div", {class: "note warn"}, err.message));
+          }
+        });
+      }}, "Upload to landing"),
+    ]), dOut);
 
   pane.append(el("h3", {}, "seed/ and landing"), filesBox);
   paneRefreshFiles(f, filesBox);
