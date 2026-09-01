@@ -26,6 +26,34 @@
 
 {# Safe cast that yields NULL rather than erroring on bad input.
    Raw is all strings by design, so every prepared model needs this. #}
+{% macro ident(name) -%}
+  {#-
+    Quote a COLUMN NAME so any name works, including one with a space in it.
+
+    Which macros take a name and which take an EXPRESSION is the distinction
+    that matters here, and it is not cosmetic. `dedupe_rank`, `scd2_hash`,
+    `scd2_effective_to` and `as_of` are handed identifiers and interpolate them
+    into SQL, so `PARTITION BY Trade Id` is a syntax error rather than a
+    quoting inconvenience -- those call this. `safe_cast`, `clean_string` and
+    `parse_date` are handed expressions and nest inside each other
+    (`safe_cast(clean_string('x'), 'DECIMAL(18,2)')`), so quoting their
+    argument would break every existing model; those do not.
+
+    Column names reaching the prepared layer are normally ordinary identifiers
+    anyway, because `feeds.yml` maps awkward source headers to clean names at
+    ingest -- see docs/DECISIONS.md#source-column-names. This is the second
+    line of defence, for a name that is still awkward and for the models that
+    read raw directly.
+
+    Already-quoted and qualified names are passed through: a caller that wrote
+    `t.business_date` or `` `Trade Id` `` meant it.
+  -#}
+  {%- set text = name | string | trim -%}
+  {%- if '`' in text or '.' in text or '(' in text -%}{{ text }}
+  {%- else -%}{{ '`' ~ text ~ '`' }}{%- endif -%}
+{%- endmacro %}
+
+
 {% macro safe_cast(col, type) %}
   TRY_CAST({{ col }} AS {{ type }})
 {% endmacro %}
@@ -118,7 +146,8 @@
    then diverged. #}
 {% macro dedupe_rank(partition_keys) %}
   ROW_NUMBER() OVER (
-    PARTITION BY _business_date, {{ partition_keys | join(', ') }}
+    PARTITION BY _business_date,
+      {%- for k in partition_keys %} {{ ident(k) }}{{ ',' if not loop.last }}{% endfor %}
     ORDER BY _file_version DESC, _row_number DESC
   )
 {% endmacro %}
@@ -165,7 +194,7 @@
   #}
   sha2(concat_ws('||'
     {%- for c in columns %},
-    coalesce(cast({{ c }} as string), '')
+    coalesce(cast({{ ident(c) }} as string), '')
     {%- endfor %}), 256)
 {% endmacro %}
 
@@ -179,9 +208,10 @@
     a timestamp on every joined row.
   #}
   coalesce(
-    date_sub(lead({{ order_column }}) over (
-      partition by {{ partition_columns | join(', ') }}
-      order by {{ order_column }}), 1),
+    date_sub(lead({{ ident(order_column) }}) over (
+      partition by
+      {%- for c in partition_columns %} {{ ident(c) }}{{ ',' if not loop.last }}{% endfor %}
+      order by {{ ident(order_column) }}), 1),
     DATE '9999-12-31')
 {% endmacro %}
 
@@ -199,7 +229,9 @@
     doubling every joined row. The mutually_exclusive_ranges test is what
     catches that, and is not optional on any table using this.
   #}
-  {%- set keys = key_columns | join(', ') -%}
+  {%- set keys = [] -%}
+  {%- for c in key_columns %}{%- do keys.append(ident(c)) %}{%- endfor -%}
+  {%- set keys = keys | join(', ') -%}
   touched as (
 
       select distinct {{ keys }}
@@ -233,7 +265,8 @@
 
       select
           *,
-          lag(_row_hash) over (partition by {{ key_columns | join(', ') }}
+          lag(_row_hash) over (partition by
+            {%- for c in key_columns %} {{ ident(c) }}{{ ',' if not loop.last }}{% endfor %}
                                order by business_date)          as _prev_hash
       from {{ source_cte }}
 
@@ -254,7 +287,8 @@
   #}
   business_date                                             as effective_from,
   {{ scd2_effective_to('business_date', key_columns) }}     as effective_to,
-  lead(business_date) over (partition by {{ key_columns | join(', ') }}
+  lead(business_date) over (partition by
+    {%- for c in key_columns %} {{ ident(c) }}{{ ',' if not loop.last }}{% endfor %}
                             order by business_date) is null  as is_current,
   {#
     business_date is gone as a column, so it cannot be the partition column.

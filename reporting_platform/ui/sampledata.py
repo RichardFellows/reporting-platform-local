@@ -332,7 +332,10 @@ def generate(feed: Feed, *, days: int = 3, rows: int = 0,
         with path.open("w", newline="", encoding=feed.file_encoding) as fh:
             w = csv.writer(fh, delimiter=feed.delimiter,
                            quotechar=feed.quote_char)
-            w.writerow(list(feed.columns))
+            # The FILE's header, not the platform names -- a generated
+            # delivery that ingest cannot read is worse than no delivery.
+            # See docs/DECISIONS.md#source-column-names
+            w.writerow(list(feed.file_header))
             w.writerows(out_rows)
         written.append({"filename": name, "business_date": bd.isoformat(),
                         "rows": rows})

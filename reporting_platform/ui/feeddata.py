@@ -117,8 +117,12 @@ def preview(feed: Feed, filename: str, rows: int = 5) -> dict[str, Any]:
 def compare_header(feed: Feed, header: list[str]) -> dict[str, list[str]]:
     got = [h.strip() for h in header]
     return {
-        "missing_columns": [c for c in feed.columns if c not in got],
-        "extra_columns": [c for c in got if c not in feed.columns],
+        # Compared in SOURCE names: this is a statement about the delivered
+        # file, and the platform name a column would become is not something
+        # the upstream can act on.
+        # See docs/DECISIONS.md#source-column-names
+        "missing_columns": [c for c in feed.file_header if c not in got],
+        "extra_columns": [c for c in got if c not in feed.file_header],
     }
 
 

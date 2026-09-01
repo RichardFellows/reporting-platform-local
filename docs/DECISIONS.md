@@ -1035,3 +1035,63 @@ which is precisely why ignoring `hasMore` would go unnoticed until it did not.
 This is also why the watchdog mounts `./dbt` read-only: it needs the declared
 set, and nothing else from the project.
 
+## source-column-names
+
+A column may declare the name it has **in the delivered file** separately from
+the name the platform uses:
+
+```yaml
+columns:
+  - trade_id: "Trade Id"
+  - counterparty_id: "Cpty Ref"
+  - notional
+```
+
+Sparse, like `column_types`: a bare string means the header is already a usable
+identifier, which is most of them. The rename happens once, in
+`reconcile_schema` during ingest, so **raw onwards sees only identifiers**.
+
+Real deliveries do not arrive with snake_case headers. `Trade Id`,
+`Cpty Ref`, `Notional (USD)` are ordinary, and a space in a column name is not
+a cosmetic problem downstream: dbt macros interpolate column names into SQL,
+so `PARTITION BY Trade Id` is a syntax error. Renaming in every prepared model
+instead would mean quoting at every call site, in every model, forever --
+and getting it wrong produces a build failure a long way from the cause.
+
+Raw stays 1:1 with the delivery in the way that matters: same rows, same
+values, same order, everything a string. Only the identifiers are normalised.
+
+Two things follow, and both are the same rule -- **drift is a statement about
+the file**:
+
+- `missing_columns` and `extra_columns` are reported in SOURCE names, from
+  ingest and from the console's header check alike. "The delivery did not have
+  `Cpty Ref`" is something an upstream can act on; the platform name it would
+  have become is not.
+- `_extra_columns` keys are source names, necessarily -- an undeclared column
+  has no platform name.
+- The sample-data generator writes the SOURCE header, or the deliveries it
+  generates would be ones the ingest cannot read.
+
+## identifiers-in-macros
+
+`ident()` in `macros/engine.sql` quotes a column name. Which macros call it is
+the distinction that matters, and it is not stylistic:
+
+- **Identifier-typed** -- `dedupe_rank`, `scd2_hash`, `scd2_effective_to`,
+  `scd2_incremental_scope`, `scd2_columns` -- are handed a *name* and
+  interpolate it into SQL. These quote.
+- **Expression-typed** -- `safe_cast`, `clean_string`, `parse_date` -- are
+  handed an *expression* and nest inside one another
+  (`safe_cast(clean_string('x'), 'DECIMAL(18,2)')`). Quoting their argument
+  would produce `` TRIM(`NULLIF(...)`) `` and break every existing model. These
+  do not, and must not.
+
+Already-qualified or already-quoted names pass through untouched, so
+`as_of('r', 'business_date')` and `r.counterparty_id` still work.
+
+With [source-column-names](#source-column-names) doing the normalising at
+ingest, the prepared layer rarely sees an awkward identifier at all. This is
+the second line of defence, and it is what makes a model that reads raw
+directly safe to write.
+

@@ -108,16 +108,31 @@ def read_landing(spark, fd, uri: str):
 
 
 def reconcile_schema(df, fd) -> tuple:
-    """Align the arrival to the declared schema; surface drift."""
+    """Align the arrival to the declared schema, rename to platform names, and
+    surface drift.
+
+    THIS IS WHERE SOURCE COLUMN NAMES STOP EXISTING. A delivery may head its
+    columns `Trade Id` or `Notional (USD)`; `feeds.yml` maps those to
+    identifiers, and everything from the raw table onwards sees only the
+    identifier. Doing it here rather than in each prepared model means the
+    awkward name lives in one place instead of in every macro call that
+    touches it. See docs/DECISIONS.md#source-column-names
+
+    Drift is reported in SOURCE names, because drift is a statement about the
+    file: "the delivery did not have `Cpty Ref`" is actionable with the
+    upstream, and the platform name it would have become is not.
+    """
     from pyspark.sql import functions as F
 
     arrived = set(df.columns)
-    declared = list(fd.columns)
-    missing = [c for c in declared if c not in arrived]
-    extra = sorted(arrived - set(declared))
+    # (platform name, name in the file), in declared order.
+    declared = [(c, fd.source_column(c)) for c in fd.columns]
+    expected = {source for _, source in declared}
+    missing = [source for _, source in declared if source not in arrived]
+    extra = sorted(arrived - expected)
 
-    for c in missing:
-        df = df.withColumn(c, F.lit(None).cast("string"))
+    for source in missing:
+        df = df.withColumn(source, F.lit(None).cast("string"))
 
     if extra:
         pairs = []
@@ -130,7 +145,8 @@ def reconcile_schema(df, fd) -> tuple:
             F.create_map().cast("map<string,string>"),
         )
 
-    df = df.select(*[F.col(f"`{c}`").cast("string").alias(c) for c in declared],
+    df = df.select(*[F.col(f"`{source}`").cast("string").alias(name)
+                     for name, source in declared],
                    "_extra_columns")
     return df, {"missing_columns": missing, "extra_columns": extra}
 

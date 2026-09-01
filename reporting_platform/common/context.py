@@ -91,6 +91,22 @@ class Feed:
     # what the PREPARED model should do with the column, which is the one
     # thing the scaffold and the generator both need to agree on.
     column_types: dict[str, str] = field(default_factory=dict)
+    # Platform column name -> the name that column has IN THE FILE, for the
+    # ones that differ. Sparse, like column_types: a feed whose headers are
+    # already usable identifiers has none of these and no diff.
+    #
+    # Real deliveries do not arrive with snake_case headers. `Trade Id`,
+    # `Cpty Ref`, `Notional (USD)` are ordinary, and a name with a space in it
+    # poisons everything downstream of raw: dbt macros interpolate column
+    # names into SQL, and `PARTITION BY Trade Id` is a syntax error rather than
+    # a quoting inconvenience. Renaming at INGEST rather than in every model
+    # means the awkward name exists in exactly one place -- the file, and this
+    # mapping -- and raw onwards is ordinary identifiers.
+    #
+    # Raw stays 1:1 with the delivery in the way that matters: same rows, same
+    # values, same order, everything a string. Only the identifiers are
+    # normalised. See docs/DECISIONS.md#source-column-names
+    source_columns: dict[str, str] = field(default_factory=dict)
     # Whether this feed is expected to deliver on every business date. False
     # opts it out of the completeness check, which infers the
     # business calendar from what other feeds delivered -- a feed that does
@@ -100,6 +116,19 @@ class Feed:
     # expected whenever another feed delivered on it) or "weekly" (only that
     # each week containing business dates saw at least one delivery).
     cadence: str = "daily"
+
+    def source_column(self, name: str) -> str:
+        """The name this platform column has in the delivered file."""
+        return self.source_columns.get(name, name)
+
+    @property
+    def file_header(self) -> list[str]:
+        """Column names as the FILE carries them, in declared order.
+
+        What drift is measured against, what the sample-data generator writes,
+        and what an uploaded header is compared to.
+        """
+        return [self.source_column(c) for c in self.columns]
 
     @property
     def raw_table(self) -> str:
@@ -120,6 +149,32 @@ class Feed:
         return bd, int(raw_version) if raw_version else 1
 
 
+def split_columns(declared: list) -> tuple[list[str], dict[str, str]]:
+    """`columns:` entries -> (platform names, {platform: source} for the odd ones).
+
+    Each entry is either a bare string, when the file's header is already a
+    usable identifier, or a single-key mapping `{trade_id: "Trade Id"}` when it
+    is not. Both forms in one list, because most columns need no mapping and a
+    uniform mapping form would make every feed block twice as long to say
+    nothing.
+    """
+    names: list[str] = []
+    sources: dict[str, str] = {}
+    for item in declared:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict) and len(item) == 1:
+            name, source = next(iter(item.items()))
+            names.append(str(name))
+            if source is not None and str(source) != str(name):
+                sources[str(name)] = str(source)
+        else:
+            raise ValueError(
+                f"unusable `columns` entry {item!r}: expected a name, or a "
+                f"single-key mapping of platform name to source name")
+    return names, sources
+
+
 @lru_cache(maxsize=None)
 def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
     cfg = _load("feeds.yml")
@@ -127,6 +182,11 @@ def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
     out: dict[str, Feed] = {}
     for block in cfg["feeds"]:
         merged = {**defaults, **block}
+        names, sources = split_columns(merged.get("columns") or [])
+        merged["columns"] = names
+        # An explicit source_columns: block wins over the inline form, so a
+        # feed can use whichever reads better without them fighting.
+        merged["source_columns"] = {**sources, **(merged.get("source_columns") or {})}
         allowed = {f.name for f in Feed.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         out[block["name"]] = Feed(**{k: v for k, v in merged.items() if k in allowed})
     return out
