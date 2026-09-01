@@ -294,10 +294,21 @@ def api_test_pattern(payload: dict):
 
 
 @app.post("/api/infer-columns")
-async def api_infer_columns(file: UploadFile = File(...)):
-    """Read a CSV's header to pre-fill the column list and types."""
+async def api_infer_columns(file: UploadFile = File(...),
+                            delimiter: str = Form(","),
+                            file_encoding: str = Form("utf-8")):
+    """Read a delivery's header to pre-fill the column list and types.
+
+    The delimiter comes from the form rather than defaulting to a comma. It
+    used to default, which meant uploading a pipe-delimited file returned ONE
+    column whose name was the entire header row -- and that then became the
+    feed's `columns:` list and its scaffolded model. It failed looking like a
+    malformed file rather than like a wrong setting.
+    """
     content = await file.read()
-    columns = feeddata.columns_from_csv(content)
+    columns = feeddata.columns_from_csv(
+        content, encoding=file_encoding,
+        delimiter=registry.unescape_char(delimiter))
     return {"columns": columns, "column_types": scaffold.infer_types(columns),
             "types_available": scaffold.COLUMN_TYPES}
 

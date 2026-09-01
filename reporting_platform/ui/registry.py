@@ -9,6 +9,7 @@ that touches only the feed being added.
 """
 from __future__ import annotations
 
+import codecs
 import io
 import re
 from dataclasses import dataclass, field
@@ -30,13 +31,28 @@ COLUMN_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 # presents them. Anything not listed here is left alone -- a per-feed
 # `arrival_timeout_hours` set by hand survives an edit through the UI.
 BLOCK_ORDER = ["name", "description", "source_system", "filename_pattern",
+               "delimiter", "quote_char", "header", "file_encoding",
                "business_key", "expected_min_rows", "cadence", "completeness",
                "schema_drift", "columns", "column_types"]
 
 # Values that live in `defaults:`. A feed block repeating the default value is
-# noise in the diff, so these are only written when they differ from it.
+# noise in the diff, so these are only written when they differ from it. The
+# four format keys are here rather than absent because a pipe-delimited or
+# latin-1 feed is ordinary, and the alternative was hand-editing feeds.yml
+# after every console-created feed.
 OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "completeness": True,
-                         "schema_drift": "warn"}
+                         "schema_drift": "warn", "delimiter": ",",
+                         "quote_char": '"', "header": True,
+                         "file_encoding": "utf-8"}
+
+# Two-character sequences a person types into a one-character field, because
+# there is no other way to type a tab into a text input.
+ESCAPES = {"\\t": "\t", "\\\\": "\\"}
+
+
+def unescape_char(value: str) -> str:
+    """`\\t` -> an actual tab. Anything else is returned unchanged."""
+    return ESCAPES.get(value, value)
 
 
 def _yaml() -> YAML:
@@ -70,6 +86,14 @@ class FeedSpec:
     cadence: str = "daily"
     completeness: bool = True
     schema_drift: str = "warn"
+    # How to READ the file. All four default to the `defaults:` block and are
+    # written only when they differ -- see OPTIONAL_WITH_DEFAULT. They reach
+    # Spark's reader unchanged (ingest_feed.py), so a wrong delimiter lands one
+    # column holding the whole row rather than failing.
+    delimiter: str = ","
+    quote_char: str = '"'
+    header: bool = True
+    file_encoding: str = "utf-8"
     # Sparse: ONLY the columns whose type disagrees with what infer_type()
     # guesses. The caller reduces it (scaffold.overrides_only) before handing
     # it over, so this module stays ignorant of how a type is guessed -- it
@@ -94,6 +118,10 @@ class FeedSpec:
             cadence=str(payload.get("cadence") or "daily").strip(),
             completeness=bool(payload.get("completeness", True)),
             schema_drift=str(payload.get("schema_drift") or "warn").strip(),
+            delimiter=unescape_char(str(payload.get("delimiter") or ",")),
+            quote_char=unescape_char(str(payload.get("quote_char") or '"')),
+            header=bool(payload.get("header", True)),
+            file_encoding=str(payload.get("file_encoding") or "utf-8").strip(),
             column_types={str(k): str(v) for k, v in
                           (payload.get("column_types") or {}).items() if v},
         )
@@ -164,6 +192,22 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         errors["cadence"] = "must be 'daily' or 'weekly'"
     if spec.schema_drift not in ("warn", "fail"):
         errors["schema_drift"] = "must be 'warn' or 'fail'"
+
+    # Spark's CSV reader takes a single character for `sep` and `quote`. A
+    # two-character value is accepted by the form and then either throws inside
+    # the ingest or, worse, splits on neither character and lands one column.
+    if len(spec.delimiter) != 1:
+        errors["delimiter"] = (
+            "must be exactly one character (type \\t for a tab) -- it becomes "
+            "Spark's `sep`, which takes a single character")
+    if len(spec.quote_char) != 1:
+        errors["quote_char"] = "must be exactly one character"
+    try:
+        codecs.lookup(spec.file_encoding)
+    except LookupError:
+        errors["file_encoding"] = (
+            f"unknown encoding {spec.file_encoding!r} -- try utf-8, latin-1 "
+            f"or cp1252")
 
     if errors:
         raise FeedValidationError(errors)
@@ -322,7 +366,9 @@ def remove(name: str) -> None:
 def spec_from_feed(fd: Feed) -> FeedSpec:
     return FeedSpec(
         name=fd.name, description=fd.description, source_system=fd.source_system,
-        filename_pattern=fd.filename_pattern, business_key=list(fd.business_key),
+        filename_pattern=fd.filename_pattern,
+        delimiter=fd.delimiter, quote_char=fd.quote_char,
+        header=fd.header, file_encoding=fd.file_encoding, business_key=list(fd.business_key),
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
         cadence=fd.cadence, completeness=fd.completeness,
         schema_drift=fd.schema_drift, column_types=dict(fd.column_types or {}),

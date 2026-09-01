@@ -335,6 +335,33 @@ function feedForm(f, creating) {
   const completeness = el("input", {type: "checkbox"});
   completeness.checked = f ? f.completeness : true;
 
+  // ---------------------------------------------------------- file format
+  // These four reach Spark's reader unchanged. A wrong delimiter does not
+  // fail: it lands ONE column holding the whole row, so it is worth setting
+  // before anything is uploaded or generated.
+  const DELIMS = [[",", "comma"], ["|", "pipe"], ["\\t", "tab"],
+                  [";", "semicolon"], ["", "other\u2026"]];
+  const known = DELIMS.some(([v]) => v === (f?.delimiter ?? ","));
+  const delim = el("select", {}, DELIMS.map(([v, label]) =>
+    el("option", {value: v,
+                  selected: (known ? v === (f?.delimiter ?? ",") : v === "")
+                            ? "selected" : null},
+       v ? label + "  " + (v === "\\t" ? "\\t" : v) : label)));
+  const delimOther = el("input", {class: "mono", style: "width:6em",
+                                  placeholder: "\\t", maxlength: "2",
+                                  value: known ? "" : (f?.delimiter ?? "")});
+  const syncDelim = () => { delimOther.disabled = delim.value !== ""; };
+  delim.addEventListener("change", syncDelim);
+  syncDelim();
+  const readDelim = () => (delim.value === "" ? delimOther.value : delim.value);
+
+  const quote = el("input", {class: "mono", style: "width:6em", maxlength: "1",
+                             value: f?.quote_char ?? '"'});
+  const encoding = el("input", {class: "mono", style: "width:10em",
+                                value: f?.file_encoding ?? "utf-8"});
+  const hasHeader = el("input", {type: "checkbox"});
+  hasHeader.checked = f ? f.header : true;
+
   async function testPattern() {
     const r = await jpost("/api/test-pattern",
       {pattern: pattern.value, filename: example.value});
@@ -406,11 +433,15 @@ function feedForm(f, creating) {
   };
   for (const c of (f?.columns ?? [])) addColRow(c, (f?.column_types ?? {})[c] ?? "");
 
-  const upload = el("input", {type: "file", accept: ".csv,text/csv"});
+  const upload = el("input", {type: "file", accept: ".csv,.txt,.dat,text/csv,text/plain"});
   upload.addEventListener("change", async () => {
     if (!upload.files.length) return;
     const fd = new FormData();
     fd.append("file", upload.files[0]);
+    // Without these the server splits on a comma whatever the file is, and a
+    // pipe-delimited delivery yields one column named after the whole header.
+    fd.append("delimiter", readDelim());
+    fd.append("file_encoding", encoding.value.trim() || "utf-8");
     const r = await api("/api/infer-columns", {method: "POST", body: fd});
     colsBox.textContent = "";
     for (const c of r.columns) addColRow(c, r.column_types[c]);
@@ -515,6 +546,23 @@ function feedForm(f, creating) {
              "Unchecked opts the feed out of gap detection entirely (monthly or ad-hoc feeds).")]),
       ]),
     ]),
+    el("div", {class: "grid2"}, [
+      field("delimiter", "Delimiter", el("div", {class: "row"}, [delim, delimOther]),
+        "Becomes Spark's `sep`, which takes a single character. A wrong one does not fail \u2014 " +
+        "it lands one column holding the whole row. Only written to feeds.yml when it is not a comma."),
+      field("quote_char", "Quote character", quote,
+        "Leave as \" unless the source quotes with something else."),
+    ]),
+    el("div", {class: "grid2"}, [
+      field("file_encoding", "File encoding", encoding,
+        "utf-8 unless the source says otherwise \u2014 latin-1 and cp1252 are the usual others."),
+      el("div", {class: "field"}, [
+        el("label", {}, "Header row"),
+        el("div", {class: "row"}, [hasHeader,
+          el("span", {class: "sub", style: "font-size:12px"},
+             "Unchecked means the first line is data. Column names then come only from the list below.")]),
+      ]),
+    ]),
   );
 
   const readTypes = () => {
@@ -541,6 +589,10 @@ function feedForm(f, creating) {
       cadence: cadence.value,
       schema_drift: drift.value,
       completeness: completeness.checked,
+      delimiter: readDelim(),
+      quote_char: quote.value,
+      file_encoding: encoding.value.trim(),
+      header: hasHeader.checked,
     }),
     clearErrors: () => Object.values(errBoxes).forEach(e => e.textContent = ""),
     showErrors: (err) => {

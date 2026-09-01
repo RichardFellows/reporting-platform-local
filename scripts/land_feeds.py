@@ -26,7 +26,15 @@ def main() -> int:
         if not d.exists():
             print(f"skip {name}: {d} not found")
             continue
-        files = sorted(d.glob("*.csv"))
+        # Matched against the FEED'S OWN pattern, not a *.csv glob. A feed
+        # may deliver .txt, .dat or anything else -- feeds.yml carries the
+        # filename pattern precisely so the extension is not the platform's
+        # business -- and a glob here silently landed nothing for those,
+        # leaving the feed reporting "0 pending" with the file sitting in
+        # seed/. It also skips files that do not belong to the feed, which the
+        # glob would have landed for the ingest to ignore later.
+        files = sorted(p for p in d.iterdir()
+                       if p.is_file() and fd.parse_filename(p.name))
         if a.limit:
             files = files[: a.limit]
         for f in files:
