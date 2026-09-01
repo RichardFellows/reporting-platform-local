@@ -997,3 +997,41 @@ Three things make the derivation safe rather than merely shorter:
 
 The consequence: adding a feed is five files, not six, and the feed console no
 longer splices Python source with `ast` to register the table.
+
+## catalog-reconciliation
+
+`check_orphan_tables` in the watchdog compares what the Nessie catalog holds on
+`main` against what `managed_tables()` declares. It is the inverse of the
+failure that list used to have.
+
+Deriving the set from feeds.yml and the dbt project
+([managed-tables-are-derived](#managed-tables-are-derived)) means a table stops
+being maintained the moment its feed or model is deleted -- correctly, but
+silently. The data does not go anywhere: it sits in the warehouse, never
+compacted, its snapshots never expiring, retention never trimming it, and
+nothing says so. This check is what says so.
+
+**Declared-but-absent is deliberately not a finding.** A model that has never
+been built has no table yet, which is the normal state of a fresh clone and of
+any model added since the last build. Alerting on it would fire on every
+healthy new checkout -- the exact shape this file has twice been corrected for
+(see [watchdog-wall-clock-window](#watchdog-wall-clock-window) and
+[watchdog-eligible-vs-overdue](#watchdog-eligible-vs-overdue)). It is recorded
+as a fact, `unbuilt_tables`, so it is visible without being an alarm.
+
+**The orphan warning does not self-clear, and that is right.** An orphan is a
+real condition that persists until someone drops the table or restores what
+declared it. The test that matters is whether the quiet state is *reachable*,
+not whether the warning is short-lived -- and it is: drop the table and the
+watchdog returns to OK. Verified by creating one, seeing the WARN name it,
+dropping it and watching the severity go back.
+
+It reads the catalog over the Nessie REST API rather than with `SHOW TABLES`,
+because the watchdog imports no Spark and runs every five minutes; a
+SparkSession would cost about 22 seconds of that. The listing is paginated and
+the client follows the pages -- on a warehouse this size that is one page,
+which is precisely why ignoring `hasMore` would go unnoticed until it did not.
+
+This is also why the watchdog mounts `./dbt` read-only: it needs the declared
+set, and nothing else from the project.
+

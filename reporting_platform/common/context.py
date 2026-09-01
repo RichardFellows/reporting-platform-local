@@ -495,6 +495,28 @@ class Nessie:
             json={"fromRefName": from_branch, "fromHash": src["hash"]},
         )
 
+    def list_entries(self, ref: str = "main") -> list[dict[str, Any]]:
+        """Every content entry on a ref -- tables and namespaces.
+
+        Paginated: Nessie answers with `hasMore` and a `token`, and a caller
+        that ignores them silently sees only the first page. On a warehouse
+        this size that is one page, which is exactly why it would go unnoticed
+        until it was not.
+
+        This is the cheap way to ask what the catalog holds. The alternative,
+        `SHOW TABLES`, costs a SparkSession -- about 22 seconds -- and the
+        watchdog runs every five minutes and imports no Spark at all.
+        """
+        entries: list[dict[str, Any]] = []
+        params: dict[str, Any] = {}
+        while True:
+            page = self._req("GET", f"/trees/{_urlquote(ref, safe='')}/entries",
+                             params=params).json()
+            entries.extend(page.get("entries", []))
+            if not page.get("hasMore"):
+                return entries
+            params = {"pageToken": page["token"]}
+
     def create_tag(self, name: str, from_ref: str = "main") -> dict[str, Any]:
         src = self.get_reference(from_ref)["reference"]
         return self._req(

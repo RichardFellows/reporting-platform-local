@@ -279,6 +279,60 @@ def check_nessie() -> tuple[list[Finding], dict]:
     return findings, facts
 
 
+# ------------------------------------------------------------ orphan tables
+def check_orphan_tables() -> tuple[list[Finding], dict]:
+    """Tables in the catalog that nothing declares any more.
+
+    THE INVERSE OF THE FAILURE managed_tables() USED TO HAVE. That set is
+    derived from feeds.yml and the dbt project (see
+    docs/DECISIONS.md#managed-tables-are-derived), so a table stops being
+    maintained the moment its feed or model is deleted -- correctly, but
+    silently. The data does not go anywhere: it sits in the warehouse, never
+    compacted, its snapshots never expiring, retention never trimming it, and
+    nothing anywhere says so.
+
+    Declared-but-absent is deliberately NOT a finding. A model that has never
+    been built has no table yet, which is the normal state of a fresh clone and
+    of any model added since the last build. Reporting it would fire on every
+    healthy new checkout -- the failure mode this file has twice been fixed for.
+    It is recorded as a fact so it is visible without being an alarm.
+
+    This one does not self-clear, and that is correct: an orphan is a real
+    condition that persists until someone drops the table or restores what
+    declared it. Its quiet state is reachable, which is the test that matters.
+    See docs/DECISIONS.md#catalog-reconciliation
+    """
+    from reporting_platform.common.context import Nessie, managed_tables
+
+    try:
+        entries = Nessie().list_entries("main")
+    except Exception as exc:
+        return [Finding("orphan_tables", ALERT,
+                        f"cannot list catalog entries: {exc}"[:300])], {}
+
+    in_catalog = {".".join(e["name"]["elements"])
+                  for e in entries if e.get("type") == "ICEBERG_TABLE"}
+    declared = {t.split(".", 1)[1] for t, _layer in managed_tables()}
+
+    orphans = sorted(in_catalog - declared)
+    unbuilt = sorted(declared - in_catalog)
+    facts = {"catalog_tables": len(in_catalog), "declared_tables": len(declared),
+             "orphan_tables": len(orphans), "unbuilt_tables": len(unbuilt)}
+    if unbuilt:
+        facts["unbuilt"] = unbuilt
+
+    findings = []
+    if orphans:
+        findings.append(Finding(
+            "orphan_tables", WARN,
+            f"{len(orphans)} table(s) on main are not declared by any feed or "
+            f"dbt model, so maintenance and retention do not cover them and "
+            f"they grow untended: {', '.join(orphans)}. Drop them, or restore "
+            f"whatever used to declare them.",
+            tables=orphans))
+    return findings, facts
+
+
 # --------------------------------------------------------------- warehouse
 def check_warehouse(history: list[dict], now: datetime) -> tuple[list[Finding], dict]:
     """Warehouse size, and whether it has moved at all across recent runs.
@@ -520,6 +574,7 @@ def evaluate(history_path: str = HISTORY_PATH) -> dict:
     facts: dict = {}
     for check in (lambda: check_orchestrator(now),
                   check_nessie,
+                  check_orphan_tables,
                   lambda: check_warehouse(history, now),
                   # ORDER MATTERS, and the lambda is what makes it work:
                   # `facts` is read when this is CALLED, after
