@@ -211,38 +211,65 @@ keyed by *layer*, not by table. If the prepared `sort_order` names a column
 your table lacks, `maintain.py` intersects it with the real columns and falls
 back to binpack, so that is not a failure either.
 
-## 6. `scripts/generate_feeds.py` — sample data
+## 6. Sample data
 
-Local-stack only, but skip it and the feed has nothing to run against, and
-anyone regenerating the seed loses it.
+Local-stack only, but skip it and the feed has nothing to run against.
 
-**Draw values from `common/volatility.py`, not from a module-level
-`random`.** Two rules, and the second is the one that bites:
+**You do not write a generator.** `scripts/generate_feeds.py` hand-writes
+generators for the four original feeds only — `trade`, `counterparty`,
+`rating`, `primary_limits` — because their *pathologies* are the point and a
+definition-driven generator cannot produce them: the two injected failures, the
+schema drift, the absent delivery, the non-overlapping SCD2 ranges
+`dbt_utils.mutually_exclusive_ranges` tests, the cadence difference between a
+daily feed and a weekly one.
 
-*Never the shared stream.* Every generator drawing from one `random` seeded at
-import means the numbers any of them gets depend on how many draws came
-before, so adding a feed silently changes every trade notional and rating
-already in `seed/` — still valid data, and a diff covering the whole
-directory. `stable_rng(...)` seeds from the entity key instead, so generation
-order stops mattering at all.
-
-*A value is a function of (entity, epoch), not of (entity, date).* Reference
-data holds still. Generators here used to redraw every attribute on every
-business date, which made `primary_limits` carry 35 different amounts for one
-limit across its 35 delivered dates and gave `trade` a brand-new set of 400
-trade_ids every morning. Use `epoch()` to pick the block a value holds for and
-`epoch_start()` for any `*_date` that should say when the current value came
-into force. Keep the result a pure function of the business date — the seed is
-generated sparse for old history and dense for the tail, and anything walking
-from "yesterday's value" makes those two disagree.
-
-Prove it
-either way:
+Every **other** feed in `feeds.yml` is generated from its own definition by
+`reporting_platform/ui/sampledata.py`, the console's generator, which
+`generate_feeds.py` calls after the hand-written four. So one command seeds all
+of them:
 
 ```powershell
-docker compose exec -T airflow python /opt/platform/scripts/generate_feeds.py --end 2026-08-19 --out /tmp/check --clean
-# then diff /tmp/check/trade against seed/trade -- must be identical
+docker compose exec -T airflow python -m scripts.generate_feeds --out /opt/platform/seed
 ```
+
+Look for `<feed>: N files (from feed definition)` in the output. That generator
+does three things a naive one would not, each the difference between a file
+that tests something and one that does not:
+
+- **It generates for business dates the other feeds delivered on.** A
+  `relationships` test compares against reference data on the *same*
+  `business_date`, so rows dated where `counterparty` has nothing are
+  guaranteed to fail a test that has found nothing wrong with the feed. It
+  therefore runs *after* the hand-written four and raises on an empty `seed/`.
+- **Foreign keys are drawn from the real reference data**, read out of the
+  other feed's seed CSVs. Random `CP#####` values would fail `relationships`
+  for reasons that say nothing about the feed under test.
+- **It varies the representations the platform exists to normalise** — dates
+  alternate between `yyyy-MM-dd` and `yyyyMMdd`, booleans cycle Y/N/true/1/0 —
+  so `parse_date` and the boolean CASE are actually exercised.
+
+Values are a function of `(entity, epoch)` rather than `(entity, date)`, so
+reference data holds still between deliveries instead of churning every
+morning. See `common/volatility.py` and
+[DECISIONS.md#generated-data-must-hold-still](DECISIONS.md#generated-data-must-hold-still).
+
+**If you call `sampledata.generate()` directly, pass `types=`.** Without it it
+re-guesses from the column *name*, so a column declared `decimal` in
+`column_types:` gets a non-numeric value, the prepared model's `safe_cast`
+nulls the whole column, and **nothing fails** — because nulling is what
+`safe_cast` is for. `scaffold.resolve_types(feed)` is the value to pass. See
+[DECISIONS.md#resolve-types-is-authoritative](DECISIONS.md#resolve-types-is-authoritative).
+
+```python
+from reporting_platform.common.context import feeds
+from reporting_platform.ui import sampledata, scaffold
+feed = feeds()["primary_limits"]
+sampledata.generate(feed, days=0, types=scaffold.resolve_types(feed))
+```
+
+The alternative is the console's **Data** tab, which uploads a real CSV — the
+better option once you have one, because it is the actual file shape rather
+than a plausible one.
 
 ---
 
