@@ -283,24 +283,13 @@ def check_nessie() -> tuple[list[Finding], dict]:
 def check_warehouse(history: list[dict], now: datetime) -> tuple[list[Finding], dict]:
     """Warehouse size, and whether it has moved at all across recent runs.
 
-    THE WINDOW IS WALL-CLOCK, NOT SAMPLES, and that is the whole subtlety.
-    This check originally required five flat *evaluations*, which at the
-    configured `--loop 300` is twenty-five minutes. Reclamation is nightly. So
-    on a perfectly healthy platform the check went WARN twenty-five minutes
-    after every reclamation and stayed there until the next one -- it was
-    firing continuously in the live logs. A monitor whose
-    quiet state is unreachable teaches people to ignore it.
+    THE WINDOW IS WALL-CLOCK, NOT SAMPLES, and the current sample is part of it.
+    A sample-counted window does not match the nightly cadence of the thing that
+    clears it. See docs/DECISIONS.md#watchdog-wall-clock-window
 
-    The current sample is also part of the window. Reading only `history` --
-    which is written *after* the checks run -- meant a warehouse that had just
-    changed still failed the flatness test, and worse, the message quoted the
-    new size as the value that had been flat.
-
-    It stays a WARN even now that D4 automates reclamation, because flat is
-    still legitimate: a quiet weekend produces no garbage, so there is nothing
-    to collect and the line is correctly level. The condition that genuinely
-    means reclamation is broken is `check_deferred_backlog` below -- files
-    identified as collectable and still sitting there -- and that one alerts.
+    Stays a WARN, because flat is legitimate: a quiet weekend produces no
+    garbage. The condition that genuinely means reclamation is broken is
+    `check_deferred_backlog` below, and that one alerts.
     """
     try:
         from reporting_platform.retention.orphan_storage import warehouse_table_prefixes
@@ -360,30 +349,22 @@ def _spans(history: list[dict], cutoff: float) -> bool:
     return False
 
 
-# -------------------------------------------------- deferred backlog (D4)
+# ------------------------------------------------------- deferred backlog
 def check_deferred_backlog(
     now: datetime, last_success_at: str | None = None
 ) -> tuple[list[Finding], dict]:
     """Has a housekeeping run left GC-identified files undeleted past their window?
 
-    THIS IS THE CHECK THAT REPLACES THE OLD D4 WARNING, and it is the one
-    assertion in this file that is both satisfiable and meaningful. Nessie
-    GC's sweep records files rather than deleting them; `retention
-    .deferred_deletes()` executes those records once they are older than
-    `deferred_delete_after_hours`. If that pass stops working -- the JAR is
+    This is the one assertion in this file that is both satisfiable and
+    meaningful. Nessie GC's sweep records files rather than deleting them;
+    `retention.deferred_deletes()` executes those records once they are older
+    than `deferred_delete_after_hours`. If that pass stops working -- the JAR is
     gone, the GC database is unreachable, the step throws and is swallowed --
     the records pile up and the warehouse silently stops falling.
 
-    ELIGIBLE IS NOT THE SAME AS OVERDUE, and conflating them made this check
-    fire almost continuously on a healthy platform. It
-    originally alerted as soon as a live-set was older than the deferral
-    window. But the window is `deferred_delete_after_hours` while the thing
-    that ACTS on it is the nightly DAG, so a set recorded at 22:00 with a 1h
-    window is "overdue" from 23:00 until the next night's run twenty-three
-    hours later -- on a platform doing exactly what it should. Its message
-    even said the pass "is not running", which was false. That is
-    #29 in a new costume: a window that does not match the cadence of the
-    thing it describes, wearing an explanation that reads as a diagnosis.
+    ELIGIBLE IS NOT THE SAME AS OVERDUE, and conflating them makes this check
+    fire almost continuously on a healthy platform.
+    See docs/DECISIONS.md#watchdog-eligible-vs-overdue
 
     So the condition is not "time has passed". It is **a housekeeping run
     completed after these files became eligible, and they are still here** --

@@ -761,3 +761,205 @@ Two consequences in `platform_housekeeping.py`:
 
 Expiring snapshots before expiring tags reclaims nothing while appearing to
 succeed, which is why the order in that DAG's docstring is the point.
+
+## table-naming-no-layer-prefix
+
+Table names carry no layer prefix. They were `prep_*` and `rpt_*`; the namespace
+already says which layer a table is in, so the prefix repeated it inside the
+name -- `prepared.prep_trade`, `reporting.rpt_exposure_change`.
+
+The layer is now the only thing distinguishing a table from its upstream:
+`raw.trade` is the landed 1:1 copy and `prepared.trade` the conformed one, same
+name, different namespace. That is legal because dbt keeps models and sources in
+separate namespaces -- a model named `trade` and a source `raw.trade` coexist
+without collision. Verified, not assumed.
+
+The dbt model name and the `PREPARED_TABLES` entry must be renamed
+**together**. A mismatch in either direction points every maintenance and
+retention task at a table that does not exist, and does so silently, because
+`managed_tables()` never checks that its entries resolve.
+
+## managed-tables-single-definition
+
+`managed_tables()` is one definition, imported by both the DAG and the CLIs.
+
+It lived in `platform_housekeeping.py`, which meant the `--table` examples in
+the Makefile and README were a hand-maintained subset -- and they had already
+drifted to five tables against the DAG's nine, so `make retention` quietly left
+four tables growing. A forked copy that stops matching the original, where the
+copy looks authoritative.
+
+The raw half is derived from `feeds()` rather than listed, so adding a feed
+extends maintenance and retention automatically. `PREPARED_TABLES` is the half
+that is not derived, which is why it is the one file in
+`docs/ADDING-A-FEED.md` that fails silently when skipped.
+
+## spark-master-no-local-fallback
+
+`spark_session()` refuses a `local` master rather than falling back to it.
+
+A missing or blank `SPARK_MASTER` meaning "run the whole job inside this
+container" is a configuration error that **looks like success**: the job
+completes, the cluster sits idle, and nothing anywhere is red. Failing loudly is
+the only way that surfaces.
+
+The default in code is the same address `docker-compose.yml` sets, so a bare
+`python -m ...` inside the container still works. See
+[spark-master-single-source](#spark-master-single-source) for the other reader.
+
+## branch-in-the-table-name
+
+The Nessie branch is named **in the table reference** --
+`lakehouse.raw.`trade@ingest/trade/...`` -- rather than in session config.
+
+This is what lets one Spark session serve a whole chunk of files. When the
+branch was session-level config (`spark.sql.catalog.lakehouse.ref`), every file
+needed its own SparkSession: 127 Spark applications for 183 files, each paying
+executor acquisition and catalog init before doing a few seconds of actual work.
+
+Per-file branch isolation is unchanged; only how the branch is named changed.
+Backticks are required, because branch names contain `/` and `-`.
+
+Verified against the live catalog that all three operations the ingest module
+performs work through it -- `CREATE TABLE IF NOT EXISTS`, the
+`MAX(_file_version)` read, and `DataFrameWriterV2.append()` -- and that a write
+lands on the branch with `main` untouched.
+
+## watchdog-wall-clock-window
+
+The warehouse-flatness window is **wall-clock, not samples**, and the current
+sample is part of it.
+
+The check originally required five flat *evaluations*, which at `--loop 300` is
+twenty-five minutes. Reclamation is nightly. So on a perfectly healthy platform
+the check went WARN twenty-five minutes after every reclamation and stayed there
+until the next one -- firing continuously in the live logs. A monitor whose
+quiet state is unreachable teaches people to ignore it.
+
+Reading only `history`, which is written *after* the checks run, meant a
+warehouse that had just changed still failed the flatness test -- and the
+message quoted the new size as the value that had been flat.
+
+The general form: **a check whose window does not contain the thing it describes
+will either never fire or never stop.** Match the window to the cadence of
+whatever clears it.
+
+## watchdog-eligible-vs-overdue
+
+Eligible is not the same as overdue, and conflating them made the deferred-
+backlog check fire almost continuously on a healthy platform.
+
+It originally alerted as soon as a live-set was older than the deferral window.
+But the window is `deferred_delete_after_hours` while the thing that *acts* on
+it is the nightly DAG, so a set recorded at 22:00 with a 1h window is "overdue"
+from 23:00 until the next night's run twenty-three hours later -- on a platform
+doing exactly what it should. Its message even said the pass "is not running",
+which was false: an explanation that reads as a diagnosis.
+
+The condition is not "time has passed". It is **a housekeeping run completed
+after these files became eligible, and they are still here** -- which is the
+actual statement "the deferred-delete pass ran and did not do its job".
+
+Same shape as [watchdog-wall-clock-window](#watchdog-wall-clock-window).
+
+## retention-partial-failure-report
+
+A half-applied run is the failure shape this chain actually produces, so it
+reports which tables were applied instead of throwing that away with the
+exception -- and the CLI prints the report **before** failing.
+
+Re-running is safe: every step recomputes what is left to do rather than
+replaying what it did. But "safe to re-run" is only useful to someone who knows
+what state they are re-running from, so the report has to say it. A traceback on
+its own is not enough to decide anything.
+
+## minio-per-object-delete
+
+Orphan sweeps delete one object at a time. Batched `delete_objects` is faster,
+but MinIO rejects it without a `Content-MD5` header, which current botocore does
+not send:
+
+```
+MissingContentMD5: Missing required header for this request: Content-Md5
+```
+
+Per-object `DELETE` has no such requirement and behaves the same on MinIO and
+real S3. For table-sized prefixes the difference does not matter, and being
+portable matters more than being quick in a destructive path.
+
+## generated-data-must-hold-still
+
+Generated feed data is a function of **(entity, epoch)**, not (entity, date). An
+epoch is a block of days an attribute holds still for; `epoch()` numbers the
+blocks and `stable_rng()` draws the value from the block number, so a value is
+identical on every date inside a block and changes when the block rolls.
+
+Without that, every value in every row changes on every delivery, and a
+generated feed looks like the most volatile market data imaginable rather than
+like the reference data most feeds are. That mattered beyond realism: it made
+two questions the platform exists to answer unanswerable, because the answer
+measured the generator rather than the design. *How much of the warehouse is
+unchanged restatement? Would slowly-changing-dimension storage pay for itself?*
+On the old seed the honest answer to both was "cannot tell from here".
+
+Three specific traps this closes:
+
+- **`trade_id` must not embed the business date.** `TRD{bd}{n}` means every
+  delivery invents an entirely new portfolio and no trade ever appears twice --
+  16,400 rows with 16,400 distinct `trade_id`s across 41 dates, a book with no
+  continuity, in which `exposure_change` never sees an UNCHANGED row.
+- **Which agencies rate a name is decided once per (counterparty, agency)**, not
+  redrawn per file, or coverage flickers on and off.
+- **The console's generator keys its RNG on the epoch too**, with `version` in
+  the key so a `_v2` redelivery is a genuine restatement.
+
+See `reporting_platform/common/volatility.py` for `HOLD_BY_TYPE`.
+
+## resolve-types-is-authoritative
+
+`scaffold.resolve_types()` is the single answer to "what is this column?",
+called by the API summary, the scaffold, and the sample-data generator.
+
+Calling `infer_types` separately from each gives the same answer only while
+nobody disagrees with the guess. The moment someone does, the scaffold uses
+their choice and the generator uses the guess, and the two artefacts no longer
+describe the same column -- a `decimal` column gets a non-numeric sample value,
+`safe_cast` nulls it, and nothing fails, because nulling is what `safe_cast` is
+for.
+
+It is sparse by design: `feed.column_types` holds only genuine overrides.
+
+**Pass `types=` when calling `sampledata.generate()` directly.** Leaving it off
+is exactly the bug above.
+
+## one-session-per-chunk
+
+`ingest()` opens its own SparkSession and stops it in a `finally` block at the
+end of every call, so calling it in a tight loop in-process does **not** reuse
+one JVM the way it looks like it should. Each call tears down and rebuilds the
+SparkContext, re-resolving and reloading the Iceberg, Nessie and
+aws-sdk-bundle jars through a fresh `URLClassLoader` every time.
+
+Across ~48 sequential ingests in one long-lived process that leaked enough
+classloader and heap state to kill the JVM with `java.lang.OutOfMemoryError:
+Java heap space`, alongside recurring "Unclosed S3FileIO instance" warnings
+pointing at the same per-call teardown.
+
+`scripts/bulk_ingest.py` therefore drives ingests as separate processes, one
+session per chunk of files. The branch is named per statement rather than per
+session so a single session can serve a whole chunk -- see
+[branch-in-the-table-name](#branch-in-the-table-name).
+
+## one-destructive-dialog
+
+Feed deletion asks **once**, and the secondary choice (also delete the model
+`.sql`) is a checkbox on the page rather than a second `confirm()`.
+
+A second `confirm()` *after* the type-the-name gate has already passed is a
+trap: Cancel or Escape there returns `false`, which did not cancel the delete --
+it deleted the feed and kept the file. Escape means "get me out of this"
+everywhere else, so the one key a hesitant person reaches for was the one that
+committed.
+
+The checkbox is visible before you commit, and the prompt states which files
+will go.

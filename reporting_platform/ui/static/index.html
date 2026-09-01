@@ -276,12 +276,10 @@ let DEL_MODEL = null;
 
 async function deleteFeed(pane, f) {
   // ONE dialog, and the secondary choice is a checkbox on the page rather than
-  // a second confirm(). It used to be `confirm("Also delete ....sql?")` AFTER
-  // the type-the-name gate had already passed -- and Cancel or Escape there
-  // returns false, which did NOT cancel the delete: it deleted the feed and
-  // kept the file. Escape means "get me out of this" everywhere else, so the
-  // one key a hesitant person reaches for was the one that committed. The
-  // checkbox is visible before you commit, and the prompt now states which
+  // a second confirm(). A second confirm() after the type-the-name gate makes
+  // Escape commit the delete instead of cancelling it -- the one key a
+  // hesitant person reaches for. See docs/DECISIONS.md#one-destructive-dialog
+  // The checkbox is visible before you commit, and the prompt states which
   // way it is set so the confirmation describes what will actually happen.
   const alsoModel = !!(DEL_MODEL && DEL_MODEL.checked);
   const typed = prompt(
@@ -386,9 +384,9 @@ function feedForm(f, creating) {
     // re-inferring on every read.
     ct._touched = !!ty;
     ct.addEventListener("change", () => { ct._touched = true; });
-    // Infer on blur, not just on CSV upload. "+ column" rows used to default
-    // to `string` forever, so eight hand-typed columns produced eight wrong
-    // types while the same eight read from a header produced six right ones.
+    // Infer on blur, not just on CSV upload, or hand-typed "+ column" rows
+    // default to `string` forever while the same names read from a CSV header
+    // get inferred properly.
     cn.addEventListener("blur", async () => {
       const v = cn.value.trim();
       if (!v || ct._touched) return;
@@ -775,12 +773,10 @@ async function showPreview(f, filename, box) {
 // ------------------------------------------------------------------ run tab
 function paneRun(pane, f) {
   const out = el("div", {class: "outbox"});
-  // The strip used to be five static labels: a picture of the pipeline that
-  // never said anything about THIS feed. Everything needed to make it answer
-  // "where am I in the loop?" was already being fetched and displayed further
-  // down the same page, just never joined up. It now colours each stage from
-  // /api/feeds/<name>/state, which is deliberately Spark-free (see the
-  // endpoint's docstring) so it can be redrawn after every run.
+  // Colours each stage from /api/feeds/<name>/state so the strip answers
+  // "where am I in the loop?" for THIS feed rather than being a picture of the
+  // pipeline. That endpoint is deliberately Spark-free (see its docstring) so
+  // this can be redrawn after every run.
   const strip = el("div", {class: "stage", id: "stage-strip"});
   pane.append(strip);
   renderStage(strip, f);
@@ -861,10 +857,10 @@ function paneRun(pane, f) {
          [downstream, el("span", {}, "include downstream reporting models")]),
     ]));
 
-  // EVERY output goes here, below every control on this tab. It used to sit
-  // directly under the buttons that produced it, which reads better right up
-  // until three run cards render and shove "Test this feed" 75px down the page
-  // mid-click. Nothing below this point is clickable.
+  // EVERY output goes here, below every control on this tab. Output directly
+  // under the button that produced it reads better right up until three run
+  // cards render and shove the next control down the page mid-click. Nothing
+  // below this point is clickable.
   pane.append(el("h3", {}, "Output"), out, testOut);
 
   const hist = el("div", {id: "run-history"});
@@ -907,11 +903,9 @@ async function renderStage(strip, f) {
   try { draw(await api(`/api/feeds/${f.name}/state`)); } catch (_) { /* labels stand */ }
 }
 
-// ONE place that re-reads everything a completed run can have changed. The
-// console used to render the feed pills and the run history exactly once and
-// never again, so it would sit there showing "DAG not parsed yet" above three
-// successful runs of that very DAG, and "no runs yet" in the history table
-// directly below them. Both were true when drawn and false within a minute,
+// ONE place that re-reads everything a completed run can have changed. Drawn
+// once and never again, the pills say "DAG not parsed yet" above three
+// successful runs of that very DAG -- true when drawn, false a minute later,
 // and a page that contradicts itself teaches you to disbelieve the pills that
 // ARE right. Called whenever a watched run or job reaches a terminal state.
 let REFRESH_TIMER = null;

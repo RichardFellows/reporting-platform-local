@@ -152,14 +152,9 @@ def feed(name: str) -> Feed:
 # retention task at a table that does not exist, and does so silently, because
 # managed_tables() never checks that its entries resolve.
 #
-# NO LAYER PREFIX ON ANY OF THESE. The names used to be `prep_*` and `rpt_*`;
-# the namespace already says which layer a table is in, so the prefix repeated
-# it inside the name -- `prepared.prep_trade`, `reporting.rpt_exposure_change`.
-# The layer is now the ONLY thing distinguishing a table from its upstream:
-# `raw.trade` is the landed 1:1 copy and `prepared.trade` the conformed one,
-# same name, different namespace. That is legal because dbt keeps models and
-# sources in separate namespaces -- a model named `trade` and a source
-# `raw.trade` coexist without collision (verified, not assumed).
+# NO LAYER PREFIX ON ANY OF THESE: the namespace already says which layer a
+# table is in, so `raw.trade` and `prepared.trade` are the same name in
+# different namespaces. See docs/DECISIONS.md#table-naming-no-layer-prefix
 PREPARED_TABLES = ["trade", "counterparty", "rating", "primary_limits",
                    "collateral"]
 REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
@@ -169,12 +164,9 @@ REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
 def managed_tables() -> list[tuple[str, str]]:
     """(fully qualified table, layer) for everything the platform maintains.
 
-    ONE definition, imported by both the DAG and the CLIs. It used to live in
-    `platform_housekeeping.py`, which meant the `--table` examples in the
-    Makefile and README were a hand-maintained subset -- and they had already
-    drifted to five tables against the DAG's nine, so `make retention` quietly
-    left four tables growing. That is a forked copy
-    that stops matching the original, where the copy looks authoritative.
+    ONE definition, imported by both the DAG and the CLIs, so a hand-maintained
+    `--table` list cannot drift from what the DAG actually maintains.
+    See docs/DECISIONS.md#managed-tables-single-definition
 
     The raw half is derived from `feeds()` rather than listed, so adding a feed
     extends maintenance and retention automatically.
@@ -268,12 +260,10 @@ def spark_session(app_name: str, ref: str = "main"):
     warehouse = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
     nessie_uri = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")
 
-    # No local[*] fallback, deliberately. A missing/blank SPARK_MASTER used to
-    # mean "run the whole job inside this container", which is a configuration
-    # error that LOOKS like success: the job completes, the cluster sits idle,
-    # and nothing anywhere is red. Fail loudly instead. The value is set on
-    # the airflow services in docker-compose.yml; the default below is the
-    # same address so a bare `python -m ...` in the container still works.
+    # No local[*] fallback, deliberately: running in-container is a config
+    # error that LOOKS like success. The default below is the same address as
+    # docker-compose.yml so a bare `python -m ...` still works.
+    # See docs/DECISIONS.md#spark-master-no-local-fallback
     master = os.environ.get("SPARK_MASTER") or "spark://spark-master:7077"
     if master.startswith("local"):
         raise RuntimeError(
@@ -321,7 +311,7 @@ def spark_session(app_name: str, ref: str = "main"):
         .master(master)
         .config("spark.jars.packages", packages)
         # The driver runs in the calling container and does no task work, so
-        # it needs far less heap than the old local[*] session did -- but not
+        # it needs far less heap than a local[*] session would -- but not
         # the 1g default, which is tight once Iceberg/Nessie/aws-sdk-bundle
         # classes are loaded and exercised across repeated catalog operations.
         .config("spark.driver.memory", "2g")

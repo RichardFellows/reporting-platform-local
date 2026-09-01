@@ -293,11 +293,10 @@ def update(spec: FeedSpec) -> None:
                 if key in block:
                     block[key] = new[key]
                 else:
-                    # A key being set for the first time -- an override that
-                    # was previously falling back to `defaults:`. Assigning it
-                    # would append it after `columns`, so the block would end
-                    # up ordered by when it was edited rather than the order
-                    # docs/ADDING-A-FEED.md reads in. Insert it at its place.
+                    # A key set for the first time. Assigning it would append
+                    # it after `columns`, ordering the block by when it was
+                    # edited rather than the order docs/ADDING-A-FEED.md reads
+                    # in. Insert it at its place instead.
                     block.insert(_position_for(block, key), key, new[key])
             elif key in block:
                 # Fell back to the default: drop the override rather than

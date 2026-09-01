@@ -1,14 +1,11 @@
 """One-off bulk ingest: ingest every pending landed file, across all feeds.
 
-`ingest()` in ingest_feed.py opens its own SparkSession and calls
-spark.stop() in a finally block at the end of every single call -- so
-calling it in a tight loop in-process, as this script originally did,
-doesn't reuse one JVM the way it looks like it should. Each call tears
-down and rebuilds the SparkContext, re-resolving/reloading the Iceberg,
-Nessie and aws-sdk-bundle jars via a fresh URLClassLoader every time.
-Across ~48 sequential ingests in one long-lived process, that leaked
-enough classloader/heap state to kill the JVM with
-`java.lang.OutOfMemoryError: Java heap space` (plus recurring "Unclosed
+`ingest()` in ingest_feed.py stops its SparkSession at the end of every call,
+so calling it in a tight loop in-process does NOT reuse one JVM the way it looks
+like it should -- it rebuilds the SparkContext and reloads the jars through a
+fresh URLClassLoader each time, and eventually dies with
+`java.lang.OutOfMemoryError: Java heap space`.
+See docs/DECISIONS.md#one-session-per-chunk (plus recurring "Unclosed
 S3FileIO instance" warnings pointing at the same kind of per-call
 resource that was never being released).
 

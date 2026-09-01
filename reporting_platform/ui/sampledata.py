@@ -315,20 +315,11 @@ def generate(feed: Feed, *, days: int = 3, rows: int = 0,
         name = filename_for(feed, bd, version)
         out_rows = []
         for i in range(1, rows + 1):
-            # One RNG per (row, column, EPOCH) rather than one per FILE.
-            #
-            # It used to be `random.Random(crc32(feed|date|version))` -- a new
-            # stream for every business date -- so every value in every row
-            # changed on every delivery. A feed generated here looked like the
-            # most volatile market data imaginable rather than like the
-            # reference data most new feeds are, and the change-detection the
-            # prepared layer exists to do had nothing to detect but noise.
-            #
-            # Keying on the epoch instead holds a value still for its type's
-            # hold period (volatility.HOLD_BY_TYPE) and changes it when that
-            # period rolls. `version` stays in the key so a _v2 redelivery is a
-            # genuine restatement, which is what the console's version field is
-            # for.
+            # One RNG per (row, column, EPOCH) rather than one per FILE, so a
+            # value holds still for its type's hold period and changes when
+            # that period rolls. `version` stays in the key so a _v2
+            # redelivery is a genuine restatement.
+            # See docs/DECISIONS.md#generated-data-must-hold-still
             entity = f"{feed.name}#{i:05d}"
             out_rows.append([
                 _value(col, types.get(col, "string"), i,

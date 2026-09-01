@@ -175,11 +175,11 @@ def gen_counterparty(bd: date, out: Path, drift: bool, version: int = 1) -> None
 def gen_rating(bd: date, out: Path, version: int = 1) -> None:
     """Agency ratings: a grade, when it was assigned, and an outlook.
 
-    Three things used to churn daily and no longer do. WHICH agencies rate a
-    name was redrawn per file, so coverage flickered on and off; it is now
-    decided once per (counterparty, agency). The grade moves on a roughly
-    yearly epoch and the outlook about twice as often, which is the real
-    relationship between the two.
+    WHICH agencies rate a name is decided once per (counterparty, agency)
+    rather than redrawn per file, so coverage does not flicker. The grade moves
+    on a roughly yearly epoch and the outlook about twice as often, which is the
+    real relationship between the two.
+    See docs/DECISIONS.md#generated-data-must-hold-still
 
     `rating_date` is now the date the CURRENT GRADE came into force, not the
     business date. A rating_date equal to the delivery date on every row is
@@ -318,13 +318,11 @@ def gen_trade(bd: date, out: Path, version: int = 1, inject_bad: bool = False,
               clean: bool = False) -> None:
     """A PERSISTING BOOK, not 400 brand-new trades every morning.
 
-    `trade_id` used to embed the business date -- TRD{bd}{n} -- so every
-    delivery invented an entirely new portfolio and no trade ever appeared
-    twice. `prepared.trade` held 16,400 rows with 16,400 distinct trade_ids
-    across 41 dates: a book with no continuity, in which nothing could be
-    compared to itself and `exposure_change` never saw an UNCHANGED row.
+    `trade_id` must NOT embed the business date, or every delivery invents a new
+    portfolio, nothing can be compared to itself, and `exposure_change` never
+    sees an UNCHANGED row. See docs/DECISIONS.md#generated-data-must-hold-still
 
-    Now each of the 400 slots holds one trade for its tenor and is refilled at
+    Each of the 400 slots holds one trade for its tenor and is refilled at
     maturity. Within a trade's life EVERYTHING IS IMMUTABLE -- counterparty,
     book, product, currency, notional, trade_date, maturity_date -- and only
     `mtm_value` moves, at a frequency set by how much life the trade has left

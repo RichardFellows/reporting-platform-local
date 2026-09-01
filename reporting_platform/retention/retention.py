@@ -885,10 +885,10 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
     report["nessie_gc"] = nessie_gc(dry_run)
     # Step 3b: execute the deletes that PREVIOUS sweeps deferred and whose
     # review window has now passed. Deliberately after the sweep above -- the
-    # set that sweep just recorded is the newest one and cannot be eligible,
-    # so this reads as "yesterday's findings, actioned today". Never fail the
-    # nightly chain over it: the rest of retention is still correct without
-    # it, exactly as it was before D4.
+    # set that sweep just recorded is the newest one and cannot be eligible, so
+    # this reads as "yesterday's findings, actioned today". Never fail the
+    # nightly chain over it: the rest of retention is still correct without it.
+    # See docs/DECISIONS.md#gc-lag-and-assertions
     try:
         report["deferred_deletes"] = deferred_deletes(dry_run)
     except Exception as e:
@@ -944,13 +944,12 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
 
     report["finished"] = datetime.now(timezone.utc).isoformat()
 
-    # A half-applied run is the failure shape this chain actually produces
-    #, and
-    # and it used to leave NO record of which tables had been applied --
-    # the report was built up and then thrown away with the exception. Re-running
-    # is safe: every step recomputes what is left to do rather than replaying
-    # what it did, and that is now proven rather than asserted. But "safe to re-run" is only useful to someone who knows what
-    # state they are re-running from, so say it.
+    # A half-applied run is the failure shape this chain actually produces, so
+    # it must report which tables were applied rather than throwing that away
+    # with the exception. Re-running is safe -- every step recomputes what is
+    # left to do rather than replaying what it did -- but that is only useful to
+    # someone who knows what state they are re-running from.
+    # See docs/DECISIONS.md#retention-partial-failure-report
     failed = [t["table"] for t in report["tables"] if t.get("error")]
     if failed:
         applied = [t["table"] for t in report["tables"] if not t.get("error")]
@@ -995,9 +994,9 @@ def main(argv=None) -> int:
     try:
         print(json.dumps(run(tables, dry_run=a.dry_run), indent=2, default=str))
     except RetentionPartialFailure as e:
-        # Print the report BEFORE failing. The whole point is
-        # that a half-applied run must say what it applied; a traceback on its
-        # own is what it used to give and it is not enough to decide anything.
+        # Print the report BEFORE failing: a half-applied run must say what it
+        # applied, and a traceback alone is not enough to decide anything.
+        # See docs/DECISIONS.md#retention-partial-failure-report
         print(json.dumps(e.report, indent=2, default=str))
         log.error("%s", e)
         return 1

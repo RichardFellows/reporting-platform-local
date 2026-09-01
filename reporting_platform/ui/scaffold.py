@@ -94,11 +94,9 @@ def resolve_types(feed) -> dict[str, str]:
     """The authoritative per-column treatment: stored overrides beat the guess.
 
     ONE function, called by everything that needs to know what a column is --
-    the API summary, the scaffold, and the sample-data generator. They used to
-    each call `infer_types` separately, which is only the same answer while
-    nobody disagrees with the guess. The moment someone did, the scaffold used
-    their choice and the generator used the guess, and the two artefacts no
-    longer described the same column.
+    the API summary, the scaffold, and the sample-data generator. Calling
+    `infer_types` separately gives the same answer only while nobody disagrees
+    with the guess. See docs/DECISIONS.md#resolve-types-is-authoritative
 
     Sparse by design: `feed.column_types` holds only genuine overrides, so a
     feed nobody has corrected resolves exactly as it always did.

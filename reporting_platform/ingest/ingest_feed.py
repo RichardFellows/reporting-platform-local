@@ -40,19 +40,11 @@ def _at_branch(table: str, branch: str | None) -> str:
     `lakehouse.raw.trade` on branch `ingest/trade/...` becomes
     `lakehouse.raw.`trade@ingest/trade/...``.
 
-    THIS IS WHAT LETS ONE SPARK SESSION SERVE A WHOLE CHUNK OF FILES. The
-    branch used to be session-level config (spark.sql.catalog.lakehouse.ref),
-    so every file needed its own SparkSession -- 127 Spark applications for
-    183 files, each paying executor acquisition and catalog init before doing
-    a few seconds of actual work. Per-file branch isolation is unchanged; only
-    how the branch is named changed.
+    THIS IS WHAT LETS ONE SPARK SESSION SERVE A WHOLE CHUNK OF FILES: naming the
+    branch per statement rather than per session. Per-file branch isolation is
+    unchanged. See docs/DECISIONS.md#branch-in-the-table-name
 
     Backticks are required: branch names contain `/` and `-`.
-
-    Verified against the live catalog that all three operations this module
-    performs work through it -- CREATE TABLE IF NOT EXISTS, the MAX(_file_version)
-    read, and DataFrameWriterV2.append() -- and that a write lands on the
-    branch with `main` untouched.
     """
     if not branch or branch == "main":
         return table

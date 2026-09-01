@@ -180,11 +180,10 @@ def run(tables: list[tuple[str, str]], force: bool = False,
             if not dry_run:
                 layer_cfg = layers.get(layer, {})
                 for action in actions:
-                    # Isolate per table. An action failing on one table used to
-                    # abort the loop, throwing away the metrics already
-                    # collected for every table -- including the ones needed to
-                    # diagnose the failure. Errors are recorded and re-raised
-                    # after the loop so the run still fails loudly.
+                    # Isolate per table: an action failing on one table must
+                    # not throw away the metrics collected for the others,
+                    # which are what diagnose the failure. Recorded here and
+                    # re-raised after the loop, so the run still fails loudly.
                     try:
                         if action == "compact":
                             entry["performed"].append(

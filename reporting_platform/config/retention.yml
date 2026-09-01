@@ -147,13 +147,11 @@ nessie_gc:
   # false makes the sweep delete immediately.
   defer_deletes: true
 
-  # ------------------------------------------------ deferral window (D4)
-  # Deferral used to mean "a human runs `nessie-gc deferred-deletes` by hand",
-  # which in practice meant nobody did and NOTHING was ever reclaimed
-  # unattended. The window is a policy value, not a manual step: the nightly
-  # run executes the deferred deletes recorded by any live-set that is at
-  # least this old, so every file still gets a review period, and reclamation
-  # still happens without anyone remembering.
+  # ----------------------------------------------------- deferral window
+  # A POLICY VALUE, not a manual step: the nightly run executes the deferred
+  # deletes recorded by any live-set at least this old, so every file gets a
+  # review period AND reclamation happens without anyone remembering.
+  # See docs/DECISIONS.md#gc-lag-and-assertions
   #
   # The sweep that RECORDS a set never deletes it in the same run -- that is
   # the whole point of deferral. Set to 0 only if you want same-run deletion,

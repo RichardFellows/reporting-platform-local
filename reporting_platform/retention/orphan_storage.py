@@ -164,15 +164,9 @@ def sweep_orphan_prefixes(dry_run: bool = True) -> dict:
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
             for obj in page.get("Contents", []):
-                # One object at a time, deliberately. Batched delete_objects is
-                # faster but MinIO rejects it without a Content-MD5 header,
-                # which current botocore does not send:
-                #   MissingContentMD5: Missing required header for this
-                #   request: Content-Md5
-                # Per-object DELETE has no such requirement and behaves the
-                # same on MinIO and real S3. For table-sized prefixes the
-                # difference does not matter, and being portable matters more
-                # than being quick in a destructive path.
+                # One object at a time, deliberately: batched delete_objects
+                # needs a Content-MD5 header botocore does not send, and MinIO
+                # rejects it. See docs/DECISIONS.md#minio-per-object-delete
                 s3.delete_object(Bucket=bucket, Key=obj["Key"])
                 deleted += 1
         log.info("deleted orphan prefix %s", prefix)
