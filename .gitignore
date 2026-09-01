@@ -18,6 +18,12 @@ nessie-openapi.json
 nessie-openapi.yaml
 nessie-test.txt
 
+# marimo's per-session state, written beside the notebook it belongs to.
+# The notebook itself IS the source and is committed -- that is the whole
+# reason for marimo over Jupyter -- but this directory is scratch: cell
+# outputs and execution state, rewritten on every run.
+__marimo__/
+
 # editor
 .vscode/
 var/
