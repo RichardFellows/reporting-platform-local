@@ -9,9 +9,9 @@ already tried the obvious thing and it failed in a way that did not name itself.
 
 **The code points here rather than repeating it.** A line like
 
-```python
-# See docs/DECISIONS.md#cosmos-packages
-copy_dbt_packages=False,
+```yaml
+# See docs/DECISIONS.md#dbt-packages-volume
+- dbt-packages:/opt/platform/run/packages
 ```
 
 means the reasoning lives in the matching `##` section below. Anchors are
