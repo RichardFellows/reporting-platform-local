@@ -119,9 +119,14 @@ dbt and pyspark are deliberately **not** constrained by that file — their pins
 are the ones validated against a live stack and must not move.
 
 The exception is `duckdb`, bumped 1.1.3 → 1.5.5 for the DuckDB console. 1.1.3's
-iceberg extension has no catalog `ATTACH` at all: `ATTACH ... (TYPE ICEBERG)`
-fails with ``Binder Error: Unrecognized storage type "ICEBERG"``. 1.5.5 attaches
-to an Iceberg REST catalog and reads it, which is what
+iceberg extension has no catalog `ATTACH` at all:
+
+```
+ATTACH ... (TYPE ICEBERG)
+Binder Error: Unrecognized storage type "ICEBERG"
+```
+
+1.5.5 attaches to an Iceberg REST catalog and reads it, which is what
 `scripts/duckdb_console.py` needs.
 
 There is no `dbt-duckdb`, on purpose — see
@@ -810,7 +815,7 @@ The default in code is the same address `docker-compose.yml` sets, so a bare
 ## branch-in-the-table-name
 
 The Nessie branch is named **in the table reference** --
-`lakehouse.raw.`trade@ingest/trade/...`` -- rather than in session config.
+``lakehouse.raw.`trade@ingest/trade/...` `` -- rather than in session config.
 
 This is what lets one Spark session serve a whole chunk of files. When the
 branch was session-level config (`spark.sql.catalog.lakehouse.ref`), every file
