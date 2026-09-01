@@ -141,17 +141,18 @@ Two corollaries worth holding on to:
   `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
-- **Adding a feed is six files and no DAG edit** — `docs/ADDING-A-FEED.md`
+- **Adding a feed is five files and no DAG edit** — `docs/ADDING-A-FEED.md`
   has them in order. `generate_feeds.py` is not one of them: it hand-writes
   generators for the four original feeds, whose pathologies are the point, and
   generates every *other* feed in `feeds.yml` from its definition via the
   console's `ui/sampledata.py`. Pass `types=` when calling that directly — from
   the column name alone it re-guesses, and a `decimal` column gets a string
-  that `safe_cast` silently nulls. The only one that fails silently if you skip it is
-  `PREPARED_TABLES` in `common/context.py`: the table just never gets
-  maintained or retained.
+  that `safe_cast` silently nulls. Nothing in it fails silently any more:
+  the prepared and reporting tables that maintenance and retention cover are
+  derived from the dbt project directory, so the model file IS the
+  registration.
 - **The feed console (`reporting_platform/ui`, <http://localhost:8082>) writes
-  those six files from a form** and drives land → ingest → build. It is a
+  those five files from a form** and drives land → ingest → build. It is a
   front end for the doc above, not a second source of truth: it round-trips
   `feeds.yml` with ruamel so the comments survive, and the change it makes is
   an ordinary reviewable diff, checked with `dbt parse` (~5s, no Spark) so a

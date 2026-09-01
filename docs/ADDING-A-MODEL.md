@@ -118,13 +118,17 @@ example: a counterparty present in trades but missing from the reference feed
 is worth surfacing, but blocking the entire risk report over it is worse than
 publishing it with a null.
 
-## 3. If it is a `prepared` model: `PREPARED_TABLES`
+## 3. There is no step 3
 
-Add the model name to `PREPARED_TABLES` in
-`reporting_platform/common/context.py` (or `REPORTING_TABLES` for a reporting
-one). **This is the one step with no error if you skip it** — the table simply
-never gets compacted, its snapshots never expire, and retention never trims it.
-It grows quietly. See [ADDING-A-FEED.md](ADDING-A-FEED.md) step 5.
+A model does not have to be registered anywhere for maintenance and retention
+to cover it. `managed_tables()` derives the prepared and reporting sets from
+the dbt project directory, so the `.sql` file you just wrote is the
+registration — the same way `feeds.yml` is the registration for a raw table.
+
+This was a hand-maintained list in `common/context.py`, and it was the one step
+with no error if you skipped it: the table simply never got compacted, its
+snapshots never expired, and retention never trimmed it. See
+[DECISIONS.md#managed-tables-are-derived](DECISIONS.md#managed-tables-are-derived).
 
 ---
 
@@ -177,8 +181,8 @@ are swept after 120h.
 
 - **No DAG file.** Cosmos renders the graph from the project.
 - **No task dependencies.** They come from your `ref()`s.
-- **No retention or maintenance policy.** Both are keyed by *layer*, not by
-  table — though see step 3 for the one list that is hand-maintained.
+- **No retention or maintenance policy, and no registration.** Both are keyed
+  by *layer*, and the table set is derived from this directory.
 - **No schedule.** `reporting_build` runs when `prepared_build` publishes.
 
 ---
@@ -187,6 +191,6 @@ are swept after 120h.
 
 | | |
 |---|---|
-| [ADDING-A-FEED.md](ADDING-A-FEED.md) | the six files a new *feed* touches |
+| [ADDING-A-FEED.md](ADDING-A-FEED.md) | the five files a new *feed* touches |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | § *How the dbt builds become Airflow tasks* — why Cosmos is configured the way it is |
 | [FEED-UI.md](FEED-UI.md) | the console on :8082, which scaffolds a prepared model from a form |

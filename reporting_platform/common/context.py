@@ -145,19 +145,57 @@ def feed(name: str) -> Feed:
     return feeds()[name]
 
 
-# These are dbt MODEL names, and because no `alias` is configured on any of
-# them, each is ALSO the table name in the catalog: model `trade` materialises
-# as `prepared.trade`. Keep it that way -- model and table must be renamed
-# TOGETHER. A mismatch in either direction points every maintenance and
-# retention task at a table that does not exist, and does so silently, because
-# managed_tables() never checks that its entries resolve.
+# The prepared and reporting tables are DERIVED from the dbt project, not
+# listed. See docs/DECISIONS.md#managed-tables-are-derived
 #
-# NO LAYER PREFIX ON ANY OF THESE: the namespace already says which layer a
-# table is in, so `raw.trade` and `prepared.trade` are the same name in
-# different namespaces. See docs/DECISIONS.md#table-naming-no-layer-prefix
-PREPARED_TABLES = ["trade", "counterparty", "rating", "collateral"]
-REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
-                    "exposure_change"]
+# This rests on model filename == table name, which holds because no model
+# carries a layer prefix or a dbt `alias` -- `raw.trade` and `prepared.trade`
+# are the same name in different namespaces.
+# See docs/DECISIONS.md#table-naming-no-layer-prefix
+DBT_MODELS_DIR = Path(os.environ.get("DBT_PROJECT_DIR", "/opt/platform/dbt")) / "models"
+
+# A model whose `alias` differs from its filename would break the one
+# assumption this derivation rests on, silently and in the direction that
+# matters: maintenance and retention would address a table that does not exist.
+_ALIAS = re.compile(r"\balias\s*=")
+
+
+@lru_cache(maxsize=None)
+def _models_at(layer: str, mtime_ns: int) -> tuple[str, ...]:
+    names = []
+    for path in sorted((DBT_MODELS_DIR / layer).glob("*.sql")):
+        if _ALIAS.search(path.read_text(encoding="utf-8")):
+            raise RuntimeError(
+                f"{path} sets a dbt `alias`. managed_tables() derives table "
+                f"names from model FILENAMES, so an alias would point "
+                f"maintenance and retention at a table that does not exist. "
+                f"Either drop the alias or teach context.models_in() to read "
+                f"the manifest.")
+        names.append(path.stem)
+    return tuple(names)
+
+
+def models_in(layer: str) -> tuple[str, ...]:
+    """dbt model names in a layer, which are also its table names.
+
+    Keyed on the DIRECTORY's mtime, which changes when a model is added or
+    removed -- the only events that change this set. Same reasoning as
+    `_load`: a long-lived process must not hold a stale answer.
+
+    RAISES rather than returning empty when the directory is absent. Returning
+    () would be the silent failure this derivation exists to remove: a
+    container without the dbt project mounted (the watchdog is one) would
+    quietly report that the platform manages nothing, and every maintenance and
+    retention pass would succeed having done nothing at all.
+    """
+    directory = DBT_MODELS_DIR / layer
+    if not directory.is_dir():
+        raise RuntimeError(
+            f"no dbt models directory at {directory}. managed_tables() derives "
+            f"the prepared and reporting tables from the dbt project, so it "
+            f"needs the project mounted -- set DBT_PROJECT_DIR, or mount ./dbt "
+            f"into this service.")
+    return _models_at(layer, directory.stat().st_mtime_ns)
 
 
 def managed_tables() -> list[tuple[str, str]]:
@@ -165,14 +203,16 @@ def managed_tables() -> list[tuple[str, str]]:
 
     ONE definition, imported by both the DAG and the CLIs, so a hand-maintained
     `--table` list cannot drift from what the DAG actually maintains.
-    See docs/DECISIONS.md#managed-tables-single-definition
+    See docs/DECISIONS.md#managed-tables-single-definition and
+    #managed-tables-are-derived
 
-    The raw half is derived from `feeds()` rather than listed, so adding a feed
-    extends maintenance and retention automatically.
+    NOTHING HERE IS HAND-MAINTAINED. The raw half comes from `feeds()`, the
+    other two from the dbt project, so adding a feed or a model extends
+    maintenance and retention on its own.
     """
     tables = [(f.raw_table, "raw") for f in feeds().values()]
-    tables += [(f"{CATALOG}.prepared.{t}", "prepared") for t in PREPARED_TABLES]
-    tables += [(f"{CATALOG}.reporting.{t}", "reporting") for t in REPORTING_TABLES]
+    for layer in ("prepared", "reporting"):
+        tables += [(f"{CATALOG}.{layer}.{t}", layer) for t in models_in(layer)]
     return tables
 
 

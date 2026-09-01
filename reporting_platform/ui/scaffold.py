@@ -1,12 +1,17 @@
-"""Generate the four non-registry files a new feed needs.
+"""Generate the three non-registry files a new feed needs.
 
-docs/ADDING-A-FEED.md is six files. `registry.py` writes the first one; this
+docs/ADDING-A-FEED.md is five files. `registry.py` writes the first one; this
 writes the rest:
 
   2. dbt/models/raw/_sources.yml       -- declare raw to dbt
   3. dbt/models/prepared/<feed>.sql    -- the prepared model
   4. dbt/models/prepared/_prepared.yml -- the tests
-  5. common/context.py PREPARED_TABLES -- register for maintenance
+
+There is no step registering the table for maintenance. There used to be: it
+spliced the model name into `PREPARED_TABLES` in common/context.py, and it was
+THE ONE STEP WITH NO ERROR IF IT WAS SKIPPED. `managed_tables()` now derives
+that set from the dbt project directory, so writing step 3 IS registering it.
+See docs/DECISIONS.md#managed-tables-are-derived
 
 Two things this module is deliberately NOT:
 
@@ -22,10 +27,6 @@ feed is already present and returns `skipped` instead of replacing what is
 there. Regenerating over a hand-edited model would destroy exactly the work
 the previous paragraph asks for.
 
-Step 5 edits Python source. That is done through `ast` rather than a regex:
-the module is located by parsing it and the assignment's own source offsets
-are used to splice, so a comment containing the string `PREPARED_TABLES`
-cannot be mistaken for the assignment.
 """
 from __future__ import annotations
 
@@ -394,47 +395,6 @@ def _dump(doc, y: YAML, path: Path) -> None:
     path.write_text(buf.getvalue(), encoding="utf-8")
 
 
-# ------------------------------------------------- 5. PREPARED_TABLES in context
-def prepared_tables_source() -> tuple[str, ast.Assign]:
-    src = CONTEXT_PY.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    for node in tree.body:
-        if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == "PREPARED_TABLES"):
-            return src, node
-    raise RuntimeError("PREPARED_TABLES assignment not found in context.py")
-
-
-def register_prepared_table(name: str) -> Step:
-    """Add the model to PREPARED_TABLES.
-
-    THE ONE STEP WITH NO ERROR IF IT IS SKIPPED. Without it the table is never
-    compacted, its snapshots never expire and retention never trims it -- it
-    just grows, quietly. Which is exactly why the feed console does it rather
-    than reminding someone to.
-    """
-    src, node = prepared_tables_source()
-    current = ast.literal_eval(ast.get_source_segment(src, node.value))
-    if name in current:
-        return Step(str(CONTEXT_PY), "skipped",
-                    f"{name} already in PREPARED_TABLES")
-
-    updated = [*current, name]
-    literal = _wrap_list(updated, indent=len("PREPARED_TABLES = "))
-    lines = src.splitlines(keepends=True)
-    start = sum(len(x) for x in lines[:node.lineno - 1]) + node.col_offset
-    end = sum(len(x) for x in lines[:node.end_lineno - 1]) + node.end_col_offset
-    new_src = src[:start] + f"PREPARED_TABLES = {literal}" + src[end:]
-
-    # Parse before writing: this is the module every other component imports,
-    # and a syntax error here takes the whole platform down rather than one
-    # feed.
-    ast.parse(new_src)
-    CONTEXT_PY.write_text(new_src, encoding="utf-8")
-    return Step(str(CONTEXT_PY), "written", f"{name} added to PREPARED_TABLES")
-
-
 def _wrap_list(items: list[str], indent: int, width: int = 79) -> str:
     """Render a list literal wrapped the way the surrounding file wraps them."""
     out, line = [], "["
@@ -456,7 +416,7 @@ def existing_prepared_models() -> set[str]:
 
 
 def scaffold(spec: FeedSpec, types: dict[str, str] | None = None) -> list[Step]:
-    """Run steps 2-5. Each step is independent and reports its own outcome.
+    """Run steps 2-4. Each step is independent and reports its own outcome.
 
     Deliberately NOT transactional. A partial scaffold is a set of ordinary
     files in the working tree that `git diff` shows and a human can finish or
@@ -468,8 +428,7 @@ def scaffold(spec: FeedSpec, types: dict[str, str] | None = None) -> list[Step]:
     steps: list[Step] = []
     for fn in (lambda: write_source(spec),
                lambda: write_model(spec, types),
-               lambda: write_tests(spec, models),
-               lambda: register_prepared_table(spec.name)):
+               lambda: write_tests(spec, models)):
         try:
             steps.append(fn())
         except Exception as exc:                       # noqa: BLE001
@@ -478,20 +437,20 @@ def scaffold(spec: FeedSpec, types: dict[str, str] | None = None) -> list[Step]:
 
 
 def status(name: str) -> dict[str, bool]:
-    """Which of the four non-registry pieces exist for this feed.
+    """Which of the three non-registry pieces exist for this feed.
 
     Read by the UI so a feed added by hand, or one whose scaffold half-ran,
     shows what it is actually missing rather than being assumed complete.
     """
     src_text = SOURCES_YML.read_text(encoding="utf-8")
     prep_text = PREPARED_YML.read_text(encoding="utf-8")
-    ctx_src, node = prepared_tables_source()
-    prepared_tables = ast.literal_eval(ast.get_source_segment(ctx_src, node.value))
+    # No 'maintained' key any more: managed_tables() derives the set from this
+    # directory, so `prepared_model` IS that answer.
+    # See docs/DECISIONS.md#managed-tables-are-derived
     return {
         "dbt_source": bool(re.search(rf"^\s*-\s*name:\s*{re.escape(name)}\s*$",
                                      src_text, re.M)),
         "prepared_model": (PREPARED_DIR / f"{name}.sql").exists(),
         "prepared_tests": bool(re.search(rf"^\s*-\s*name:\s*{re.escape(name)}\s*$",
                                          prep_text, re.M)),
-        "maintained": name in prepared_tables,
     }

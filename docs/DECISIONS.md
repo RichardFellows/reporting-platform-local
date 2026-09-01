@@ -960,3 +960,40 @@ committed.
 
 The checkbox is visible before you commit, and the prompt states which files
 will go.
+
+## managed-tables-are-derived
+
+`managed_tables()` derives the prepared and reporting table sets from the dbt
+project directory -- one model file, one table -- rather than from a list in
+`common/context.py`.
+
+That list was hand-maintained, and `docs/ADDING-A-FEED.md` had to call it out
+as **the one step with no error if you skip it**: the table simply never got
+compacted, its snapshots never expired, and retention never trimmed it. It grew
+quietly. A step that has to be documented as "remember this or nothing tells
+you" is a step that should not exist.
+
+The dbt project is the right source because it is *declarative*. The catalog is
+not: `SHOW TABLES` describes what happens to be there, so a table left behind by
+a removed model would keep being maintained, and before the first build the set
+would be empty. It would also cost a Spark session, or a network call, inside a
+module the Airflow DAG processor imports on every parse.
+
+Three things make the derivation safe rather than merely shorter:
+
+- **Keyed on the DIRECTORY's mtime**, which changes when a model is added or
+  removed -- the only events that change the set. Same reasoning as
+  [`_load`](#managed-tables-single-definition): a long-lived process must not
+  hold a stale answer. Verified live: a new `.sql` appears in
+  `managed_tables()` without a restart.
+- **A missing directory RAISES.** Returning `()` would be the same silent
+  failure in a new place -- a container without the dbt project mounted (the
+  watchdog is one) would report that the platform manages nothing, and every
+  maintenance and retention pass would succeed having done nothing.
+- **A dbt `alias` RAISES.** The derivation rests on model filename == table
+  name. An alias would break that in the direction that matters, pointing
+  maintenance and retention at a table that does not exist. No model sets one
+  today; the guard is there so the first one that does says so.
+
+The consequence: adding a feed is five files, not six, and the feed console no
+longer splices Python source with `ast` to register the table.

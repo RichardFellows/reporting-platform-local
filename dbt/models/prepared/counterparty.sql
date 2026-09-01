@@ -32,7 +32,7 @@
       This is where the provenance of a RESTATEMENT now lives -- see the
       lineage note in docs/ARCHITECTURE.md. The audit chain moved, it did not
       shorten.
-    * The table keeps its NAME. `PREPARED_TABLES` in common/context.py,
+    * The table keeps its NAME. `managed_tables()` in common/context.py,
       managed_tables(), retention and maintenance are all keyed by name, and
       renaming this to `counterparty_history` would have meant touching every
       one of them to express nothing.

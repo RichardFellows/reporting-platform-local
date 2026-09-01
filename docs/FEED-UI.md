@@ -35,7 +35,7 @@ anything shared needs a real identity layer in front of it.
 
 ## Adding a feed
 
-The **New feed** form writes all six files:
+The **New feed** form writes all five files:
 
 | | File | Written by |
 |---|---|---|
@@ -43,12 +43,14 @@ The **New feed** form writes all six files:
 | 2 | `dbt/models/raw/_sources.yml` | `ui/scaffold.py` |
 | 3 | `dbt/models/prepared/<feed>.sql` | `ui/scaffold.py` |
 | 4 | `dbt/models/prepared/_prepared.yml` | `ui/scaffold.py` |
-| 5 | `reporting_platform/common/context.py` (`PREPARED_TABLES`) | `ui/scaffold.py` |
-| 6 | sample data | the **Data** tab, by upload |
+| 5 | sample data | the **Data** tab, by upload |
 
-Step 5 is the one with no error if it is skipped — the table just never gets
-compacted, its snapshots never expire and retention never trims it. Doing it
-automatically is most of the reason this console exists.
+There is no step registering the table for maintenance. There used to be, and
+it was the one with no error if it was skipped — the table just never got
+compacted, its snapshots never expired and retention never trimmed it.
+`managed_tables()` now derives that set from the dbt project, so writing the
+model registers it. See
+[DECISIONS.md#managed-tables-are-derived](DECISIONS.md#managed-tables-are-derived).
 
 ### The filename pattern
 

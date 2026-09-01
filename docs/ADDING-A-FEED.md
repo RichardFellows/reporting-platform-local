@@ -4,12 +4,12 @@ Worked example: a `margin_call` feed from the `margin_src` source system,
 delivering `marginCalls_20260801.csv`. The lowerCamelCase filename is
 deliberate — it is what makes the per-feed `filename_pattern` earn its keep.
 
-**Six files, in this order.** The order matters only in that each step is
+**Five files, in this order.** The order matters only in that each step is
 verifiable on its own — do not batch them and then debug the whole thing at
 once.
 
 > **There is a UI for this.** The feed console at <http://localhost:8082>
-> writes all six files from one form, with the filename pattern derived from a
+> writes all five files from one form, with the filename pattern derived from a
 > real filename and every trap below turned into a validation message. See
 > [FEED-UI.md](FEED-UI.md). Read this document anyway: the console does what it
 > describes and the diff it produces is meant to be reviewed as an ordinary
@@ -190,28 +190,7 @@ At minimum: `not_null` on the business key, a
 Use `severity: warn` for a test that flags something to investigate rather
 than something that should block publication (see `rating.rating_rank`).
 
-## 5. `reporting_platform/common/context.py` — register for maintenance
-
-```python
-PREPARED_TABLES = ["trade", "counterparty", "rating",
-                   "margin_call"]
-```
-
-**The raw half of `managed_tables()` is derived from `feeds()` and needs no
-change. The prepared half is a hand-maintained list, and this is the one step
-with no error if you skip it** — the table simply never gets compacted, its
-snapshots never expire, and retention never trims it. It grows quietly. This
-list holds dbt *model* names, which — with no `alias` configured anywhere —
-are also the catalog table names. `margin_call` here materialises as
-`prepared.margin_call`. Rename one without the other and every maintenance
-and retention task points at a table that does not exist, without error.
-
-Nothing in `retention.yml` or `maintenance.yml` needs editing — both are
-keyed by *layer*, not by table. If the prepared `sort_order` names a column
-your table lacks, `maintain.py` intersects it with the real columns and falls
-back to binpack, so that is not a failure either.
-
-## 6. Sample data
+## 5. Sample data
 
 Local-stack only, but skip it and the feed has nothing to run against.
 
@@ -306,6 +285,11 @@ Worth knowing, because it is where the effort would otherwise go:
 
 - **No DAG file.** `feed_ingest.py` generates one DAG per entry in
   `feeds.yml`.
+- **No maintenance registration.** `managed_tables()` derives the prepared and
+  reporting sets from the dbt project directory, so writing step 3 registers
+  the table. This used to be a sixth file, and was the one step with no error
+  if you skipped it -- see
+  [DECISIONS.md#managed-tables-are-derived](DECISIONS.md#managed-tables-are-derived).
 - **No `prepared_build` schedule.** It ORs the asset of every feed, derived
   from `feeds()`, so a new feed triggers rebuilds automatically.
 - **No retention or maintenance policy.** Both are keyed by layer.

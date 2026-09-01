@@ -163,10 +163,9 @@ def api_update_feed(name: str, payload: dict):
     """Edit a registered feed.
 
     Renaming is not offered. The name is the raw table, the DAG id, the S3
-    prefix, the dbt source, the model and the PREPARED_TABLES entry all at
-    once, and changing it in the registry alone would leave a raw table with
-    data in it that nothing refers to any more. Delete and re-add, or rename
-    all six by hand.
+    prefix, the dbt source and the model all at once, and changing it in the
+    registry alone would leave a raw table with data in it that nothing refers
+    to any more. Delete and re-add, or rename all five by hand.
     """
     payload = {**payload, "name": name}
     spec = FeedSpec.from_payload(payload)
@@ -201,9 +200,10 @@ def api_delete_feed(name: str, confirm: str = "", scaffold_too: bool = False):
     registry.remove(name)
     return {"deleted": name, "raw_table_left_in_place": fd.raw_table,
             "files_removed": removed,
-            "note": ("The dbt source entry, the test block and the "
-                     "PREPARED_TABLES entry are left for you to remove -- each "
-                     "sits inside a file with other feeds' content in it.")}
+            "note": ("The dbt source entry and the test block are left for "
+                     "you to remove -- each sits inside a file with other "
+                     "feeds' content in it. Deleting the model file is enough "
+                     "to stop the table being maintained.")}
 
 
 @app.post("/api/scaffold/{name}")

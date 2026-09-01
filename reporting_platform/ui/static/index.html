@@ -170,7 +170,7 @@ async function selectFeed(name, tab) {
 // ------------------------------------------------------------ feed detail
 function scaffoldPills(s) {
   const labels = {dbt_source: "dbt source", prepared_model: "prepared model",
-                  prepared_tests: "tests", maintained: "maintained"};
+                  prepared_tests: "tests"};
   // These are PRESENCE checks -- the file exists, the entry is in the YAML.
   // Whether dbt can actually read what is there is a different question, and
   // the caption says so rather than letting four green pills imply it.
@@ -268,7 +268,7 @@ function paneDetails(pane, f) {
 
   pane.append(el("div", {class: "note"},
     "The name is fixed once created: it is the raw table, the DAG id, the S3 prefix, " +
-    "the dbt source, the model and the PREPARED_TABLES entry at the same time. " +
+    "the dbt source and the model at the same time. " +
     "To rename, delete and re-add."));
 }
 
@@ -614,8 +614,8 @@ function newFeed() {
   d.textContent = "";
   d.append(el("h2", {}, "New feed"),
            el("div", {class: "sub"},
-              "Writes feeds.yml, the dbt source, a prepared model, its tests, and the " +
-              "PREPARED_TABLES entry — the six files in docs/ADDING-A-FEED.md."));
+              "Writes feeds.yml, the dbt source, a prepared model and its tests — the " +
+              "five files in docs/ADDING-A-FEED.md."));
   const form = feedForm(null, true);
   d.append(form.node);
   const out = el("div");
