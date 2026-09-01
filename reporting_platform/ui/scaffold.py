@@ -13,7 +13,7 @@ Two things this module is deliberately NOT:
 **It is not a template engine anyone should treat as final.** What it emits is
 the skeleton the doc describes, with the macro calls that are not optional
 already in place. The derivations that make a model worth reading -- the
-`is_active` normalisation on counterparty, `is_current` on primary_limits --
+`is_active` normalisation on counterparty, the boolean CASE on collateral --
 are judgement calls about a specific feed, and the generated file says so in
 a comment at the top rather than pretending otherwise.
 
@@ -157,7 +157,7 @@ def write_source(spec: FeedSpec) -> Step:
     entry = CommentedMap()
     entry["name"] = spec.name
     # Only name the source system if the description does not already -- most
-    # of them end in "from GCIS2" and "(GCIS2)" after it reads like a stutter.
+    # of them end in "from SRC" and "(SRC)" after it reads like a stutter.
     body = spec.description.rstrip(".")
     if spec.source_system.lower() not in body.lower():
         body = f"{body} ({spec.source_system})"

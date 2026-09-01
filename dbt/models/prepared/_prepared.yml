@@ -111,59 +111,6 @@ models:
           upper_bound_column: effective_to
           partition_by: counterparty_id || '|' || agency
           gaps: allowed
-
-
-  - name: primary_limits
-    description: >
-      Conformed primary credit limits from GCIS2, typed, one row per limit
-      version. Use limit_in_force() to ask whether a limit applies on a date.
-      Limit vs exposure comparison belongs in reporting.
-    columns:
-      - name: limit_id
-        tests: [not_null]
-      - name: counterparty_id
-        tests:
-          - not_null
-          # Same payoff as trade: a limit against a counterparty the
-          # reference feed has never sent fails the TEST, and the branch is
-          # never merged. The load itself still succeeds.
-          - relationships:
-              to: ref('counterparty')
-              field: counterparty_id
-      - name: limit_amount
-        tests:
-          - not_null
-          - dbt_utils.accepted_range: {min_value: 0, inclusive: true}
-      - name: currency
-        tests: [not_null]
-      - name: limit_type
-        tests:
-          - not_null
-          - accepted_values: {values: ['PRE_SETTLEMENT', 'SETTLEMENT', 'ISSUER']}
-      - name: status
-        tests:
-          - accepted_values: {values: ['ACTIVE', 'SUSPENDED', 'EXPIRED']}
-      # `is_current` means "the live VERSION of this record", not "in force on
-      # the delivered date" -- that business meaning is the limit_in_force()
-      # macro. See docs/DECISIONS.md#scd2-is-current
-      - name: effective_from
-        tests: [not_null]
-      - name: effective_to
-        tests: [not_null]
-      - name: is_current
-        tests: [not_null]
-    tests:
-      - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [limit_id, effective_from]
-      # See the counterparty block: this is the test that catches a failed
-      # close, which as_of() would otherwise turn into silently doubled rows.
-      # gaps: allowed because effective_to is an INCLUSIVE upper bound.
-      - dbt_utils.mutually_exclusive_ranges:
-          lower_bound_column: effective_from
-          upper_bound_column: effective_to
-          partition_by: limit_id
-          gaps: allowed
-
   - name: collateral
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.

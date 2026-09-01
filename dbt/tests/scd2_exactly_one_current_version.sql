@@ -1,9 +1,9 @@
 {#
   Every entity in every SCD2 table must have exactly ONE open version.
 
-  One test across all three rather than one per model: the invariant is a
-  property of the SCD2 shape, not of counterparties, and a per-model copy is
-  the thing that gets forgotten when a fourth table is converted.
+  One test across every SCD2 table rather than one per model: the invariant is
+  a property of the SCD2 shape, not of counterparties, and a per-model copy is
+  the thing that gets forgotten when the next table is converted.
 
   It catches two different broken states, and neither is expressible as a
   column test:
@@ -28,11 +28,6 @@ with all_entities as (
     select 'rating',
            counterparty_id || '|' || agency, is_current
     from {{ ref('rating') }}
-
-    union all
-    select 'primary_limits',
-           limit_id, is_current
-    from {{ ref('primary_limits') }}
 
 )
 

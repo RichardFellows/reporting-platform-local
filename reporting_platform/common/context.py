@@ -155,8 +155,7 @@ def feed(name: str) -> Feed:
 # NO LAYER PREFIX ON ANY OF THESE: the namespace already says which layer a
 # table is in, so `raw.trade` and `prepared.trade` are the same name in
 # different namespaces. See docs/DECISIONS.md#table-naming-no-layer-prefix
-PREPARED_TABLES = ["trade", "counterparty", "rating", "primary_limits",
-                   "collateral"]
+PREPARED_TABLES = ["trade", "counterparty", "rating", "collateral"]
 REPORTING_TABLES = ["counterparty_exposure", "exposure_by_country",
                     "exposure_change"]
 

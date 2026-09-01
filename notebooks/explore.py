@@ -34,22 +34,20 @@ def _():
     import sys
 
     sys.path.insert(0, "/opt/platform")
-    return mo, sys
+    return (mo,)
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        # Lakehouse explorer
+    mo.md("""
+    # Lakehouse explorer
 
-        Landing CSVs and the `raw` / `prepared` / `reporting` Iceberg layers,
-        through one read-only DuckDB connection.
+    Landing CSVs and the `raw` / `prepared` / `reporting` Iceberg layers,
+    through one read-only DuckDB connection.
 
-        **You are looking at published `main`.** Build branches are not visible
-        here — that is a property of the Iceberg REST catalog, not a setting.
-        """
-    )
+    **You are looking at published `main`.** Build branches are not visible
+    here — that is a property of the Iceberg REST catalog, not a setting.
+    """)
     return
 
 
@@ -82,19 +80,17 @@ def _(ALIAS, con, mo):
 
     catalog = mo.ui.table(_rows, selection=None, label="Published tables on `main`")
     catalog
-    return (catalog,)
+    return
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ## Scratch SQL
+    mo.md("""
+    ## Scratch SQL
 
-        Anything DuckDB understands. Tables are `lakehouse.<layer>.<table>`;
-        landing files are `read_csv_auto('s3://lakehouse/landing/<feed>/*.csv')`.
-        """
-    )
+    Anything DuckDB understands. Tables are `lakehouse.<layer>.<table>`;
+    landing files are `read_csv_auto('s3://lakehouse/landing/<feed>/*.csv')`.
+    """)
     return
 
 
@@ -124,26 +120,24 @@ def _(con, mo, query):
     except Exception as exc:
         result = mo.md(f"```\n{exc}\n```").callout(kind="warn")
     result
-    return (result,)
-
-
-@app.cell
-def _(mo):
-    mo.md(
-        """
-        ## Landing files — what actually arrived
-
-        The immutable evidence copy, read straight from object storage. This is
-        the only layer that is not Iceberg, and the only one where you can see
-        a delivery that was landed but deliberately **not** ingested (a date
-        outside the retention keep-set).
-        """
-    )
     return
 
 
 @app.cell
-def _(con, mo):
+def _(mo):
+    mo.md("""
+    ## Landing files — what actually arrived
+
+    The immutable evidence copy, read straight from object storage. This is
+    the only layer that is not Iceberg, and the only one where you can see
+    a delivery that was landed but deliberately **not** ingested (a date
+    outside the retention keep-set).
+    """)
+    return
+
+
+@app.cell
+def _(mo):
     from reporting_platform.common.context import feeds
 
     _feed_names = sorted(feeds())
@@ -151,7 +145,7 @@ def _(con, mo):
         options=_feed_names, value=_feed_names[0], label="feed"
     )
     feed_pick
-    return feed_pick, feeds
+    return (feed_pick,)
 
 
 @app.cell
@@ -167,30 +161,28 @@ def _(con, feed_pick, mo):
     except Exception as exc:
         landing = mo.md(f"```\n{exc}\n```").callout(kind="warn")
     landing
-    return (landing,)
+    return
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ## Joining across layers
+    mo.md("""
+    ## Joining across layers
 
-        The example below is the one most likely to catch you out.
-        `counterparty`, `rating` and `primary_limits` are **SCD2**: one row per
-        version, not per business date, with `effective_from` / `effective_to`.
+    The example below is the one most likely to catch you out.
+    `counterparty` and `rating` are **SCD2**: one row per
+    version, not per business date, with `effective_from` / `effective_to`.
 
-        An equality join against them does not fail and does not return
-        nothing — it returns a **plausible-looking subset**. Joining
-        `c.effective_from = t.business_date` on this data gives 463 rows where
-        the correct join gives the lot: only the dates a version happened to
-        start on. Numbers that look reasonable and are silently incomplete are
-        worse than an error.
+    An equality join against them does not fail and does not return
+    nothing — it returns a **plausible-looking subset**. Joining
+    `c.effective_from = t.business_date` on this data gives 463 rows where
+    the correct join gives the lot: only the dates a version happened to
+    start on. Numbers that look reasonable and are silently incomplete are
+    worse than an error.
 
-        Join point-in-time instead — the same thing `as_of()` expands to in
-        the dbt models.
-        """
-    )
+    Join point-in-time instead — the same thing `as_of()` expands to in
+    the dbt models.
+    """)
     return
 
 
@@ -220,21 +212,19 @@ def _(con, mo):
         ]
     )
     scd2_example
-    return (scd2_example,)
+    return
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ## Reconciling a layer against the one below it
+    mo.md("""
+    ## Reconciling a layer against the one below it
 
-        The question worth asking of any change: does `prepared` still account
-        for what `raw` received? Raw is all strings and holds every delivered
-        version; prepared keeps the latest `_file_version` per business date.
-        A gap here is a dedupe or an incremental-window problem.
-        """
-    )
+    The question worth asking of any change: does `prepared` still account
+    for what `raw` received? Raw is all strings and holds every delivered
+    version; prepared keeps the latest `_file_version` per business date.
+    A gap here is a dedupe or an incremental-window problem.
+    """)
     return
 
 
@@ -269,7 +259,18 @@ def _(con, mo):
         ]
     )
     recon
-    return (recon,)
+    return
+
+
+@app.cell
+def _(con, mo):
+    _df = mo.sql(
+        f"""
+        SELECT * FROM "lakehouse"."prepared"."rating" LIMIT 100
+        """,
+        engine=con
+    )
+    return
 
 
 if __name__ == "__main__":

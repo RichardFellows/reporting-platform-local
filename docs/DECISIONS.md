@@ -520,14 +520,6 @@ set and differs from `schema` -- it only supports a two-level `schema.table`
 namespace. `spark.sql.defaultCatalog=lakehouse`, set in `profiles.yml`, makes
 unqualified `raw.trade` resolve against the lakehouse/Nessie catalog instead.
 
-## scd2-is-current
-
-`is_current` on the prepared SCD2 tables means "the live **version** of this
-record", not the older business meaning of "in force on the delivered date".
-
-The business version was a function of `business_date`, which an SCD2 row does
-not have. That definition lives on as the `limit_in_force()` macro.
-
 ## cosmos-rendered-builds
 
 The build tasks are not two hand-written `dbt run` / `dbt test` subprocess
@@ -583,7 +575,7 @@ task per *test* -- 51 of them -- and the layer would spend most of an hour
 starting and stopping JVMs. `BUILD` (model and its tests in one `dbt build` per
 node) is wrong for a second reason: under eager indirect selection a
 `relationships` test is pulled in with the model it is declared on, but its
-OTHER parent may not have been built yet -- `primary_limits`' relationship to
+OTHER parent may not have been built yet -- `collateral`'s relationship to
 `counterparty` is not a dependency of the *model*, so Cosmos has no reason to
 order them. Under cautious selection that test is silently dropped instead,
 which is worse. Testing the whole layer once, after it is whole, has neither

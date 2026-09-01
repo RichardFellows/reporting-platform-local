@@ -263,35 +263,3 @@
   #}
   trunc(business_date, 'MM')                                as effective_from_month
 {% endmacro %}
-
-
-{% macro limit_in_force(alias, business_date_expr) %}
-  {#
-    Is this limit in force on the given date?
-
-    THIS USED TO BE AN `is_current` COLUMN ON prepared.primary_limits, and it
-    could not survive SCD2: it is a function of business_date, and an SCD2 row
-    has no business_date. Two names would also have collided, since `is_current`
-    now means "this is the live VERSION of the record" on every SCD2 table.
-
-    It is a macro rather than nothing, because the model's docstring was right
-    about why it existed: "it is computed here so that every consumer asks the
-    question the same way -- the alternative is each report writing its own
-    BETWEEN, which is precisely how the legacy estate ended up with limits that
-    disagreed between screens." A macro keeps that single definition; only its
-    shape moved from a column to a call.
-
-    Note the limit's OWN effective_date/expiry_date are business facts about
-    the limit, entirely separate from the record's effective_from/effective_to.
-  #}
-  case
-      when {{ alias }}.status is null then null
-      when {{ alias }}.status <> 'ACTIVE' then false
-      when {{ alias }}.effective_date is not null
-           and {{ business_date_expr }} < {{ alias }}.effective_date then false
-      -- A null expiry is an open-ended limit, not a missing value.
-      when {{ alias }}.expiry_date is not null
-           and {{ business_date_expr }} > {{ alias }}.expiry_date then false
-      else true
-  end
-{% endmacro %}

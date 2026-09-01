@@ -318,14 +318,14 @@ function feedForm(f, creating) {
       err]);
   };
 
-  const name = el("input", {value: f?.name ?? "", placeholder: "primary_limits",
+  const name = el("input", {value: f?.name ?? "", placeholder: "margin_call",
                             class: "mono", disabled: creating ? null : "disabled"});
   const desc = el("textarea", {rows: "2", placeholder: "What this feed carries, and from where."});
   desc.value = f?.description ?? "";
-  const src = el("input", {value: f?.source_system ?? "", placeholder: "GCIS2"});
+  const src = el("input", {value: f?.source_system ?? "", placeholder: "MARGIN_SRC"});
   const pattern = el("input", {class: "mono", value: f?.filename_pattern ?? "",
                                placeholder: "FEED_(?P<business_date>\\d{8})\\.csv"});
-  const example = el("input", {class: "mono", placeholder: "primaryLimits_20260801.csv"});
+  const example = el("input", {class: "mono", placeholder: "marginCalls_20260801.csv"});
   const patternResult = el("div", {class: "sub", style: "font-size:12px;margin-top:6px"});
   const minRows = el("input", {type: "number", min: "0", value: f?.expected_min_rows ?? 10});
   const cadence = el("select", {}, ["daily", "weekly"].map(v =>

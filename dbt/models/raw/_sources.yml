@@ -51,14 +51,6 @@ sources:
         freshness:
           warn_after: {count: 3, period: day}
           error_after: {count: 10, period: day}
-
-      - name: primary_limits
-        description: Primary credit limits per counterparty and limit type, from GCIS2.
-        columns:
-          - name: limit_id
-            tests: [not_null]
-          - name: counterparty_id
-            tests: [not_null]
       - name: collateral
         description: Collateral positions held against counterparty exposure, from the collateral management
           system (COLL_SRC).

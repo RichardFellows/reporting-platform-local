@@ -82,26 +82,6 @@ feeds:
       - rating
       - rating_date
       - outlook
-
-  - name: primary_limits
-    description: Primary credit limits per counterparty and limit type, from gcis2.
-    source_system: GCIS2
-    # Note the lowerCamelCase prefix: gcis2 names its extracts differently from
-    # the other upstreams. The pattern is per-feed precisely so a new source
-    # system does not force a filename convention on anyone.
-    filename_pattern: 'primaryLimits_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [limit_id]
-    expected_min_rows: 10
-    columns:
-      - limit_id
-      - counterparty_id
-      - limit_type
-      - limit_amount
-      - currency
-      - effective_date
-      - expiry_date
-      - status
-
   - name: collateral
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.

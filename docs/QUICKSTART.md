@@ -185,10 +185,9 @@ From the seed generated above, expect roughly:
 | `raw.trade` | 41 of 55 landed |
 | `raw.counterparty` | 40 of 53 landed |
 | `raw.rating` | 36 of 36 landed |
-| `raw.primary_limits` | 40 of 53 landed |
 
-157 files in total. (`primary_limits` was missing from this table until the
-cold run above counted them.)
+117 files in total. Counts are illustrative -- what matters is that every feed
+in `feeds.yml` appears, with `landed` matching what the cold run counted.
 
 ---
 
@@ -198,8 +197,7 @@ cold run above counted them.)
 not override that, so on a fresh clone they are all paused and no build will
 ever fire. Ask Airflow what exists rather than naming them — the DAG set is
 derived from `feeds.yml`, so a hard-coded list here goes stale the first time
-anyone adds a feed. It already had: it named six, and `ingest_primary_limits`
-made seven.
+anyone adds a feed -- and it already had, the first time one was added.
 
 ```bash
 docker compose exec -T airflow airflow dags list -o plain | awk 'NR>1 {print $1}' |
@@ -244,16 +242,15 @@ docker compose exec -T airflow python -m scripts.duckdb_console \
 ```
 
 **Eleven** tables across `raw`, `prepared` and `reporting` means the whole
-chain landed — four `raw`, four `prepared`, three `reporting`. (This page said
-nine until the `primary_limits` feed added one to each of the first two
-layers.)
+chain landed — four `raw`, four `prepared`, three `reporting`. Adding a feed
+adds one to each of the first two, so check the count against `feeds.yml`
+rather than against this page.
 
 Expected row counts after the build:
 
 | Table | Rows |
 |---|---|
 | `prepared.trade` | 16,000 |
-| `prepared.primary_limits` | 5,755 |
 | `reporting.counterparty_exposure` | 2,400 |
 | `reporting.exposure_change` | 2,400 |
 
@@ -356,7 +353,6 @@ watchdog exits 0.*
 
 *Corrections that run forced into this page: the service count (eleven/nine →
 twelve/ten, stale since `feed-ui` was added), the table count (nine → eleven,
-stale since the `primary_limits` feed), a hard-coded six-DAG unpause list that
-had never included `ingest_primary_limits`, and the manual pool/`dbt deps`
-steps, which are now done by `airflow-init` because forgetting either failed
-silently.*
+stale since a feed was added), a hard-coded DAG unpause list that had never
+included the newest ingest DAG, and the manual pool/`dbt deps` steps, which are
+now done by `airflow-init` because forgetting either failed silently.*

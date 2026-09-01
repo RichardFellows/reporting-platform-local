@@ -161,10 +161,10 @@ reads the dbt project and **renders one Airflow task per model**, wired in the
 models' own `ref()` order, with a test task closing the layer:
 
 ```
-open_branch ─► dbt.counterparty_run ─┐
-            ├─► dbt.rating_run       ├─► dbt.dbt_test ─┬─► publish
-            ├─► dbt.trade_run        │                 └─► keep_failed_branch
-            └─► dbt.primary_limits_run ─┘
+open_branch ─► dbt.counterparty_run ┐
+            ├─► dbt.rating_run      ├─► dbt.dbt_test ─┬─► publish
+            ├─► dbt.trade_run       │                 └─► keep_failed_branch
+            └─► dbt.collateral_run  ┘
 ```
 
 The shape of the build is unchanged — branch, build, test, merge only if clean
@@ -232,7 +232,7 @@ rather than loud:
 |---|---|
 | **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands. Start here.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, Nessie write-audit-publish, per-feed DAG topology, why Spark is the only build engine |
-| **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the six files a new feed touches, in order, with the worked `primary_limits` example |
+| **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the six files a new feed touches, in order, with a worked example |
 | **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same six files through a form, plus land/ingest/build buttons |
 | [notebooks/explore.py](notebooks/explore.py) | marimo notebook on :8083 — query landing files and every Iceberg layer through one read-only DuckDB session |
@@ -676,10 +676,9 @@ docker compose exec -T airflow airflow dags list -o plain | awk 'NR>1 {print $1}
 docker compose exec -T airflow airflow dags list -o plain
 ```
 
-That loop used to be a hard-coded list of six DAG ids, and **it had already
-gone stale**: adding the `primary_limits` feed made a seventh,
-`ingest_primary_limits`, which the list did not name — so anyone following this
-page left one feed paused and had no reason to suspect it. The set of DAGs is
+That loop used to be a hard-coded list of DAG ids, and **it had already gone
+stale**: adding a feed made one more ingest DAG than the list named — so anyone
+following this page left that feed paused and had no reason to suspect it. The set of DAGs is
 derived from `feeds.yml`, so any list written down beside it is a copy waiting
 to drift.
 

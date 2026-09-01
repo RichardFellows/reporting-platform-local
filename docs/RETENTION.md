@@ -17,7 +17,7 @@ This is why `partition_by=['business_date']` is described throughout this
 document as a retention requirement.
 
 **SCD2 tables** (`prepared.counterparty`, `prepared.rating`,
-`prepared.primary_limits`) — that requirement does not apply,
+`prepared.counterparty`) — that requirement does not apply,
 because there is no `business_date` to partition by. Instead:
 
 - a **current** version is never expired, however old — it is the answer to

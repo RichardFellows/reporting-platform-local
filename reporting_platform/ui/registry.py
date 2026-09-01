@@ -214,7 +214,7 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
 
 
 def derive_pattern(example_filename: str) -> str | None:
-    """Turn `primaryLimits_20260801.csv` into the regex feeds.yml wants.
+    """Turn `marginCalls_20260801.csv` into the regex feeds.yml wants.
 
     The filename pattern is the field most likely to be got wrong, and it
     fails silently when it is -- `find_pending` simply never matches. Deriving

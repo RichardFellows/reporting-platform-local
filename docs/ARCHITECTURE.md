@@ -212,10 +212,10 @@ one per model, in the models' own `ref()` order — with `open_branch` in front
 and `publish` behind:
 
 ```
-open_branch ─┬─► dbt.counterparty_run ────┐
-             ├─► dbt.rating_run           │
-             ├─► dbt.trade_run            ├─► dbt.dbt_test ─┬─► publish
-             └─► dbt.primary_limits_run ──┘                 └─► keep_failed_branch
+open_branch ─┬─► dbt.counterparty_run ┐
+             ├─► dbt.rating_run       │
+             ├─► dbt.trade_run        ├─► dbt.dbt_test ─┬─► publish
+             └─► dbt.collateral_run   ┘                 └─► keep_failed_branch
 ```
 
 Write-audit-publish is unchanged by this — the branch is still opened once,
@@ -240,7 +240,7 @@ repeated in the `dbt_builds.py` docstring next to the code it governs.
 | `InvocationMode.SUBPROCESS` | Cosmos defaults to running dbt **in the calling process**. Our target is `method: session`, so dbt builds a SparkSession — an in-process JVM with non-daemon threads would stop the task heartbeating and the scheduler would zombie-reap it ~300s after the work had already succeeded. Same constraint that puts every other Spark call behind `scripts/_spark_task.py`. |
 | `pool="lakehouse_write"` on every rendered task | One dbt invocation is one Spark application, capped at 2 cores against a 6-core worker. Per-model tasks would otherwise start several at once, and standalone mode hands out free cores and holds them until the session stops — so the losers wait forever rather than failing. The single slot serialises them exactly as the old monolithic `dbt run` did by holding it for its whole duration. |
 | `LoadMode.DBT_LS` | `LoadMode.CUSTOM` (Cosmos's own parser) is faster and needs no dbt, but on this project it emits **every test twice** — once bare, once `test.dbt.`-prefixed — which collides as Airflow task ids, and it misses model-level tests entirely, including the `unique_combination_of_columns` blocks that are the only proof `dedupe_rank` works. `dbt ls` finds all 51 tests, and does not open a Spark session. |
-| `TestBehavior.AFTER_ALL` | The `AFTER_EACH` default renders one task per *test* — 51 JVM starts for a layer that has four models. `BUILD` is wrong for a different reason: under eager indirect selection a `relationships` test is pulled in with the model it is declared on, but its other parent may not be built yet (`primary_limits` → `counterparty` is a dependency of the *test*, not the model), and under cautious selection that test is silently dropped instead. Testing the whole layer once, after it is whole, has neither problem. |
+| `TestBehavior.AFTER_ALL` | The `AFTER_EACH` default renders one task per *test* — 51 JVM starts for a layer that has four models. `BUILD` is wrong for a different reason: under eager indirect selection a `relationships` test is pulled in with the model it is declared on, but its other parent may not be built yet (`collateral` → `counterparty` is a dependency of the *test*, not the model), and under cautious selection that test is silently dropped instead. Testing the whole layer once, after it is whole, has neither problem. |
 
 `dbt ls` costs about 5s per parse; Cosmos caches the result against a hash of
 the project files, so it is paid again only when a model actually changes.
@@ -249,9 +249,8 @@ the project files, so it is paid again only when a model actually changes.
 
 ## Slowly-changing dimensions in `prepared`
 
-`prepared.counterparty`, `prepared.rating` and `prepared.primary_limits`
-store **one row per version**, not one per business date. `trade` and
-`collateral` stay daily snapshots.
+`prepared.counterparty` and `prepared.rating` store **one row per version**,
+not one per business date. `trade` and `collateral` stay daily snapshots.
 
 The split is measured, not stylistic. Against 40 retained business dates:
 
@@ -260,9 +259,8 @@ Measured, built:
 | table | snapshot rows | as SCD2 | saved |
 |---|---|---|---|
 | `counterparty` | 2,400 | **70** | 97% |
-| `primary_limits` | 5,680 | **940** | 83% |
 | `rating` | 5,580 | **1,402** | 75% |
-| **reference total** | **13,660** | **2,412** | **82%** |
+| **reference total** | **7,980** | **1,472** | **82%** |
 | `trade` | 16,000 | 14,443 | 10% — *not converted* |
 | `collateral` | 650 | 219 | *not converted, see below* |
 
@@ -280,8 +278,7 @@ actually restates unchanged positions — measure first.
 ### Grain is per business key, not per table
 
 `rating` versions per **(counterparty_id, agency)**: Moody's downgrading must
-not close the S&P version. `primary_limits` versions per `limit_id`. Getting
-this wrong interleaves two independent histories into one chain, and the
+not close the S&P version, where a per-table grain would interleave two independent histories into one chain, and the
 `mutually_exclusive_ranges` test is partitioned on the same key so it catches
 exactly that.
 
@@ -299,15 +296,6 @@ the Iceberg REST endpoint. A view exists to keep consumers unchanged, and it
 would have dropped the one consumer that cannot be changed by editing a model.
 
 ### Three consequences worth knowing
-
-**`primary_limits.is_current` is gone.** It meant "in force on the business
-date delivered for" — a function of `business_date`, which an SCD2 row has
-not got, and the name now means "the live version of this record". Its
-definition survives as the `limit_in_force(alias, date)` macro, so the single
-shared definition the column existed to provide is intact; only its shape
-changed. Note the table now carries two unrelated date ranges:
-`effective_date`/`expiry_date` (when the **limit** applies, a business fact)
-and `effective_from`/`effective_to` (when the **record version** applied).
 
 **A late feed is now carried forward, not nulled.** A version's range spans a
 missing delivery, so a point-in-time join finds the counterparty on a day its

@@ -6,7 +6,7 @@ feed console's "generate a delivery"). They had the same defect independently
 and would have been fixed the same way twice, which is how two copies start.
 
 THE DEFECT. Both drew every attribute from a stream keyed on the business
-date, so every value changed on every delivery. `prepared.primary_limits` held
+date, so every value changed on every delivery. A reference dimension held
 5,755 rows expressing 5,755 distinct versions -- LIM00001IS carried 35
 different amounts across its 35 delivered dates -- and `prepared.trade` held
 16,400 rows with 16,400 distinct trade_ids, a book in which no trade ever

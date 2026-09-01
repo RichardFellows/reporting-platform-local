@@ -1,8 +1,8 @@
 # Adding a feed
 
-Worked example: `primary_limits`, from the `gcis2` source system, delivering
-`primaryLimits_20260801.csv`. Every step below is a real change in that
-commit, so `git show` is a second copy of this document that cannot drift.
+Worked example: a `margin_call` feed from the `margin_src` source system,
+delivering `marginCalls_20260801.csv`. The lowerCamelCase filename is
+deliberate — it is what makes the per-feed `filename_pattern` earn its keep.
 
 **Six files, in this order.** The order matters only in that each step is
 verifiable on its own — do not batch them and then debug the whole thing at
@@ -24,21 +24,21 @@ the asset that triggers `prepared_build`, and the retention/maintenance
 entries. Nothing else in the platform needs to learn the feed's name.
 
 ```yaml
-  - name: primary_limits
-    description: Primary credit limits per counterparty and limit type, from gcis2.
-    source_system: GCIS2
-    filename_pattern: 'primaryLimits_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [limit_id]
+  - name: margin_call
+    description: Margin calls per counterparty and call type, from margin_src.
+    source_system: MARGIN_SRC
+    filename_pattern: 'marginCalls_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    business_key: [margin_call_id]
     expected_min_rows: 10
-    columns: [limit_id, counterparty_id, limit_type, limit_amount,
-              currency, effective_date, expiry_date, status]
+    columns: [margin_call_id, counterparty_id, call_type, call_amount,
+              currency, effective_date, due_date, status]
 ```
 
 Four things that are easy to get wrong:
 
 - **`name` is a table name, an Airflow DAG id and an S3 prefix at once.**
-  `primary_limits` gives `lakehouse.raw.primary_limits`, DAG
-  `ingest_primary_limits` and landing prefix `landing/primary_limits/`. Use
+  `margin_call` gives `lakehouse.raw.margin_call`, DAG
+  `ingest_margin_call` and landing prefix `landing/margin_call/`. Use
   lowercase with underscores regardless of what the upstream calls its files.
 - **`filename_pattern` must yield a `business_date` named group**, and it is
   matched with `re.fullmatch`, not `search` — a pattern that does not cover
@@ -46,7 +46,7 @@ Four things that are easy to get wrong:
   anything pending. The `(?:_v(?P<version>\d+))?` group is optional but you
   want it: it is how a re-delivery lands as a new `_file_version` instead of
   a duplicate. The pattern is per-feed precisely so a source system with its
-  own naming convention (`primaryLimits_`, lowerCamelCase, unlike the other
+  own naming convention (`marginCalls_`, lowerCamelCase, unlike the other
   three feeds) does not force that convention on anyone else.
 - **`columns` is the declared contract, and it is *not* discovered from the
   file.** It becomes the raw DDL, all `STRING`. A column in the file but not
@@ -68,7 +68,7 @@ Optional, and worth a thought rather than a default:
 Verify before moving on:
 
 ```powershell
-docker compose exec -T airflow python -c "from reporting_platform.common.context import feeds; f=feeds()['primary_limits']; print(f.raw_table, f.asset_uri, f.parse_filename('primaryLimits_20260801.csv'))"
+docker compose exec -T airflow python -c "from reporting_platform.common.context import feeds; f=feeds()['margin_call']; print(f.raw_table, f.asset_uri, f.parse_filename('marginCalls_20260801.csv'))"
 ```
 
 A `None` from `parse_filename` means the regex is wrong. Fix it here, not later.
@@ -76,10 +76,10 @@ A `None` from `parse_filename` means the regex is wrong. Fix it here, not later.
 ## 2. `dbt/models/raw/_sources.yml` — declare raw to dbt
 
 ```yaml
-      - name: primary_limits
-        description: Primary credit limits per counterparty and limit type, from GCIS2.
+      - name: margin_call
+        description: Margin calls per counterparty and call type, from MARGIN_SRC.
         columns:
-          - name: limit_id
+          - name: margin_call_id
             tests: [not_null]
           - name: counterparty_id
             tests: [not_null]
@@ -102,8 +102,8 @@ and dbt warns on every invocation.
 ## 3. `dbt/models/prepared/<feed>.sql` — the prepared model
 
 **Name the model after the feed, with no layer prefix.** Feed
-`primary_limits` gives model `primary_limits`, which materialises as
-`prepared.primary_limits` alongside `raw.primary_limits` — same name, the
+`margin_call` gives model `margin_call`, which materialises as
+`prepared.margin_call` alongside `raw.margin_call` — same name, the
 namespace carries the layer. These were `prep_*` and `rpt_*` once; the prefix
 repeated what the namespace already said. dbt keeps models and sources in
 separate namespaces, so a model named `trade` and a source `raw.trade` do not
@@ -114,21 +114,21 @@ Copy the nearest existing model rather than starting blank —
 skeleton is fixed and the three macro calls are not optional:
 
 ```sql
-{{ config(materialized='incremental', unique_key=['business_date','limit_id'],
+{{ config(materialized='incremental', unique_key=['business_date','margin_call_id'],
           partition_by=['business_date'], tags=['prepared','reference']) }}
 
 with raw_rows as (
-    select *, {{ dedupe_rank(['limit_id']) }} as _rn
-    from {{ source('raw', 'primary_limits') }}
+    select *, {{ dedupe_rank(['margin_call_id']) }} as _rn
+    from {{ source('raw', 'margin_call') }}
     where {{ incremental_window('_business_date', 'business_date') }}
 ),
 deduped as (select * from raw_rows where _rn = 1),
 cleaned as (
     select
         _business_date                       as business_date,
-        {{ clean_string('limit_id') }}       as limit_id,
-        {{ safe_cast(clean_string('limit_amount'), 'DECIMAL(18,2)') }} as limit_amount,
-        {{ parse_date(clean_string('expiry_date')) }}                  as expiry_date,
+        {{ clean_string('margin_call_id') }}       as margin_call_id,
+        {{ safe_cast(clean_string('call_amount'), 'DECIMAL(18,2)') }} as call_amount,
+        {{ parse_date(clean_string('due_date')) }}                  as due_date,
         _source_file                         as source_file,
         _file_version                        as source_file_version,
         {{ audit_columns() }}
@@ -164,22 +164,22 @@ utilisation and breach flags would be reporting-layer opinions.
 no tests builds green forever and publishes whatever it is given.
 
 ```yaml
-  - name: primary_limits
+  - name: margin_call
     columns:
       - name: counterparty_id
         tests:
           - not_null
           - relationships: {to: ref('counterparty'), field: counterparty_id}
-      - name: limit_amount
+      - name: call_amount
         tests:
           - not_null
           - dbt_utils.accepted_range: {min_value: 0, inclusive: true}
-      - name: limit_type
+      - name: call_type
         tests:
-          - accepted_values: {values: ['PRE_SETTLEMENT', 'SETTLEMENT', 'ISSUER']}
+          - accepted_values: {values: ['INITIAL', 'VARIATION']}
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, limit_id]
+          combination_of_columns: [business_date, margin_call_id]
 ```
 
 At minimum: `not_null` on the business key, a
@@ -194,7 +194,7 @@ than something that should block publication (see `rating.rating_rank`).
 
 ```python
 PREPARED_TABLES = ["trade", "counterparty", "rating",
-                   "primary_limits"]
+                   "margin_call"]
 ```
 
 **The raw half of `managed_tables()` is derived from `feeds()` and needs no
@@ -202,8 +202,8 @@ change. The prepared half is a hand-maintained list, and this is the one step
 with no error if you skip it** — the table simply never gets compacted, its
 snapshots never expire, and retention never trims it. It grows quietly. This
 list holds dbt *model* names, which — with no `alias` configured anywhere —
-are also the catalog table names. `primary_limits` here materialises as
-`prepared.primary_limits`. Rename one without the other and every maintenance
+are also the catalog table names. `margin_call` here materialises as
+`prepared.margin_call`. Rename one without the other and every maintenance
 and retention task points at a table that does not exist, without error.
 
 Nothing in `retention.yml` or `maintenance.yml` needs editing — both are
@@ -217,7 +217,7 @@ Local-stack only, but skip it and the feed has nothing to run against.
 
 **You do not write a generator.** `scripts/generate_feeds.py` hand-writes
 generators for the four original feeds only — `trade`, `counterparty`,
-`rating`, `primary_limits` — because their *pathologies* are the point and a
+`rating`, `margin_call` — because their *pathologies* are the point and a
 definition-driven generator cannot produce them: the two injected failures, the
 schema drift, the absent delivery, the non-overlapping SCD2 ranges
 `dbt_utils.mutually_exclusive_ranges` tests, the cadence difference between a
@@ -263,7 +263,7 @@ nulls the whole column, and **nothing fails** — because nulling is what
 ```python
 from reporting_platform.common.context import feeds
 from reporting_platform.ui import sampledata, scaffold
-feed = feeds()["primary_limits"]
+feed = feeds()["margin_call"]
 sampledata.generate(feed, days=0, types=scaffold.resolve_types(feed))
 ```
 
@@ -277,10 +277,10 @@ than a plausible one.
 
 ```powershell
 # 1. sample data -> landing
-docker compose exec -T airflow python -m scripts.land_feeds --feed primary_limits
+docker compose exec -T airflow python -m scripts.land_feeds --feed margin_call
 
 # 2. what would be ingested (read-only)
-docker compose exec -T airflow python -m scripts._spark_task pending primary_limits
+docker compose exec -T airflow python -m scripts._spark_task pending margin_call
 
 # 3. landing -> raw, every pending file
 docker compose exec -T airflow python -m scripts.bulk_ingest
@@ -290,7 +290,7 @@ $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select path:models/prepared --vars "{nessie_ref: $branch}"
 
 # 5. the new DAG is created PAUSED -- it will never fire until you do this
-docker compose exec -T airflow airflow dags unpause ingest_primary_limits
+docker compose exec -T airflow airflow dags unpause ingest_margin_call
 ```
 
 Step 5 is the one that gets forgotten. `airflow dags list` shows a paused DAG
@@ -316,7 +316,7 @@ Worth knowing, because it is where the effort would otherwise go:
 **A delivery outside the retention keep-set is landed but never ingested.**
 `find_pending` computes the raw keep-set (10 business days + 80 month-ends)
 from the dates present in *landing* and skips everything else, so it does not
-re-ingest history that retention has already expired. `primaryLimits_20260801.csv`
+re-ingest history that retention has already expired. `marginCalls_20260801.csv`
 is a Saturday: it is in landing, no other feed delivered on that date, and it
 is neither a month-end nor within the last 10 business days — so it is
 correctly skipped. That is not a bug, and forcing it in only gives the next
@@ -324,7 +324,7 @@ retention run something to delete:
 
 ```powershell
 # only if you actually want it
-docker compose exec -T airflow python -m reporting_platform.ingest.ingest_feed --feed primary_limits --object landing/primary_limits/primaryLimits_20260801.csv
+docker compose exec -T airflow python -m reporting_platform.ingest.ingest_feed --feed margin_call --object landing/margin_call/marginCalls_20260801.csv
 ```
 
 **A new daily feed reports completeness gaps until it has history.** The check
