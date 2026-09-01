@@ -20,23 +20,10 @@ a later run deletes it. So reclamation is lagged by design, and `storage_report`
 cannot assert that bytes fell tonight — see its docstring.
 
 CONCURRENCY: every task here that touches table files holds the SAME
-`lakehouse_write` pool as the ingest tasks (`feed_ingest.py`) and the dbt build
-tasks (`dbt_builds.py`). That single one-slot pool is what actually prevents
-`remove_orphan_files` running underneath an in-flight write, which corrupts the
-table.
-
-This must stay one shared pool. An Airflow task belongs to exactly one pool, so
-splitting maintenance into its own one-slot pool does NOT exclude it from
-writers -- two one-slot pools happily run in parallel with each other. That was
-the original arrangement (a separate `iceberg_maintenance` pool) and it left
-the corruption window open while looking deliberate. `max_active_runs=1` below
-already prevents this DAG colliding with itself, so the second pool bought
-nothing even on its own terms.
-
-The accepted cost: a feed arriving mid-compaction queues behind it rather than
-running concurrently. That is the right trade -- maintenance is scheduled after
-the last publication of the day, and a feed is late, not lost
-(`arrival_timeout_hours: 26`).
+`lakehouse_write` pool as ingest and the dbt builds. That one shared slot is
+what prevents `remove_orphan_files` running underneath an in-flight write, which
+corrupts the table. It must stay ONE pool -- a second one-slot pool does not
+exclude anything. See docs/DECISIONS.md#one-shared-write-pool
 
 Strictly, only `remove_orphan_files` corrupts on a concurrent write; compaction
 and snapshot expiry are safe under Iceberg's optimistic concurrency. Splitting
@@ -59,10 +46,9 @@ try:
 except ImportError:
     from airflow.decorators import dag, task  # type: ignore
 
-# 3x the base delay (30s locally, and still the longest of the three DAGs).
-# Housekeeping's tasks are the slow destructive ones, so retrying one straight
-# away is more likely to collide with whatever it collided with the first time.
-# See the RETRY_DELAY note in dbt_builds.py for why this is no longer minutes.
+# 3x the base delay (30s locally, the longest of the three DAGs): these are the
+# slow destructive tasks, and retrying one straight away is more likely to
+# collide with whatever it collided with. See docs/DECISIONS.md#retry-delay
 RETRY_DELAY = timedelta(
     seconds=3 * int(os.environ.get("AIRFLOW_RETRY_DELAY_SECONDS", "10")))
 
@@ -88,12 +74,9 @@ def _spark_subprocess(*args: str) -> dict:
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        # Tail alone is not enough to diagnose. A Py4JJavaError carries a
-        # Java stack far longer than the tail budget, so the exception
-        # MESSAGE -- the only line that says what went wrong -- falls off
-        # the front and the log shows nothing but Java frames. That cost a
-        # full re-run by hand to read the ValidationException behind
-        # Include the head of the last traceback too.
+        # Head of the last traceback as well as the tail: a Py4JJavaError's Java
+        # stack pushes the exception MESSAGE off the front of a tail-only
+        # budget. See docs/DECISIONS.md#log-tail-plus-head
         err = proc.stderr or ""
         cut = err.rfind("Traceback (most recent call last)")
         head = err[cut:cut + 2500] if cut >= 0 else ""
@@ -266,15 +249,10 @@ def platform_housekeeping():
                    "deferred_deleted": deferred.get("files_deleted"),
                    "deferred_pending": deferred.get("files_pending")}
 
-        # Machinery assertion, and it comes BEFORE the dry-run return on
-        # purpose. that defect's lesson was that a dry run must not be held to
-        # assertions about deletion — but this is not one. retention
-        # deliberately swallows a deferred-delete failure so the rest of the
-        # chain still completes, so nothing else would notice D4 rotting back
-        # to the state it was built to fix. A dry run still lists the
-        # live-sets, so an error here means the GC database or the tool is
-        # unreachable, which is exactly as broken on a dry run as on a real
-        # one and is the cheapest possible place to find out.
+        # A MACHINERY assertion, not a deletion one, which is why it comes
+        # before the dry-run return: retention swallows a deferred-delete
+        # failure so the chain completes, so nothing else would notice this
+        # breaking. See docs/DECISIONS.md#gc-lag-and-assertions
         if deferred.get("error"):
             raise AirflowException(
                 "the deferred-delete pass failed: " + str(deferred["error"])
@@ -308,9 +286,9 @@ def platform_housekeeping():
         if gc_deferred:
             # Correct and expected: reclamation is lagged by the deferral
             # window, so a night whose eligible live-sets held nothing removes
-            # nothing. INFO, not WARNING — this used to be the standing D4
-            # warning, and leaving it loud after the gap was closed would be
-            # training people to ignore a message that now means "working".
+            # nothing. INFO, not WARNING -- a standing warning that means
+            # "working" trains people to ignore it.
+            # See docs/DECISIONS.md#gc-lag-and-assertions
             log.info(
                 "nothing removed this run: reclamation is deferred by %sh, so "
                 "tonight's pass actions sweeps from that long ago and those "

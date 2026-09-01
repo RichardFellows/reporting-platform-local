@@ -28,18 +28,8 @@ except ImportError:                     # Airflow 2.x
     from airflow.decorators import dag, task       # type: ignore
     _AF3 = False
 
-# Retry delay: SECONDS, not the five minutes this used to be.
-#
-# Five minutes is a sensible production number -- it waits out a transient
-# cluster or catalog blip without hammering it. On a laptop it is simply dead
-# time: the whole prepared build is about three minutes, so one retried task
-# doubled the wall clock of the thing you were watching, and a mid-graph
-# failure left the rest of the graph parked behind the pool for longer than the
-# build itself takes.
-#
-# Env-var'd rather than hard-coded so the OpenShift deployment can put its own
-# number back without a code change; the default is the local-stack one,
-# because this repo IS the local stack.
+# Env-var'd so a cluster deployment can put a production number back without a
+# code change. See docs/DECISIONS.md#retry-delay
 RETRY_DELAY = timedelta(seconds=int(os.environ.get("AIRFLOW_RETRY_DELAY_SECONDS", "10")))
 
 DEFAULT_ARGS = {
@@ -53,10 +43,9 @@ DEFAULT_ARGS = {
 def _spark_subprocess(*args: str) -> dict:
     """Run a Spark-using operation in a child process and parse its JSON.
 
-    In-process SparkSessions make an Airflow task hang after it returns: the
-    JVM's non-daemon threads keep the process alive, heartbeats stop, and the
-    scheduler reaps the task as a zombie ~300s later even though the work
-    succeeded. See scripts/_spark_task.py. In OpenShift this becomes a
+    An in-process SparkSession makes the task hang after it returns and the
+    scheduler zombie-reaps it. See docs/DECISIONS.md#spark-in-a-subprocess.
+    In OpenShift this becomes a
     KubernetesPodOperator issuing spark-submit -- same module, same arguments,
     a different execution wrapper, and the same process-isolation property.
     """
@@ -69,12 +58,9 @@ def _spark_subprocess(*args: str) -> dict:
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        # Tail alone is not enough to diagnose. A Py4JJavaError carries a
-        # Java stack far longer than the tail budget, so the exception
-        # MESSAGE -- the only line that says what went wrong -- falls off
-        # the front and the log shows nothing but Java frames. That cost a
-        # full re-run by hand to read the ValidationException behind
-        # Include the head of the last traceback too.
+        # Head of the last traceback as well as the tail: a Py4JJavaError's Java
+        # stack pushes the exception MESSAGE off the front of a tail-only
+        # budget. See docs/DECISIONS.md#log-tail-plus-head
         err = proc.stderr or ""
         cut = err.rfind("Traceback (most recent call last)")
         head = err[cut:cut + 2500] if cut >= 0 else ""

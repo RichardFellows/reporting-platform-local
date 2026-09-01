@@ -522,3 +522,242 @@ record", not the older business meaning of "in force on the delivered date".
 
 The business version was a function of `business_date`, which an SCD2 row does
 not have. That definition lives on as the `limit_in_force()` macro.
+
+## cosmos-rendered-builds
+
+The build tasks are not two hand-written `dbt run` / `dbt test` subprocess
+calls. `DbtTaskGroup` reads the dbt project and emits **one Airflow task per
+model**, wired in the models' own `ref()` order, plus a test task -- so a broken
+model is a red task carrying that model's name rather than a 4000-character log
+tail, and a clear-and-retry restarts from the model that failed instead of from
+the top of the layer.
+
+Nothing about the *shape* of the build changed: branch -> build -> test ->
+merge-only-if-clean, with the branch retained on failure. Cosmos supplies the
+middle; `open_branch` and `publish` are the same tasks they always were.
+
+**Adding a model requires no DAG edit.** The graph is derived from the dbt
+project on every DAG parse, so a new `.sql` under `models/prepared/` appears as
+a new task in `prepared_build` by itself, the same way a new entry in
+`feeds.yml` appears as a new ingest DAG. That symmetry is the point.
+
+## cosmos-load-bearing-settings
+
+Four settings in `airflow/dags/dbt_builds.py` are load-bearing.
+
+**`InvocationMode.SUBPROCESS`.** Cosmos defaults to `DBT_RUNNER`, which invokes
+dbt *in the calling process*. The dbt target is `method: session` -- dbt builds
+a SparkSession -- so `DBT_RUNNER` would leave a JVM with non-daemon threads
+inside the Airflow task process, heartbeats would stop, and the scheduler would
+zombie-reap the task ~300s after the work had already succeeded. Same constraint
+that puts every other Spark call behind `scripts/_spark_task.py`.
+
+**`pool="lakehouse_write"` on every rendered task.** One dbt invocation is one
+Spark application, and each caps itself at 2 cores against a 6-core worker.
+Per-model tasks mean Airflow would otherwise start several at once and the
+cluster would hand out cores until nothing could get a full share -- standalone
+mode grants free cores on request and holds them until the session stops, so the
+losers wait forever rather than failing. The single pool slot serialises them
+exactly as the old monolithic `dbt run` did by holding that slot for its whole
+duration.
+
+**`LoadMode.DBT_LS`.** `LoadMode.CUSTOM` (Cosmos's own parser, no dbt
+invocation) looks attractive because it is fast and touches no adapter -- but on
+this project it emits **every test twice**, once under a bare id and once under
+a `test.dbt.` one, which would collide as Airflow task ids, and it misses
+model-level tests entirely: the `dbt_utils.unique_combination_of_columns` blocks
+that prove `dedupe_rank` works never appear. Verified by loading the graph both
+ways. `DBT_LS` shells out to real dbt, finds all 51 tests, and does not connect
+to Spark -- `dbt ls` resolves the profile without opening a session. It costs
+~5s per DAG parse, which Cosmos caches against a hash of the project files.
+
+**`TestBehavior.AFTER_ALL`**, not the `AFTER_EACH` default and not `BUILD`.
+Every rendered task is a separate dbt invocation and therefore a separate Spark
+application with its own ~30s session startup. `AFTER_EACH` would render one
+task per *test* -- 51 of them -- and the layer would spend most of an hour
+starting and stopping JVMs. `BUILD` (model and its tests in one `dbt build` per
+node) is wrong for a second reason: under eager indirect selection a
+`relationships` test is pulled in with the model it is declared on, but its
+OTHER parent may not have been built yet -- `primary_limits`' relationship to
+`counterparty` is not a dependency of the *model*, so Cosmos has no reason to
+order them. Under cautious selection that test is silently dropped instead,
+which is worse. Testing the whole layer once, after it is whole, has neither
+problem. Overridable via `COSMOS_TEST_BEHAVIOR` so a developer can flip to
+`AFTER_EACH` while chasing one failing test.
+
+## cosmos-packages
+
+dbt packages are installed **once** by `airflow-init`, not per task:
+`install_dbt_deps` would make every rendered task run `dbt deps` against the
+network before doing any work.
+
+`copy_dbt_packages` is `False`. It was `True` while packages lived in the
+project directory, to carry them into the temporary project Cosmos builds for
+each task -- without them that directory has no `dbt_utils` and every
+`dbt_utils` test fails to compile. It is `False` now because
+`packages-install-path` is **absolute** (see
+[dbt-packages-volume](#dbt-packages-volume)). Cosmos resolves that key against
+the project folder to find what to copy, and joining a folder with an absolute
+path yields the absolute path itself, so the copy would have the same source and
+destination. Nothing needs copying: the path is identical inside every process
+in the container, so the dbt subprocess in the temporary project resolves it
+directly.
+
+Verified with a Cosmos-shaped temporary project whose `dbt_packages` symlink
+pointed at an **empty** directory: every `dbt_utils_*` test still resolved.
+
+## cosmos-profile-config
+
+One `ProfileConfig` for everything: the committed `dbt/profiles.yml`, used
+as-is. Cosmos can also *synthesise* a profile from an Airflow connection
+(`profile_mapping`), and that is deliberately not used -- `profiles.yml` carries
+about thirty `server_side_parameters` lines of Iceberg/Nessie/S3A wiring, and a
+second generated copy of that in the Airflow connections table is a forked
+definition that drifts. There is one profile, it is in git, and dbt on the
+command line and dbt under Cosmos read the same file.
+
+## cosmos-emit-datasets
+
+`emit_datasets=False`, or Cosmos attaches a Dataset outlet to every model task.
+
+The cascade in this platform is deliberately **layer-grained**: the `prepared`
+asset means "the whole prepared layer is published and merged to main", which is
+emitted by `publish` and is the only thing `reporting_build` should react to.
+Per-model datasets would fire on a branch, before any audit, and before the
+merge.
+
+## cosmos-exclude-exposures
+
+dbt `exposures` are documentation -- they declare who *consumes* a mart and
+build nothing. Cosmos has no converter for them and logs `Unavailable conversion
+function for <DbtResourceType.EXPOSURE>` on every DAG parse, for each one.
+Dropping them at selection time is honest about what they are and keeps the
+parse log readable; they are still rendered in `dbt docs`, which is where they
+belong.
+
+## dbt-target-guard
+
+`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**.
+
+The failure it prevents is silent. The branch each build opens is passed to dbt
+as the `nessie_ref` var, and only the Spark profiles honour it; an engine that
+cannot address a Nessie branch ignores it and writes to the catalog's default
+branch instead. The build would then **succeed**, having written to `main` with
+no branch, no audit and nothing red anywhere.
+
+The fallback value matters for the same reason. It used to be `duckdb_local`,
+which was harmless only because `duckdb_local` was broken -- an unset
+`DBT_TARGET` crashed loudly. Fixing that target would have turned the loud
+failure into a silent one.
+
+The check lives at import time rather than inside a task because Cosmos builds
+the dbt command itself, so there is no single call site to guard. A bad
+`DBT_TARGET` becomes a DAG import error visible in the UI rather than a green
+run that published to main.
+
+## assets-are-or-not-and
+
+A bare list is **AND** in Airflow: `schedule=[a, b, c]` waits until every one of
+them has a new event since the last run. That is the opposite of what this
+platform needs -- `docs/ARCHITECTURE.md` says "triggered by ANY upstream asset",
+"No feed waits for any other feed to arrive", and "a feed that is late does not
+block the ones that arrived". With a list, one late feed silently holds up every
+build, which is exactly the batch window the per-feed design exists to remove.
+
+Verified against the live scheduler: with `schedule=[trade, cpty, rating]`, an
+ingest of trade alone emitted its dataset event and `prepared_build` never
+fired.
+
+`any_of()` reduces with `|`, which yields `DatasetAny`/`AssetAny` on Airflow
+2.9+ and 3.x. If that is unavailable the list is returned unchanged **and a
+warning is logged**, because degrading to AND silently is how this was missed in
+the first place.
+
+## retry-delay
+
+Retry delay is seconds, not the five minutes it used to be.
+
+Five minutes is a sensible production number -- it waits out a transient cluster
+or catalog blip without hammering it. On a laptop it is dead time: the whole
+prepared build is about three minutes, so one retried task doubled the wall
+clock of the thing you were watching, and a mid-graph failure left the rest of
+the graph parked behind the pool for longer than the build itself takes.
+
+Env-var'd via `AIRFLOW_RETRY_DELAY_SECONDS` rather than hard-coded, so the
+OpenShift deployment can put its own number back without a code change. The
+default is the local-stack one, because this repo *is* the local stack.
+
+## spark-in-a-subprocess
+
+Anything running Spark inside an Airflow task must go through
+`scripts/_spark_task.py`, as a subprocess.
+
+An in-process SparkSession makes the task hang after it returns: the JVM's
+non-daemon threads keep the process alive, heartbeats stop, and the scheduler
+reaps the task as a zombie ~300s later even though the work succeeded.
+
+This is still true on the cluster -- the *driver* is what lives in that process.
+In OpenShift the subprocess becomes a `KubernetesPodOperator` issuing
+`spark-submit`: same module, same arguments.
+
+It is the same constraint that forces `InvocationMode.SUBPROCESS` in Cosmos --
+see [cosmos-load-bearing-settings](#cosmos-load-bearing-settings).
+
+## log-tail-plus-head
+
+Failed subprocesses report the **head of the last traceback as well as the
+tail**.
+
+A tail alone is not enough to diagnose. A `Py4JJavaError` carries a Java stack
+far longer than the tail budget, so the exception *message* -- the only line
+that says what went wrong -- falls off the front and the log shows nothing but
+Java frames. That cost a full re-run by hand to read the `ValidationException`
+behind it.
+
+## one-shared-write-pool
+
+Every task that touches table files -- ingest, the dbt model tasks, and
+maintenance -- holds the **same** one-slot `lakehouse_write` pool. That is what
+prevents `remove_orphan_files` running underneath an in-flight write, which
+corrupts the table.
+
+It must stay **one** pool. An Airflow task belongs to exactly one pool, so
+splitting maintenance into its own one-slot pool does *not* exclude it from
+writers -- two one-slot pools happily run in parallel with each other. That was
+the original arrangement (a separate `iceberg_maintenance` pool) and it left the
+corruption window open while looking deliberate. `max_active_runs=1` on the
+housekeeping DAG already prevents it colliding with itself, so the second pool
+bought nothing even on its own terms.
+
+The accepted cost: a feed arriving mid-compaction queues behind it rather than
+running concurrently. That is the right trade -- maintenance is scheduled after
+the last publication of the day, and a feed is late, not lost
+(`arrival_timeout_hours: 26`).
+
+Without the pool, every task sits `queued` forever with nothing to say why,
+which is why `airflow-init` creates it -- see
+[airflow-init-four-things](#airflow-init-four-things).
+
+## gc-lag-and-assertions
+
+Identification and removal are two different steps, a deferral window apart: the
+Nessie GC sweep records what is collectable, and a later run deletes it.
+Reclamation is therefore **lagged by design**, and `storage_report` cannot
+assert that bytes fell tonight.
+
+Two consequences in `platform_housekeeping.py`:
+
+- A night whose eligible live-sets held nothing removes nothing. That is correct
+  and expected, so it logs at INFO, not WARNING. A standing warning that means
+  "working" trains people to ignore it -- including the next real one.
+- The live-set assertion is a **machinery** assertion, not a deletion one, which
+  is why it runs *before* the dry-run return. A dry run must not be held to
+  assertions about deletion -- but this is not one. Retention deliberately
+  swallows a deferred-delete failure so the rest of the chain still completes,
+  so nothing else would notice the mechanism rotting. A dry run still lists the
+  live-sets, so an error here means the GC database or the tool is unreachable,
+  which is exactly as broken on a dry run as on a real one, and is the cheapest
+  possible place to find out.
+
+Expiring snapshots before expiring tags reclaims nothing while appearing to
+succeed, which is why the order in that DAG's docstring is the point.
