@@ -90,13 +90,13 @@ both of which were live defects at one point:
 
 **No layer prefix on any table name.** The namespace already says which layer
 a table is in, so `prepared.prep_trade` and `reporting.rpt_exposure_change`
-were saying it twice. Full names are `lakehouse.raw.trade`,
-`lakehouse.prepared.trade`, `lakehouse.reporting.counterparty_exposure`.
+were saying it twice. Full names are `lakehouse.raw.fo_trade`,
+`lakehouse.prepared.fo_trade`, `lakehouse.reporting.counterparty_exposure`.
 
 A feed's landed and conformed tables therefore share a name and differ only by
-namespace — `raw.trade` and `prepared.trade`. That is legal because dbt keeps
+namespace — `raw.fo_trade` and `prepared.fo_trade`. That is legal because dbt keeps
 models and sources in separate namespaces: a model named `trade` and a source
-`raw.trade` coexist without collision. Verified against a live parse before the
+`raw.fo_trade` coexist without collision. Verified against a live parse before the
 rename, not assumed.
 
 The consequence to remember is in `common/context.py`: no `alias` is
@@ -128,10 +128,10 @@ The DAG topology is therefore:
                            │
         ┌──────────────────┼──────────────────┐
         ▼                  ▼                  ▼
-  ingest_trade      ingest_counterparty   ingest_rating      ← one DAG per feed,
+  ingest_fo_trade      ingest_ref_counterparty   ingest_ref_rating      ← one DAG per feed,
         │                  │                  │                generated from feeds.yml
         ▼                  ▼                  ▼
-   Asset: raw.trade   Asset: raw.counterparty  Asset: raw.rating
+   Asset: raw.fo_trade   Asset: raw.ref_counterparty  Asset: raw.ref_rating
         └──────────────────┼──────────────────┘
                            ▼
                   prepared_build (dbt)          ← triggered by ANY upstream asset
@@ -212,10 +212,10 @@ one per model, in the models' own `ref()` order — with `open_branch` in front
 and `publish` behind:
 
 ```
-open_branch ─┬─► dbt.counterparty_run ┐
-             ├─► dbt.rating_run       │
-             ├─► dbt.trade_run        ├─► dbt.dbt_test ─┬─► publish
-             └─► dbt.collateral_run   ┘                 └─► keep_failed_branch
+open_branch ─┬─► dbt.ref_counterparty_run ┐
+             ├─► dbt.ref_rating_run       │
+             ├─► dbt.fo_trade_run        ├─► dbt.dbt_test ─┬─► publish
+             └─► dbt.ref_collateral_run   ┘                 └─► keep_failed_branch
 ```
 
 Write-audit-publish is unchanged by this — the branch is still opened once,
@@ -249,7 +249,7 @@ the project files, so it is paid again only when a model actually changes.
 
 ## Slowly-changing dimensions in `prepared`
 
-`prepared.counterparty` and `prepared.rating` store **one row per version**,
+`prepared.ref_counterparty` and `prepared.ref_rating` store **one row per version**,
 not one per business date. `trade` and `collateral` stay daily snapshots.
 
 The split is measured, not stylistic. Against 40 retained business dates:
@@ -413,7 +413,7 @@ through the same catalog.
 ```
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 docker compose exec -T airflow python -m scripts.duckdb_console \
-    "select business_date, count(*) from lakehouse.prepared.trade group by 1"
+    "select business_date, count(*) from lakehouse.prepared.fo_trade group by 1"
 ```
 
 It is a script rather than a dbt target deliberately. The engine macros are

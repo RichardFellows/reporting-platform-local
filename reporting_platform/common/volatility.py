@@ -8,7 +8,7 @@ and would have been fixed the same way twice, which is how two copies start.
 THE DEFECT. Both drew every attribute from a stream keyed on the business
 date, so every value changed on every delivery. A reference dimension held
 5,755 rows expressing 5,755 distinct versions -- LIM00001IS carried 35
-different amounts across its 35 delivered dates -- and `prepared.trade` held
+different amounts across its 35 delivered dates -- and `prepared.fo_trade` held
 16,400 rows with 16,400 distinct trade_ids, a book in which no trade ever
 appeared twice. Nothing in the pipeline was wrong. The upstream was simply
 being simulated as maximally volatile, which is the opposite of what reference

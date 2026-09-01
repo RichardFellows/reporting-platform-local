@@ -20,7 +20,7 @@ Combines many small files into fewer right-sized files.
 
 ```sql
 CALL lakehouse.system.rewrite_data_files(
-  table => 'raw.trade',
+  table => 'raw.fo_trade',
   strategy => 'sort',
   sort_order => 'business_date, counterparty_id',
   where => 'business_date >= date "2026-08-01"',
@@ -49,7 +49,7 @@ Reorganises manifest files so that manifest-level partition pruning works.
 Cheap, and worth running whenever compaction ran.
 
 ```sql
-CALL lakehouse.system.rewrite_manifests('raw.trade');
+CALL lakehouse.system.rewrite_manifests('raw.fo_trade');
 ```
 
 ### 3. `expire_snapshots`
@@ -74,7 +74,7 @@ tag expiry, not before.
 
 ```sql
 CALL lakehouse.system.expire_snapshots(
-  table => 'raw.trade',
+  table => 'raw.fo_trade',
   older_than => TIMESTAMP '2026-08-05 00:00:00',
   retain_last => 5
 );
@@ -90,7 +90,7 @@ the debris of failed writes.
 
 ```sql
 CALL lakehouse.system.remove_orphan_files(
-  table => 'raw.trade',
+  table => 'raw.fo_trade',
   older_than => TIMESTAMP '2026-08-08 00:00:00'
 );
 ```
@@ -128,7 +128,7 @@ Only relevant for merge-on-read tables. Our `prepared` incremental models use
 data files.
 
 ```sql
-CALL lakehouse.system.rewrite_position_delete_files('prepared.trade');
+CALL lakehouse.system.rewrite_position_delete_files('prepared.fo_trade');
 ```
 
 ## Nessie GC

@@ -27,7 +27,7 @@
 with
 
 {% if is_incremental() %}
-{{ scd2_incremental_scope(source('raw', 'rating'), ['counterparty_id', 'agency']) }}
+{{ scd2_incremental_scope(source('raw', 'ref_rating'), ['counterparty_id', 'agency']) }}
 {% endif %}
 
 raw_rows as (
@@ -35,7 +35,7 @@ raw_rows as (
     select
         r.*,
         {{ dedupe_rank(['r.counterparty_id', 'r.agency']) }} as _rn
-    from {{ source('raw', 'rating') }} r
+    from {{ source('raw', 'ref_rating') }} r
     {% if is_incremental() %}
     join touched t
       on t.counterparty_id = r.counterparty_id and t.agency = r.agency

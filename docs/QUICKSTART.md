@@ -166,7 +166,7 @@ log line like:
 
 ```
 trade: ignoring 14 landed object(s) outside the retention keep-set
-(expired, not new): landing/trade/TRADE_20260716.csv, ...
+(expired, not new): landing/fo_trade/TRADE_20260716.csv, ...
 ```
 
 Retention keeps "10 recent business days plus 80 month-ends". A landed file
@@ -182,9 +182,9 @@ From the seed generated above, expect roughly:
 
 | Table | Files |
 |---|---|
-| `raw.trade` | 41 of 55 landed |
-| `raw.counterparty` | 40 of 53 landed |
-| `raw.rating` | 36 of 36 landed |
+| `raw.fo_trade` | 41 of 55 landed |
+| `raw.ref_counterparty` | 40 of 53 landed |
+| `raw.ref_rating` | 36 of 36 landed |
 
 117 files in total. Counts are illustrative -- what matters is that every feed
 in `feeds.yml` appears, with `landed` matching what the cold run counted.
@@ -250,7 +250,7 @@ Expected row counts after the build:
 
 | Table | Rows |
 |---|---|
-| `prepared.trade` | 16,000 |
+| `prepared.fo_trade` | 16,000 |
 | `reporting.counterparty_exposure` | 2,400 |
 | `reporting.exposure_change` | 2,400 |
 
@@ -344,7 +344,7 @@ artefact removed, on 2026-08-30 — stack up **53s**, seed **2s**, land **6s**,
 ingest **28m56s** (157 files), `prepared_build` **3m18s** and the
 asset-triggered `reporting_build` **2m56s**, both green, eleven tables
 queryable at the documented row counts. Then a single new delivery landed and
-run through `ingest_trade`: it cut `published/2026-08-20/demo2`, and
+run through `ingest_fo_trade`: it cut `published/2026-08-20/demo2`, and
 `prepared_build` and `reporting_build` each fired themselves off the asset
 below them, ending with `2026-08-20` in `reporting.exposure_change` and the
 catalog holding `main` and that one tag — no surviving `build/*` branch. The

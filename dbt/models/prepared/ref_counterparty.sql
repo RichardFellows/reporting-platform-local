@@ -45,7 +45,7 @@
 with
 
 {% if is_incremental() %}
-{{ scd2_incremental_scope(source('raw', 'counterparty'), ['counterparty_id']) }}
+{{ scd2_incremental_scope(source('raw', 'ref_counterparty'), ['counterparty_id']) }}
 {% endif %}
 
 raw_rows as (
@@ -53,7 +53,7 @@ raw_rows as (
     select
         r.*,
         {{ dedupe_rank(['r.counterparty_id']) }} as _rn
-    from {{ source('raw', 'counterparty') }} r
+    from {{ source('raw', 'ref_counterparty') }} r
     {% if is_incremental() %}
     join touched t on t.counterparty_id = r.counterparty_id
     left join replay_from p on p.counterparty_id = r.counterparty_id

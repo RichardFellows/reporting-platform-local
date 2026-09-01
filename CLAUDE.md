@@ -141,6 +141,12 @@ Two corollaries worth holding on to:
   `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
+- **A feed is named `<source_system>_<feed>`** — `fo_trade`,
+  `ref_counterparty`, `treasury_margin_call` — and it is TYPED into feeds.yml,
+  not derived. That one string is the raw table, the DAG id, the landing
+  prefix, the dbt source table and the prepared model at once, so prefixing the
+  name prefixes all five and none of them can drift.
+  See `docs/DECISIONS.md#feed-names-carry-the-source`.
 - **A column may be named differently in the file than in the platform.**
   `- trade_id: "Trade Id"` in `feeds.yml` renames at ingest, so raw onwards is
   ordinary identifiers and dbt macros never have to quote one. Drift is
@@ -188,7 +194,7 @@ docker compose exec -T airflow python -m reporting_platform.maintenance.maintain
 
 # DAGs
 docker compose exec -T airflow airflow dags list-runs -d prepared_build -o plain
-docker compose exec -T airflow airflow dags trigger ingest_trade
+docker compose exec -T airflow airflow dags trigger ingest_fo_trade
 
 # what Cosmos rendered -- one *_run task per dbt model, plus dbt_test
 docker compose exec -T airflow airflow tasks list prepared_build

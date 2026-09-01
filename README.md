@@ -127,13 +127,13 @@ triggered by Airflow **assets** rather than by schedule.
 
 ```mermaid
 flowchart TB
-    T(["trade arrives"]) --> IT["ingest_trade"]
-    C(["counterparty arrives"]) --> IC["ingest_counterparty"]
-    R(["rating arrives"]) --> IR["ingest_rating"]
+    T(["trade arrives"]) --> IT["ingest_fo_trade"]
+    C(["counterparty arrives"]) --> IC["ingest_ref_counterparty"]
+    R(["rating arrives"]) --> IR["ingest_ref_rating"]
 
-    IT --> AT{{"Asset<br/>raw.trade"}}
-    IC --> AC{{"Asset<br/>raw.counterparty"}}
-    IR --> AR{{"Asset<br/>raw.rating"}}
+    IT --> AT{{"Asset<br/>raw.fo_trade"}}
+    IC --> AC{{"Asset<br/>raw.ref_counterparty"}}
+    IR --> AR{{"Asset<br/>raw.ref_rating"}}
 
     AT --> PB["prepared_build<br/><i>triggered by ANY<br/>upstream asset</i>"]
     AC --> PB
@@ -161,10 +161,10 @@ reads the dbt project and **renders one Airflow task per model**, wired in the
 models' own `ref()` order, with a test task closing the layer:
 
 ```
-open_branch ─► dbt.counterparty_run ┐
-            ├─► dbt.rating_run      ├─► dbt.dbt_test ─┬─► publish
-            ├─► dbt.trade_run       │                 └─► keep_failed_branch
-            └─► dbt.collateral_run  ┘
+open_branch ─► dbt.ref_counterparty_run ┐
+            ├─► dbt.ref_rating_run      ├─► dbt.dbt_test ─┬─► publish
+            ├─► dbt.fo_trade_run       │                 └─► keep_failed_branch
+            └─► dbt.ref_collateral_run  ┘
 ```
 
 The shape of the build is unchanged — branch, build, test, merge only if clean
@@ -321,9 +321,9 @@ counterparty reference, an unparseable notional, and a new upstream column
 appearing partway through. Each one exercises a specific design decision.
 
 ```bash
-ls seed/trade | tail -5        # note TRADE_20260813_v2.csv
-head -1 seed/counterparty/CPTY_20260810.csv   # note lei_code appeared
-ls seed/counterparty/CPTY_20260817.csv        # absent: the late-feed case
+ls seed/fo_trade | tail -5        # note TRADE_20260813_v2.csv
+head -1 seed/ref_counterparty/CPTY_20260810.csv   # note lei_code appeared
+ls seed/ref_counterparty/CPTY_20260817.csv        # absent: the late-feed case
 ```
 
 ## 2. Start storage and catalog only
@@ -373,10 +373,10 @@ Resist the urge to load everything. Land a single day:
 
 ```bash
 docker compose exec airflow python -m scripts.land_feeds \
-  --source /opt/platform/seed --feed counterparty --limit 1
+  --source /opt/platform/seed --feed ref_counterparty --limit 1
 ```
 
-Look at it in MinIO under `lakehouse/landing/counterparty/`. This object is
+Look at it in MinIO under `lakehouse/landing/ref_counterparty/`. This object is
 immutable and is never rewritten. It is the evidence copy — the thing that lets
 you answer "what did upstream actually send us" without asking upstream.
 
@@ -384,8 +384,8 @@ you answer "what did upstream actually send us" without asking upstream.
 
 ```bash
 docker compose exec airflow python -m reporting_platform.ingest.ingest_feed \
-  --feed counterparty \
-  --object landing/counterparty/CPTY_20240229.csv
+  --feed ref_counterparty \
+  --object landing/ref_counterparty/CPTY_20240229.csv
 ```
 
 Watch what the output tells you, then check the catalog:
@@ -402,7 +402,7 @@ Now query the raw table and look at what landed:
 
 ```bash
 docker compose exec spark-master /opt/spark/bin/spark-sql -e \
-  "SELECT * FROM lakehouse.raw.counterparty LIMIT 5"
+  "SELECT * FROM lakehouse.raw.ref_counterparty LIMIT 5"
 ```
 
 Note that **every source column is a string**. That is deliberate. Casting
@@ -417,16 +417,16 @@ Land and ingest both versions of the same trade date:
 
 ```bash
 docker compose exec airflow python -m scripts.land_feeds \
-  --source /opt/platform/seed --feed trade
+  --source /opt/platform/seed --feed fo_trade
 
 docker compose exec airflow python -m reporting_platform.ingest.ingest_feed \
-  --feed trade --object landing/trade/TRADE_20260813.csv
+  --feed fo_trade --object landing/fo_trade/TRADE_20260813.csv
 docker compose exec airflow python -m reporting_platform.ingest.ingest_feed \
-  --feed trade --object landing/trade/TRADE_20260813_v2.csv
+  --feed fo_trade --object landing/fo_trade/TRADE_20260813_v2.csv
 
 docker compose exec spark-master /opt/spark/bin/spark-sql -e \
   "SELECT _business_date, _file_version, count(*)
-   FROM lakehouse.raw.trade WHERE _business_date = DATE '2026-08-13'
+   FROM lakehouse.raw.fo_trade WHERE _business_date = DATE '2026-08-13'
    GROUP BY 1,2 ORDER BY 2"
 ```
 
@@ -713,10 +713,10 @@ The point is that **you trigger one thing and three run.** Hold a trade file
 back from section 7, land it, and trigger only the ingest:
 
 ```bash
-docker compose exec -T airflow airflow dags trigger ingest_trade -r demo1
+docker compose exec -T airflow airflow dags trigger ingest_fo_trade -r demo1
 ```
 
-`ingest_trade` writes `raw.trade` and updates its **asset**. `prepared_build`
+`ingest_fo_trade` writes `raw.fo_trade` and updates its **asset**. `prepared_build`
 is scheduled on *any* raw asset, so it starts on its own; it updates the
 prepared asset, and `reporting_build` starts on its own in turn. Watch:
 
@@ -792,7 +792,7 @@ published `main` answers in about a second:
 ```bash
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 docker compose exec -T airflow python -m scripts.duckdb_console \
-  "select business_date, count(*) from lakehouse.prepared.trade
+  "select business_date, count(*) from lakehouse.prepared.fo_trade
    group by 1 order by 1 desc limit 5"
 ```
 

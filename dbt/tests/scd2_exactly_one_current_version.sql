@@ -22,12 +22,12 @@ with all_entities as (
 
     select 'counterparty' as model,
            counterparty_id as entity, is_current
-    from {{ ref('counterparty') }}
+    from {{ ref('ref_counterparty') }}
 
     union all
     select 'rating',
            counterparty_id || '|' || agency, is_current
-    from {{ ref('rating') }}
+    from {{ ref('ref_rating') }}
 
 )
 

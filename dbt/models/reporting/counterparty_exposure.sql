@@ -23,21 +23,21 @@
 with trades as (
 
     select *
-    from {{ ref('trade') }}
+    from {{ ref('fo_trade') }}
     where {{ incremental_window('business_date') }}
       and coalesce(is_matured, false) = false
 
 ),
 
 counterparties as (
-    select * from {{ ref('counterparty') }}
+    select * from {{ ref('ref_counterparty') }}
 ),
 
 {#
   WHICH COUNTERPARTIES WERE ACTUALLY DELIVERED ON EACH DATE.
 
   This reads `raw` from the reporting layer, which is unusual here and is the
-  point: `prepared.counterparty` is SCD2 now and deliberately holds no record
+  point: `prepared.ref_counterparty` is SCD2 now and deliberately holds no record
   of a delivery that restated an unchanged value. The delivery record still
   exists exactly once, in raw, and copying it into prepared to avoid this join
   would rebuild the 2,400-row table SCD2 just removed.
@@ -56,7 +56,7 @@ delivered as (
     select
         _business_date                          as business_date,
         {{ clean_string('counterparty_id') }}   as counterparty_id
-    from {{ source('raw', 'counterparty') }}
+    from {{ source('raw', 'ref_counterparty') }}
     group by 1, 2
 
 ),
@@ -90,7 +90,7 @@ worst_rating as (
         -- rating set last week from one set two years ago.
         max(r.effective_from)                                   as rating_as_of
     from dates d
-    join {{ ref('rating') }} r
+    join {{ ref('ref_rating') }} r
       on r.counterparty_id = d.counterparty_id
      and {{ as_of('r', 'd.business_date') }}
     group by d.business_date, d.counterparty_id

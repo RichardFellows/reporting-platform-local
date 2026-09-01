@@ -14,7 +14,7 @@
   and CI builds on its own `ci/mr-*` branch. So the prefix guards against a
   collision the architecture already prevents, while breaking the layer model
   in docs/ARCHITECTURE.md: `raw` is created literally by ingest_feed.py, which
-  left `lakehouse.raw.trade` sitting beside
+  left `lakehouse.raw.fo_trade` sitting beside
   `lakehouse.lakehouse_prepared.trade`.
 
   Returning the custom schema verbatim gives lakehouse.raw /

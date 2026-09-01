@@ -23,7 +23,7 @@ with raw_rows as (
     select
         *,
         {{ dedupe_rank(['collateral_id']) }} as _rn
-    from {{ source('raw', 'collateral') }}
+    from {{ source('raw', 'ref_collateral') }}
     where {{ incremental_window('_business_date', 'business_date') }}
 
 ),

@@ -16,8 +16,8 @@ operation, the analogue of partition switching. It rewrites no data files.
 This is why `partition_by=['business_date']` is described throughout this
 document as a retention requirement.
 
-**SCD2 tables** (`prepared.counterparty`, `prepared.rating`,
-`prepared.counterparty`) — that requirement does not apply,
+**SCD2 tables** (`prepared.ref_counterparty`, `prepared.ref_rating`,
+`prepared.ref_counterparty`) — that requirement does not apply,
 because there is no `business_date` to partition by. Instead:
 
 - a **current** version is never expired, however old — it is the answer to

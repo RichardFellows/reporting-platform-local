@@ -518,7 +518,7 @@ There is also no `database:` on the source on purpose. dbt-spark's
 `SparkRelation` raises `Cannot set database in spark!` whenever `database` is
 set and differs from `schema` -- it only supports a two-level `schema.table`
 namespace. `spark.sql.defaultCatalog=lakehouse`, set in `profiles.yml`, makes
-unqualified `raw.trade` resolve against the lakehouse/Nessie catalog instead.
+unqualified `raw.fo_trade` resolve against the lakehouse/Nessie catalog instead.
 
 ## cosmos-rendered-builds
 
@@ -766,9 +766,9 @@ already says which layer a table is in, so the prefix repeated it inside the
 name -- `prepared.prep_trade`, `reporting.rpt_exposure_change`.
 
 The layer is now the only thing distinguishing a table from its upstream:
-`raw.trade` is the landed 1:1 copy and `prepared.trade` the conformed one, same
+`raw.fo_trade` is the landed 1:1 copy and `prepared.fo_trade` the conformed one, same
 name, different namespace. That is legal because dbt keeps models and sources in
-separate namespaces -- a model named `trade` and a source `raw.trade` coexist
+separate namespaces -- a model named `trade` and a source `raw.fo_trade` coexist
 without collision. Verified, not assumed.
 
 The dbt model name and the `PREPARED_TABLES` entry must be renamed
@@ -1130,4 +1130,65 @@ This is the "object-created event" the ingest DAGs' `schedule=None` comment
 always referred to. Until this existed, nothing triggered an ingest
 automatically at all — the comment described an intended mechanism rather than
 a working one.
+
+## feed-names-carry-the-source
+
+A feed is named `<source_system>_<feed>`: `fo_trade`, `ref_counterparty`,
+`treasury_margin_call`. It is **typed into `feeds.yml`**, not derived.
+
+The point is disambiguation: two systems delivering something called
+`positions` are two different feeds, and the name is the only thing that
+separates them at a glance in the object store, the catalog, the DAG list and
+the model tree.
+
+**Typed rather than derived, deliberately.** The feed name is already the raw
+table, the Airflow DAG id, the landing prefix, the dbt source table and the
+prepared model name — one string doing five jobs, which is what keeps them
+impossible to desynchronise. Deriving a *different* string for some of those
+reintroduces exactly the mismatch `managed_tables()` cannot detect and
+`ADDING-A-FEED.md` warns about: rename one without the other and every
+maintenance and retention task addresses a table that does not exist, silently.
+Prefixing the name prefixes all five at once, and costs no code at all.
+
+This replaced a per-source **namespace** scheme (`raw_<source>.<feed>`, with
+`landing/<source>/<feed>/` and a sources file per system) that was built and
+then backed out. Worth knowing why, if it is ever proposed again:
+
+- It cannot nest. dbt-spark supports only a two-level `schema.table`, so
+  `raw.<source>.<table>` is impossible ([raw-is-a-source](#raw-is-a-source)) and
+  the namespace has to be a single flattened segment anyway.
+- It multiplies namespaces, and every one of them is a thing to create, grant,
+  retain and reason about, for a distinction the table name can carry for free.
+- It moves the source system OUT of the name, so the DAG id, the model file and
+  the prepared table stop mentioning it. The disambiguation only exists where
+  the namespace is visible.
+
+The one thing worth keeping from that work is written down separately, because
+it is a real bug and not a design preference: see
+[namespace-before-branch](#namespace-before-branch).
+
+## namespace-before-branch
+
+`ensure_raw_namespace()` runs against `main` **before** the ingest branch is
+cut, separately from `ensure_raw_table()`.
+
+`ensure_raw_table` used to do both, and issued `CREATE NAMESPACE` *unqualified*
+-- so against `main` -- while `CREATE TABLE` addressed the branch, which had
+been cut a moment earlier. On any catalog where the namespace already existed
+this was invisible, which is every warm stack. On one where it did not:
+
+```
+org.apache.iceberg.exceptions.NoSuchNamespaceException: Namespace does not exist: raw
+```
+
+Creating it *on the branch* is not the fix, and the reason is worth recording:
+Nessie's `` `table@branch` `` suffix applies to a **table** identifier. Used on
+a namespace it does not fail -- it creates a namespace literally named
+`` `raw@ingest/...` `` on main. Verified against the live catalog, and then
+cleaned up by hand. A mechanism that fails by making junk rather than by
+erroring is one to write down.
+
+So the namespace is created on `main` first and the branch inherits it. A
+namespace holds no data, and this is the same precedent the cold-start
+bootstrap already sets.
 

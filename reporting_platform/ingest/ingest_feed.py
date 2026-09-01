@@ -15,7 +15,7 @@ Design rules this job enforces:
 
 Usage:
     python -m reporting_platform.ingest.ingest_feed \
-        --feed trade --object landing/trade/TRADE_20260811.csv \
+        --feed fo_trade --object landing/fo_trade/TRADE_20260811.csv \
         --run-id 20260811T060000-a1b2c3
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ log = logging.getLogger("ingest")
 def _at_branch(table: str, branch: str | None) -> str:
     """Address `table` on a Nessie branch WITHOUT rebinding the session.
 
-    `lakehouse.raw.trade` on branch `ingest/trade/...` becomes
+    `lakehouse.raw.fo_trade` on branch `ingest/trade/...` becomes
     `lakehouse.raw.`trade@ingest/trade/...``.
 
     THIS IS WHAT LETS ONE SPARK SESSION SERVE A WHOLE CHUNK OF FILES: naming the
@@ -58,6 +58,15 @@ def _landing_uri(object_key: str) -> str:
     return f"{root}/{object_key}" if not object_key.startswith("s3a://") else object_key
 
 
+def ensure_raw_namespace(spark, fd) -> None:
+    """Create the feed's raw namespace on `main`, idempotently.
+
+    Separate from ensure_raw_table because it has to happen at a different
+    REFERENCE and a different moment -- see the call site in ingest().
+    """
+    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{fd.raw_namespace}")
+
+
 def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     """Create the raw table if absent.
 
@@ -67,7 +76,6 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     metadata operations. See docs/RETENTION.md.
     """
     cols = ",\n        ".join(f"`{c}` STRING" for c in fd.columns)
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{fd.raw_namespace}")
     spark.sql(
         f"""
         CREATE TABLE IF NOT EXISTS {table or fd.raw_table} (
@@ -198,6 +206,9 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
     if owns:
         spark = spark_session(f"bootstrap-main-{fd.name}", ref="main")
     try:
+        # Namespace first here too: this path writes straight to main, and
+        # ensure_raw_table no longer creates the namespace.
+        ensure_raw_namespace(spark, fd)
         ensure_raw_table(spark, fd)
     finally:
         if owns:
@@ -239,15 +250,31 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     nessie = Nessie()
     _bootstrap_main_if_empty(nessie, fd, spark)
 
-    branch = branch_name("ingest", fd.name, bdate, run_id)
-    nessie.create_branch(branch)
-    log.info("created branch %s", branch)
-
     # The session is bound to `main` and the BRANCH is named per statement, so
     # one session can serve many files.
     owns_session = spark is None
     if owns_session:
         spark = spark_session(f"ingest-{fd.name}-{run_id}", ref="main")
+
+    # ON MAIN, AND BEFORE THE BRANCH IS CUT. A namespace cannot be created on a
+    # branch: Nessie's `@branch` suffix applies to a TABLE identifier, and
+    # using it on a namespace does not fail -- it creates a namespace literally
+    # named "`raw_x@ingest/...`" on main. Verified against the live catalog.
+    #
+    # So the namespace must exist on main first and the branch inherits it.
+    # Creating it after the branch was cut is what broke the first ingest into
+    # a new raw_<source> namespace:
+    #   NoSuchNamespaceException: Namespace does not exist: raw
+    # -- CREATE NAMESPACE landed on main while CREATE TABLE addressed the
+    # branch, cut a moment earlier. It hides for as long as the namespace
+    # already exists, which on a warm stack it always does; it appears on a
+    # catalog where it does not, which is where it matters most.
+    ensure_raw_namespace(spark, fd)
+
+    branch = branch_name("ingest", fd.name, bdate, run_id)
+    nessie.create_branch(branch)
+    log.info("created branch %s", branch)
+
     raw_at_branch = _at_branch(fd.raw_table, branch)
     try:
         ensure_raw_table(spark, fd, raw_at_branch)

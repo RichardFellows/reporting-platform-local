@@ -1,7 +1,7 @@
 version: 2
 
 models:
-  - name: counterparty
+  - name: ref_counterparty
     description: >
       Conformed counterparty reference. The single shared representation —
       every report that needs a counterparty attribute ref()s this, so
@@ -49,7 +49,7 @@ models:
           partition_by: counterparty_id
           gaps: allowed
 
-  - name: trade
+  - name: fo_trade
     description: Conformed, typed trade positions. No joins, no report opinions.
     columns:
       - name: business_date
@@ -62,7 +62,7 @@ models:
           # The load never fails on a bad reference — the TEST fails, and the
           # branch is not merged. This is the write-audit-publish payoff.
           - relationships:
-              to: ref('counterparty')
+              to: ref('ref_counterparty')
               field: counterparty_id
       - name: notional
         tests:
@@ -75,7 +75,7 @@ models:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [business_date, trade_id]
 
-  - name: rating
+  - name: ref_rating
     description: Agency ratings with numeric rank and grade band.
     columns:
       - name: counterparty_id
@@ -111,7 +111,7 @@ models:
           upper_bound_column: effective_to
           partition_by: counterparty_id || '|' || agency
           gaps: allowed
-  - name: collateral
+  - name: ref_collateral
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.
     # SCAFFOLDED MINIMUM: not_null on the business key, uniqueness
@@ -129,7 +129,7 @@ models:
         tests:
           - not_null
           - relationships:
-              to: ref('counterparty')
+              to: ref('ref_counterparty')
               field: counterparty_id
     tests:
       - dbt_utils.unique_combination_of_columns:

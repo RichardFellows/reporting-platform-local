@@ -19,7 +19,7 @@ sources:
     # raises "Cannot set database in spark!" whenever database is set and
     # differs from schema -- it only supports a 2-level schema.table
     # namespace. spark.sql.defaultCatalog=lakehouse (set in profiles.yml) makes
-    # unqualified `raw.trade` etc. resolve against the lakehouse/Nessie catalog
+    # unqualified `raw.fo_trade` etc. resolve against the lakehouse/Nessie catalog
     # instead.
     schema: raw
     loaded_at_field: _ingest_ts
@@ -31,29 +31,29 @@ sources:
       error_after: {count: 50, period: hour}
 
     tables:
-      - name: trade
-        description: Daily position-level trade extract from the front office (TRADE_SRC).
+      - name: fo_trade
+        description: Daily position-level trade extract from the front office (FO_SRC).
         columns:
           - name: trade_id
             tests: [not_null]
           - name: counterparty_id
             tests: [not_null]
 
-      - name: counterparty
+      - name: ref_counterparty
         description: Counterparty reference data from CPTY_SRC.
         columns:
           - name: counterparty_id
             tests: [not_null]
 
-      - name: rating
+      - name: ref_rating
         description: External agency credit ratings from RATING_SRC.
         # Ratings are not redelivered daily by every agency; relax freshness.
         freshness:
           warn_after: {count: 3, period: day}
           error_after: {count: 10, period: day}
-      - name: collateral
+      - name: ref_collateral
         description: Collateral positions held against counterparty exposure, from the collateral management
-          system (COLL_SRC).
+          system (REF_SRC).
         columns:
           - name: collateral_id
             tests: [not_null]

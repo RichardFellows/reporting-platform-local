@@ -1,6 +1,6 @@
 # Adding a feed
 
-Worked example: a `margin_call` feed from the `margin_src` source system,
+Worked example: a `treasury_margin_call` feed from the `treasury` source system,
 delivering `marginCalls_20260801.csv`. The lowerCamelCase filename is
 deliberate — it is what makes the per-feed `filename_pattern` earn its keep.
 
@@ -24,9 +24,9 @@ the asset that triggers `prepared_build`, and the retention/maintenance
 entries. Nothing else in the platform needs to learn the feed's name.
 
 ```yaml
-  - name: margin_call
-    description: Margin calls per counterparty and call type, from margin_src.
-    source_system: MARGIN_SRC
+  - name: treasury_margin_call
+    description: Margin calls per counterparty and call type, from treasury.
+    source_system: TREASURY
     filename_pattern: 'marginCalls_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [margin_call_id]
     expected_min_rows: 10
@@ -37,8 +37,8 @@ entries. Nothing else in the platform needs to learn the feed's name.
 Four things that are easy to get wrong:
 
 - **`name` is a table name, an Airflow DAG id and an S3 prefix at once.**
-  `margin_call` gives `lakehouse.raw.margin_call`, DAG
-  `ingest_margin_call` and landing prefix `landing/margin_call/`. Use
+  `treasury_margin_call` gives `lakehouse.raw.treasury_margin_call`, DAG
+  `ingest_margin_call` and landing prefix `landing/treasury_margin_call/`. Use
   lowercase with underscores regardless of what the upstream calls its files.
 - **`filename_pattern` must yield a `business_date` named group**, and it is
   matched with `re.fullmatch`, not `search` — a pattern that does not cover
@@ -76,7 +76,7 @@ Optional, and worth a thought rather than a default:
 Verify before moving on:
 
 ```powershell
-docker compose exec -T airflow python -c "from reporting_platform.common.context import feeds; f=feeds()['margin_call']; print(f.raw_table, f.asset_uri, f.parse_filename('marginCalls_20260801.csv'))"
+docker compose exec -T airflow python -c "from reporting_platform.common.context import feeds; f=feeds()['treasury_margin_call']; print(f.raw_table, f.asset_uri, f.parse_filename('marginCalls_20260801.csv'))"
 ```
 
 A `None` from `parse_filename` means the regex is wrong. Fix it here, not later.
@@ -84,8 +84,8 @@ A `None` from `parse_filename` means the regex is wrong. Fix it here, not later.
 ## 2. `dbt/models/raw/_sources.yml` — declare raw to dbt
 
 ```yaml
-      - name: margin_call
-        description: Margin calls per counterparty and call type, from MARGIN_SRC.
+      - name: treasury_margin_call
+        description: Margin calls per counterparty and call type, from TREASURY.
         columns:
           - name: margin_call_id
             tests: [not_null]
@@ -110,11 +110,11 @@ and dbt warns on every invocation.
 ## 3. `dbt/models/prepared/<feed>.sql` — the prepared model
 
 **Name the model after the feed, with no layer prefix.** Feed
-`margin_call` gives model `margin_call`, which materialises as
-`prepared.margin_call` alongside `raw.margin_call` — same name, the
+`treasury_margin_call` gives model `treasury_margin_call`, which materialises as
+`prepared.treasury_margin_call` alongside `raw.treasury_margin_call` — same name, the
 namespace carries the layer. These were `prep_*` and `rpt_*` once; the prefix
 repeated what the namespace already said. dbt keeps models and sources in
-separate namespaces, so a model named `trade` and a source `raw.trade` do not
+separate namespaces, so a model named `trade` and a source `raw.fo_trade` do not
 collide.
 
 Copy the nearest existing model rather than starting blank —
@@ -127,7 +127,7 @@ skeleton is fixed and the three macro calls are not optional:
 
 with raw_rows as (
     select *, {{ dedupe_rank(['margin_call_id']) }} as _rn
-    from {{ source('raw', 'margin_call') }}
+    from {{ source('raw', 'treasury_margin_call') }}
     where {{ incremental_window('_business_date', 'business_date') }}
 ),
 deduped as (select * from raw_rows where _rn = 1),
@@ -172,7 +172,7 @@ utilisation and breach flags would be reporting-layer opinions.
 no tests builds green forever and publishes whatever it is given.
 
 ```yaml
-  - name: margin_call
+  - name: treasury_margin_call
     columns:
       - name: counterparty_id
         tests:
@@ -204,7 +204,7 @@ Local-stack only, but skip it and the feed has nothing to run against.
 
 **You do not write a generator.** `scripts/generate_feeds.py` hand-writes
 generators for the four original feeds only — `trade`, `counterparty`,
-`rating`, `margin_call` — because their *pathologies* are the point and a
+`rating`, `treasury_margin_call` — because their *pathologies* are the point and a
 definition-driven generator cannot produce them: the two injected failures, the
 schema drift, the absent delivery, the non-overlapping SCD2 ranges
 `dbt_utils.mutually_exclusive_ranges` tests, the cadence difference between a
@@ -250,7 +250,7 @@ nulls the whole column, and **nothing fails** — because nulling is what
 ```python
 from reporting_platform.common.context import feeds
 from reporting_platform.ui import sampledata, scaffold
-feed = feeds()["margin_call"]
+feed = feeds()["treasury_margin_call"]
 sampledata.generate(feed, days=0, types=scaffold.resolve_types(feed))
 ```
 
@@ -264,10 +264,10 @@ than a plausible one.
 
 ```powershell
 # 1. sample data -> landing
-docker compose exec -T airflow python -m scripts.land_feeds --feed margin_call
+docker compose exec -T airflow python -m scripts.land_feeds --feed treasury_margin_call
 
 # 2. what would be ingested (read-only)
-docker compose exec -T airflow python -m scripts._spark_task pending margin_call
+docker compose exec -T airflow python -m scripts._spark_task pending treasury_margin_call
 
 # 3. landing -> raw, every pending file
 docker compose exec -T airflow python -m scripts.bulk_ingest
@@ -316,7 +316,7 @@ retention run something to delete:
 
 ```powershell
 # only if you actually want it
-docker compose exec -T airflow python -m reporting_platform.ingest.ingest_feed --feed margin_call --object landing/margin_call/marginCalls_20260801.csv
+docker compose exec -T airflow python -m reporting_platform.ingest.ingest_feed --feed treasury_margin_call --object landing/treasury_margin_call/marginCalls_20260801.csv
 ```
 
 **A new daily feed reports completeness gaps until it has history.** The check

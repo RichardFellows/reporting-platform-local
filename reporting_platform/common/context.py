@@ -209,7 +209,7 @@ def feed(name: str) -> Feed:
 # listed. See docs/DECISIONS.md#managed-tables-are-derived
 #
 # This rests on model filename == table name, which holds because no model
-# carries a layer prefix or a dbt `alias` -- `raw.trade` and `prepared.trade`
+# carries a layer prefix or a dbt `alias` -- `raw.fo_trade` and `prepared.fo_trade`
 # are the same name in different namespaces.
 # See docs/DECISIONS.md#table-naming-no-layer-prefix
 DBT_MODELS_DIR = Path(os.environ.get("DBT_PROJECT_DIR", "/opt/platform/dbt")) / "models"

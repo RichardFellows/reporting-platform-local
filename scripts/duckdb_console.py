@@ -33,7 +33,7 @@ both -- one version store, two front doors.
 
     # a one-off query
     docker compose exec -T airflow python -m scripts.duckdb_console \
-        "select business_date, count(*) from lakehouse.prepared.trade
+        "select business_date, count(*) from lakehouse.prepared.fo_trade
          group by 1 order by 1 desc limit 5"
 
     # what is in there

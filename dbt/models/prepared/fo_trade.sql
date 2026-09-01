@@ -21,7 +21,7 @@ with raw_rows as (
     select
         *,
         {{ dedupe_rank(['trade_id']) }} as _rn
-    from {{ source('raw', 'trade') }}
+    from {{ source('raw', 'fo_trade') }}
     where {{ incremental_window('_business_date', 'business_date') }}
 
 ),

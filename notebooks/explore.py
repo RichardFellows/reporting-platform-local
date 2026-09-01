@@ -195,8 +195,8 @@ def _(con, mo):
         c.country_code,
         count(*)                as trades,
         round(sum(t.notional))  as notional
-    from lakehouse.prepared.trade t
-    join lakehouse.prepared.counterparty c
+    from lakehouse.prepared.fo_trade t
+    join lakehouse.prepared.ref_counterparty c
       on  c.counterparty_id = t.counterparty_id
       -- POINT-IN-TIME, not c.business_date = t.business_date. effective_to is
       -- DATE '9999-12-31' on the open version, so no null handling is needed.
@@ -233,12 +233,12 @@ def _(con, mo):
     _sql = """
     with raw_latest as (
         select _business_date as business_date, count(distinct trade_id) as ids
-        from lakehouse.raw.trade
+        from lakehouse.raw.fo_trade
         group by 1
     ),
     prep as (
         select business_date, count(distinct trade_id) as ids
-        from lakehouse.prepared.trade
+        from lakehouse.prepared.fo_trade
         group by 1
     )
     select

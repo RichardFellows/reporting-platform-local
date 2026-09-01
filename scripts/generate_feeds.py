@@ -303,7 +303,7 @@ def gen_trade(bd: date, out: Path, version: int = 1, inject_bad: bool = False,
 # is a list of what is implemented here, so it belongs next to the functions;
 # deriving it by introspecting `gen_*` names would be clever and would silently
 # skip a feed the moment someone renamed one.
-HAND_WRITTEN = frozenset({"trade", "counterparty", "rating"})
+HAND_WRITTEN = frozenset({"fo_trade", "ref_counterparty", "ref_rating"})
 
 
 def main() -> int:
@@ -356,18 +356,18 @@ def main() -> int:
     inject_bad_on = sorted(dense)[-6] if len(dense) >= 6 else None
 
     for d in days:
-        gen_trade(d, a.out / "trade", version=a.version, clean=a.clean,
+        gen_trade(d, a.out / "fo_trade", version=a.version, clean=a.clean,
                   inject_bad=(inject_bad_on is not None and d == inject_bad_on))
         if d != skip_cpty:
-            gen_counterparty(d, a.out / "counterparty", version=a.version,
+            gen_counterparty(d, a.out / "ref_counterparty", version=a.version,
                              drift=bool(drift_from and d >= drift_from))
         if d.weekday() == 0 or d in sparse:      # ratings arrive weekly-ish
-            gen_rating(d, a.out / "rating", version=a.version)
+            gen_rating(d, a.out / "ref_rating", version=a.version)
 
     # The deliberate _v2 restatement of one date. Skipped when the whole run is
     # already a versioned redelivery, which would otherwise collide.
     if redeliver and a.version == 1:
-        gen_trade(redeliver, a.out / "trade", version=2, clean=a.clean)
+        gen_trade(redeliver, a.out / "fo_trade", version=2, clean=a.clean)
 
     # Feeds with no hand-written generator above, from the console's
     # definition-driven one. Imported HERE rather than at module scope on

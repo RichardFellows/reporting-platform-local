@@ -1,7 +1,7 @@
 """Watch a host folder and ingest whatever is dropped into it.
 
 Drop `TRADE_20260901.csv` into `inbox/` and it lands in
-`landing/trade/TRADE_20260901.csv`, the ingest DAG runs, and the file moves to
+`landing/fo_trade/TRADE_20260901.csv`, the ingest DAG runs, and the file moves to
 `inbox/.processed/trade/`. No console, no MinIO UI, no CLI.
 
 That is what the upstream will actually do: write a file to a directory. The

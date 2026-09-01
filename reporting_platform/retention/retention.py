@@ -967,7 +967,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser()
     p.add_argument("--table", action="append", default=[],
-                   help="fqn:layer, e.g. lakehouse.raw.trade:raw (repeatable)")
+                   help="fqn:layer, e.g. lakehouse.raw.fo_trade:raw (repeatable)")
     p.add_argument("--dry-run", action="store_true",
                    help="report what would be expired without changing anything")
     p.add_argument("--deferred-only", action="store_true",
