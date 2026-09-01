@@ -83,9 +83,11 @@ def build_feed_dag(feed):
     @dag(
         dag_id=f"ingest_{feed.name}",
         description=f"Ingest {feed.name}: {feed.description}",
-        # No schedule. The DAG is started by the arrival sensor DAG or by an
-        # object-created event; a cron would reintroduce the batch window we
-        # are trying to remove.
+        # No schedule. A run is triggered per arrival -- by the inbox watcher
+        # when a file is dropped (reporting_platform/ingest/inbox.py), by the
+        # feed console, or by hand. A cron would reintroduce the batch window
+        # the per-feed design exists to remove.
+        # See docs/DECISIONS.md#inbox-is-polled
         schedule=None,
         start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
         catchup=False,

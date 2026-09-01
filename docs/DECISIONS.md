@@ -1095,3 +1095,39 @@ ingest, the prepared layer rarely sees an awkward identifier at all. This is
 the second line of defence, and it is what makes a model that reads raw
 directly safe to write.
 
+## inbox-is-polled
+
+The inbox watcher polls. It does not use inotify, `watchdog`, or filesystem
+events of any kind, and that is deliberate: **filesystem events do not cross a
+Docker Desktop bind mount** on Windows or macOS. The host writes the file, the
+container is never notified, and an event-driven watcher sits there reporting
+itself healthy while files pile up — a monitor whose failure mode is silence.
+
+Polling costs a directory listing every ten seconds. For a folder receiving a
+handful of files a day that is nothing, and it behaves identically on every
+host, which an event-based watcher demonstrably does not.
+
+Four behaviours make it safe to leave running, and each replaces a way a naive
+loop loses data:
+
+- **It waits for the file to stop changing.** A file exists from the moment it
+  is created, not when it is finished, so uploading on sight means uploading
+  half a CSV — which then ingests *cleanly*, with `expected_min_rows` the only
+  thing between that and a silently truncated delivery. A file is ready when
+  its size and mtime are unchanged across two consecutive polls.
+- **It routes by the feeds' own `filename_pattern`s**, so nothing here repeats
+  `feeds.yml`. A file matching none is moved to `.rejected/` rather than left,
+  because a file left in place is retried and logged forever.
+- **A file matching more than one feed is rejected, not guessed.** Overlapping
+  patterns are a configuration error, and picking one would put a delivery in
+  the wrong raw table — which looks like data rather than like an error.
+- **It moves the file before triggering the DAG.** If the trigger fails the
+  file is already out of the way and recorded as landed, so the next pass does
+  not re-upload it as a new `_file_version`. A missed trigger is a button
+  press; a duplicate ingest is not.
+
+This is the "object-created event" the ingest DAGs' `schedule=None` comment
+always referred to. Until this existed, nothing triggered an ingest
+automatically at all — the comment described an intended mechanism rather than
+a working one.
+

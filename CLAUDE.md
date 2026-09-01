@@ -205,6 +205,10 @@ docker compose exec -T airflow airflow dags list -o plain | ForEach-Object {
 # out-of-band health check (its own container, no Airflow dependency)
 docker compose logs --tail 20 watchdog
 
+# drop a file in ./inbox and it lands, ingests and moves to .processed/<feed>/
+docker compose up -d inbox
+docker compose exec -T inbox python -m reporting_platform.ingest.inbox --dry-run
+
 # feed console -- add/edit a feed, land it, ingest it, watch the builds
 docker compose up -d feed-ui     # http://localhost:8082
 

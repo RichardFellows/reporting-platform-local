@@ -291,6 +291,34 @@ services:
     ports: ["${NOTEBOOK_HOST_PORT:-8083}:8083"]
     restart: unless-stopped
 
+  # --------------------------------------------------------------- inbox
+  # Drop a file into ./inbox on the host and it lands, ingests, and moves to
+  # inbox/.processed/<feed>/. Routed by the feeds' own filename patterns, so
+  # nothing here repeats feeds.yml.
+  #
+  # POLLED, not inotify: filesystem events do not cross a Docker Desktop bind
+  # mount, so an event-driven watcher would sit here healthy and idle while
+  # files piled up. See reporting_platform/ingest/inbox.py.
+  inbox:
+    <<: *airflow-common
+    command: python -m reporting_platform.ingest.inbox --loop 10
+    environment:
+      <<: *s3-env
+      PYTHONPATH: /opt/platform
+      PYTHONUNBUFFERED: "1"
+      REPORTING_INBOX: /opt/platform/inbox
+      # It triggers the ingest DAG through the same API the console uses.
+      AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
+      AIRFLOW_API_USER: admin
+      AIRFLOW_API_PASSWORD: admin
+    volumes:
+      - ./reporting_platform:/opt/platform/reporting_platform:ro
+      - ./scripts:/opt/platform/scripts:ro
+      # READ-WRITE: the watcher moves each file into .processed/ or .rejected/
+      # once it has dealt with it, which is what stops it reprocessing.
+      - ./inbox:/opt/platform/inbox
+    restart: unless-stopped
+
   # ------------------------------------------------------------- watchdog
   # Deliberately NOT an Airflow service and in no depends_on with one.
   # See docs/DECISIONS.md#watchdog-independent
