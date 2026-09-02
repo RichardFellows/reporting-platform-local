@@ -41,4 +41,29 @@ defaults:
 # and the prepared model at once.
 # See docs/DECISIONS.md#feed-names-carry-the-source and
 # docs/DECISIONS.md#the-empty-project
-feeds: []
+feeds:
+
+  - name: treasury_margin_call
+    description: Margin calls per counterparty and call type, from TREASURY.
+    source_system: TREASURY
+    filename_pattern: 'marginCalls_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.txt'
+    delimiter: '|'
+    business_key: [margin_call_id]
+    expected_min_rows: 10
+    columns:
+      - margin_call_id: Margin Call Id
+      - counterparty_id: Cpty Ref
+      - call_amount: Call Amount (USD)
+      - currency
+      - call_date: Call Date
+    column_types:
+      call_amount: decimal
+      call_date: date
+    control:
+      filename_pattern: 'marginCalls_(?P<business_date>\d{8})\.ctl'
+      filename_template: 'marginCalls_{business_date}.ctl'
+      delimiter: '|'
+      keys:
+        business_date: ReportingDate
+        rows: Rows
+        md5: MD5
