@@ -67,6 +67,25 @@ def required(feed) -> bool:
     return bool(s) and s.get("required", True)
 
 
+def versioned(feed) -> bool:
+    """Does this sender ship a control file PER VERSION, or one per date?
+
+    Read from the control `filename_pattern`: a `(?P<version>...)` group means
+    a redelivery brings its own sidecar, and pairing is on (date, version). No
+    group means one sidecar per business date, and pairing is on the date
+    alone -- whichever delivery of that date it accompanies.
+
+    This has to be ONE rule because two code paths pair these up: the pending
+    check builds the expected control name from `filename_template`, and the
+    inbox watcher matches an arriving control file back to its delivery. They
+    disagreed: a template without {version} mapped BOTH marginCalls_20260902.txt
+    and marginCalls_20260902_v2.txt onto the same sidecar, so find_pending
+    offered both, while the watcher paired the sidecar only with v1 and never
+    triggered the redelivery at all. Silently.
+    """
+    return "(?P<version>" in (spec(feed).get("filename_pattern") or "")
+
+
 def control_name(feed, business_date: date, version: int = 1) -> str | None:
     """The control filename this delivery should be accompanied by.
 

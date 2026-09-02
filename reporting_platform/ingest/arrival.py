@@ -208,10 +208,24 @@ def delivery_for_control(feed: Feed, control_filename: str) -> str | None:
     parsed = control.is_control(feed, control_filename)
     if parsed is None:
         return None
+    bdate, cversion = parsed
+
+    candidates = []
     for key in matching(feed, list_landing(feed)):
-        if feed.parse_filename(key.rsplit("/", 1)[-1]) == parsed:
-            return key
-    return None
+        got = feed.parse_filename(key.rsplit("/", 1)[-1])
+        if got is None or got[0] != bdate:
+            continue
+        if control.versioned(feed) and got[1] != cversion:
+            continue
+        candidates.append((got[1], key))
+    if not candidates:
+        return None
+    # HIGHEST VERSION WINS when the sender ships one control file per DATE. A
+    # redelivery supersedes, so the sidecar describes the newest delivery of
+    # that date -- and if the sender did not refresh it, the digest check
+    # aborts loudly rather than the watcher doing nothing at all, which is what
+    # happened before: a _v2 delivery was simply never triggered.
+    return max(candidates)[1]
 
 
 def read_object(key: str) -> bytes:
