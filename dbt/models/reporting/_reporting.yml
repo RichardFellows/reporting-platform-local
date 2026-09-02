@@ -8,3 +8,13 @@
 # nothing. Cosmos excludes them from the DAG deliberately; see
 # docs/DECISIONS.md#cosmos-exclude-exposures.
 version: 2
+
+models:
+  - name: margin_call_exposure
+    description: Margin call amounts per counterparty, point-in-time from the SCD2.
+    columns:
+      - name: margin_call_id
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [business_date, margin_call_id]
