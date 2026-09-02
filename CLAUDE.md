@@ -141,6 +141,12 @@ Two corollaries worth holding on to:
   `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
+- **A control file ABORTS the ingest, it does not fail a test.** "Is this the
+  file the sender sent" is a different question from "is this value right", and
+  the second is what prepared's tests are for. The delivery is not pending
+  until its control file lands — otherwise every feed whose sender writes the
+  sidecar second fails spuriously. See
+  `docs/DECISIONS.md#control-files-abort-the-ingest`.
 - **A feed is named `<source_system>_<feed>`** — `fo_trade`,
   `ref_counterparty`, `treasury_margin_call` — and it is TYPED into feeds.yml,
   not derived. That one string is the raw table, the DAG id, the landing

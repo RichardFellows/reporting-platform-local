@@ -1192,3 +1192,66 @@ So the namespace is created on `main` first and the branch inherits it. A
 namespace holds no data, and this is the same precedent the cold-start
 bootstrap already sets.
 
+## control-files-abort-the-ingest
+
+Some senders ship a sidecar with the delivery:
+
+```
+ReportingDate|20260831
+CreatedDate|20260901Z0003.14
+Rows|143256
+MD5|<digest>
+```
+
+Checking it **aborts the ingest**; it is not a dbt test. The platform's rule
+that *a bad value must land and fail a TEST, not a LOAD* is about **values** --
+casting happens in prepared precisely so a broken value is caught by
+write-audit-publish instead of stopping a delivery. A control file asks a
+different question: not "is this value right" but "is this the file the sender
+sent, complete and uncorrupted". Modelling bytes you already know are wrong is
+not a test. `expected_min_rows` already set the precedent that delivery-level
+completeness aborts, and an abort is cheap here: the branch is abandoned and
+`main` never moves.
+
+**Three touchpoints, and the first is the one that bites.**
+
+- **Pending.** A delivery whose control file has not arrived is *not pending*.
+  Without that, the file becomes pending the moment it lands and the ingest
+  fails on a sidecar that is two seconds behind it -- a spurious failure on
+  every feed whose sender writes the control file second, which is most of
+  them. Verified: delivery alone gives `pending: []`; the control file appears
+  and it becomes pending.
+- **The digest, before the branch is cut.** It is a property of the delivered
+  bytes, so it needs no branch and no table, and failing there leaves nothing
+  to clean up. Verified: a corrupted delivery aborts with no leftover
+  `ingest/*` branch and `main` unchanged.
+- **The row count, before the write.** It needs the parsed frame, so it cannot
+  run with the digest; it sits beside the `expected_min_rows` check and
+  abandons the same branch.
+
+**The parser is per-feed, because every source writes these differently.**
+`format: keyvalue` declares which of the sender's keys mean `rows`, `md5` and
+`business_date`, so `Rows` / `RECORD_COUNT` / `NumRecords` are the same thing
+without any of them being hard-coded; `content_pattern` is a named-group regex
+for anything that is not key/value at all. Same escape hatch as
+`filename_pattern`, for the same reason: a new dialect should not need a
+release. Keys the feed does not map -- `CreatedDate` above -- are ignored.
+
+**The digest is not assumed to be hex.** It is compared as an opaque string
+against the computed one rendered in the feed's declared encoding, defaulting
+to hex and compared case-insensitively. Base64 exists in the wild, and a
+checker that insists on 32 hex characters rejects a good control file with a
+message about the wrong thing.
+
+**`rows_include_header` is explicit.** Some senders count the header line and
+some do not; neither is wrong, and guessing produces an off-by-one that reads
+as data loss.
+
+One failure worth expecting: **line-ending translation breaks the digest on a
+file that is otherwise perfectly good.** A Windows hop that rewrites `
+` to
+`
+` changes every byte-derived checksum, and it looks exactly like
+corruption. The mismatch message says so, because the first person to hit it
+will otherwise go looking for a broken sender.
+

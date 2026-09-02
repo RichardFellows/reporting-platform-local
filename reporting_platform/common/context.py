@@ -70,6 +70,10 @@ class Feed:
     header: bool = True
     file_encoding: str = "utf-8"
     schema_drift: str = "warn"
+    # Control-file (sidecar) validation, when the sender ships one. Absent for
+    # feeds that do not. See reporting_platform/ingest/control.py and
+    # docs/DECISIONS.md#control-files-abort-the-ingest
+    control: dict[str, Any] = field(default_factory=dict)
     # Per-column prepared-layer treatment, e.g. {"haircut_pct": "decimal"}.
     #
     # OPTIONAL AND SPARSE: only columns whose treatment differs from what

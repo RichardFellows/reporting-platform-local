@@ -71,6 +71,7 @@ Optional, and worth a thought rather than a default:
 | `cadence: weekly` | The feed does not deliver every business date. Without it the completeness check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
 | `completeness: false` | Monthly or ad-hoc. Opts out of the gap check entirely. |
 | `schema_drift: fail` | Abort the load on an extra *or* missing column instead of landing and warning. The default `warn` is usually right — a rejected file is a file nobody looks at. |
+| `control:` | The sender ships a control file (row count, checksum) beside the delivery. The delivery is not pending until the control file lands, the digest is checked before the ingest branch is cut, and the row count before the write — any mismatch aborts with `main` untouched. See [DECISIONS.md#control-files-abort-the-ingest](DECISIONS.md#control-files-abort-the-ingest). |
 | `column_types:` | A column whose prepared-layer treatment is not what its *name* implies. `haircut_pct` reads as a string to the inference but should be `decimal`; `settlement_ccy` is a code, not free text. Only list the disagreements — anything absent falls back to the inference. It is what the feed console writes when you change a type on the form, and what the sample-data generator reads, so the two cannot drift apart. Raw is still all strings; this describes the **prepared** model. |
 
 Verify before moving on:

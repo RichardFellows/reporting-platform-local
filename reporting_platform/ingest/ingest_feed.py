@@ -215,6 +215,39 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
             spark.stop()
 
 
+def _check_control(fd, object_key: str, bdate) -> dict:
+    """Verify the delivery against its control file, if it has one.
+
+    Returns the control text alongside the report so the row-count check later
+    does not have to fetch and parse it a second time.
+    """
+    from reporting_platform.ingest import arrival, control
+
+    if not control.spec(fd):
+        return {}
+    key = arrival.control_key(fd, object_key)
+    if key is None:
+        return {}
+    try:
+        text = arrival.read_object(key).decode(fd.file_encoding, errors="replace")
+    except Exception as exc:                                    # noqa: BLE001
+        if control.required(fd):
+            raise control.ControlError(
+                f"{fd.name}: control file {key} could not be read: {exc}. "
+                f"The delivery is not ingested -- a control file that is "
+                f"declared and missing is the case it exists to catch."
+            ) from exc
+        log.warning("%s: no readable control file at %s; continuing because "
+                    "control.required is false", fd.name, key)
+        return {}
+
+    report = control.check_bytes(fd, arrival.read_object(object_key), text, bdate)
+    report["text"] = text
+    report["key"] = key
+    log.info("%s: control file %s verified", fd.name, key.rsplit("/", 1)[-1])
+    return report
+
+
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
            business_date: date | None = None, dry_run: bool = False,
            spark=None) -> dict:
@@ -255,6 +288,12 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     owns_session = spark is None
     if owns_session:
         spark = spark_session(f"ingest-{fd.name}-{run_id}", ref="main")
+
+    # Control file first, and before anything is created. The digest is a
+    # property of the delivered bytes, so it needs no branch and no table --
+    # and failing here leaves nothing at all to clean up.
+    # See docs/DECISIONS.md#control-files-abort-the-ingest
+    control_report = _check_control(fd, object_key, bdate)
 
     # ON MAIN, AND BEFORE THE BRANCH IS CUT. A namespace cannot be created on a
     # branch: Nessie's `@branch` suffix applies to a TABLE identifier, and
@@ -321,6 +360,13 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         )
 
         row_count = df.count()
+        if control_report.get("text") is not None:
+            from reporting_platform.ingest import control as _control
+            # Needs the parsed frame, so it cannot run with the digest check.
+            # Same abort, same abandoned branch.
+            control_report["rows"] = _control.check_rows(
+                fd, control_report["text"], row_count)
+
         if row_count < fd.expected_min_rows:
             # Abandon the branch: main is untouched, nothing to roll back.
             raise ValueError(

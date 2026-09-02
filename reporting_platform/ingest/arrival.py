@@ -101,6 +101,34 @@ def retention_keep_dates(feed: Feed, observed: list[date]) -> set[date]:
     ))
 
 
+def control_key(feed: Feed, data_key: str) -> str | None:
+    """The landing key of the control file describing this delivery, if any."""
+    from reporting_platform.ingest import control
+
+    parsed = feed.parse_filename(data_key.rsplit("/", 1)[-1])
+    if parsed is None or not control.spec(feed):
+        return None
+    name = control.control_name(feed, parsed[0], parsed[1])
+    return f"{feed.landing_prefix}/{feed.name}/{name}" if name else None
+
+
+def _with_control(feed: Feed, candidates: list[str], landed: list[str]) -> list[str]:
+    """Drop candidates whose required control file has not landed yet."""
+    from reporting_platform.ingest import control
+
+    if not control.required(feed):
+        return candidates
+    present = set(landed)
+    ready, waiting = [], []
+    for key in candidates:
+        expected = control_key(feed, key)
+        (ready if expected and expected in present else waiting).append(key)
+    if waiting:
+        log.info("%s: %d file(s) waiting for a control file: %s", feed.name,
+                 len(waiting), ", ".join(k.rsplit("/", 1)[-1] for k in waiting[:3]))
+    return ready
+
+
 def find_pending(feed: Feed, skip_ingested_check: bool = False) -> list[str]:
     """Object keys that have arrived but not yet been ingested.
 
@@ -122,7 +150,14 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False) -> list[str]:
     PLUS 80 month-ends", so expired dates are gaps in the middle of the range,
     not everything below some cutoff.
     """
-    candidates = matching(feed, list_landing(feed))
+    landed = list_landing(feed)
+    candidates = matching(feed, landed)
+    # A delivery whose control file has not arrived yet is NOT pending. Without
+    # this, the file becomes pending the moment it lands and the ingest fails
+    # on a control file that is simply seconds behind it -- a spurious failure
+    # on every feed whose sender writes the sidecar second, which is most of
+    # them. See docs/DECISIONS.md#control-files-abort-the-ingest
+    candidates = _with_control(feed, candidates, landed)
     if skip_ingested_check:
         return candidates
 
@@ -155,6 +190,16 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False) -> list[str]:
             feed.name, len(expired),
             ", ".join(sorted(expired)[:3]) + ("..." if len(expired) > 3 else ""))
     return pending
+
+
+def read_object(key: str) -> bytes:
+    """Fetch one landing object whole.
+
+    Used for control files and for digesting a delivery. Whole rather than
+    streamed on purpose: a control file is a few hundred bytes, and a digest
+    has to see every byte anyway.
+    """
+    return _client().get_object(Bucket=_bucket(), Key=key)["Body"].read()
 
 
 def put_landing(feed: Feed, local_path: str, filename: str | None = None) -> str:
