@@ -1275,3 +1275,45 @@ file that is otherwise perfectly good.** A Windows hop that rewrites `
 corruption. The mismatch message says so, because the first person to hit it
 will otherwise go looking for a broken sender.
 
+## the-empty-project
+
+This branch ships no feeds and no models. `feeds.yml` has `feeds: []`,
+`dbt/models/` holds only the schema-file skeletons, and `dbt ls` reports
+`Found 598 macros / No nodes selected!`.
+
+Everything else is deliberately still here: the macro library, the console, the
+inbox watcher, control-file validation, retention, maintenance, the watchdog and
+both build DAGs. An empty project is a platform waiting for a feed, not a
+dismantled one.
+
+Three things that surprised the emptying, all worth keeping in mind if the
+project is ever emptied again:
+
+- **`dbt_project.yml` warns about unused configuration paths, and that is
+  correct.** With no models, `models.reporting_platform.prepared` and friends
+  configure nothing. Do NOT delete them to silence it: `+partition_by` is a
+  retention requirement, not a preference
+  ([no-unused-config-paths](#no-unused-config-paths) is about a block that
+  would warn *forever*; this one shrinks as models arrive -- verified, four
+  paths with none, two with a single prepared model, and none once both layers
+  are populated).
+- **`any_of([])` reported a capability failure it had not had.** The empty
+  asset list made `functools.reduce` raise `TypeError`, and the handler for
+  "this Airflow cannot OR assets" caught it and said so on every DAG parse. It
+  was false, and a message that reads as a diagnosis without being one is worse
+  than no message. Empty is now handled before the reduce.
+- **The build DAGs still render**, with `open_branch`, `publish` and
+  `keep_failed_branch` and no model tasks in between. Cosmos is content with an
+  empty project; a run would open a branch and merge nothing.
+
+The singular SCD2 invariant test could not stay -- it names the models it
+covers, so with none it does not compile. Its body and its reasoning moved to
+`docs/ADDING-A-MODEL.md`, to be recreated with the first SCD2 model.
+
+`scripts/generate_feeds.py` lost its four hand-written generators with the
+feeds they generated, and with them the platform's only way to produce a build
+that fails its tests ON PURPOSE. That was how write-audit-publish was
+demonstrated refusing to publish. The definition-driven generator that remains
+produces data satisfying each feed's own contract, so proving the safety net
+now means breaking something deliberately.
+

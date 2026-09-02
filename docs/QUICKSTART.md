@@ -1,5 +1,17 @@
 # Quick start
 
+> **THIS BRANCH SHIPS NO FEEDS AND NO MODELS.** The dbt project is empty and
+> `feeds.yml` has an empty `feeds:` list, ready for real feeds. Everything
+> below that generates a seed, lands it and builds it describes the synthetic
+> feeds that used to exist and will do nothing until you add one.
+>
+> Start at [ADDING-A-FEED.md](ADDING-A-FEED.md), or open the feed console on
+> :8082 and use the **New feed** form. Then upload a real delivery on its
+> **Data** tab, or drop one into `./inbox`. The infrastructure sections of this
+> page -- bringing the stack up, what each service is, checking it is healthy
+> -- are unaffected.
+
+
 Clone to a published `reporting` layer, in nine commands.
 
 This is the short path. [`README.md`](../README.md)'s numbered walkthrough is

@@ -30,30 +30,4 @@ sources:
       warn_after: {count: 26, period: hour}
       error_after: {count: 50, period: hour}
 
-    tables:
-      - name: fo_trade
-        description: Daily position-level trade extract from the front office (FO_SRC).
-        columns:
-          - name: trade_id
-            tests: [not_null]
-          - name: counterparty_id
-            tests: [not_null]
-
-      - name: ref_counterparty
-        description: Counterparty reference data from CPTY_SRC.
-        columns:
-          - name: counterparty_id
-            tests: [not_null]
-
-      - name: ref_rating
-        description: External agency credit ratings from RATING_SRC.
-        # Ratings are not redelivered daily by every agency; relax freshness.
-        freshness:
-          warn_after: {count: 3, period: day}
-          error_after: {count: 10, period: day}
-      - name: ref_collateral
-        description: Collateral positions held against counterparty exposure, from the collateral management
-          system (REF_SRC).
-        columns:
-          - name: collateral_id
-            tests: [not_null]
+    tables: []

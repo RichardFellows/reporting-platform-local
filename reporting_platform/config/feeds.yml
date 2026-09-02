@@ -31,72 +31,14 @@ defaults:
   # identical to 'warn').
   schema_drift: warn
 
-feeds:
-
-  - name: fo_trade
-    description: Daily position-level trade extract from the front office.
-    source_system: FO_SRC
-    filename_pattern: 'TRADE_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [trade_id]
-    expected_min_rows: 100
-    columns:
-      - trade_id
-      - counterparty_id
-      - book
-      - product_type
-      - notional
-      - currency
-      - trade_date
-      - maturity_date
-      - mtm_value
-
-  - name: ref_counterparty
-    description: Counterparty reference data. Slowly changing.
-    source_system: REF_SRC
-    filename_pattern: 'CPTY_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [counterparty_id]
-    expected_min_rows: 10
-    columns:
-      - counterparty_id
-      - legal_name
-      - country_code
-      - sector
-      - parent_counterparty_id
-      - is_active
-
-  - name: ref_rating
-    description: External agency credit ratings.
-    source_system: REF_SRC
-    filename_pattern: 'RATING_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [counterparty_id, agency]
-    expected_min_rows: 10
-    # Agency ratings arrive weekly, not daily. Without this the completeness
-    # check infers the business calendar from the daily feeds and
-    # reports every non-delivery day as a gap -- it did exactly that on its
-    # first run, five false gaps in a ten-day window. `weekly` asks only that
-    # each week containing business dates saw at least one delivery.
-    cadence: weekly
-    columns:
-      - counterparty_id
-      - agency
-      - rating
-      - rating_date
-      - outlook
-  - name: ref_collateral
-    description: Collateral positions held against counterparty exposure, from the collateral management
-      system.
-    source_system: REF_SRC
-    filename_pattern: 'COLLATERAL_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [collateral_id]
-    expected_min_rows: 10
-    columns:
-      - collateral_id
-      - counterparty_id
-      - collateral_type
-      - market_value
-      - currency
-      - valuation_date
-      - haircut_pct
-      - is_eligible
-    column_types:
-      haircut_pct: decimal
+# EMPTY. Add a feed here and the platform grows an ingest DAG, a raw table, an
+# asset that triggers the builds, and retention/maintenance coverage -- with no
+# DAG file edited. docs/ADDING-A-FEED.md has the five files in order, and the
+# feed console on :8082 writes them from a form.
+#
+# Name a feed <source_system>_<feed> -- fo_trade, treasury_margin_call. That one
+# string is the raw table, the DAG id, the landing prefix, the dbt source table
+# and the prepared model at once.
+# See docs/DECISIONS.md#feed-names-carry-the-source and
+# docs/DECISIONS.md#the-empty-project
+feeds: []

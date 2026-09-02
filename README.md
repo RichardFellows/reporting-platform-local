@@ -1,5 +1,13 @@
 # Reporting Platform — Local Full-Stack Approximation
 
+> **Empty project.** No feeds, no models: `feeds.yml` has an empty `feeds:`
+> list and `dbt/models/` holds only the schema-file skeletons. The platform,
+> its macros, the console, the inbox watcher, retention, maintenance and the
+> build DAGs are all intact and wait for the first feed. Examples below name
+> feeds that no longer exist; they are illustrative.
+> See [docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md).
+
+
 A laptop-runnable approximation of the target lakehouse: on-prem S3-compatible
 object storage, OpenShift compute, Airflow, Iceberg, Nessie, dbt and Spark —
 replacing the legacy ETL / RDBMS / scheduler ingest-and-report chain.

@@ -79,6 +79,14 @@ def any_of(assets):
     import logging
     import operator
 
+    if not assets:
+        # No feeds yet -- an empty project, not a capability problem. Without
+        # this the reduce below raises TypeError and the handler reports "this
+        # Airflow does not support OR-ing assets", which is false and is
+        # printed on every DAG parse. A message that reads as a diagnosis and
+        # is not one is worse than no message.
+        return []
+
     try:
         return functools.reduce(operator.or_, assets)
     except TypeError:
