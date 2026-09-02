@@ -1243,6 +1243,26 @@ to hex and compared case-insensitively. Base64 exists in the wild, and a
 checker that insists on 32 hex characters rejects a good control file with a
 message about the wrong thing.
 
+**The control file is what triggers the ingest, not the delivery.** Senders
+that ship a sidecar send it second, precisely so its arrival means the delivery
+is complete -- that is what it is for. So the inbox watcher lands a delivery
+for such a feed and does nothing else; the run is triggered when the control
+file appears. Triggering on the delivery would fire while the sender is still
+writing the sidecar, and every one of those runs would fail on a control file
+two seconds away. Feeds with no control block are still triggered by their
+delivery. Control files are processed last within a sweep, so a delivery and
+its sidecar arriving between two polls are landed in the right order whatever
+their extensions do to a sort.
+
+**Pairing in the watcher must not touch Spark.** The obvious implementation --
+ask `find_pending` which delivery is now ready -- pulls in `already_ingested()`,
+which reads the raw table and therefore builds a SparkSession. That is correct
+in an Airflow task and quite wrong in a poller: it would start a JVM every time
+a control file arrived, and take cluster cores from outside the
+`lakehouse_write` pool while doing it. Caught by seeing `spark-submit-parent`
+in the watcher's own logs. `arrival.delivery_for_control()` pairs them with an
+S3 listing and a regex instead.
+
 **`rows_include_header` is explicit.** Some senders count the header line and
 some do not; neither is wrong, and guessing produces an off-by-one that reads
 as data loss.

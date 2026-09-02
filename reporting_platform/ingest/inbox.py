@@ -26,9 +26,23 @@ thing between that and a silently truncated delivery. A file is considered
 ready when its size and mtime are unchanged across two consecutive polls.
 
 **It routes by the feeds' own filename patterns**, so no configuration here
-repeats what `feeds.yml` already says. A file matching no feed is moved to
-`.rejected/` rather than left in place, because a file that stays put is one
-the watcher retries forever, logging on every pass.
+repeats what `feeds.yml` already says -- delivery patterns AND control-file
+patterns. A file matching no feed is moved to `.rejected/` rather than left in
+place, because a file that stays put is one the watcher retries forever,
+logging on every pass.
+
+**THE CONTROL FILE IS THE TRIGGER, not the delivery.** Senders that ship a
+sidecar always send it second, precisely so its arrival means "the delivery is
+complete" -- that is what a control file is for. So for a feed with a
+`control:` block the delivery is landed and nothing else happens; the ingest is
+triggered when the control file arrives. Triggering on the delivery instead
+would fire while the sender is still writing the sidecar, and every one of
+those runs would fail on a control file that is two seconds away. A feed with
+no control block is triggered by its delivery, as before.
+
+Control files are processed LAST within a sweep, so a delivery and its sidecar
+arriving between two polls are landed in the right order regardless of what
+their extensions do to a sort.
 
 **A file matching MORE than one feed is rejected, not guessed.** Two feeds with
 overlapping patterns is a configuration error, and picking one arbitrarily
@@ -72,22 +86,30 @@ def _skip(path: Path) -> bool:
             or path.name.endswith((".tmp", ".part", ".crdownload", ".filepart")))
 
 
-def route(filename: str) -> tuple[Feed | None, str | None]:
-    """Which feed claims this filename, by the feeds' own patterns.
+def route(filename: str) -> tuple[Feed | None, str, str | None]:
+    """Which feed claims this filename, and as what.
 
-    Returns (feed, reason-it-was-rejected). Exactly one of the two is set.
+    Returns (feed, kind, reason-it-was-rejected) where kind is "delivery" or
+    "control". Either feed is set, or reason is.
     """
-    matched = [fd for fd in feeds().values() if fd.parse_filename(filename)]
+    from reporting_platform.ingest import control
+
+    matched = [(fd, "delivery") for fd in feeds().values()
+               if fd.parse_filename(filename)]
+    matched += [(fd, "control") for fd in feeds().values()
+                if control.is_control(fd, filename)]
     if not matched:
-        return None, ("matches no feed's filename_pattern -- check the name, "
-                      "or the pattern in feeds.yml")
+        return None, "", ("matches no feed's filename_pattern, and no feed's "
+                          "control filename_pattern -- check the name, or the "
+                          "patterns in feeds.yml")
     if len(matched) > 1:
-        return None, ("matches more than one feed ("
-                      + ", ".join(sorted(f.name for f in matched))
-                      + ") -- overlapping filename_patterns are a "
-                        "configuration error, and guessing would put the "
-                        "delivery in the wrong raw table")
-    return matched[0], None
+        where = ", ".join(sorted(f"{fd.name} ({kind})" for fd, kind in matched))
+        return None, "", (f"matches more than one thing ({where}) -- "
+                          f"overlapping patterns are a configuration error, "
+                          f"and guessing would put the delivery in the wrong "
+                          f"raw table")
+    fd, kind = matched[0]
+    return fd, kind, None
 
 
 def _move(path: Path, folder: str, feed_name: str | None = None) -> Path:
@@ -103,8 +125,24 @@ def _move(path: Path, folder: str, feed_name: str | None = None) -> Path:
     return dest
 
 
-def _trigger(feed: Feed, key: str) -> dict:
-    """Unpause if needed, then trigger one run for this object.
+def _triggers(feed: Feed, kind: str) -> bool:
+    """Is THIS file the one that should start an ingest?
+
+    The control file, when the feed has one -- it is sent second precisely to
+    say the delivery is complete. The delivery itself otherwise.
+    """
+    from reporting_platform.ingest import control
+
+    return kind == "control" if control.spec(feed) else kind == "delivery"
+
+
+def _trigger(feed: Feed, key: str | None,
+             control_filename: str | None = None) -> dict:
+    """Unpause if needed, then trigger a run.
+
+    `key` is the object to ingest. None means this was a CONTROL file, and the
+    delivery it describes is paired from the landing listing -- deliberately
+    without Spark, see arrival.delivery_for_control.
 
     Imports the console's orchestration module rather than opening a second
     HTTP client: there is one definition of how this platform talks to
@@ -121,10 +159,23 @@ def _trigger(feed: Feed, key: str) -> dict:
     if dag.get("is_paused"):
         orchestration.set_paused(dag_id, False)
         unpaused = True
-    run = orchestration.trigger(dag_id, conf={"object_key": key},
-                                note="dropped into the inbox")
+    if key is not None:
+        run = orchestration.trigger(dag_id, conf={"object_key": key},
+                                    note="dropped into the inbox")
+        return {"triggered": True, "dag_id": dag_id, "unpaused": unpaused,
+                "run_id": run.get("dag_run_id")}
+
+    from reporting_platform.ingest import arrival
+    delivery = arrival.delivery_for_control(feed, control_filename)
+    if delivery is None:
+        return {"triggered": False, "dag_id": dag_id, "unpaused": unpaused,
+                "reason": ("control file landed but its delivery is not in "
+                           "landing -- it never arrived, or its name does not "
+                           "pair with the control file's business date")}
+    run = orchestration.trigger(dag_id, conf={"object_key": delivery},
+                                note="control file arrived")
     return {"triggered": True, "dag_id": dag_id, "unpaused": unpaused,
-            "run_id": run.get("dag_run_id")}
+            "run_id": run.get("dag_run_id"), "delivery": delivery}
 
 
 def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> list[dict]:
@@ -135,9 +186,13 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
             f"no inbox directory at {INBOX}. Create it and mount it, or set "
             f"REPORTING_INBOX.")
 
-    for path in sorted(INBOX.iterdir()):
-        if _skip(path):
-            continue
+    def _order(p):
+        # Controls last: a delivery and its sidecar arriving between two polls
+        # must be landed in that order, whatever their extensions do to a sort.
+        fd, kind, _ = route(p.name)
+        return (1 if kind == "control" else 0, p.name)
+
+    for path in sorted((p for p in INBOX.iterdir() if not _skip(p)), key=_order):
         try:
             stat = path.stat()
         except FileNotFoundError:          # moved or removed mid-pass
@@ -152,7 +207,7 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
             seen[path.name] = (stat.st_size, stat.st_mtime, count + 1)
             continue
 
-        feed, reason = route(path.name)
+        feed, kind, reason = route(path.name)
         if feed is None:
             log.warning("rejecting %s: %s", path.name, reason)
             if not dry_run:
@@ -163,8 +218,9 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
             continue
 
         if dry_run:
-            results.append({"file": path.name, "status": "would ingest",
-                            "feed": feed.name})
+            results.append({"file": path.name, "status": "would land",
+                            "feed": feed.name, "kind": kind,
+                            "would_trigger": _triggers(feed, kind)})
             continue
 
         try:
@@ -181,8 +237,22 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
         moved = _move(path, PROCESSED, feed.name)
         seen.pop(path.name, None)
         outcome = {"file": path.name, "status": "landed", "feed": feed.name,
-                   "key": key, "moved_to": str(moved.relative_to(INBOX))}
-        outcome.update(_trigger(feed, key))
+                   "kind": kind, "key": key,
+                   "moved_to": str(moved.relative_to(INBOX))}
+
+        if not _triggers(feed, kind):
+            # A delivery for a feed that ships a control file: landed, and
+            # deliberately nothing more. The sidecar is what says it is
+            # complete.
+            outcome["triggered"] = False
+            outcome["reason"] = "waiting for this feed's control file"
+            log.info("landed %s -> %s (waiting for the control file)",
+                     path.name, key)
+            results.append(outcome)
+            continue
+
+        outcome.update(_trigger(feed, key if kind == "delivery" else None,
+                                control_filename=path.name))
         log.info("landed %s -> %s%s", path.name, key,
                  "" if outcome.get("triggered") else
                  f" (NOT triggered: {outcome.get('reason')})")

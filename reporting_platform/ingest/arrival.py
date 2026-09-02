@@ -192,6 +192,28 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False) -> list[str]:
     return pending
 
 
+def delivery_for_control(feed: Feed, control_filename: str) -> str | None:
+    """The delivery key a control file describes, WITHOUT touching Spark.
+
+    An S3 listing and a regex, nothing more. The alternative -- asking
+    find_pending -- pulls in already_ingested(), which reads the raw table and
+    therefore starts a SparkSession. That is fine in an Airflow task and quite
+    wrong in the inbox watcher, which is a poller that must stay cheap: it
+    would build a JVM every time a control file arrived, and take cluster
+    cores from outside the lakehouse_write pool while doing it.
+    See docs/DECISIONS.md#control-files-abort-the-ingest
+    """
+    from reporting_platform.ingest import control
+
+    parsed = control.is_control(feed, control_filename)
+    if parsed is None:
+        return None
+    for key in matching(feed, list_landing(feed)):
+        if feed.parse_filename(key.rsplit("/", 1)[-1]) == parsed:
+            return key
+    return None
+
+
 def read_object(key: str) -> bytes:
     """Fetch one landing object whole.
 
