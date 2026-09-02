@@ -1,0 +1,4 @@
+ReportingDate|20260902
+CreatedDate|20260902Z0600.00
+Rows|12
+MD5|0c3af64f617285b3ec5eb86834e69dbe
