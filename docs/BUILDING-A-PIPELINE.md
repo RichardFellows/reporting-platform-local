@@ -202,7 +202,7 @@ with
   model reads the PREPARED table, where that name does not survive.
 #}
 {{ scd2_incremental_scope(ref('treasury_margin_call'), ['margin_call_id'],
-                          date_column='business_date') }}
+                          date_column='business_date') }},
 {% endif %}
 
 source_rows as (
@@ -235,32 +235,28 @@ versioned as (
 
 {{ scd2_changes('versioned', ['margin_call_id']) }}
 
-ranged as (
-
-    select
-        margin_call_id,
-        counterparty_id,
-        call_amount,
-        currency,
-        call_date,
-        {{ scd2_columns(['margin_call_id']) }}
-    from kept
-
-)
-
-select * from ranged
+select
+    margin_call_id,
+    counterparty_id,
+    call_amount,
+    currency,
+    call_date,
+    {{ scd2_columns(['margin_call_id']) }}
+from kept
 ```
 
 - **`date_column='business_date'`.** The default is raw's `_business_date`;
   a model built off a *prepared* table must say so, and getting it wrong fails
   only on the incremental path — so the first build passes and the second does
   not.
-- **`scd2_changes` must be followed by another CTE, not by the final
-  `select`.** It emits `kept as (…),` with a trailing comma, because it is
-  designed to be chained. Ending the model with `select … from kept` gives
-  `[PARSE_SYNTAX_ERROR] Syntax error at or near …`, pointing at the projection
-  rather than at the macro. Wrap the projection in a `ranged as (…)` CTE and
-  `select * from ranged`.
+- **The CTE-emitting macros do not punctuate themselves.** Both
+  `scd2_incremental_scope` and `scd2_changes` emit CTEs *without* a trailing
+  comma, so the caller adds one when another CTE follows — note the `}},`
+  inside the `{% if is_incremental() %}` block above — and omits it when the
+  model ends on the macro, as it does here. They used to carry the comma, which
+  made them impossible to end a `with` chain on: `select … from kept` produced
+  `),` then `select`, and Spark reported `[PARSE_SYNTAX_ERROR]` pointing at the
+  projection rather than at the macro forty lines above.
 - **Join BOTH `touched` and `replay_from` on the incremental path.** `touched`
   is the entities that moved recently, *including ones never seen before*;
   `replay_from` is where each already-open version began. Filtering on

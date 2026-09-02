@@ -218,6 +218,22 @@
 
 {% macro scd2_incremental_scope(source_relation, key_columns, date_column='_business_date') %}
   {#
+    EMITS CTEs WITHOUT A TRAILING COMMA. The caller punctuates:
+
+        with
+        {% if is_incremental() %}
+        {{ scd2_incremental_scope(...) }},
+        {% endif %}
+        source_rows as ( ... )
+
+    The comma used to live in here, which made the macro impossible to end a
+    `with` chain on: `{{ scd2_changes(...) }}` followed by `select` produced
+    `),` then `select`, and Spark reported PARSE_SYNTAX_ERROR pointing at the
+    projection rather than at the macro forty lines above it. A fragment that
+    cannot be last is a hidden constraint; a missing comma is a syntax error on
+    the caller's own line, where the fix is.
+  #}
+  {#
     The two CTEs every SCD2 model needs on its incremental path, so the logic
     exists once rather than once per reference table.
 
@@ -260,11 +276,27 @@
       where is_current
       group by {{ keys }}
 
-  ),
+  )
 {% endmacro %}
 
 
 {% macro scd2_changes(source_cte, key_columns) %}
+  {#
+    EMITS CTEs WITHOUT A TRAILING COMMA. The caller punctuates:
+
+        with
+        {% if is_incremental() %}
+        {{ scd2_incremental_scope(...) }},
+        {% endif %}
+        source_rows as ( ... )
+
+    The comma used to live in here, which made the macro impossible to end a
+    `with` chain on: `{{ scd2_changes(...) }}` followed by `select` produced
+    `),` then `select`, and Spark reported PARSE_SYNTAX_ERROR pointing at the
+    projection rather than at the macro forty lines above it. A fragment that
+    cannot be last is a hidden constraint; a missing comma is a syntax error on
+    the caller's own line, where the fix is.
+  #}
   {#
     Collapse a per-business-date stream into one row per CHANGE. A delivery
     that restates an unchanged entity produces nothing, which is the point.
@@ -284,7 +316,7 @@
   kept as (
       select * from changes
       where _prev_hash is null or _prev_hash <> _row_hash
-  ),
+  )
 {% endmacro %}
 
 
