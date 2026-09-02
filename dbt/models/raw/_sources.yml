@@ -30,4 +30,11 @@ sources:
       warn_after: {count: 26, period: hour}
       error_after: {count: 50, period: hour}
 
-    tables: []
+    tables:
+      - name: treasury_margin_call
+        description: Margin calls per counterparty and call type, from TREASURY.
+        columns:
+          - name: margin_call_id
+            tests: [not_null]
+          - name: counterparty_id
+            tests: [not_null]
