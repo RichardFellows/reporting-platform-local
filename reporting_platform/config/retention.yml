@@ -27,14 +27,25 @@ environments:
     landing:
       keep_years: 8
 
+    # RAW IS THE SHORT ONE: 45 business days and no month-ends. Raw is a 1:1
+    # copy of what arrived, kept long enough to re-derive prepared after a
+    # modelling change and to answer "what did the file actually say"; the
+    # long history lives in prepared, which is smaller and typed.
+    #
+    # find_pending computes its keep-set from THIS policy, so a delivery older
+    # than the window is landed and never ingested -- deliberately, or every
+    # retention run would be undone by the next ingest.
     raw:
-      keep_business_days: 10
-      keep_month_ends: 80
+      keep_business_days: 45
+      keep_month_ends: 0
       snapshot_retention_days: 7
       snapshot_retain_last: 5
 
+    # PREPARED IS THE LONG ONE: the same 45 recent days, plus 80 month-ends --
+    # the reporting points. Prepared is typed and deduplicated, so a month-end
+    # costs a fraction of the raw it came from.
     prepared:
-      keep_business_days: 10
+      keep_business_days: 45
       keep_month_ends: 80
       snapshot_retention_days: 7
       snapshot_retain_last: 5

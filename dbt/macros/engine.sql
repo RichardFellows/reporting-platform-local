@@ -216,10 +216,18 @@
     DATE '9999-12-31')
 {% endmacro %}
 
-{% macro scd2_incremental_scope(source_relation, key_columns) %}
+{% macro scd2_incremental_scope(source_relation, key_columns, date_column='_business_date') %}
   {#
     The two CTEs every SCD2 model needs on its incremental path, so the logic
     exists once rather than once per reference table.
+
+    `date_column` is raw's `_business_date` by default, because that is what an
+    SCD2 model built straight off a source reads. A model built off a PREPARED
+    table passes `business_date` instead -- the underscore-prefixed name does
+    not survive the prepared layer. Getting it wrong fails only on the
+    INCREMENTAL path, so the first build against a fresh branch passes and the
+    second one does not: the same shape as incremental_window's two-argument
+    form, and the same reason it is called out in docs/ADDING-A-FEED.md.
 
     `replay_from` IS THE LOAD-BEARING HALF. A touched entity's currently-open
     version can have begun months or years before the lookback window, and the
@@ -237,7 +245,7 @@
 
       select distinct {{ keys }}
       from {{ source_relation }}
-      where _business_date >= (
+      where {{ ident(date_column) }} >= (
           select coalesce(max(_inc.effective_from), date '1900-01-01')
                  - interval {{ var('lookback_days', 3) }} day
           from {{ this }} as _inc

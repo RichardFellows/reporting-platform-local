@@ -240,6 +240,7 @@ rather than loud:
 |---|---|
 | **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands. Start here.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, Nessie write-audit-publish, per-feed DAG topology, why Spark is the only build engine |
+| **[docs/BUILDING-A-PIPELINE.md](docs/BUILDING-A-PIPELINE.md)** | one feed to a mart: raw, a 1:1 prepared table, an SCD2 table built from it, and a point-in-time reporting model — the whole shape in order |
 | **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the five files a new feed touches, in order, with a worked example |
 | **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same five files through a form, plus land/ingest/build buttons |

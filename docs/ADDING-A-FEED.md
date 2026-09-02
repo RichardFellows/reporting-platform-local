@@ -8,6 +8,11 @@ deliberate — it is what makes the per-feed `filename_pattern` earn its keep.
 verifiable on its own — do not batch them and then debug the whole thing at
 once.
 
+> **Building the whole pipeline, not just the feed?**
+> [BUILDING-A-PIPELINE.md](BUILDING-A-PIPELINE.md) runs from a delivery to a
+> mart: raw at 45 days, a 1:1 prepared table at 45 days plus 80 month-ends, an
+> SCD2 table built from that, and a reporting model over it.
+
 > **There is a UI for this.** The feed console at <http://localhost:8082>
 > writes all five files from one form, with the filename pattern derived from a
 > real filename and every trap below turned into a validation message. See
