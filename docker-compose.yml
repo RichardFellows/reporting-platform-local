@@ -259,6 +259,12 @@ services:
       REPORTING_SEED_DIR: /opt/platform/seed
       SPARK_MASTER: spark://spark-master:7077
       DBT_TARGET: ${DBT_TARGET:-spark_local}
+      # So reporting_platform/ingest/sniff.py (docs/DELIVERY-SHAPES.md step 5)
+      # can read `s3://lakehouse/...` directly through the same DuckDB
+      # connection recipe the notebook service uses -- see
+      # scripts/duckdb_console.py:connect(). Nothing here uses it yet; this
+      # is the prerequisite, not the wiring.
+      REPORTING_DUCKDB_S3_SECRET: "1"
       # Host-side URLs, rendered for the BROWSER -- nothing inside the network
       # otherwise knows the host mapping.
       MINIO_CONSOLE_URL: http://localhost:${MINIO_CONSOLE_HOST_PORT:-19001}

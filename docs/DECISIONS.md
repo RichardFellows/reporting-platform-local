@@ -1521,3 +1521,93 @@ normalizer: no feed in `feeds.yml` uses `delivery.control` yet, only
 inbox-triggered run genuinely skips cleanly rather than failing -- the whole
 point of the `AirflowSkipException` change -- has not been watched happen
 against a real Airflow scheduler.
+
+## the-sniffer
+
+The sniffer backend for step 5 of `docs/DELIVERY-SHAPES.md`
+(`reporting_platform/ingest/sniff.py`): propose delimiter, quote, header,
+encoding, per-column types and business-key candidates from a real delivered
+file. It is a normalizer that writes nothing -- a human decides.
+
+**Uses DuckDB's `sniff_csv()` rather than hand-rolled frequency analysis.**
+`scripts/duckdb_console.py` and `notebooks/explore.py` already depend on
+DuckDB being installed and able to read `s3://lakehouse/...` directly
+(`httpfs`, an S3 secret gated on `REPORTING_DUCKDB_S3_SECRET`), so this adds
+no new dependency and no new connection recipe -- `sniff_delivery(con, path)`
+takes a connection made with `scripts.duckdb_console.connect()`. Verified
+against real data on the live stack: pointed at a landed `fo_trade` delivery
+in MinIO, correct delimiter and correct per-column types read from real
+values. `REPORTING_DUCKDB_S3_SECRET` is now also set for `feed-ui` in
+`docker-compose.yml`, not only `notebook` -- the prerequisite for the
+console to eventually call this, not the console wiring itself, which this
+change does not include.
+
+**`sniff_csv`'s type names are DuckDB's own SQL types, not Arrow's.** Asked
+directly and checked rather than assumed: `sniff_csv` on a real duckdb 1.5.5
+returns `BIGINT`/`DOUBLE`/`VARCHAR`/`DATE`/`TIMESTAMP`/`BOOLEAN`, not Arrow's
+`int64`/`float64`/`utf8`/`date32[day]`. `DUCKDB_TYPE_MAP` translates them
+into this platform's `column_types` vocabulary
+(`ui/scaffold.py:COLUMN_TYPES`) with a module-level `assert` that keeps the
+two from drifting apart silently. A decimal-looking column ("100.50") comes
+back as plain `DOUBLE`, never a parametrised `DECIMAL(p,s)` -- also checked
+-- but the map strips a parameter list before lookup anyway, since nothing
+here should depend on duckdb continuing to prefer `DOUBLE`.
+
+**Types with no platform cast fall back to "string", not to a guess.**
+`TIME`, `TIMESTAMP` (and `TIMESTAMPTZ`), `INTERVAL`, `BLOB`, `UUID` are
+deliberately absent from `DUCKDB_TYPE_MAP` rather than mapped to the closest
+thing: `dbt/macros/engine.sql`'s `parse_date` only parses a DATE-shaped
+string, there is no `parse_timestamp`, so forcing a `TIMESTAMP` column into
+`date` would silently drop the time of day with no error raised anywhere.
+"string" is a TRY_CAST-free passthrough; it is the safe direction precisely
+because it commits to nothing.
+
+**Three things were tried and found wrong by actually running duckdb, not
+by reasoning about it, and are asserted against in `tests/test_sniff.py` so
+a regression back to any of them is caught:**
+
+1. *Encoding is not detected by `sniff_csv` at all.* It assumes UTF-8
+   (silently stripping a UTF-8 BOM -- checked) and raises a clear,
+   catchable error on anything else. `_sniff_with_encoding` tries a
+   BOM-implied encoding first, then `ENCODING_FALLBACKS` in order.
+2. *`utf-16` must never be guessed from content.* A first draft included it
+   in the fallback list, and `sniff_csv(..., encoding='utf-16')` on plain
+   ASCII/latin-1 bytes does NOT raise -- it reinterprets byte-pairs as
+   UTF-16 code units and "succeeds" with one garbled VARCHAR column,
+   reported as HIGH confidence, before any real candidate got a turn.
+   UTF-16 has no reliable signature without a BOM, so it is only ever tried
+   via `_bom_encoding` finding one.
+3. *`cp1252` must be tried AFTER `latin-1`, not before.* Checked byte by
+   byte against a real duckdb: duckdb's own `latin-1` rejects the C1 control
+   range (0x80-0x9F) that ordinary ISO-8859-1 would accept, and `cp1252`
+   accepts that entire range except five undefined slots -- so cp1252's
+   accepted byte range is latin-1's strict superset. Tried in the wrong
+   order, latin-1 can never be the one that succeeds, which is dead code
+   wearing a comment that lies about what it does. In the right order,
+   plain Western-European text gets the more accurate "latin-1" label, and
+   `cp1252` -- genuinely the widest net of anything in the list -- is what
+   `sniff_delivery` flags `encoding_confidence: "low"` for, as the true
+   last resort. Neither encoding is infallible: a byte undefined in both
+   (0x81, tested) raises one clear `ValueError` rather than a raw duckdb
+   traceback from whichever fallback happened to run last.
+
+**`candidate_keys` reuses `sniff_csv`'s own `Prompt` field** -- a complete,
+already-escaped `read_csv(...)` call -- rather than re-deriving
+delimiter/quote/encoding escaping a second time to build a uniqueness-scan
+query. Single-column candidates only; a composite key is still a human's
+call. A header-only file (no data rows) proposes no candidates rather than
+a false positive from an empty uniqueness comparison.
+
+**Returns the FULL per-column type map, not yet reduced to overrides** --
+matching what `ui.scaffold.resolve_types` returns elsewhere. A caller
+persisting this into `feeds.yml` is expected to call
+`ui.scaffold.overrides_only(columns, column_types)` on it first, the same
+reduction every other write path already uses, so a column this sniffer
+agrees with `infer_type` about still produces no diff.
+
+Not built, and not started: archive-layout sniffing, date-source detection
+(container vs. member vs. path), and everything on the console side -- no
+route, no form, no unclaimed-deliveries queue reading `inbox`'s
+`.rejected/` or landing's unrecognised-object count. The backend this
+section describes is a library function nothing in the running platform
+calls yet.

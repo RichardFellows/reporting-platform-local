@@ -5,8 +5,8 @@ python -m tests.run                    # everything
 python -m tests.run test_conventions   # one module
 ```
 
-Runs on the host (needs `pyyaml` and `ruamel.yaml`) or inside the stack with
-no rebuild:
+Runs on the host (needs `pyyaml`, `ruamel.yaml` and `duckdb`) or inside the
+stack with no rebuild:
 
 ```powershell
 docker compose exec -T airflow python -m tests.run
@@ -23,6 +23,15 @@ The normalize stage and `find_pending` run against `tests/fakes3.py`, a
 40-line in-memory stand-in implementing only the four S3 calls this platform
 makes. It cannot tell you whether Spark reads a part correctly or whether the
 Nessie branch merges — those were verified by running them.
+
+`test_sniff.py` is the one exception to "no MinIO, no Spark, no Airflow" and
+deliberately not to the spirit of it: `reporting_platform/ingest/sniff.py`
+(step 5 of `docs/DELIVERY-SHAPES.md`) calls a REAL `duckdb.connect()` against
+LOCAL temp files rather than S3 -- DuckDB is an embedded library, not a
+service to fake, and sniffing is the one thing here worth testing against the
+genuine engine rather than a stand-in of it. What it cannot tell you is
+whether `s3://lakehouse/...` reads work the same way over `httpfs` against
+real MinIO -- that is verified by running it, same as everything else.
 
 Everything else in this repo is verified by running it against the live stack,
 which is the habit `CLAUDE.md` opens with. These tests do not replace that and

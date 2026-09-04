@@ -1,13 +1,14 @@
 # Delivery shapes
 
-**Status: steps 1-4 built, step 5 proposed.** Sections in the future
-tense describe work that does not exist yet. When a step lands, its section
-moves to the present tense and the reasoning moves to
-[DECISIONS.md](DECISIONS.md) — step 1 at
+**Status: steps 1-4 built, step 5 partially built** (the sniffer backend;
+the console wiring is not). Sections in the future tense describe work that
+does not exist yet. When a step lands, its section moves to the present
+tense and the reasoning moves to [DECISIONS.md](DECISIONS.md) — step 1 at
 [#feed-conventions](DECISIONS.md#feed-conventions), step 2 at
 [#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index), step 4 at
-[#control-file-gate](DECISIONS.md#control-file-gate). Step 3's reasoning has
-not moved yet — its section below is still the write-up.
+[#control-file-gate](DECISIONS.md#control-file-gate), the sniffer at
+[#the-sniffer](DECISIONS.md#the-sniffer). Step 3's reasoning has not moved
+yet — its section below is still the write-up.
 
 Today a feed is [five files and no DAG edit](ADDING-A-FEED.md). That is cheap
 enough — until the delivery is a zip with the date on the container and no date
@@ -341,16 +342,22 @@ the delivery it belongs to.
 Not yet verified on the live stack — same caveat as step 3, and for the same
 reason: no feed in `feeds.yml` uses `delivery.control` yet.
 
-## 5. Onboard from a real file
+## 5. Onboard from a real file — **PARTIALLY BUILT**: the sniffer backend
+
+The reasoning now lives at
+[DECISIONS.md#the-sniffer](DECISIONS.md#the-sniffer); what follows is what
+was built and what was not.
 
 The console already derives the filename pattern from one example
 (`derive_pattern`, `ui/registry.py:278`) and columns from an uploaded CSV
-(`columns_from_csv`, `ui/feeddata.py:136`). Extend that into a **sniffer**: a
-normalizer running in propose mode. Give it the actual delivery — zip, pipe
-file, whatever — and it proposes the whole block: delimiter by frequency
-analysis, encoding by BOM then decode attempt, archive layout by listing
-members, date source by looking for an 8-digit run in container vs member vs
-path, headers to identifiers through the existing `platform_names`.
+(`columns_from_csv`, `ui/feeddata.py:136`). `reporting_platform/ingest/sniff.py`
+is a **sniffer**: propose mode, not a normalizer that writes anything. Given a
+real delivered file it proposes delimiter, quote, header, encoding and
+per-column types by calling DuckDB's own `sniff_csv()` -- a real, tested CSV
+sniffer already a dependency here via `scripts/duckdb_console.py` and
+`notebooks/explore.py` -- rather than hand-rolled frequency analysis, plus a
+uniqueness scan on top for business-key candidates. Headers become
+identifiers through the existing `platform_names`.
 
 **Infer types from values, not from column names.** `infer_type`
 (`ui/scaffold.py:59`) guesses from the name, and the repo already documents
@@ -358,17 +365,24 @@ what that produces: a column typed `decimal` whose generated sample data is a
 string, `safe_cast` nulls the column, the build goes green, 75 rows and 0
 non-null
 ([DECISIONS.md#resolve-types-is-authoritative](DECISIONS.md#resolve-types-is-authoritative)).
-With a real file in hand the guess can simply be right. Candidate business keys
-come the same way — scan the sample for uniqueness — which is the last field on
-the form a human still has to reason about.
+With a real file in hand the guess can simply be right.
 
-Then close the loop on discovery. `inbox` moves an unclaimed file to
-`.rejected/` (`ingest/inbox.py:75`), and landing's sweep counts unrecognised
-objects and leaves them. Both become one queryable backlog once `ready/` exists:
-**landed but not normalized**. Surface it in the console as "unclaimed
-deliveries — onboard this", with the sniffer pre-filled from the file sitting in
-it. That is the moment a new feed actually appears in real life — not as a
-ticket, as a file nobody expected.
+Verified against real data on the live stack: pointed at a landed
+`fo_trade` delivery in MinIO through `s3://lakehouse/...`, using the same
+DuckDB connection `scripts/duckdb_console.connect()` builds
+(`REPORTING_DUCKDB_S3_SECRET`, now also set for `feed-ui`, not only
+`notebook`) -- correct delimiter, correct per-column types read from real
+values, not names.
+
+**Not built**: archive-layout sniffing (a zip's own member list, unlike a
+plain CSV's header, needs its own proposal shape); date-source detection
+across container/member/path; and the console side entirely -- no button, no
+form pre-fill, no unclaimed-deliveries queue. `inbox` still moves an
+unclaimed file to `.rejected/` (`ingest/inbox.py`) and landing's sweep still
+only counts unrecognised objects rather than surfacing them as "landed but
+not normalized" for one queryable backlog. That is the moment a new feed
+actually appears in real life -- not as a ticket, as a file nobody expected
+-- and it is still a ticket today.
 
 ---
 
@@ -380,7 +394,7 @@ ticket, as a file nobody expected.
 | 2 | `ready/` + manifest + normalize stage, pass-through only | **Built.** The architecture. Behaviour-preserving, verified against the live stack before anything new depends on it. |
 | 3 | Archive normalizer | **Built**, not yet live-verified. The zip case. First normalizer that copies bytes. |
 | 4 | Control-file normalizer | **Built**, not yet live-verified. Readiness in one place, and the exact-count assertion. |
-| 5 | Sniffer + unclaimed queue | A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
+| 5 | Sniffer + unclaimed queue | **Sniffer backend built**, live-verified; console wiring and the unclaimed queue not built. A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
 
 Steps 3-5 are each *one normalizer* because step 2 built the stage. That is the
 whole reason step 2 exists as its own change rather than arriving underneath
