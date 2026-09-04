@@ -1339,3 +1339,82 @@ different hat.
 writing to `ready/`. That form is what every runbook, the README walkthrough and
 `docs/ADDING-A-FEED.md` tell you to type, and a one-off manual ingest should not
 leave a queue entry behind.
+
+## archive-normalizer
+
+Step 3 of `docs/DELIVERY-SHAPES.md`: `custodyPositions_20260903.zip` holding
+CSVs whose own names say nothing about which day they are for. The date is on
+the container, not the members, and that is the one case this builds --
+`delivery: {kind: archive, business_date_from: container, parts: concat}`.
+`business_date_from: member`/`path` and `parts: separate` are recognised keys
+with no implementation behind them.
+
+**Unbuilt values raise "NOT BUILT", not "unknown".** A typo and a missing
+feature are different problems with different fixes, so
+`context.NOT_BUILT` (`common/context.py:214`) lists them by name and
+`resolve_delivery_config` checks that table before the `allowed` one. Folding
+them into one error would make a real gap look like a fixable spelling
+mistake, and it would only be caught by someone reading the source rather than
+the message.
+
+**The container is still `landing/`'s ordinary filename.** `matching()` and
+landing retention run `filename_pattern` over the container exactly as they do
+for a plain CSV, so archives need no special case in either -- routing and the
+evidence sweep stay ignorant that this feed unpacks at all. That is only true
+because `business_date_from: container` is the one case built: the date comes
+from the same name `parse_filename` already parses.
+
+**This is the first normalizer that copies bytes, and the copies live under
+`ready/<feed>/<stem>/`, never `landing/<feed>/.unpacked/`.** That was the
+first instinct, and it is wrong for a reason that only surfaces months later:
+`sweep_landing` walks `landing/<feed>/` and refuses to delete anything it
+cannot parse, because unparseable means *evidence, keep it*. An extracted
+member matches no `filename_pattern` and would report as `unrecognised` on
+every nightly sweep, forever, with the count logged once a night and acted on
+by nobody. Putting the members under `ready/` instead removes three problems
+at once rather than needing three guards: `list_landing` is prefix-scoped so
+it never sees them, landing retention never sees them, and `landing/`'s
+evidence semantics stay honest -- the container is what the upstream sent, a
+member is a derived artefact.
+
+**A member's `object_key` is derived from the container's filename and the
+member's own name, never a timestamp or a run id.** `already_ingested`
+matches on `_source_file` (`arrival.py:63`), so an unstable key would
+re-ingest a re-normalized delivery as a new `_file_version` -- the same
+silent loop `find_pending`'s retention filter exists to prevent, one level
+down.
+
+**A member name is validated, not sanitised, before it is joined onto the
+destination prefix.** `_safe_member_name` (`ingest/normalize.py:155`) refuses
+anything containing a path separator or naming `.`/`..` outright, rather than
+stripping or normalising it into something that looks safe -- a zip member
+naming `../../ref_counterparty/injected.csv` is the standard archive-traversal
+bug, and it would write into another feed's `ready/` prefix or over a
+manifest if joined blindly.
+
+**`parts` order is sorted by member name, not archive order.** A zip's
+internal member order is whatever the sender's library happened to write, and
+letting it drive `parts` -- and therefore the union order `ingest` reads --
+would make ingestion depend on how the sender built the file. Sorting makes
+re-normalizing an unchanged archive byte-identical, the same property
+`file/v1` gets for free from having only one part.
+
+**Write is not optional here**, unlike the pass-through normalizer, which
+`normalize(..., write=False)` uses so a manual `--object landing/...` ingest
+leaves no queue entry. An archive's members have to be materialised under
+`ready/` before anything can read them, and the `ready/` sweep collects them
+by iterating manifests -- skip the write and the extracted members exist with
+no manifest pointing at them, uncollectable by the retention pass that is
+supposed to own them. Cheaper to always enqueue and let the delivery be
+marked ingested normally.
+
+**An archive that unpacks to zero matching members is a load error, not an
+empty day.** `expected_min_rows` exists to catch a truncated file; landing a
+delivery with no parts would pass that floor by accident rather than by
+having actually delivered rows.
+
+Verified so far only against `tests/fakes3.py` (`tests/test_archive.py`),
+with real zip bytes through Python's `zipfile` -- no feed in `feeds.yml` uses
+`kind: archive` yet, so this has not been driven through MinIO, Spark, and a
+real `ingest` end to end. That is the next thing to do before trusting it,
+not an assumption to carry forward.

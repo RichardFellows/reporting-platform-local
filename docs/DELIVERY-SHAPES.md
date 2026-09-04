@@ -270,43 +270,31 @@ than a loud one.
 
 ## 3. The archive normalizer — **BUILT**, for `concat`/`container` only
 
+The reasoning now lives at
+[DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer); what
+follows is what was built.
+
 ```yaml
 delivery:
   kind: archive               # file | archive
   member_pattern: '.*\.csv'   # which members belong to this feed
-  business_date_from: container   # container | member | path
-  parts: concat               # concat | separate
+  business_date_from: container   # container | member | path -- only container is built
+  parts: concat               # concat | separate -- only concat is built
 ```
 
 The normalizer reads the container from `landing/`, explodes matching members
-into `ready/<feed>/<delivery_id>/`, and writes one manifest listing them. This
-is the first normalizer that actually copies bytes, and the derived copies live
-in `ready/` where short retention and rebuildability apply.
+into `ready/<feed>/<stem>/`, and writes one manifest whose `parts` list them.
+This is the first normalizer that actually copies bytes; the derived copies
+live in `ready/`, where short retention and rebuildability apply, never under
+`landing/`. `business_date_from: member`/`path` and `parts: separate` are
+recognised keys that raise a "NOT BUILT" error naming the gap rather than
+being silently accepted (`context.NOT_BUILT`).
 
-`parts: concat` means the members are one logical delivery cut into files by
-the sender, landing as one `_file_version`. `separate` means each member is its
-own delivery with its own manifest. `concat` matches the case in hand and
-`separate` is the one that needs justifying.
-
-**The member `object_key` must be stable across re-normalization.** Derive it
-from the container stem and member name, never from a timestamp or a UUID —
-`already_ingested` matches on `_source_file` (`arrival.py:63`), so an unstable
-key means a re-normalized delivery re-ingests as a new `_file_version`. That is
-the same silent loop `find_pending`'s retention filter exists to prevent.
-
-### Why the derived members are not under `landing/`
-
-`landing/<feed>/.unpacked/` was the first instinct and it is wrong for a reason
-that surfaces months later. `sweep_landing` walks `landing/<feed>/`
-(`retention/landing.py:121`) and never deletes what it cannot parse. Unpacked
-members would match no filename pattern, count as `unrecognised` on every
-nightly sweep, and accumulate forever while the log mentioned it once a night.
-
-Under a separate prefix, three problems disappear at once rather than needing
-three guards: `list_landing` is prefix-scoped (`arrival.py:46`) and never sees
-them; landing retention never sees them; and landing's evidence semantics stay
-honest, because **the container is what the upstream sent** and a member is a
-derived artefact.
+**Not yet verified on the live stack.** `tests/test_archive.py` exercises real
+zip bytes through Python's `zipfile`, but against `tests/fakes3.py`; no feed
+in `feeds.yml` uses `kind: archive` yet, so this has not been driven through
+MinIO, Spark and a real `ingest` end to end. That is the next thing to do
+before the BUILT marker above is fully earned.
 
 ## 4. Control files
 
@@ -370,7 +358,7 @@ ticket, as a file nobody expected.
 |---|---|---|
 | 1 | `conventions:` tier | **Built.** No new runtime concept. Makes 2-5 cheap to express. Useful even if nothing else is built. |
 | 2 | `ready/` + manifest + normalize stage, pass-through only | **Built.** The architecture. Behaviour-preserving, verified against the live stack before anything new depends on it. |
-| 3 | Archive normalizer | The zip case. First normalizer that copies bytes. |
+| 3 | Archive normalizer | **Built**, not yet live-verified. The zip case. First normalizer that copies bytes. |
 | 4 | Control-file normalizer | Readiness in one place, and the exact-count assertion. |
 | 5 | Sniffer + unclaimed queue | A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
 
