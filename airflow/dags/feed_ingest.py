@@ -6,8 +6,15 @@ received* — there is no single batch run that processes all feeds together.
 Adding a feed means adding a block to feeds.yml. No DAG file is edited.
 
 Each DAG:
-  wait_for_arrival  ->  ingest (Spark)  ->  publish (Nessie merge + tag)
+  resolve_arrival -> normalize -> ingest (Spark) -> publish (Nessie merge + tag)
 and emits an Asset on completion, which is what triggers the dbt builds.
+
+`normalize` is the stage that turns whatever the upstream actually delivered
+into the one shape ingest understands -- a manifest in `ready/` naming the
+business date, the objects holding the rows, and how to read them. It costs
+nothing for a plain CSV (a small JSON object, no copy) and it is where zips,
+control files and everything else in docs/DELIVERY-SHAPES.md will be handled,
+so `ingest` keeps exactly one code path.
 """
 from __future__ import annotations
 
@@ -100,11 +107,14 @@ def build_feed_dag(feed):
 
         @task(task_id="resolve_arrival")
         def resolve_arrival(**context) -> dict:
-            """Determine which object to ingest.
+            """Determine which delivery to ingest.
 
-            Triggered runs carry the object key in dag_run.conf. A manual run
-            with no conf falls back to the newest unprocessed object for the
-            feed, which is what you want when re-running by hand.
+            Triggered runs carry the object key in dag_run.conf -- a LANDING
+            key, because that is what the inbox watcher and the console have
+            in hand. A manual run with no conf falls back to the oldest
+            unprocessed delivery, which by then is a MANIFEST key. Both are
+            handed to `normalize` below, which resolves either into a
+            manifest.
             """
             conf = (context["dag_run"].conf or {}) if context.get("dag_run") else {}
             key = conf.get("object_key") or context["params"].get("object_key")
@@ -116,6 +126,35 @@ def build_feed_dag(feed):
                 from airflow.exceptions import AirflowSkipException
                 raise AirflowSkipException(f"no pending arrivals for {feed.name}")
             return {"object_key": pending[0], "business_date": None}
+
+        @task(task_id="normalize")
+        def normalize_task(arrival: dict) -> dict:
+            """Landing object -> a manifest in `ready/`. No Spark.
+
+            Plain Python -- boto3 and json -- so it runs in the task process
+            rather than through `scripts/_spark_task.py`. The moment a
+            normalizer needs Spark it must move there, for the reason that
+            module's header gives.
+
+            Idempotent: a delivery that already has a manifest is left alone,
+            and a manifest key arriving here passes straight through. That is
+            what makes a retry safe and what lets the same task serve both the
+            triggered path (a landing key from the inbox) and the manual one
+            (a manifest key from `pending`).
+            """
+            from reporting_platform.common.context import feed as get_feed
+            from reporting_platform.ingest import normalize as norm
+
+            fd = get_feed(feed.name)
+            key = arrival["object_key"]
+            if norm.is_manifest_key(fd, key):
+                return {**arrival, "normalized": False}
+            manifest = norm.normalize(fd, key)
+            return {"object_key": norm.manifest_key(fd, key),
+                    "business_date": arrival.get("business_date"),
+                    "normalized": True,
+                    "landed_object": key,
+                    "delivery_business_date": manifest["business_date"]}
 
         @task(task_id="ingest", outlets=[asset], pool="lakehouse_write")
         def ingest_task(arrival: dict, **context) -> dict:
@@ -172,7 +211,8 @@ def build_feed_dag(feed):
             return result
 
         arrival = resolve_arrival()
-        ingested = ingest_task(arrival)
+        ready = normalize_task(arrival)
+        ingested = ingest_task(ready)
         report_drift(ingested) >> record_publication(ingested)
 
     return _dag()

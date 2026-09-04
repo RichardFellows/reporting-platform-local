@@ -18,11 +18,14 @@ writes to stderr stays out of the way.
 
 Usage:
     python -m scripts._spark_task pending <feed>
-    python -m scripts._spark_task ingest <feed> <object_key> [run_id] [business_date]
+    python -m scripts._spark_task ingest <feed> <key> [run_id] [business_date]
     python -m scripts._spark_task maintain-metrics <fqn:layer>...
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
     python -m scripts._spark_task completeness [lookback_business_days]
+
+`pending` returns MANIFEST keys under ready/; `ingest` takes one of those or a
+landing object key. See reporting_platform/ingest/normalize.py.
 """
 from __future__ import annotations
 

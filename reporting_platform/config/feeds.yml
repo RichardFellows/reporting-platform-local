@@ -9,6 +9,10 @@
 
 defaults:
   landing_prefix: landing
+  # Derived from landing/ and rebuildable from it -- a cache, not a
+  # third copy. Kept OUT of landing/ so the evidence sweep never sees
+  # it. See docs/DELIVERY-SHAPES.md.
+  ready_prefix: ready
   raw_namespace: raw
   arrival_poke_seconds: 60
   arrival_timeout_hours: 26      # deliberately > 24h: a feed is late, not lost
@@ -31,6 +35,26 @@ defaults:
   # identical to 'warn').
   schema_drift: warn
 
+# A middle tier between `defaults:` above and a feed block below:
+# defaults -> convention -> feed, each layer overriding the last.
+#
+# The variation between feeds is mostly PER SOURCE SYSTEM, not per feed. One
+# system sends pipe-delimited files, another sends zips with a control file,
+# and that knowledge previously had nowhere to live -- so it was retyped into
+# every feed block and drifted between them. Onboard the source system once,
+# and its second and fortieth feeds are a name, a key and a column list.
+#
+# A convention may set anything a feed block may except `name` and
+# `convention` itself, and conventions DO NOT CHAIN. Naming one that does not
+# exist is an error at load, not a silent fall back to `defaults:`, and so is
+# a misspelled key inside one. See docs/DECISIONS.md#feed-conventions
+conventions:
+
+  ref_src:
+    # The three reference feeds are one delivery arrangement, not three.
+    source_system: REF_SRC
+    expected_min_rows: 10
+
 feeds:
 
   - name: fo_trade
@@ -51,11 +75,10 @@ feeds:
       - mtm_value
 
   - name: ref_counterparty
+    convention: ref_src
     description: Counterparty reference data. Slowly changing.
-    source_system: REF_SRC
     filename_pattern: 'CPTY_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [counterparty_id]
-    expected_min_rows: 10
     columns:
       - counterparty_id
       - legal_name
@@ -65,11 +88,10 @@ feeds:
       - is_active
 
   - name: ref_rating
+    convention: ref_src
     description: External agency credit ratings.
-    source_system: REF_SRC
     filename_pattern: 'RATING_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [counterparty_id, agency]
-    expected_min_rows: 10
     # Agency ratings arrive weekly, not daily. Without this the completeness
     # check infers the business calendar from the daily feeds and
     # reports every non-delivery day as a gap -- it did exactly that on its
@@ -83,12 +105,11 @@ feeds:
       - rating_date
       - outlook
   - name: ref_collateral
+    convention: ref_src
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.
-    source_system: REF_SRC
     filename_pattern: 'COLLATERAL_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [collateral_id]
-    expected_min_rows: 10
     columns:
       - collateral_id
       - counterparty_id

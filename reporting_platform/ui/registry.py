@@ -69,16 +69,23 @@ def platform_names(headers: list[str]) -> tuple[list[str], dict[str, str]]:
 # Keys the UI writes into a feed block, in the order docs/ADDING-A-FEED.md
 # presents them. Anything not listed here is left alone -- a per-feed
 # `arrival_timeout_hours` set by hand survives an edit through the UI.
-BLOCK_ORDER = ["name", "description", "source_system", "filename_pattern",
+BLOCK_ORDER = ["name", "description", "source_system", "convention",
+               "filename_pattern",
                "delimiter", "quote_char", "header", "file_encoding",
                "business_key", "expected_min_rows", "cadence", "completeness",
                "schema_drift", "columns", "column_types"]
 
-# Values that live in `defaults:`. A feed block repeating the default value is
-# noise in the diff, so these are only written when they differ from it. The
-# four format keys are here rather than absent because a pipe-delimited or
-# latin-1 feed is ordinary, and the alternative was hand-editing feeds.yml
-# after every console-created feed.
+# Keys only written when they differ from what the feed would INHERIT, because
+# a block repeating an inherited value is noise in the diff. The four format
+# keys are here rather than absent because a pipe-delimited or latin-1 feed is
+# ordinary, and the alternative was hand-editing feeds.yml after every
+# console-created feed.
+#
+# THESE VALUES ARE THE FALLBACK, NOT THE ANSWER. What a feed actually inherits
+# is `defaults:` overlaid with its convention, which only feeds.yml knows --
+# see `_inherited()` below. This map supplies the two keys that have no entry
+# in `defaults:` at all (`cadence`, `completeness`, which default in the Feed
+# dataclass) and covers the case where feeds.yml cannot be read.
 OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "completeness": True,
                          "schema_drift": "warn", "delimiter": ",",
                          "quote_char": '"', "header": True,
@@ -125,6 +132,10 @@ class FeedSpec:
     cadence: str = "daily"
     completeness: bool = True
     schema_drift: str = "warn"
+    # The `conventions:` entry this feed inherits from, or "" to stand alone.
+    # Every key the convention supplies is then omitted from the feed's own
+    # block, so the convention stays the single place that value is written.
+    convention: str = ""
     # How to READ the file. All four default to the `defaults:` block and are
     # written only when they differ -- see OPTIONAL_WITH_DEFAULT. They reach
     # Spark's reader unchanged (ingest_feed.py), so a wrong delimiter lands one
@@ -160,6 +171,7 @@ class FeedSpec:
             cadence=str(payload.get("cadence") or "daily").strip(),
             completeness=bool(payload.get("completeness", True)),
             schema_drift=str(payload.get("schema_drift") or "warn").strip(),
+            convention=str(payload.get("convention") or "").strip(),
             delimiter=unescape_char(str(payload.get("delimiter") or ",")),
             quote_char=unescape_char(str(payload.get("quote_char") or '"')),
             header=bool(payload.get("header", True)),
@@ -197,6 +209,23 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         errors["description"] = "required -- it is the DAG description too"
     if not spec.source_system:
         errors["source_system"] = "required -- it becomes the DAG's tag"
+
+    if spec.convention:
+        # Checked here as well as at load, because the two failures are not
+        # the same one. context.effective_defaults() raises when feeds.yml is
+        # already wrong, which takes the whole platform down at import; this
+        # catches a typo on its way IN, while it is still a message next to a
+        # form field.
+        from reporting_platform.common import context
+
+        try:
+            known = context.conventions()
+        except Exception:                                      # noqa: BLE001
+            known = {}
+        if spec.convention not in known:
+            errors["convention"] = (
+                f"no convention named {spec.convention!r} -- defined: "
+                f"{', '.join(sorted(known)) or '(none)'}")
 
     if not spec.filename_pattern:
         errors["filename_pattern"] = "required"
@@ -297,13 +326,55 @@ def derive_pattern(example_filename: str) -> str | None:
             + "(?:_v(?P<version>\\d+))?" + re.escape(tail))
 
 
+def _inherited(spec: FeedSpec) -> dict[str, Any]:
+    """What this feed's block would inherit if it declared nothing.
+
+    `defaults:` overlaid with the feed's convention, from feeds.yml, over the
+    dataclass-level fallbacks in OPTIONAL_WITH_DEFAULT.
+
+    WITHOUT THIS, A CONVENTION IS DEFEATED BY THE FIRST CONSOLE EDIT. `_block`
+    omits a key whose value matches the default; comparing against the
+    hardcoded map alone, a feed inheriting `delimiter: "|"` from its convention
+    would have `delimiter: "|"` written into its own block on the next save --
+    pinning the value where the convention can no longer change it, in a diff
+    that looks like someone meant it.
+
+    Falls back to the hardcoded map if feeds.yml cannot be read or names no
+    such convention. That direction is safe: it writes a key that could have
+    been inherited, which is noise. The opposite -- assuming inheritance that
+    is not there -- would DROP a key the feed needs.
+    """
+    from reporting_platform.common import context
+
+    try:
+        return {**OPTIONAL_WITH_DEFAULT,
+                **context.effective_defaults(spec.convention or "")}
+    except Exception:                                          # noqa: BLE001
+        return dict(OPTIONAL_WITH_DEFAULT)
+
+
 def _block(spec: FeedSpec) -> CommentedMap:
-    """The YAML mapping for one feed, defaults omitted."""
+    """The YAML mapping for one feed, inherited values omitted."""
     block = CommentedMap()
+    inherited = _inherited(spec)
     for key in BLOCK_ORDER:
         value = getattr(spec, key)
-        if key in OPTIONAL_WITH_DEFAULT:
-            if value == OPTIONAL_WITH_DEFAULT[key]:
+        # Omit ANY key whose value is exactly what the feed would inherit --
+        # not just the OPTIONAL_WITH_DEFAULT subset. A convention may supply
+        # `source_system` or `expected_min_rows` as readily as `delimiter`,
+        # and the narrower rule wrote those back into every feed block on the
+        # first save, pinning them where the convention could no longer change
+        # them.
+        #
+        # Safe for the identity keys because `defaults:` cannot supply them:
+        # `name`, `description`, `filename_pattern`, `business_key` and
+        # `columns` are never in `inherited`, so they are always written.
+        if key in inherited and value == inherited[key]:
+            continue
+        if key == "convention":
+            # Omitted entirely when the feed stands alone, which is the normal
+            # case and how every feed block looked before conventions existed.
+            if not value:
                 continue
             block[key] = value
         elif key == "filename_pattern":
@@ -448,6 +519,7 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         header=fd.header, file_encoding=fd.file_encoding, business_key=list(fd.business_key),
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
         cadence=fd.cadence, completeness=fd.completeness,
-        schema_drift=fd.schema_drift, column_types=dict(fd.column_types or {}),
+        schema_drift=fd.schema_drift, convention=fd.convention,
+        column_types=dict(fd.column_types or {}),
         source_columns=dict(fd.source_columns or {}),
     )

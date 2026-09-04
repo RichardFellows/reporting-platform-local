@@ -235,11 +235,13 @@ rather than loud:
 | **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the five files a new feed touches, in order, with a worked example |
 | **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same five files through a form, plus land/ingest/build buttons |
+| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | conventions and the `landing/`+`ready/` split are built; zips and control files are still proposed |
 | [notebooks/explore.py](notebooks/explore.py) | marimo notebook on :8083 — query landing files and every Iceberg layer through one read-only DuckDB session |
 | [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
 | [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | what changes on promotion, and the three things that genuinely differ |
 | [docs/DEV-PROCESS.md](docs/DEV-PROCESS.md) | ticket-to-prod path, why dbt and DAG changes carry different risk, the CAB digest gate |
+| [tests/README.md](tests/README.md) | the config-level tests -- `make test`, no stack needed, and why there is no pytest |
 
 ## Layout
 

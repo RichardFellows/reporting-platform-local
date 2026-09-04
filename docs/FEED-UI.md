@@ -69,6 +69,21 @@ compacted, its snapshots never expired and retention never trimmed it.
 model registers it. See
 [DECISIONS.md#managed-tables-are-derived](DECISIONS.md#managed-tables-are-derived).
 
+### Convention
+
+A dropdown of the conventions defined in `feeds.yml`, plus **(none)**. Picking
+one makes the feed inherit that source system's settings, and the console then
+leaves every key the convention supplies **out** of the feed's own block — so
+the value stays in one place and changing the convention still changes the
+feed. Clearing it does the reverse: everything the convention was supplying is
+written into the block explicitly, because a feed that silently reverted to a
+comma delimiter would land one column holding the whole row and not fail.
+
+It is a closed list rather than free text on purpose. A typo'd convention name
+is not an error anyone would see — the feed would load, having quietly
+inherited nothing. See
+[DECISIONS.md#feed-conventions](DECISIONS.md#feed-conventions).
+
 ### The filename pattern
 
 The field most likely to be wrong, and it fails **silently**: `find_pending`

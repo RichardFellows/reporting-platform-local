@@ -218,6 +218,30 @@ def gen_rating(bd: date, out: Path, version: int = 1) -> None:
     write_csv(out / f"RATING_{bd:%Y%m%d}{suffix}.csv", header, rows)
 
 
+# How often a trade is revalued, by how much of its life is left. A trade near
+# maturity is marked every day; a ten-year swap is not repriced meaningfully
+# between month-ends. This is the whole "short-dated trades move day on day,
+# long-dated ones sit still for weeks" behaviour, in one table.
+MTM_HOLD = ((90, 1), (365, 5), (10_000, 20))    # (residual days <=, hold days)
+
+# (weight, min_days, max_days). Weights are percentages and the three sum to
+# 100; the fallback in _slot_tenor covers a rounding gap rather than a real
+# branch. The spread is the point: short trades are remarked daily while a
+# multi-year swap is byte-identical for a month at a time, which is the
+# behaviour the prepared and reporting layers should be being asked to cope
+# with. See docs/DECISIONS.md#generated-data-must-hold-still
+#
+# BOTH THIS AND MTM_HOLD WERE LOST, not absent by design. `_slot_tenor` and
+# `gen_trade` referenced them and nothing defined them, so `generate_feeds.py`
+# raised NameError on the FIRST trade of the first delivery -- seeding the
+# platform, which is the command QUICKSTART opens with, was broken outright.
+# Restored from 71ad3ba, the commit that last had them, rather than
+# re-guessed: these bands decide the maturity profile and the mark frequency
+# of the generated book, so inventing new ones would silently change every
+# generated dataset and every test that runs against it.
+TENORS = ((25, 20, 90), (45, 180, 540), (30, 1000, 3000))
+
+
 def _slot_tenor(slot: int) -> int:
     """Days this slot's trades run for. Fixed per slot, so the book has a
     stable maturity profile rather than a new one every morning."""

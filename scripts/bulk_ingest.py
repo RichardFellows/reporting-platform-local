@@ -20,6 +20,11 @@ startup is fast.
 Safe to re-run after a crash or interruption: `find_pending` checks each
 feed's raw table for `_source_file` values already committed to `main`,
 so already-ingested files are skipped automatically.
+
+It now ingests MANIFEST keys under `ready/`, not landing keys. `find_pending`
+reconciles `ready/` from `landing/` first, so a file pushed straight into the
+bucket by an upstream agent -- which runs no code of ours -- still gets picked
+up here. See reporting_platform/ingest/normalize.py.
 """
 from __future__ import annotations
 

@@ -23,6 +23,10 @@ up: env ## Start the whole local stack
 	@echo "Airflow  http://localhost:8081   (admin / admin)"
 	@echo "Spark    http://localhost:8080"
 
+.PHONY: test
+test: ## Config-level tests (no stack needed, ~1s). See tests/README.md
+	python -m tests.run
+
 .PHONY: down
 down: ## Stop the stack, keep volumes
 	$(COMPOSE) down

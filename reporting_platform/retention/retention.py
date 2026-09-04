@@ -930,6 +930,18 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
         log.warning("landing sweep failed: %s", str(e)[:200])
         report["landing"] = {"error": str(e)[:200]}
 
+    # Same shape, same reasoning, different prefix: `ready/` is flat object
+    # storage too. It is a CACHE -- everything in it is rebuildable by
+    # re-normalizing from landing -- so failing the chain over it would be
+    # even less justified than failing over landing.
+    try:
+        from reporting_platform.retention.ready import sweep_ready
+
+        report["ready"] = sweep_ready(dry_run=dry_run)
+    except Exception as e:                     # never fail retention over this
+        log.warning("ready sweep failed: %s", str(e)[:200])
+        report["ready"] = {"error": str(e)[:200]}
+
     # Step 6: prefixes no reference points at. Runs LAST, after GC has had its
     # chance -- GC can only collect files of content it enumerates from live
     # refs, so anything left after it is either live or genuinely stranded.

@@ -62,6 +62,16 @@ class Feed:
     columns: list[str]
     expected_min_rows: int = 0
     landing_prefix: str = "landing"
+    # Where normalization puts a delivery's manifest and any derived parts.
+    # SEPARATE FROM `landing_prefix` ON PURPOSE, and not a subfolder of it:
+    # `retention/landing.py` walks the landing prefix and never deletes an
+    # object whose name it cannot parse, because that prefix is the evidence
+    # copy. Manifests match no filename_pattern, so under landing/ they would
+    # count as `unrecognised` on every nightly sweep and accumulate forever.
+    # Kept apart, `list_landing` and the landing sweep are both prefix-scoped
+    # and simply never see them -- no exclusion filter to forget.
+    # See docs/DELIVERY-SHAPES.md.
+    ready_prefix: str = "ready"
     raw_namespace: str = "raw"
     arrival_poke_seconds: int = 60
     arrival_timeout_hours: int = 26
@@ -116,6 +126,18 @@ class Feed:
     # expected whenever another feed delivered on it) or "weekly" (only that
     # each week containing business dates saw at least one delivery).
     cadence: str = "daily"
+    # The `conventions:` entry this feed drew its defaults from, or "" for a
+    # feed that stands alone. Recorded rather than discarded so the console can
+    # round-trip it and so a resolved Feed can say where a surprising value
+    # came from -- a feed whose delimiter is "|" with no `delimiter` key in its
+    # own block is otherwise unexplainable from feeds.yml alone.
+    convention: str = ""
+    # How a landed object becomes units of work. Absent means `kind: file` --
+    # one object, one delivery, date from the filename -- which is every feed
+    # that existed before archives did and stays the default forever.
+    # Validated at load by `resolve_delivery_config`.
+    # See docs/DECISIONS.md#ready-is-a-derived-index and docs/DELIVERY-SHAPES.md
+    delivery: dict[str, Any] = field(default_factory=dict)
 
     def source_column(self, name: str) -> str:
         """The name this platform column has in the delivered file."""
@@ -175,13 +197,218 @@ def split_columns(declared: list) -> tuple[list[str], dict[str, str]]:
     return names, sources
 
 
+# ------------------------------------------------------------------ delivery
+# What `delivery:` may say. Every value here is DISPATCHED ON by
+# ingest/normalize.py -- there is no key in this table that nothing reads,
+# which is the failure this repo keeps having (`schema_drift` was documented
+# and read by nothing for months, so `fail` silently meant `warn`).
+DELIVERY_KINDS = ("file", "archive")
+BUSINESS_DATE_FROM = ("container",)
+PARTS_MODES = ("concat",)
+DELIVERY_KEYS = {"kind", "member_pattern", "business_date_from", "parts"}
+
+# Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
+# error can say "not built" rather than "unknown", which are different
+# problems with different fixes -- one is a typo, the other is a missing
+# feature and a decision about whether to write it.
+NOT_BUILT = {
+    "business_date_from": {
+        "member": "the date is on each member rather than the container, so "
+                  "the container name need not match filename_pattern at all "
+                  "-- which `matching()` and landing retention both rely on",
+        "path": "the date is a folder in the key, which needs a pattern over "
+                "the whole key rather than the filename",
+    },
+    "parts": {
+        "separate": "one manifest per member instead of one with N parts; "
+                    "normalize() would have to return a list",
+    },
+}
+
+
+def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
+    """Validate a `delivery:` block and fill its defaults.
+
+    Checked at LOAD, like `conventions:`, and for the same reason: every way
+    this can be wrong is otherwise silent. A misspelled `kind` would fall
+    through to the pass-through normalizer and ingest a zip as if it were a
+    CSV -- which does not fail, it lands one column of binary rubbish.
+    """
+    if not delivery:
+        return {"kind": "file"}
+    if not isinstance(delivery, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery:` must be a mapping, got "
+            f"{type(delivery).__name__}")
+
+    unknown = set(delivery) - DELIVERY_KEYS
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery:` has unknown key(s) "
+            f"{', '.join(sorted(unknown))}. Valid: "
+            f"{', '.join(sorted(DELIVERY_KEYS))}")
+
+    out = {"kind": delivery.get("kind", "file")}
+    for key, allowed in (("kind", DELIVERY_KINDS),
+                         ("business_date_from", BUSINESS_DATE_FROM),
+                         ("parts", PARTS_MODES)):
+        value = delivery.get(key)
+        if value is None:
+            continue
+        if value in NOT_BUILT.get(key, {}):
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `delivery.{key}: {value}` is "
+                f"described in docs/DELIVERY-SHAPES.md but NOT BUILT -- "
+                f"{NOT_BUILT[key][value]}")
+        if value not in allowed:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `delivery.{key}: {value!r}` is "
+                f"not recognised. Valid: {', '.join(allowed)}")
+        out[key] = value
+
+    if out["kind"] == "archive":
+        out.setdefault("business_date_from", "container")
+        out.setdefault("parts", "concat")
+        # No default: which members belong to this feed is not guessable, and
+        # a wrong guess silently ingests the wrong files.
+        if not delivery.get("member_pattern"):
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} is `kind: archive` and sets no "
+                f"`member_pattern`. Which members belong to this feed is not "
+                f"guessable -- a zip routinely carries a manifest, a checksum "
+                f"or another feed's file alongside the data.")
+        out["member_pattern"] = delivery["member_pattern"]
+        try:
+            re.compile(out["member_pattern"])
+        except re.error as exc:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `delivery.member_pattern` is "
+                f"not a valid regex: {exc}") from exc
+    elif delivery.get("member_pattern"):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} sets `member_pattern` with "
+            f"`kind: {out['kind']}`. It is only read for archives, so leaving "
+            f"it here would suggest a filter that never runs.")
+    return out
+
+
+# A convention may set anything a feed block may, EXCEPT these two.
+#
+# `name`: sharing one across feeds would silently collapse them into a single
+# entry in the registry dict -- the last one wins and the others simply vanish,
+# with no error anywhere.
+#
+# `convention`: conventions DO NOT CHAIN. Resolution reads the name from the
+# feed block only, so a convention naming another one would not inherit from
+# it -- it would just overwrite the resolved Feed's `convention` field with a
+# name that had no effect, which is a lie told by the very field that exists to
+# explain where a value came from. Chaining is also a diamond-merge design
+# nobody has asked for; one layer between defaults and the feed is the whole
+# point.
+CONVENTION_FORBIDDEN = {
+    "name": "that is per-feed identity, and sharing one would collapse two "
+            "feeds into a single registry entry",
+    "convention": "conventions do not chain -- setting it here would record a "
+                  "name that had no effect",
+}
+
+
+def resolve_conventions(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate the `conventions:` section and return it, or {} if absent.
+
+    Checked HERE, at load, rather than where a value is used, because the
+    failure modes are all silent otherwise: a misspelled convention name would
+    fall back to defaults and produce a feed configured subtly wrong rather
+    than one that does not exist, and a misspelled KEY inside a convention
+    would be dropped by the `allowed` filter below without comment. Both
+    produce a working platform doing the wrong thing, which is the failure this
+    repo keeps having and keeps regretting.
+
+    Unknown keys are rejected in conventions but NOT in feed blocks. That is
+    inconsistent on purpose: `conventions:` is new surface with nothing
+    depending on it, so it can be strict from the start, whereas adding the
+    same check to feed blocks could refuse to load an existing feeds.yml and
+    take the whole platform down at import for a key that has always been
+    harmlessly ignored. Worth doing later, deliberately, as its own change.
+    """
+    section = cfg.get("conventions") or {}
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"feeds.yml: `conventions:` must be a mapping of name to settings, "
+            f"got {type(section).__name__}")
+    allowed = {f.name for f in Feed.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+    for cname, settings in section.items():
+        if not isinstance(settings, dict):
+            raise ValueError(
+                f"feeds.yml: convention {cname!r} must be a mapping, got "
+                f"{type(settings).__name__}")
+        for key in sorted(CONVENTION_FORBIDDEN.keys() & set(settings)):
+            raise ValueError(
+                f"feeds.yml: convention {cname!r} may not set {key!r}: "
+                f"{CONVENTION_FORBIDDEN[key]}")
+        unknown = set(settings) - allowed
+        if unknown:
+            raise ValueError(
+                f"feeds.yml: convention {cname!r} sets unknown key(s) "
+                f"{', '.join(sorted(unknown))}. Valid keys are: "
+                f"{', '.join(sorted(allowed - CONVENTION_FORBIDDEN.keys()))}")
+    return section
+
+
+def effective_defaults(convention: str = "",
+                       cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What a feed block inherits before its own keys are applied.
+
+    `defaults:` overlaid with the named convention, SHALLOW at each layer --
+    a dict-valued key such as `column_types` is replaced by the more specific
+    layer, not merged into it. Predictability beats convenience: with a deep
+    merge there is no way to *remove* an inherited entry, and "why is this
+    column still a decimal" becomes a question answered by reading three
+    places. Revisit deliberately if a nested `delivery:` block ever wants
+    partial override.
+
+    THIS IS THE ONLY IMPLEMENTATION OF THE MERGE. `_feeds_at` builds every
+    Feed on top of it, and the feed console asks it what a block would inherit
+    so it can leave inherited values OUT of the block it writes -- see
+    `ui/registry._block`. A second copy of this ordering would drift, and it
+    would drift silently: the console would start pinning inherited values
+    into individual feed blocks, defeating the convention while producing a
+    diff that looks deliberate.
+    """
+    cfg = _load("feeds.yml") if cfg is None else cfg
+    known = resolve_conventions(cfg)
+    if convention and convention not in known:
+        raise ValueError(
+            f"feeds.yml: convention {convention!r} is not defined. "
+            f"Available: {', '.join(sorted(known)) or '(none)'}")
+    return {**(cfg.get("defaults") or {}), **(known.get(convention) or {})}
+
+
+@lru_cache(maxsize=None)
+def _conventions_at(mtime_ns: int) -> dict[str, dict[str, Any]]:
+    return resolve_conventions(_load("feeds.yml"))
+
+
+def conventions() -> dict[str, dict[str, Any]]:
+    """The `conventions:` section, keyed by name. Empty if there is none."""
+    return _conventions_at((CONFIG_DIR / "feeds.yml").stat().st_mtime_ns)
+
+
 @lru_cache(maxsize=None)
 def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
     cfg = _load("feeds.yml")
-    defaults = cfg.get("defaults", {})
+    known = resolve_conventions(cfg)
     out: dict[str, Feed] = {}
     for block in cfg["feeds"]:
-        merged = {**defaults, **block}
+        cname = block.get("convention") or ""
+        if cname and cname not in known:
+            raise ValueError(
+                f"feeds.yml: feed {block['name']!r} names convention "
+                f"{cname!r}, which is not defined. Available: "
+                f"{', '.join(sorted(known)) or '(none)'}")
+        merged = {**effective_defaults(cname, cfg), **block}
+        merged["delivery"] = resolve_delivery_config(
+            block["name"], merged.get("delivery"))
         names, sources = split_columns(merged.get("columns") or [])
         merged["columns"] = names
         # An explicit source_columns: block wins over the inline form, so a

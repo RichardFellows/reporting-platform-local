@@ -192,6 +192,36 @@ Three properties worth knowing:
   `landing.py` warns; it does not refuse, because the failure is gradual and
   an operator shortening landing in a sandbox should not be blocked.
 
+### Ready: the work queue, for a week
+
+`ready/` holds one manifest per delivery, plus any parts a normalizer derived
+(see
+[DECISIONS.md#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index)).
+**It is a cache**: everything in it can be rebuilt by re-normalizing from
+`landing/`, which is what makes it safe to delete from and why its window is
+`ready.keep_days` (7) rather than years.
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.retention.ready --dry-run
+docker compose exec -T airflow python -m reporting_platform.retention.ready --apply
+```
+
+Unlike `landing:`, this window constrains nothing — nothing computes a
+keep-set from `ready/`. Its only floor is operational: comfortably longer than
+`arrival_timeout_hours` (26h, deliberately more than a day), or a delivery
+could be swept between being normalized and being ingested by a late run.
+
+**One rule, and it is the reason this is its own module: a manifest whose parts
+are not yet in the raw table is never swept, at any age.** That is a read of
+`already_ingested`, not a status flag in the manifest — the manifest never
+records derived state. Sweeping an un-ingested delivery is not data loss, since
+landing still holds the object, but nothing would re-normalize it on its own,
+so it is a *silent* drop, which is worse than a loud one. The sweep reports
+those as `held_uningested`.
+
+A part that points back into `landing/` is the evidence copy and is never
+deleted here; only parts under `ready/` are.
+
 Until session 5 none of this existed: the `landing:` block was four keys no
 code read, and this section described behaviour that had never run. The policy it
 described — `latest_version_only`, a `superseded_grace_days`

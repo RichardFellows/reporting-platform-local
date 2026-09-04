@@ -1192,3 +1192,150 @@ So the namespace is created on `main` first and the branch inherits it. A
 namespace holds no data, and this is the same precedent the cold-start
 bootstrap already sets.
 
+
+## feed-conventions
+
+`feeds.yml` had exactly two tiers: a global `defaults:` block and a per-feed
+one. The variation between feeds is neither. It is mostly **per source
+system** — one system sends pipe-delimited files, another sends zips with a
+control file — and that knowledge had nowhere to live, so it was retyped into
+every feed block of that system and drifted between them.
+
+`conventions:` is the middle tier. Resolution is `defaults -> convention ->
+feed`, each layer overriding the last, and it is the same
+`{**a, **b}` the `defaults` merge already was.
+
+**Shallow at every layer.** A dict-valued key such as `column_types` is
+replaced by the more specific layer, not merged into it. With a deep merge
+there is no way to *remove* an inherited entry, and "why is this column still a
+decimal" becomes a question answered by reading three places.
+
+**One implementation of the merge, in `context.effective_defaults()`.** The
+feed console needs the same answer for a different reason: `ui/registry._block`
+omits a key whose value matches what the feed would inherit, so that the
+convention stays the one place that value is written. Comparing instead against
+a hardcoded default map — which is what it did — meant a feed inheriting
+`delimiter: "|"` had `delimiter: "|"` written into its own block on the next
+save, pinning the value where the convention could no longer change it, in a
+diff that looked deliberate. That rule now covers **every** managed key, not
+just the format ones: a convention supplies `source_system` and
+`expected_min_rows` as readily as `delimiter`, and the narrower rule pinned
+those two on the first save. Verified by round-tripping every feed in the real
+`feeds.yml` through the console's save path and diffing.
+
+Clearing a feed's convention writes back everything it was supplying, rather
+than letting the feed silently revert to `defaults:` — a feed that quietly
+starts reading a pipe file with a comma delimiter lands one column holding the
+whole row, and does not fail.
+
+**Three things are errors at load rather than silent.** This file's history is
+mostly settings that did nothing (`schema_drift` read by no code,
+`delete_after_merge` read by no code, a `landing:` block read by no code), so a
+new one starts strict:
+
+| Wrong | Why it cannot be a warning |
+|---|---|
+| a feed naming an undefined convention | falls back to `defaults:` and produces a feed configured subtly wrong, rather than one that does not exist |
+| an unknown key inside a convention | dropped by the `allowed` filter with no comment — `delimeter:` would simply never apply |
+| a convention setting `name` or `convention` | `name` collapses two feeds into one registry entry, last one wins; `convention` does not chain, so it would record a name that had no effect |
+
+Unknown keys are rejected in `conventions:` but **not** in feed blocks. That is
+inconsistent on purpose: conventions are new surface with nothing depending on
+them, so they can be strict from the start, whereas adding the same check to
+feed blocks could refuse to load an existing `feeds.yml` and take the platform
+down at import over a key that has always been harmlessly ignored. Worth doing
+later, deliberately, as its own change.
+
+The console offers the defined conventions as a **closed list**, never free
+text, for the same reason: a typo there is not an error anyone would see.
+
+## ready-is-a-derived-index
+
+`landing/` was doing two jobs with opposite requirements. It is the immutable
+evidence copy — what the upstream actually sent, kept for `keep_years`, and
+never deleted on a guess — and it was also the work queue. The tension was
+already visible in the code: `sweep_landing` will not delete an object whose
+name it cannot parse, which is correct for evidence and means anything the
+platform does not recognise accumulates in the queue forever, reported as a
+count in a nightly log and nowhere else.
+
+So the two are separate prefixes with separate lifetimes:
+
+| Prefix | Job | Lifetime | Deletion rule |
+|---|---|---|---|
+| `landing/<feed>/` | evidence, byte for byte | `keep_years: 8` | never on a guess |
+| `ready/<feed>/` | work queue: a manifest per delivery, plus derived parts | `keep_days: 7` | freely, once ingested |
+
+**`ready/` is a DERIVED INDEX of `landing/`, not a queue somebody fills.**
+`find_pending` reconciles it first — a cheap, idempotent, Spark-free pass. That
+is not tidiness: the production arrival path is an agent doing a PutObject
+straight into the bucket, which runs no code of ours, so a queue that had to be
+*filled* would have an ordering bug with no error attached to it. Everything in
+`ready/` can be rebuilt by re-normalizing, and that property is the one to
+protect — the moment something there cannot be, it has become a third copy of
+the data.
+
+### What the manifest is for
+
+One delivery, one JSON object, recording the three things every downstream
+reader was previously re-deriving from the filename with its own copy of the
+same regex: the business date, which objects hold the rows, and how to read
+them. `Feed.parse_filename` had **fourteen call sites across seven modules**,
+each free to disagree.
+
+**A plain CSV is not copied.** The manifest's single part points back at the
+landing object, so the common case costs one small JSON object — measured on
+the live stack at 500 bytes against 15KB of data — and `ingest` still has
+exactly one code path, because it reads `parts` and neither knows nor cares
+whether they point into `landing/` or `ready/`. A normalizer copies bytes only
+when it transforms them.
+
+**`format` is recorded and read back at ingest**, rather than re-read live from
+`feeds.yml`, so an ingest is reproducible: what delimiter a delivery was
+actually read with is stored next to it. Correcting a wrong one is "fix
+feeds.yml, re-normalize", which is cheap because `ready/` is a cache.
+
+**A manifest is a pure function of (feed config, landing object).**
+`received_at` is the landing object's `LastModified`, not the time normalize
+ran, so re-normalizing an unchanged delivery rewrites byte-identical content.
+Anything time-based there — a `now()`, a uuid — would quietly turn an
+idempotent operation into one that produces a new delivery every time.
+
+### What is deliberately NOT in it
+
+**Ingestion status.** `already_ingested` derives that from `_source_file` in the
+raw table precisely so it cannot drift from reality; the legacy `stg`
+load-control tables are what that avoids. A manifest carrying
+`"ingested": true` is that table under a new name. The manifest records
+**observations about an event** — what arrived, how big, how to read it, what a
+control file declared — never derived state.
+
+The same line is why `ready/` retention reads `already_ingested` rather than a
+flag: a manifest whose parts are not yet in the raw table is never swept,
+regardless of age. Sweeping one is not data loss, since landing still holds the
+object — but nothing would re-normalize it on its own, so it is a *silent* drop.
+
+### Two couplings that must not be undone
+
+**`_source_file` holds the PART's key, not the manifest's.** `already_ingested`
+matches on it, so writing the manifest key there would make every delivery look
+un-ingested forever and re-ingest on the next pass. With `kind: file` the part
+*is* the landing key, which is what that column has always held — verified on
+the live stack: ingesting through a manifest wrote
+`landing/fo_trade/TRADE_20260903.csv`, and the next `pending` came back empty.
+
+**`find_pending` straddles both prefixes.** Candidates come from `ready/`, but
+the retention keep-set is still computed from the dates observed in
+**`landing/`** — the only prefix that still holds every date after raw has
+expired them, which is what `retention.yml`'s `landing:` comment is about.
+Computing it from a days-long cache would silently narrow the window and start
+reporting live business dates as expired. Giving manifests an eight-year
+lifetime so they could serve instead is the load-control-table trap in a
+different hat.
+
+### Compatibility kept on purpose
+
+`ingest --object landing/...` still works and normalizes on the fly **without**
+writing to `ready/`. That form is what every runbook, the README walkthrough and
+`docs/ADDING-A-FEED.md` tell you to type, and a one-off manual ingest should not
+leave a queue entry behind.

@@ -62,6 +62,10 @@ x-airflow-common: &airflow-common
     - ./airflow/dags:/opt/airflow/dags
     - ./reporting_platform:/opt/platform/reporting_platform
     - ./scripts:/opt/platform/scripts
+    # The config-level tests, so `python -m tests.run` works in the container
+    # as tests/README.md says. Read-only: they must never be able to edit the
+    # thing they are testing.
+    - ./tests:/opt/platform/tests:ro
     - ./dbt:/opt/platform/dbt
     - ./seed:/opt/platform/seed
     # Clean restatement of the same history, for a build that passes its tests

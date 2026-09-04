@@ -27,6 +27,18 @@ environments:
     landing:
       keep_years: 8
 
+    # THE WORK QUEUE, and a cache: manifests and any parts a normalizer
+    # derived, all rebuildable by re-normalizing from landing/. Days, not
+    # years, and unlike `landing:` it constrains nothing -- nothing computes
+    # a keep-set from it. The only floor is operational: comfortably longer
+    # than `arrival_timeout_hours` (26h), or a delivery could be swept
+    # between being normalized and being ingested by a late run.
+    #
+    # A manifest whose parts are not yet in the raw table is never swept
+    # regardless of age. See reporting_platform/retention/ready.py.
+    ready:
+      keep_days: 7
+
     raw:
       keep_business_days: 10
       keep_month_ends: 80
@@ -55,6 +67,7 @@ environments:
   # environment without an explicit restore procedure.
   dev:
     landing:   {keep_years: 1}
+    ready:     {keep_days: 2}
     raw:       {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
     prepared:  {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
     reporting: {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 5, snapshot_retain_last: 3}

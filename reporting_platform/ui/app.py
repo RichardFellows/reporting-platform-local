@@ -21,7 +21,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from reporting_platform.common.context import CATALOG, feeds
+from reporting_platform.common.context import CATALOG, conventions, feeds
 from . import (dbt_check, feeddata, feedtest, jobs, orchestration,
                registry, sampledata, scaffold)
 from .registry import FeedSpec, FeedValidationError
@@ -107,6 +107,7 @@ def _summary(fd) -> dict[str, Any]:
         "cadence": fd.cadence,
         "completeness": fd.completeness,
         "schema_drift": fd.schema_drift,
+        "convention": fd.convention,
         "raw_table": fd.raw_table,
         "asset_uri": fd.asset_uri,
         "landing_prefix": f"{fd.landing_prefix}/{fd.name}/",
@@ -123,7 +124,12 @@ def _summary(fd) -> dict[str, Any]:
 # --------------------------------------------------------------------- feeds
 @app.get("/api/feeds")
 def api_feeds():
+    # `conventions` rides along so the edit form can offer the defined ones as
+    # a closed list. A free-text field here would make a typo an invisible
+    # revert to `defaults:` -- the feed would load, and read its files with the
+    # wrong delimiter.
     return {"catalog": CATALOG,
+            "conventions": sorted(conventions()),
             "feeds": [_summary(fd) for fd in feeds().values()]}
 
 

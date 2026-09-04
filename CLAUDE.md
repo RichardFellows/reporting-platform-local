@@ -141,12 +141,39 @@ Two corollaries worth holding on to:
   `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
+- **`landing/` is the evidence copy; `ready/` is the work queue.** A
+  **normalize** stage between them turns a delivery into a MANIFEST -- one
+  JSON object naming the business date, the objects holding the rows, and the
+  delimiter/quoting/encoding to read them with. `ingest` consumes manifests;
+  `find_pending` returns manifest keys. For a plain CSV nothing is copied (the
+  part points back into `landing/`), so `ingest` keeps one code path while
+  zips and control files get their own normalizers.
+  **`_source_file` must stay the PART's key, never the manifest's** --
+  `already_ingested` matches on it, so the manifest key there would re-ingest
+  every delivery forever. **`find_pending` computes its keep-set from
+  `landing/`, not from the manifests**, because `ready/` is a days-long cache
+  and landing is the only prefix still holding every date. The manifest never
+  records whether something was ingested; that stays derived from the raw
+  table. `ready/` is reconciled from `landing/` on demand, so a file pushed
+  straight into the bucket is never stranded.
+  See `docs/DECISIONS.md#ready-is-a-derived-index` and `docs/DELIVERY-SHAPES.md`.
 - **A feed is named `<source_system>_<feed>`** — `fo_trade`,
   `ref_counterparty`, `treasury_margin_call` — and it is TYPED into feeds.yml,
   not derived. That one string is the raw table, the DAG id, the landing
   prefix, the dbt source table and the prepared model at once, so prefixing the
   name prefixes all five and none of them can drift.
   See `docs/DECISIONS.md#feed-names-carry-the-source`.
+- **`conventions:` in feeds.yml is a middle tier between `defaults:` and a
+  feed block** — `defaults -> convention -> feed`, shallow at each layer. The
+  variation between feeds is mostly per SOURCE SYSTEM, so a convention is
+  onboarded once and its feeds are a name, a key and a column list.
+  `context.effective_defaults()` is the ONLY implementation of that ordering,
+  and the feed console depends on it: `ui/registry._block` omits any key whose
+  value matches what the feed inherits, so a second copy of the merge would
+  silently start pinning inherited values into individual feed blocks. Naming
+  an undefined convention, using an unknown key inside one, or setting `name`
+  or `convention` in one are all errors at LOAD.
+  See `docs/DECISIONS.md#feed-conventions`.
 - **A column may be named differently in the file than in the platform.**
   `- trade_id: "Trade Id"` in `feeds.yml` renames at ingest, so raw onwards is
   ordinary identifiers and dbt macros never have to quote one. Drift is
@@ -181,8 +208,17 @@ Two corollaries worth holding on to:
 ## Quick reference
 
 ```powershell
+# config-level tests: feeds.yml resolution + the console's write-back.
+# No stack, ~1s. Everything else is verified by running it. tests/README.md
+python -m tests.run
+
 # bulk ingest everything pending (safe to re-run)
 docker compose exec airflow python -m scripts.bulk_ingest
+
+# what normalize produced, and what is pending (manifest keys under ready/)
+docker compose exec -T airflow python -m scripts._spark_task pending fo_trade
+# ready/ retention -- a cache; never sweeps a manifest that is not yet ingested
+docker compose exec -T airflow python -m reporting_platform.retention.ready --dry-run
 
 # build + test both layers on a throwaway branch
 $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).Trim()

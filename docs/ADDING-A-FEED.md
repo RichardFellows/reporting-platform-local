@@ -68,6 +68,7 @@ Optional, and worth a thought rather than a default:
 
 | Key | When |
 |---|---|
+| `convention: <name>` | Another feed from this source system already exists and shares its delivery arrangement. Inherits everything the convention sets; anything the convention supplies is then left OUT of this block, so it stays in one place. Naming one that is not defined is an error at load, not a silent fallback. See [DECISIONS.md#feed-conventions](DECISIONS.md#feed-conventions). |
 | `cadence: weekly` | The feed does not deliver every business date. Without it the completeness check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
 | `completeness: false` | Monthly or ad-hoc. Opts out of the gap check entirely. |
 | `schema_drift: fail` | Abort the load on an extra *or* missing column instead of landing and warning. The default `warn` is usually right — a rejected file is a file nobody looks at. |
@@ -266,7 +267,9 @@ than a plausible one.
 # 1. sample data -> landing
 docker compose exec -T airflow python -m scripts.land_feeds --feed treasury_margin_call
 
-# 2. what would be ingested (read-only)
+# 2. what would be ingested -- MANIFEST keys under ready/, not landing keys.
+#    This also reconciles ready/ from landing/, which is what gives a file
+#    pushed straight into the bucket a manifest at all.
 docker compose exec -T airflow python -m scripts._spark_task pending treasury_margin_call
 
 # 3. landing -> raw, every pending file
@@ -304,6 +307,14 @@ Worth knowing, because it is where the effort would otherwise go:
 - **No raw DDL.** `ingest_feed.ensure_raw_table` builds it from `columns`.
 
 ## Two things that will surprise you
+
+**A landed file is not ingested directly; it is normalized first.** The
+`normalize` task turns it into a manifest under `ready/` -- the business date,
+the objects holding the rows, and how to read them -- and `ingest` consumes
+that. For an ordinary CSV nothing is copied and nothing about the feed changes,
+but it is why `pending` returns a `ready/...json` key. The single-file CLI form
+below still takes a landing key and normalizes on the fly. See
+[DECISIONS.md#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index).
 
 **A delivery outside the retention keep-set is landed but never ingested.**
 `find_pending` computes the raw keep-set (10 business days + 80 month-ends)

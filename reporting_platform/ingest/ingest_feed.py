@@ -102,13 +102,19 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     )
 
 
-def read_landing(spark, fd, uri: str):
-    """Read the CSV with every column as string, permissively."""
+def read_landing(spark, fmt: dict, uri: str):
+    """Read the CSV with every column as string, permissively.
+
+    `fmt` comes from the delivery's MANIFEST, not from feeds.yml, so an ingest
+    is reproducible: what delimiter a delivery was actually read with is
+    recorded next to it rather than inferred from whatever the config says
+    today. See ingest/normalize.py.
+    """
     return (
-        spark.read.option("header", str(fd.header).lower())
-        .option("sep", fd.delimiter)
-        .option("quote", fd.quote_char)
-        .option("encoding", fd.file_encoding)
+        spark.read.option("header", str(fmt["header"]).lower())
+        .option("sep", fmt["delimiter"])
+        .option("quote", fmt["quote_char"])
+        .option("encoding", fmt["encoding"])
         .option("mode", "PERMISSIVE")
         .option("inferSchema", "false")
         .csv(uri)
@@ -215,10 +221,55 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
             spark.stop()
 
 
+def resolve_delivery(fd, key: str, business_date: date | None = None) -> dict:
+    """The manifest for `key`, whether it names a manifest or a landing object.
+
+    Ingest consumes MANIFESTS (see ingest/normalize.py). A landing key is
+    still accepted and normalized on the fly WITHOUT being written to
+    `ready/`, because `--object landing/...` is what every runbook, the README
+    walkthrough and docs/ADDING-A-FEED.md tell you to type, and a one-off
+    manual ingest should not leave a queue entry behind.
+
+    `business_date` overrides whatever the delivery says, which is how a file
+    whose name carries no parsable date gets ingested at all.
+    """
+    from reporting_platform.ingest import normalize as norm
+
+    if norm.is_manifest_key(fd, key):
+        manifest = norm.read_manifest(key)
+    else:
+        try:
+            manifest = norm.normalize(fd, key, write=False)
+        except ValueError:
+            if business_date is None:
+                raise
+            # No parsable date in the name, but the caller supplied one.
+            # Build the manifest by hand rather than refusing: this is the
+            # documented escape hatch for a delivery the pattern cannot route.
+            manifest = {
+                "manifest_version": norm.MANIFEST_VERSION,
+                "feed": fd.name, "business_date": business_date.isoformat(),
+                "delivery_id": key.rsplit("/", 1)[-1], "received_at": None,
+                "source_object": key,
+                "parts": [{"object_key": key, "bytes": None}],
+                "format": {"delimiter": fd.delimiter, "quote_char": fd.quote_char,
+                           "header": fd.header, "encoding": fd.file_encoding},
+                "declared_row_count": None, "normalizer": "manual/v1",
+            }
+    if business_date is not None:
+        manifest = {**manifest, "business_date": business_date.isoformat()}
+    return manifest
+
+
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
            business_date: date | None = None, dry_run: bool = False,
            spark=None) -> dict:
     """Land one delivery into `raw` on its own Nessie branch, then merge.
+
+    `object_key` is a MANIFEST key under `ready/`, or a landing object key --
+    see `resolve_delivery`. Everything after that point reads the manifest and
+    never the filename: the business date, which objects hold the rows, and
+    the delimiter/quoting/encoding all come from it.
 
     `spark` is an OPTIONAL session to reuse. Pass one when ingesting several
     files in a row -- `scripts/_ingest_chunk.py` does -- and the caller owns
@@ -237,15 +288,14 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
 
     fd = get_feed(feed_name)
     run_id = run_id or new_run_id()
-    filename = object_key.rsplit("/", 1)[-1]
 
-    parsed = fd.parse_filename(filename)
-    if parsed is None and business_date is None:
+    manifest = resolve_delivery(fd, object_key, business_date)
+    bdate = date.fromisoformat(manifest["business_date"])
+    parts = manifest["parts"]
+    if not parts:
         raise ValueError(
-            f"Filename {filename!r} does not match feed {feed_name!r} pattern "
-            f"{fd.filename_pattern!r} and no --business-date was supplied."
-        )
-    bdate = business_date or parsed[0]
+            f"{fd.name}: manifest {object_key} lists no parts. Nothing to "
+            f"ingest; `ready/` is a cache, so delete it and re-normalize.")
 
     nessie = Nessie()
     _bootstrap_main_if_empty(nessie, fd, spark)
@@ -280,8 +330,26 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         ensure_raw_table(spark, fd, raw_at_branch)
         version = next_file_version(spark, fd, bdate, raw_at_branch)
 
-        df = read_landing(spark, fd, _landing_uri(object_key))
-        df, drift = reconcile_schema(df, fd)
+        # ONE DATAFRAME PER PART, each tagged with its OWN object key, then
+        # unioned. `_source_file` must be the object the rows actually came
+        # from -- `already_ingested` matches on it, so writing the manifest's
+        # key here would make every delivery look un-ingested forever and
+        # re-ingest on the next pass. With `kind: file` there is exactly one
+        # part and it is the landing key, which is what this column has always
+        # held.
+        frames, drift = [], {"missing_columns": [], "extra_columns": []}
+        for part in parts:
+            part_df = read_landing(spark, manifest["format"],
+                                   _landing_uri(part["object_key"]))
+            part_df, part_drift = reconcile_schema(part_df, fd)
+            frames.append(
+                part_df.withColumn("_source_file", F.lit(part["object_key"])))
+            for k in drift:
+                drift[k] += [c for c in part_drift[k] if c not in drift[k]]
+
+        df = frames[0]
+        for extra in frames[1:]:
+            df = df.unionByName(extra)
 
         # `schema_drift: fail` was documented in feeds.yml and listed in the
         # documented as "the fail branch is unexecuted code". It was worse than
@@ -314,7 +382,6 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         df = (
             df.withColumn("_business_date", F.lit(bdate.isoformat()).cast("date"))
               .withColumn("_ingest_ts", F.lit(datetime.now(timezone.utc)).cast("timestamp"))
-              .withColumn("_source_file", F.lit(object_key))
               .withColumn("_file_version", F.lit(version).cast("int"))
               .withColumn("_row_number", F.row_number().over(row_win).cast("bigint"))
               .withColumn("_batch_id", F.lit(run_id))
@@ -343,7 +410,14 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             "rows": row_count,
             "run_id": run_id,
             "branch": branch,
-            "source_file": object_key,
+            # The object the ROWS came from, which is what `_source_file`
+            # holds and what every existing caller prints. For `kind: file`
+            # that is the landing key, exactly as before -- not the manifest
+            # key that may have been passed in.
+            "source_file": parts[0]["object_key"],
+            "manifest": (object_key if object_key != parts[0]["object_key"]
+                         else None),
+            "parts": len(parts),
             "asset_uri": fd.asset_uri,
             **drift,
         }
@@ -360,7 +434,9 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser()
     p.add_argument("--feed", required=True)
-    p.add_argument("--object", required=True, help="object key under the landing prefix")
+    p.add_argument("--object", required=True,
+                   help="a manifest key under ready/, or a landing object key "
+                        "(normalized on the fly, not written to ready/)")
     p.add_argument("--run-id")
     p.add_argument("--business-date", type=lambda s: datetime.strptime(s, "%Y-%m-%d").date())
     p.add_argument("--dry-run", action="store_true")

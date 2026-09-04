@@ -139,12 +139,13 @@ const jpost = (path, body) => api(path, {
   method: "POST", headers: {"Content-Type": "application/json"},
   body: JSON.stringify(body ?? {})});
 
-let STATE = { feeds: [], selected: null, tab: "details", types: [] };
+let STATE = { feeds: [], conventions: [], selected: null, tab: "details", types: [] };
 
 // --------------------------------------------------------------- feed list
 async function loadFeeds(keep) {
   const data = await api("/api/feeds");
   STATE.feeds = data.feeds;
+  STATE.conventions = data.conventions || [];
   const list = $("#feed-list");
   list.textContent = "";
   for (const f of data.feeds) {
@@ -334,6 +335,15 @@ function feedForm(f, creating) {
     el("option", {value: v, selected: (f?.schema_drift ?? "warn") === v ? "selected" : null}, v)));
   const completeness = el("input", {type: "checkbox"});
   completeness.checked = f ? f.completeness : true;
+  // Closed list, never free text: a typo'd convention name is not an error the
+  // user would see, it is a silent revert to `defaults:` -- the feed loads and
+  // reads its files with the wrong delimiter. "(none)" is the empty string.
+  const convention = el("select", {}, [
+    el("option", {value: "", selected: (f?.convention ?? "") === "" ? "selected" : null},
+       "(none)"),
+    ...(STATE.conventions || []).map(v =>
+      el("option", {value: v, selected: (f?.convention ?? "") === v ? "selected" : null}, v)),
+  ]);
 
   // ---------------------------------------------------------- file format
   // These four reach Spark's reader unchanged. A wrong delimiter does not
@@ -376,6 +386,10 @@ function feedForm(f, creating) {
       "Lowercase with underscores. Becomes lakehouse.raw.<name>, DAG ingest_<name> and landing/<name>/."),
     field("description", "Description", desc),
     field("source_system", "Source system", src, "Becomes the DAG's tag."),
+    field("convention", "Convention", convention,
+      "Inherit this source system's delivery settings. Anything the "
+      + "convention sets is left out of this feed's own block, so it stays "
+      + "in one place."),
     el("div", {class: "field"}, [
       el("label", {}, "Example delivered filename"),
       el("div", {class: "row"}, [
@@ -620,6 +634,7 @@ function feedForm(f, creating) {
       expected_min_rows: Number(minRows.value || 0),
       cadence: cadence.value,
       schema_drift: drift.value,
+      convention: convention.value,
       completeness: completeness.checked,
       delimiter: readDelim(),
       quote_char: quote.value,

@@ -89,6 +89,9 @@ def list_landed(feed: Feed) -> list[dict[str, Any]]:
 def pending(feed: Feed) -> list[str]:
     """The real outstanding set. Starts a Spark application -- see the header.
 
+    Returns MANIFEST keys under `ready/`, not landing keys -- what the
+    platform ingests is a normalized delivery. See ingest/normalize.py.
+
     Two filters, both in `arrival.find_pending`: not already in the raw table,
     and inside the retention keep-set. The second is why a landed file can be
     correct, unmatched by anything, and still not pending: a delivery for a
