@@ -65,9 +65,20 @@ MANIFEST_VERSION = 1
 
 # One entry per delivery kind, mapping to the string recorded in the
 # manifest's `normalizer` field. Adding a kind is an entry here plus a
-# function, not a new branch in five places. The control-file gate is step 4
-# of docs/DELIVERY-SHAPES.md.
+# function, not a new branch in five places. The control-file gate (step 4 of
+# docs/DELIVERY-SHAPES.md) is orthogonal to this -- it modifies `kind: file`
+# rather than adding a kind, so it has no entry of its own.
 NORMALIZERS = {"file": "file/v1", "archive": "archive/v1"}
+
+
+class NotReady(Exception):
+    """The delivery has landed but is not yet safe to normalize.
+
+    Distinct from a normalization failure: nothing is wrong, the sender just
+    is not done. `reconcile()` catches this separately from every other
+    exception so a delivery waiting on its control file is reported as
+    waiting, not as failed -- see docs/DECISIONS.md#control-file-gate.
+    """
 
 
 def manifest_prefix(feed: Feed) -> str:
@@ -94,6 +105,78 @@ def _head(bucket: str, key: str) -> dict[str, Any]:
     return _client().head_object(Bucket=bucket, Key=key)
 
 
+def _stem(filename: str) -> str:
+    return filename[:filename.rindex(".")] if "." in filename else filename
+
+
+def is_control_file(feed: Feed, filename: str) -> bool:
+    """Whether `filename` is SHAPED like this feed's control file.
+
+    `pattern` is a regex template, not a literal one -- `delivery.control`
+    validates `pattern.format(stem="X")` as a regex, and
+    `'{stem}\\.ctl'.format(stem="TRADE_20260903")` gives
+    `'TRADE_20260903\\.ctl'`, where the backslash is the regex escape for the
+    dot, not a literal character in the filename. Treating it as a plain
+    string template -- looking for an object literally containing a backslash
+    -- was tried first and is wrong.
+
+    A control file itself never matches `filename_pattern`: it names no
+    business date, only says something about a delivery that does. Without
+    this, `inbox.route()` would reject it as unroutable and it would never
+    reach `landing/`, and the delivery it belongs to would wait on a control
+    file that can never arrive.
+    """
+    control = feed.delivery.get("control")
+    if not control:
+        return False
+    regex = control["pattern"].replace("{stem}", "(?P<stem>.+)")
+    return re.fullmatch(regex, filename) is not None
+
+
+def _find_control_key(feed: Feed, object_key: str) -> str | None:
+    """This delivery's control file, if it has landed alongside the data file.
+
+    Searches the SAME landing folder for a sibling matching `pattern` with
+    `{stem}` substituted for the data object's own stem -- never a fixed name,
+    or every delivery would race to look for the same control file. Returns
+    None rather than a not-yet-existing key: unlike a plain-CSV part, which
+    exists as soon as normalize runs, a control file may simply not be there
+    yet, and that is the ordinary case this whole mechanism exists for.
+    """
+    from reporting_platform.ingest.arrival import list_landing
+
+    dirname, filename = object_key.rsplit("/", 1)
+    stem = _stem(filename)
+    regex = re.compile(feed.delivery["control"]["pattern"].format(stem=re.escape(stem)))
+    for key in list_landing(feed):
+        if key == object_key or key.rsplit("/", 1)[0] != dirname:
+            continue
+        if regex.fullmatch(key.rsplit("/", 1)[-1]):
+            return key
+    return None
+
+
+def _declared_row_count(feed: Feed, control_key: str) -> int | None:
+    """The exact row count a control file declares, or None if it declares none.
+
+    `row_count` is optional on `delivery.control` -- some control files are
+    pure readiness gates with nothing to parse out of them.
+    """
+    row_count = feed.delivery["control"].get("row_count")
+    if row_count is None:
+        return None
+    body = _client().get_object(Bucket=_bucket(), Key=control_key)["Body"].read()
+    text = body.decode(feed.file_encoding, errors="replace")
+    m = re.search(row_count, text)
+    if not m:
+        raise ValueError(
+            f"{feed.name}: control file {control_key} does not match "
+            f"`delivery.control.row_count` {row_count!r}. The control file "
+            f"arrived but does not say what it was validated to say -- a "
+            f"format change upstream, not a timing problem.")
+    return int(m.group("rows"))
+
+
 def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
     """The pass-through normalizer: one landing object, one delivery, no copy.
 
@@ -109,6 +192,18 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
             f"cannot be normalized. Fix the pattern, or the file is not this "
             f"feed's.")
     business_date, _version = parsed
+
+    control_key = None
+    declared_row_count = None
+    if "control" in feed.delivery:
+        control_key = _find_control_key(feed, object_key)
+        if control_key is None:
+            raise NotReady(
+                f"{feed.name}: {filename} is waiting on a control file "
+                f"matching {feed.delivery['control']['pattern']!r} (stem "
+                f"{_stem(filename)!r}) in the same landing folder. Not a "
+                f"failure -- a late feed, not a failed one.")
+        declared_row_count = _declared_row_count(feed, control_key)
 
     head = _head(_bucket(), object_key)
     return {
@@ -133,8 +228,12 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
             "header": feed.header,
             "encoding": feed.file_encoding,
         },
-        # A control file would set this; nothing does yet (step 4).
-        "declared_row_count": None,
+        # What the control file declared, an OBSERVATION recorded once rather
+        # than re-read at ingest -- see the module header on why the manifest
+        # never holds derived state, only what arrived. None for a feed with
+        # no `delivery.control`, or one whose control file sets no row_count.
+        "control_object": control_key,
+        "declared_row_count": declared_row_count,
         "normalizer": NORMALIZERS["file"],
     }
 
@@ -240,6 +339,9 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
             "header": feed.header,
             "encoding": feed.file_encoding,
         },
+        # `delivery.control` is rejected for `kind: archive` at load
+        # (context.resolve_delivery_config), so both are always None here.
+        "control_object": None,
         "declared_row_count": None,
         "normalizer": NORMALIZERS["archive"],
     }
@@ -342,22 +444,34 @@ def reconcile(feed: Feed) -> dict[str, Any]:
     One unroutable file must not stop the other nineteen from being ingested;
     it is reported instead, and the unclaimed queue in step 5 is what turns
     that count into something actionable.
+
+    A `NotReady` delivery is counted separately from a failure, in its own
+    `awaiting_control` list, and logged at INFO rather than WARNING -- nothing
+    is wrong, the control file just has not landed yet, and this function
+    runs on every poll, so it would otherwise warn about the same ordinary
+    wait on every single pass.
     """
     landed = matching(feed, list_landing(feed))
     have = set(list_manifests(feed))
-    created, failed = [], []
+    created, failed, awaiting = [], [], []
     for key in landed:
         if manifest_key(feed, key) in have:
             continue
         try:
             created.append(write_manifest(feed, normalize(feed, key, write=False)))
+        except NotReady as exc:
+            awaiting.append({"object": key, "waiting_for": str(exc)})
         except Exception as exc:                               # noqa: BLE001
             failed.append({"object": key, "error": f"{type(exc).__name__}: {exc}"})
     if failed:
         log.warning("%s: %d landed object(s) could not be normalized: %s",
                     feed.name, len(failed), failed[:3])
+    if awaiting:
+        log.info("%s: %d delivery(ies) awaiting their control file: %s",
+                 feed.name, len(awaiting),
+                 [a["object"] for a in awaiting][:3])
     return {"feed": feed.name, "landed": len(landed),
-            "created": created, "failed": failed}
+            "created": created, "failed": failed, "awaiting_control": awaiting}
 
 
 def business_date_of(manifest: dict[str, Any]) -> date:

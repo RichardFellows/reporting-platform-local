@@ -1,12 +1,13 @@
 # Delivery shapes
 
-**Status: steps 1-3 built, steps 4-5 proposed.** Sections in the future
+**Status: steps 1-4 built, step 5 proposed.** Sections in the future
 tense describe work that does not exist yet. When a step lands, its section
 moves to the present tense and the reasoning moves to
 [DECISIONS.md](DECISIONS.md) — step 1 at
 [#feed-conventions](DECISIONS.md#feed-conventions), step 2 at
-[#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index). Step 3's
-reasoning has not moved yet — its section below is still the write-up.
+[#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index), step 4 at
+[#control-file-gate](DECISIONS.md#control-file-gate). Step 3's reasoning has
+not moved yet — its section below is still the write-up.
 
 Today a feed is [five files and no DAG edit](ADDING-A-FEED.md). That is cheap
 enough — until the delivery is a zip with the date on the container and no date
@@ -296,30 +297,49 @@ in `feeds.yml` uses `kind: archive` yet, so this has not been driven through
 MinIO, Spark and a real `ingest` end to end. That is the next thing to do
 before the BUILT marker above is fully earned.
 
-## 4. Control files
+## 4. Control files — **BUILT**
+
+The reasoning now lives at
+[DECISIONS.md#control-file-gate](DECISIONS.md#control-file-gate); what
+follows is what was built.
 
 ```yaml
 delivery:
   control:
-    pattern: '{stem}\.ctl'
-    row_count: 'ROWS=(?P<rows>\d+)'
+    pattern: '{stem}\.ctl'          # a REGEX template, {stem} substituted in
+    row_count: 'ROWS=(?P<rows>\d+)' # optional; a pure gate needs no row_count
 ```
 
-A normalizer that will not emit a manifest until the control file has also
-arrived and settled. **Readiness becomes one predicate in one place** — today
-`inbox` and `find_pending` each decide it independently, and this is the change
-that stops that from being two answers.
+Only on top of `kind: file`; combining `control:` with `kind: archive` is
+rejected at load as NOT BUILT, alongside archive's own unbuilt corners.
+`normalize()` will not emit a manifest until a sibling in the same landing
+folder matches `pattern`, and reads `declared_row_count` out of it where
+`row_count` is set. A missing control file raises `NotReady`, a new
+exception distinct from every other normalization failure, and `reconcile()`
+counts it separately in `awaiting_control` rather than `failed`.
 
-The declared row count is worth more than the gate. `expected_min_rows` is a
-floor chosen to catch a truncated file; a control file states the *exact*
-count, so `declared_row_count` becomes an equality check next to the existing
-floor (`ingest_feed.py:324`), where the branch is abandoned and `main` is
-untouched. Write-audit-publish already gives the right behaviour; this gives it
-a better assertion.
+The declared row count is an equality check next to `expected_min_rows`
+(`ingest_feed.py:404`), not a replacement for it — the floor still catches a
+truncated file on a feed with no control file at all.
 
-A control file that never arrives is a **late feed, not a failed one**. It
-times out through the existing `arrival_timeout_hours: 26` path — deliberately
-longer than a day for exactly this reason — rather than failing fast.
+**A late control file does not fail the run.** `feed_ingest.py`'s
+`normalize_task` catches `NotReady` and skips rather than propagating it into
+`DEFAULT_ARGS`' two retries at `RETRY_DELAY`, which would otherwise turn "not
+here yet" into a hard failure in well under a minute. The safety-net poll
+path already built for every other feed — `find_pending`, reached from
+`resolve_arrival`'s no-conf fallback, or `scripts.bulk_ingest` — is what
+picks the delivery up once the control file actually lands, however long
+that takes. `arrival_timeout_hours` is **not** what does this: it is a
+config field nothing reads, and a first pass at this section claimed
+otherwise before that was checked against the code.
+
+`inbox.route()` needed a second check for this to work locally at all: a
+control file matches no feed's `filename_pattern` and would otherwise be
+rejected to `.rejected/` and never reach `landing/`, permanently starving
+the delivery it belongs to.
+
+Not yet verified on the live stack — same caveat as step 3, and for the same
+reason: no feed in `feeds.yml` uses `delivery.control` yet.
 
 ## 5. Onboard from a real file
 
@@ -359,7 +379,7 @@ ticket, as a file nobody expected.
 | 1 | `conventions:` tier | **Built.** No new runtime concept. Makes 2-5 cheap to express. Useful even if nothing else is built. |
 | 2 | `ready/` + manifest + normalize stage, pass-through only | **Built.** The architecture. Behaviour-preserving, verified against the live stack before anything new depends on it. |
 | 3 | Archive normalizer | **Built**, not yet live-verified. The zip case. First normalizer that copies bytes. |
-| 4 | Control-file normalizer | Readiness in one place, and the exact-count assertion. |
+| 4 | Control-file normalizer | **Built**, not yet live-verified. Readiness in one place, and the exact-count assertion. |
 | 5 | Sniffer + unclaimed queue | A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
 
 Steps 3-5 are each *one normalizer* because step 2 built the stage. That is the

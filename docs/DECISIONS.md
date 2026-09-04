@@ -1418,3 +1418,106 @@ with real zip bytes through Python's `zipfile` -- no feed in `feeds.yml` uses
 `kind: archive` yet, so this has not been driven through MinIO, Spark, and a
 real `ingest` end to end. That is the next thing to do before trusting it,
 not an assumption to carry forward.
+
+## control-file-gate
+
+Step 4 of `docs/DELIVERY-SHAPES.md`: a normalizer that will not emit a
+manifest until a second object -- the control file -- has also arrived, and
+that reads an exact row count out of it where the sender provides one.
+`delivery: {control: {pattern: '{stem}\.ctl', row_count: 'ROWS=(?P<rows>\d+)'}}`,
+on top of `kind: file` only; combining it with `kind: archive` is rejected at
+load as NOT BUILT, the same vocabulary `context.NOT_BUILT` already uses for
+the archive normalizer's own unbuilt corners.
+
+**`pattern` is a regex template, not a literal filename template, and getting
+that backwards was the first draft.** `'{stem}\.ctl'.format(stem="X")` gives
+`'X\.ctl'` -- the backslash is the regex escape for the dot, not a character
+in any real filename. `_find_control_key` (`ingest/normalize.py:136`)
+substitutes `{stem}` with the DATA file's own stem, `re.escape`d, and then
+matches that regex, full match, against the other objects in the same
+landing folder -- it does not construct one candidate key and `HEAD` it. That
+is also why `resolve_delivery_config` validates `pattern.format(stem="X")`
+as a compilable regex rather than just checking it is a non-empty string:
+the validation and the runtime behaviour have to agree on what kind of
+string this is.
+
+**`NotReady` is not `ValueError`, on purpose, and it is a new exception
+rather than a sentinel return.** A missing control file is not a
+normalization failure -- nothing is wrong, the sender is not done -- and the
+two must not collapse into one code path with one log line. `reconcile()`
+(`ingest/normalize.py:reconcile`) catches it separately into its own
+`awaiting_control` list, logged at INFO rather than WARNING, because
+`reconcile` runs on every poll and would otherwise warn about the same
+ordinary wait forever. A control file that HAS arrived but does not match
+`row_count` is the opposite case -- the sender said something and it was
+wrong -- and stays a `ValueError`: a format change upstream, not a timing
+problem, and conflating the two would make a real break look like an
+ordinary wait that will clear on its own.
+
+**The exact count is an equality check next to `expected_min_rows`, not a
+replacement for it.** `expected_min_rows` is a floor chosen to catch a
+truncated file and exists whether or not a feed has a control file;
+`declared_row_count`, read back from the manifest at `ingest_feed.py:404`,
+only exists for a feed with `delivery.control.row_count` whose control file
+matched it. Both checks abandon the branch and leave `main` untouched, same
+as every other load-time refusal here.
+
+**The manifest records `control_object` and `declared_row_count` as
+OBSERVATIONS, never as an ingested flag** -- consistent with
+[#ready-is-a-derived-index](#ready-is-a-derived-index)'s manifest philosophy,
+which already listed "what a control file declared" among the things a
+manifest is *for* before this step existed to produce one. Both are `None`
+for `kind: archive` (rejected at load, so structurally always `None`) and for
+a `kind: file` feed with no `delivery.control` at all.
+
+### The gap this closes, and the one it does not
+
+**A control-gated delivery cannot be allowed to fail hard just because it is
+early.** `docs/DELIVERY-SHAPES.md`'s original description of this step said
+a late control file "times out through the existing `arrival_timeout_hours:
+26` path" -- checked while building this, and that path does not exist.
+`arrival_timeout_hours` is a `Feed` field with a default and nothing else;
+grep for it and every hit is a comment or a docstring. That claim is
+corrected here rather than carried forward, per CLAUDE.md's own habit: a
+guard -- or in this case an explanation -- written against a documented
+mechanism rather than the working one produces a false sense of safety.
+
+What actually prevents a hard failure: `airflow/dags/feed_ingest.py`'s
+`normalize_task` catches `NotReady` and raises `AirflowSkipException` rather
+than letting it propagate. Without that, `DEFAULT_ARGS` retries twice at
+`RETRY_DELAY` -- seconds, tuned for a transient infra hiccup -- which would
+turn "the control file is not here yet" into a hard-failed DAG run in well
+under a minute, for the ordinary case this mechanism exists to handle
+gracefully. Skipping leaves nothing further asked of that run; the delivery
+is picked up later by the same safety-net poll path that already exists for
+every other feed -- `resolve_arrival`'s `find_pending` fallback, or
+`scripts.bulk_ingest` -- which reconciles `ready/` again and finds the
+control file whenever it actually lands. `arrival_timeout_hours` remains
+exactly as unenforced as it was before this step; nothing here reads it
+either, and turning it into an actual timeout -- distinguishing "still
+waiting" from "will now never arrive" -- is a real gap, not a solved one.
+
+**Inbox routing is a second gap `route()`'s data-file-only matching created,
+and it had to be closed for this to work at all locally.** A control file
+never matches any feed's `filename_pattern` -- it names no business date --
+so `inbox.py`'s original `route()` would reject it to `.rejected/` and it
+would never reach `landing/`, permanently starving the delivery it belongs
+to. `is_control_file` (`ingest/normalize.py:111`) gives `route()` a second
+check once no `filename_pattern` claims the name, and `inbox._trigger` is
+called with `key=None` for a control file rather than the file's own key --
+that key names no delivery, and handing it to `resolve_arrival` as an
+`object_key` would try to normalize the control file itself as if it were
+the data file, which fails immediately (`parse_filename` rejects it). `None`
+routes the run through `resolve_arrival`'s `find_pending` fallback instead,
+which is exactly the safety-net poll described above, reached from the
+inbox-triggered path rather than only from a schedule or a manual run. This
+also incidentally fixes the earlier-triggered, now-skipped run for the data
+file: nothing was going to re-trigger it, and the control file's own arrival
+now does.
+
+Not yet verified on the live stack, for the same reason as the archive
+normalizer: no feed in `feeds.yml` uses `delivery.control` yet, only
+`tests/test_control.py` against `tests/fakes3.py`. In particular, whether an
+inbox-triggered run genuinely skips cleanly rather than failing -- the whole
+point of the `AirflowSkipException` change -- has not been watched happen
+against a real Airflow scheduler.

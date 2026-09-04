@@ -141,7 +141,21 @@ def build_feed_dag(feed):
             what makes a retry safe and what lets the same task serve both the
             triggered path (a landing key from the inbox) and the manual one
             (a manifest key from `pending`).
+
+            A delivery waiting on its control file (`delivery.control`, step 4
+            of docs/DELIVERY-SHAPES.md) SKIPS rather than fails. `DEFAULT_ARGS`
+            retries twice at `RETRY_DELAY` -- seconds, tuned for a transient
+            infra hiccup -- which would turn "the control file has not landed
+            yet" into a hard failure long before `arrival_timeout_hours` (26h)
+            says this delivery is actually late. Skipping leaves this run
+            asking nothing further; the safety-net poll path
+            (`resolve_arrival`'s `find_pending` fallback above, or
+            `scripts.bulk_ingest`) is what picks the delivery up once the
+            control file lands, same as for a landing object nobody triggered
+            a run for at all.
             """
+            from airflow.exceptions import AirflowSkipException
+
             from reporting_platform.common.context import feed as get_feed
             from reporting_platform.ingest import normalize as norm
 
@@ -149,7 +163,10 @@ def build_feed_dag(feed):
             key = arrival["object_key"]
             if norm.is_manifest_key(fd, key):
                 return {**arrival, "normalized": False}
-            manifest = norm.normalize(fd, key)
+            try:
+                manifest = norm.normalize(fd, key)
+            except norm.NotReady as exc:
+                raise AirflowSkipException(str(exc)) from exc
             return {"object_key": norm.manifest_key(fd, key),
                     "business_date": arrival.get("business_date"),
                     "normalized": True,

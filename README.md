@@ -235,7 +235,7 @@ rather than loud:
 | **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the five files a new feed touches, in order, with a worked example |
 | **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same five files through a form, plus land/ingest/build buttons |
-| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | conventions, the `landing/`+`ready/` split, and the archive normalizer are built; control files and the onboarding sniffer are still proposed |
+| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | conventions, the `landing/`+`ready/` split, the archive normalizer and the control-file gate are built; the onboarding sniffer is still proposed |
 | [notebooks/explore.py](notebooks/explore.py) | marimo notebook on :8083 — query landing files and every Iceberg layer through one read-only DuckDB session |
 | [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |

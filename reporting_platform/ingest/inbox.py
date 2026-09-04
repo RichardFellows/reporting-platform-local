@@ -53,6 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from reporting_platform.common.context import Feed, feeds
+from reporting_platform.ingest import normalize as norm
 from reporting_platform.ingest.arrival import put_landing
 
 log = logging.getLogger("inbox")
@@ -72,22 +73,38 @@ def _skip(path: Path) -> bool:
             or path.name.endswith((".tmp", ".part", ".crdownload", ".filepart")))
 
 
-def route(filename: str) -> tuple[Feed | None, str | None]:
+def route(filename: str) -> tuple[Feed | None, str | None, bool]:
     """Which feed claims this filename, by the feeds' own patterns.
 
-    Returns (feed, reason-it-was-rejected). Exactly one of the two is set.
+    Returns (feed, reason-it-was-rejected, is_control). Exactly one of the
+    first two is set. A CONTROL file never matches `filename_pattern` -- it
+    names no business date, only says something about a delivery that does --
+    so it is checked separately, after data files, once no feed's
+    filename_pattern claims it. See ingest/normalize.py:is_control_file.
     """
     matched = [fd for fd in feeds().values() if fd.parse_filename(filename)]
-    if not matched:
-        return None, ("matches no feed's filename_pattern -- check the name, "
-                      "or the pattern in feeds.yml")
     if len(matched) > 1:
         return None, ("matches more than one feed ("
                       + ", ".join(sorted(f.name for f in matched))
                       + ") -- overlapping filename_patterns are a "
                         "configuration error, and guessing would put the "
-                        "delivery in the wrong raw table")
-    return matched[0], None
+                        "delivery in the wrong raw table"), False
+    if matched:
+        return matched[0], None, False
+
+    control_matched = [fd for fd in feeds().values()
+                       if norm.is_control_file(fd, filename)]
+    if len(control_matched) > 1:
+        return None, ("matches more than one feed's control pattern ("
+                      + ", ".join(sorted(f.name for f in control_matched))
+                      + ") -- overlapping delivery.control.pattern is a "
+                        "configuration error, and guessing would gate the "
+                        "wrong feed's delivery"), False
+    if control_matched:
+        return control_matched[0], None, True
+
+    return None, ("matches no feed's filename_pattern or control pattern -- "
+                  "check the name, or the pattern in feeds.yml"), False
 
 
 def _move(path: Path, folder: str, feed_name: str | None = None) -> Path:
@@ -103,8 +120,16 @@ def _move(path: Path, folder: str, feed_name: str | None = None) -> Path:
     return dest
 
 
-def _trigger(feed: Feed, key: str) -> dict:
-    """Unpause if needed, then trigger one run for this object.
+def _trigger(feed: Feed, key: str | None) -> dict:
+    """Unpause if needed, then trigger one run.
+
+    `key` is the DATA object to ingest, and is what `resolve_arrival` acts on
+    directly. Pass None for a CONTROL file: it names no delivery of its own,
+    so the run falls back to `resolve_arrival`'s `find_pending` path instead,
+    which reconciles `ready/` and picks up whichever waiting delivery this
+    control file has just unblocked -- including one from an earlier, already
+    -triggered run that hit `normalize.NotReady` and was skipped rather than
+    retried into it.
 
     Imports the console's orchestration module rather than opening a second
     HTTP client: there is one definition of how this platform talks to
@@ -121,7 +146,8 @@ def _trigger(feed: Feed, key: str) -> dict:
     if dag.get("is_paused"):
         orchestration.set_paused(dag_id, False)
         unpaused = True
-    run = orchestration.trigger(dag_id, conf={"object_key": key},
+    conf = {"object_key": key} if key else {}
+    run = orchestration.trigger(dag_id, conf=conf,
                                 note="dropped into the inbox")
     return {"triggered": True, "dag_id": dag_id, "unpaused": unpaused,
             "run_id": run.get("dag_run_id")}
@@ -152,7 +178,7 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
             seen[path.name] = (stat.st_size, stat.st_mtime, count + 1)
             continue
 
-        feed, reason = route(path.name)
+        feed, reason, is_control = route(path.name)
         if feed is None:
             log.warning("rejecting %s: %s", path.name, reason)
             if not dry_run:
@@ -181,9 +207,13 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
         moved = _move(path, PROCESSED, feed.name)
         seen.pop(path.name, None)
         outcome = {"file": path.name, "status": "landed", "feed": feed.name,
-                   "key": key, "moved_to": str(moved.relative_to(INBOX))}
-        outcome.update(_trigger(feed, key))
-        log.info("landed %s -> %s%s", path.name, key,
+                   "key": key, "moved_to": str(moved.relative_to(INBOX)),
+                   "is_control": is_control}
+        # A control file names no delivery of its own -- see _trigger's
+        # docstring for why the run gets no object_key.
+        outcome.update(_trigger(feed, None if is_control else key))
+        log.info("landed %s -> %s%s%s", path.name, key,
+                 " (control file)" if is_control else "",
                  "" if outcome.get("triggered") else
                  f" (NOT triggered: {outcome.get('reason')})")
         results.append(outcome)

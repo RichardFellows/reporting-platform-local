@@ -254,7 +254,8 @@ def resolve_delivery(fd, key: str, business_date: date | None = None) -> dict:
                 "parts": [{"object_key": key, "bytes": None}],
                 "format": {"delimiter": fd.delimiter, "quote_char": fd.quote_char,
                            "header": fd.header, "encoding": fd.file_encoding},
-                "declared_row_count": None, "normalizer": "manual/v1",
+                "control_object": None, "declared_row_count": None,
+                "normalizer": "manual/v1",
             }
     if business_date is not None:
         manifest = {**manifest, "business_date": business_date.isoformat()}
@@ -393,6 +394,19 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             raise ValueError(
                 f"{fd.name} {bdate}: {row_count} rows, below expected minimum "
                 f"{fd.expected_min_rows}. Branch {branch} left for inspection."
+            )
+
+        # The EXACT count next to the floor above. expected_min_rows catches a
+        # truncated file; a control file states what the sender actually
+        # counted, so this is an equality check, not another floor. Only a
+        # feed with `delivery.control.row_count` and a control file that
+        # matched it has one -- see ingest/normalize.py.
+        declared = manifest.get("declared_row_count")
+        if declared is not None and row_count != declared:
+            raise ValueError(
+                f"{fd.name} {bdate}: {row_count} rows read, control file "
+                f"{manifest.get('control_object')} declared {declared}. "
+                f"Branch {branch} left for inspection; main is untouched."
             )
 
         if dry_run:

@@ -205,7 +205,8 @@ def split_columns(declared: list) -> tuple[list[str], dict[str, str]]:
 DELIVERY_KINDS = ("file", "archive")
 BUSINESS_DATE_FROM = ("container",)
 PARTS_MODES = ("concat",)
-DELIVERY_KEYS = {"kind", "member_pattern", "business_date_from", "parts"}
+DELIVERY_KEYS = {"kind", "member_pattern", "business_date_from", "parts", "control"}
+CONTROL_KEYS = {"pattern", "row_count"}
 
 # Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
 # error can say "not built" rather than "unknown", which are different
@@ -289,6 +290,71 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
             f"feeds.yml: feed {feed_name!r} sets `member_pattern` with "
             f"`kind: {out['kind']}`. It is only read for archives, so leaving "
             f"it here would suggest a filter that never runs.")
+
+    control = delivery.get("control")
+    if control is not None:
+        if out["kind"] != "file":
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} sets `delivery.control` with "
+                f"`kind: {out['kind']}`. Gating an archive on a control file "
+                f"is described in docs/DELIVERY-SHAPES.md but NOT BUILT -- "
+                f"only `kind: file` reads `control:`.")
+        out["control"] = _resolve_control(feed_name, control)
+    return out
+
+
+def _resolve_control(feed_name: str, control: Any) -> dict[str, str]:
+    """Validate a `delivery.control` block and fill its defaults.
+
+    Same reasoning as the rest of `delivery:`: every key here is read by
+    `ingest/normalize.py`, so a typo must fail at load rather than silently
+    never gating anything.
+    """
+    if not isinstance(control, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery.control` must be a "
+            f"mapping, got {type(control).__name__}")
+
+    unknown = set(control) - CONTROL_KEYS
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery.control` has unknown "
+            f"key(s) {', '.join(sorted(unknown))}. Valid: "
+            f"{', '.join(sorted(CONTROL_KEYS))}")
+
+    pattern = control.get("pattern")
+    if not pattern or not isinstance(pattern, str):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery.control` sets no "
+            f"`pattern`. Which control file belongs to a delivery is not "
+            f"guessable.")
+    if "{stem}" not in pattern:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery.control.pattern` "
+            f"{pattern!r} does not reference `{{stem}}` -- without it every "
+            f"delivery for this feed would look for the same control filename.")
+    try:
+        re.compile(pattern.format(stem="X"))
+    except re.error as exc:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `delivery.control.pattern` is not "
+            f"a valid regex once `{{stem}}` is filled in: {exc}") from exc
+
+    out = {"pattern": pattern}
+    row_count = control.get("row_count")
+    if row_count is not None:
+        try:
+            compiled = re.compile(row_count)
+        except re.error as exc:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `delivery.control.row_count` "
+                f"is not a valid regex: {exc}") from exc
+        if "rows" not in compiled.groupindex:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `delivery.control.row_count` "
+                f"{row_count!r} has no `(?P<rows>...)` group -- that is the "
+                f"only thing normalize reads out of a match.")
+        out["row_count"] = row_count
     return out
 
 
