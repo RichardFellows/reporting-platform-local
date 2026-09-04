@@ -259,12 +259,14 @@ services:
       REPORTING_SEED_DIR: /opt/platform/seed
       SPARK_MASTER: spark://spark-master:7077
       DBT_TARGET: ${DBT_TARGET:-spark_local}
-      # So reporting_platform/ingest/sniff.py (docs/DELIVERY-SHAPES.md step 5)
-      # can read `s3://lakehouse/...` directly through the same DuckDB
-      # connection recipe the notebook service uses -- see
-      # scripts/duckdb_console.py:connect(). Nothing here uses it yet; this
-      # is the prerequisite, not the wiring.
-      REPORTING_DUCKDB_S3_SECRET: "1"
+      # The console's onboarding sniffer (ingest/sniff.py, unclaimed
+      # deliveries in .rejected/) fetches bytes with boto3 -- the same
+      # client ingest/arrival.py already uses -- rather than through
+      # DuckDB's own S3 support, so it needs no REPORTING_DUCKDB_S3_SECRET.
+      # An earlier draft set it here on the assumption the sniffer would
+      # read `s3://...` directly; it does not, so it was removed rather
+      # than left as a setting nothing reads.
+      REPORTING_INBOX: /opt/platform/inbox
       # Host-side URLs, rendered for the BROWSER -- nothing inside the network
       # otherwise knows the host mapping.
       MINIO_CONSOLE_URL: http://localhost:${MINIO_CONSOLE_HOST_PORT:-19001}
@@ -274,6 +276,22 @@ services:
       AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
       AIRFLOW_API_USER: admin
       AIRFLOW_API_PASSWORD: admin
+    # A service's own `volumes:` also REPLACES the anchored one wholesale, so
+    # this restates x-airflow-common's list and adds one: `./inbox`, READ-ONLY,
+    # so the console's unclaimed-deliveries queue can list and sniff whatever
+    # is sitting in `.rejected/` -- inbox.py itself keeps the read-write mount,
+    # since it is the one that moves files into that folder.
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./reporting_platform:/opt/platform/reporting_platform
+      - ./scripts:/opt/platform/scripts
+      - ./tests:/opt/platform/tests:ro
+      - ./dbt:/opt/platform/dbt
+      - ./seed:/opt/platform/seed
+      - ./seed_clean:/opt/platform/seed_clean
+      - airflow-logs:/opt/airflow/logs
+      - dbt-packages:/opt/platform/run/packages
+      - ./inbox:/opt/platform/inbox:ro
     ports: ["${FEED_UI_HOST_PORT:-8082}:8082"]
     restart: unless-stopped
 

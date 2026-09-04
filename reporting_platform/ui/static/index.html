@@ -106,6 +106,7 @@
 <main>
   <aside>
     <button class="newbtn" id="new-feed">+ New feed</button>
+    <button class="newbtn" id="unclaimed-btn">Unclaimed deliveries</button>
     <div id="feed-list"></div>
   </aside>
   <section class="detail" id="detail"><div class="empty">Select a feed, or add one.</div></section>
@@ -453,20 +454,65 @@ function feedForm(f, creating) {
   for (const c of (f?.columns ?? []))
     addColRow(c, (f?.column_types ?? {})[c] ?? "", (f?.source_columns ?? {})[c] ?? "");
 
-  const upload = el("input", {type: "file", accept: ".csv,.txt,.dat,text/csv,text/plain"});
+  // `raw` is the actual character sniff_csv detected -- a real tab, not the
+  // two-character "\t" the form's own DELIMS list and `readDelim()` use to
+  // display one. Same conversion `applyPaste` below already does the other
+  // way.
+  function setDelimiterField(raw) {
+    const shown = raw === "\t" ? "\\t" : raw;
+    const known = DELIMS.some(([v]) => v === shown);
+    delim.value = known ? shown : "";
+    delimOther.value = known ? "" : shown;
+    syncDelim();
+  }
+
+  const upload = el("input", {type: "file",
+    accept: ".csv,.txt,.dat,.zip,text/csv,text/plain,application/zip"});
+  const sniffNote = el("div", {class: "sub", style: "font-size:12px;margin-top:6px"});
   upload.addEventListener("change", async () => {
     if (!upload.files.length) return;
     const fd = new FormData();
     fd.append("file", upload.files[0]);
-    // Without these the server splits on a comma whatever the file is, and a
-    // pipe-delimited delivery yields one column named after the whole header.
-    fd.append("delimiter", readDelim());
-    fd.append("file_encoding", encoding.value.trim() || "utf-8");
-    const r = await api("/api/infer-columns", {method: "POST", body: fd});
+    // /api/sniff reads real VALUES -- delimiter, quote, header, encoding and
+    // per-column types from what the file actually contains, not from what
+    // was already typed into the form -- see docs/DECISIONS.md#the-sniffer.
+    // /api/infer-columns (header names only) is still there for anything
+    // sniff_csv cannot make sense of, but the form itself no longer calls it.
+    let r;
+    try { r = await api("/api/sniff", {method: "POST", body: fd}); }
+    catch (err) {
+      sniffNote.textContent = "✗ " + err.message;
+      sniffNote.style.color = "var(--bad)";
+      return;
+    }
+    setDelimiterField(r.delimiter);
+    quote.value = r.quote_char;
+    encoding.value = r.file_encoding;
+    hasHeader.checked = r.header;
     colsBox.textContent = "";
     for (const c of r.columns)
       addColRow(c, r.column_types[c], (r.source_columns || {})[c] || "");
     refreshKeyChoices();
+    if (!pattern.value.trim() && r.filename_pattern) pattern.value = r.filename_pattern;
+
+    const bits = [];
+    if (r.business_key_candidates && r.business_key_candidates.length)
+      bits.push("business key candidate(s): " + r.business_key_candidates.join(", "));
+    if (r.encoding_confidence === "low")
+      bits.push(`encoding guessed as ${r.file_encoding} -- low confidence, double-check it`);
+    if (r.archive_members) {
+      bits.push(`archive: ${r.archive_members.length} member(s), sniffed from ` +
+        `"${r.sniffed_member}". member_pattern candidate: ` +
+        `${r.member_pattern_candidate || "(none)"}. This form cannot create an ` +
+        "archive feed yet -- add a delivery: block to feeds.yml by hand after " +
+        "creating this feed with the columns/types above. See docs/DELIVERY-SHAPES.md.");
+      if (!r.container_has_date)
+        bits.push("the container's filename has no 8-digit date -- " +
+          "business_date_from: container, the only value this platform reads, " +
+          "will not work for it");
+    }
+    sniffNote.textContent = "Sniffed from real values." + (bits.length ? " " + bits.join(" · ") : "");
+    sniffNote.style.color = "var(--muted)";
   });
 
   // Paste a header row instead of clicking "+ column" once per column. The
@@ -515,9 +561,10 @@ function feedForm(f, creating) {
     colsBox,
     el("div", {class: "row"}, [
       el("button", {class: "act", onclick: () => { addColRow(); refreshKeyChoices(); }}, "+ column"),
-      el("span", {class: "sub", style: "font-size:12px"}, "or read the header from a CSV:"),
+      el("span", {class: "sub", style: "font-size:12px"}, "or sniff a real delivery (csv or zip):"),
       el("div", {style: "flex:1;min-width:200px"}, upload),
     ]),
+    sniffNote,
     el("div", {class: "row", style: "margin-top:6px"}, [
       el("div", {style: "flex:1;min-width:240px"}, paste),
       el("button", {class: "act", onclick: applyPaste}, "add list"),
@@ -654,7 +701,12 @@ function feedForm(f, creating) {
 }
 
 // ------------------------------------------------------------ new feed
-function newFeed() {
+// `draft` pre-fills the form from a sniffed proposal (see showUnclaimed
+// below) -- everything feedForm already reads off `f?.xxx` for an existing
+// feed works unchanged for a proposal shaped the same way. Business key
+// CANDIDATES are shown as a note, never auto-selected: several independently
+// -unique columns is not the same claim as "together they are the key".
+function newFeed(draft) {
   STATE.selected = null;
   loadFeeds();
   const d = $("#detail");
@@ -663,7 +715,32 @@ function newFeed() {
            el("div", {class: "sub"},
               "Writes feeds.yml, the dbt source, a prepared model and its tests — the " +
               "five files in docs/ADDING-A-FEED.md."));
-  const form = feedForm(null, true);
+  if (draft) {
+    // feedForm reads `f ? f.completeness : true` (a truthy-f check, not
+    // `f?.completeness ?? true`), so a draft that never sets `completeness`
+    // -- sniffing has no opinion on delivery cadence -- would silently
+    // uncheck it rather than default it, opting the new feed OUT of the
+    // completeness check with nothing on screen explaining why.
+    if (draft.completeness === undefined) draft.completeness = true;
+    const bits = [`Pre-filled by sniffing "${draft._sniffedFrom}".`];
+    if (draft.business_key_candidates && draft.business_key_candidates.length)
+      bits.push("business key candidate(s): " + draft.business_key_candidates.join(", "));
+    if (draft.encoding_confidence === "low")
+      bits.push(`encoding guessed as ${draft.file_encoding} -- low confidence, double-check it`);
+    if (draft.archive_members) {
+      bits.push(`archive: ${draft.archive_members.length} member(s), sniffed from ` +
+        `"${draft.sniffed_member}". member_pattern candidate: ` +
+        `${draft.member_pattern_candidate || "(none)"}. This form cannot create an ` +
+        "archive feed yet -- add a delivery: block to feeds.yml by hand after " +
+        "creating this feed with the columns/types below. See docs/DELIVERY-SHAPES.md.");
+      if (!draft.container_has_date)
+        bits.push("the container's filename has no 8-digit date -- " +
+          "business_date_from: container, the only value this platform reads, " +
+          "will not work for it");
+    }
+    d.append(el("div", {class: "note"}, bits.join(" · ")));
+  }
+  const form = feedForm(draft ?? null, true);
   d.append(form.node);
   const out = el("div");
   d.append(el("div", {class: "row"}, [
@@ -684,6 +761,65 @@ function newFeed() {
       });
     }}, "Create feed"),
   ]), out);
+}
+
+// ------------------------------------------------------ unclaimed deliveries
+// docs/DELIVERY-SHAPES.md#5-onboard-from-a-real-file: "the moment a new feed
+// actually appears in real life -- not as a ticket, as a file nobody
+// expected." Files in the inbox's `.rejected/` folder -- landed nowhere,
+// claimed by no feed's filename_pattern or control pattern.
+async function showUnclaimed() {
+  STATE.selected = null;
+  loadFeeds();
+  const d = $("#detail");
+  d.textContent = "";
+  d.append(el("h2", {}, "Unclaimed deliveries"),
+           el("div", {class: "sub"},
+              "Files dropped into the inbox that matched no feed's filename_pattern " +
+              "or control pattern, so they were moved to .rejected/ instead of landing. " +
+              "Sniff one to pre-fill a new feed from its real values."));
+  const box = el("div", {class: "scroll", style: "margin-top:14px"});
+  d.append(box);
+  let data;
+  try { data = await api("/api/unclaimed"); }
+  catch (err) { box.append(el("div", {class: "note warn"}, err.message)); return; }
+  const items = data.unclaimed || [];
+  if (!items.length) {
+    box.append(el("div", {class: "empty"}, "Nothing unclaimed right now."));
+    return;
+  }
+  const table = el("table");
+  table.append(el("tr", {}, [
+    el("th", {}, "File"), el("th", {}, "Size"), el("th", {}, "Why it was rejected"), el("th", {}),
+  ]));
+  for (const it of items) {
+    const status = it.now_claimed_by
+      ? el("span", {class: "pill ok"}, `now claimed by ${it.now_claimed_by}`)
+      : it.now_routes_as_control
+      ? el("span", {class: "pill warn"}, "now routes as a control file")
+      : el("span", {class: "sub"}, it.reason || "");
+    const btn = el("button", {class: "act primary"}, "Sniff → New feed");
+    btn.disabled = !!(it.now_claimed_by || it.now_routes_as_control);
+    if (btn.disabled)
+      btn.title = "feeds.yml has changed since this was rejected -- drop it into the inbox again instead of sniffing it here.";
+    btn.addEventListener("click", (e) => sniffUnclaimed(it.filename, e.target));
+    table.append(el("tr", {}, [
+      el("td", {class: "mono"}, it.filename),
+      el("td", {}, `${it.bytes} B`),
+      el("td", {}, status),
+      el("td", {}, btn),
+    ]));
+  }
+  box.append(table);
+}
+
+async function sniffUnclaimed(filename, btn) {
+  await withBusy(btn, async () => {
+    try {
+      const r = await jpost(`/api/unclaimed/${encodeURIComponent(filename)}/sniff`);
+      newFeed({...r, _sniffedFrom: filename});
+    } catch (err) { alert(err.message); }
+  });
 }
 
 function renderValidation(target, v) {
@@ -1220,7 +1356,8 @@ async function health() {
       if (a && l[k]) a.href = l[k] + (suffix[k] || "");
     }
   }).catch(() => { /* the hardcoded defaults stand */ });
-  $("#new-feed").addEventListener("click", newFeed);
+  $("#new-feed").addEventListener("click", () => newFeed());
+  $("#unclaimed-btn").addEventListener("click", showUnclaimed);
   await loadFeeds();
   health();
   setInterval(health, 20000);

@@ -1,9 +1,11 @@
 # Delivery shapes
 
-**Status: steps 1-4 built, step 5 partially built** (the sniffer backend;
-the console wiring is not). Sections in the future tense describe work that
-does not exist yet. When a step lands, its section moves to the present
-tense and the reasoning moves to [DECISIONS.md](DECISIONS.md) — step 1 at
+**Status: all five steps built**, except one real gap step 5 surfaced but
+did not fix: the console has no `delivery:` field, so it cannot CREATE an
+archive or control-gated feed through the form. Sections in the future
+tense describe work that does not exist yet. When a step lands, its section
+moves to the present tense and the reasoning moves to
+[DECISIONS.md](DECISIONS.md) — step 1 at
 [#feed-conventions](DECISIONS.md#feed-conventions), step 2 at
 [#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index), step 4 at
 [#control-file-gate](DECISIONS.md#control-file-gate), the sniffer at
@@ -350,7 +352,7 @@ file declaring the wrong count aborted cleanly with `main` untouched. See
 [DECISIONS.md#control-file-gate](DECISIONS.md#control-file-gate) for what
 was checked.
 
-## 5. Onboard from a real file — **PARTIALLY BUILT**: the sniffer backend
+## 5. Onboard from a real file — **BUILT**, except console support for `delivery:`
 
 The reasoning now lives at
 [DECISIONS.md#the-sniffer](DECISIONS.md#the-sniffer); what follows is what
@@ -375,22 +377,46 @@ non-null
 ([DECISIONS.md#resolve-types-is-authoritative](DECISIONS.md#resolve-types-is-authoritative)).
 With a real file in hand the guess can simply be right.
 
-Verified against real data on the live stack: pointed at a landed
-`fo_trade` delivery in MinIO through `s3://lakehouse/...`, using the same
-DuckDB connection `scripts/duckdb_console.connect()` builds
-(`REPORTING_DUCKDB_S3_SECRET`, now also set for `feed-ui`, not only
-`notebook`) -- correct delimiter, correct per-column types read from real
-values, not names.
+Archives are handled too (`sniff_archive`): extracts a matching member to a
+local temp file and sniffs it, and proposes `member_pattern` grouped by
+extension when there is no existing feed to have declared one already. Only
+`business_date_from: container` is ever proposed -- `member`/`path` are
+real, described above, and NOT BUILT, and proposing either would suggest a
+value guaranteed to fail at load; `container_has_date` says plainly when
+the container's own name has nothing to source it from.
 
-**Not built**: archive-layout sniffing (a zip's own member list, unlike a
-plain CSV's header, needs its own proposal shape); date-source detection
-across container/member/path; and the console side entirely -- no button, no
-form pre-fill, no unclaimed-deliveries queue. `inbox` still moves an
-unclaimed file to `.rejected/` (`ingest/inbox.py`) and landing's sweep still
-only counts unrecognised objects rather than surfacing them as "landed but
-not normalized" for one queryable backlog. That is the moment a new feed
-actually appears in real life -- not as a ticket, as a file nobody expected
--- and it is still a ticket today.
+**The console side is built**: `feed-ui`'s "Unclaimed deliveries" panel
+lists whatever `inbox` moved to `.rejected/` (`GET /api/unclaimed`,
+re-running `route()` so a file feeds.yml has since started claiming is
+flagged rather than sniffed), sniffs one on click
+(`POST /api/unclaimed/{filename}/sniff`) and pre-fills the "new feed" form
+from it. The form's own upload control now calls the same sniffer
+(`POST /api/sniff`) instead of only reading the header row. Business key
+CANDIDATES are shown as a note, never auto-selected.
+
+**Except**: `feedForm`/`FeedSpec` has no `delivery:` field at all, so the
+console cannot create an archive or control-gated feed through the form --
+independent of sniffing, and a real remaining gap. A sniffed archive
+proposal says so rather than silently dropping what it found; the feed
+still has to be created plain and `delivery:` added to feeds.yml by hand
+afterward. Also not built: date-source detection for member/path sourcing
+(nothing to detect towards, since neither is built either) and landing's
+own unrecognised-object count folded into the same queue -- only `inbox`'s
+`.rejected/` backlog is surfaced, a concrete existing mechanism rather than
+a general "any unclaimed object anywhere in the bucket" scanner, which
+remains an open design question.
+
+Verified against real data on the live stack, backend and console API
+alike: a landed `fo_trade` delivery in MinIO sniffed correctly via
+`s3://lakehouse/...`, and end to end through the running `feed-ui`
+container -- `.rejected/` files (plain and zipped) listed via
+`/api/unclaimed` and sniffed correctly via both new routes, path traversal
+in the filename rejected. **Not verified: an actual in-browser
+click-through** -- no browser was available in the session that built this
+(see [DECISIONS.md#the-sniffer](DECISIONS.md#the-sniffer)); the JS was
+syntax-checked and traced by hand instead, which is how a real bug
+(`completeness` silently defaulting to unchecked for any sniffed draft) was
+caught before it shipped.
 
 ---
 
@@ -402,7 +428,7 @@ actually appears in real life -- not as a ticket, as a file nobody expected
 | 2 | `ready/` + manifest + normalize stage, pass-through only | **Built.** The architecture. Behaviour-preserving, verified against the live stack before anything new depends on it. |
 | 3 | Archive normalizer | **Built and live-verified.** The zip case. First normalizer that copies bytes. |
 | 4 | Control-file normalizer | **Built and live-verified**, against a real Airflow scheduler. Readiness in one place, and the exact-count assertion. |
-| 5 | Sniffer + unclaimed queue | **Sniffer backend built**, live-verified; console wiring and the unclaimed queue not built. A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
+| 5 | Sniffer + unclaimed queue | **Built and verified against the running console**, not yet in-browser. A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
 
 Steps 3-5 are each *one normalizer* because step 2 built the stage. That is the
 whole reason step 2 exists as its own change rather than arriving underneath

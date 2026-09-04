@@ -154,3 +154,107 @@ def test_bytes_invalid_in_every_fallback_raise_cleanly():
         assert "utf-8" in str(exc) and "latin-1" in str(exc) and "cp1252" in str(exc), exc
     else:
         raise AssertionError("expected a ValueError")
+
+
+# ------------------------------------------------------------- sniff_bytes
+def test_sniff_bytes_matches_sniff_delivery():
+    """The upload/S3-bytes entry point must agree with the path-based one --
+    it is a thin wrapper, not a second implementation."""
+    data = b"a,b\n1,2\n3,4\n"
+    from_path = sniff.sniff_delivery(CON, _path(data))
+    from_bytes = sniff.sniff_bytes(CON, data, "whatever.csv")
+    assert from_path == from_bytes, (from_path, from_bytes)
+
+
+def test_sniff_bytes_dispatches_zip_to_sniff_archive():
+    r = sniff.sniff_bytes(CON, _zip({"a.csv": "x,y\n1,2\n"}), "delivery.zip")
+    assert "archive_members" in r, r
+
+
+# ------------------------------------------------------------ sniff_archive
+def _zip(members: dict) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, body in members.items():
+            zf.writestr(name, body)
+    return buf.getvalue()
+
+
+TWO_MEMBERS = {
+    "positions_1.csv": "position_id,counterparty_id,quantity\nP1,CP1,10\nP2,CP1,20\n",
+    "positions_2.csv": "position_id,counterparty_id,quantity\nP3,CP2,30\n",
+}
+
+
+def test_archive_sniffs_the_first_member_sorted_by_name():
+    """parts: concat assumes every member shares a shape, so looking at one
+    -- the first, matching ingest/normalize.py's own ordering -- is looking
+    at all of them."""
+    reversed_order = {"positions_2.csv": TWO_MEMBERS["positions_2.csv"],
+                      "positions_1.csv": TWO_MEMBERS["positions_1.csv"]}
+    r = sniff.sniff_archive(CON, _zip(reversed_order))
+    assert r["sniffed_member"] == "positions_1.csv", r
+    assert r["columns"] == ["position_id", "counterparty_id", "quantity"], r
+
+
+def test_archive_lists_every_member_regardless_of_which_is_sniffed():
+    r = sniff.sniff_archive(CON, _zip(TWO_MEMBERS))
+    assert r["archive_members"] == ["positions_1.csv", "positions_2.csv"], r
+
+
+def test_member_pattern_candidate_groups_by_extension():
+    r = sniff.sniff_archive(
+        CON, _zip({**TWO_MEMBERS, "MANIFEST.txt": "whatever"}))
+    assert r["member_pattern_candidate"] == r".*\.csv", r
+
+
+def test_member_pattern_narrows_the_candidates():
+    """Passed an existing feed's member_pattern (the re-sniff case), only
+    matching members are considered -- a checksum or manifest file
+    alongside the data must not become the sniffed member."""
+    r = sniff.sniff_archive(
+        CON, _zip({"README.txt": "not data", **TWO_MEMBERS}),
+        member_pattern=r"positions_.*\.csv")
+    assert r["sniffed_member"] == "positions_1.csv", r
+
+
+def test_empty_archive_raises_cleanly():
+    try:
+        sniff.sniff_archive(CON, _zip({}))
+    except ValueError as exc:
+        assert "empty" in str(exc), exc
+    else:
+        raise AssertionError("expected a ValueError")
+
+
+def test_no_member_matches_pattern_raises_cleanly():
+    try:
+        sniff.sniff_archive(CON, _zip(TWO_MEMBERS), member_pattern=r"nope_.*")
+    except ValueError as exc:
+        assert "nope_" in str(exc), exc
+    else:
+        raise AssertionError("expected a ValueError")
+
+
+# ------------------------------------------------------------- propose_feed
+def test_propose_feed_adds_filename_pattern():
+    r = sniff.propose_feed("MarginCall_20260904.csv",
+                           b"margin_call_id,amount\nM1,100\n")
+    assert r["filename_pattern"] == \
+        r"MarginCall_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv", r
+
+
+def test_propose_feed_flags_an_archive_with_no_date_on_the_container():
+    """business_date_from: member/path is real, described in
+    DELIVERY-SHAPES.md, and NOT BUILT (context.NOT_BUILT) -- proposing it
+    would suggest a value guaranteed to fail at load."""
+    r = sniff.propose_feed("positions.zip", _zip(TWO_MEMBERS))
+    assert r["container_has_date"] is False, r
+
+
+def test_propose_feed_confirms_the_date_on_a_dated_container():
+    r = sniff.propose_feed("custodyPositions_20260904.zip", _zip(TWO_MEMBERS))
+    assert r["container_has_date"] is True, r

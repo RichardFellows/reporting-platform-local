@@ -107,6 +107,60 @@ def route(filename: str) -> tuple[Feed | None, str | None, bool]:
                   "check the name, or the pattern in feeds.yml"), False
 
 
+def list_rejected() -> list[dict]:
+    """Files sitting in `.rejected/` -- landed nowhere, claimed by no feed.
+
+    This is docs/DELIVERY-SHAPES.md#5-onboard-from-a-real-file's "unclaimed
+    deliveries" backlog: the console's entry point for sniffing a file
+    nobody has a feed for yet. `route()` is re-run rather than reading a
+    stored reason, because feeds.yml may have changed since rejection --
+    the reason (or a feed claiming it now) should reflect the CURRENT
+    config, not the moment it was rejected.
+
+    Only `INBOX/.rejected/` -- landing's own "unrecognised object" count
+    (`retention/landing.py`) is a narrower, per-feed case (a file for an
+    ALREADY-onboarded feed with the wrong name) and is not surfaced here.
+    """
+    d = INBOX / REJECTED
+    if not d.is_dir():
+        return []
+    out = []
+    for path in sorted(d.iterdir()):
+        if _skip(path):
+            continue
+        feed, reason, is_control = route(path.name)
+        stat = path.stat()
+        out.append({
+            "filename": path.name,
+            "bytes": stat.st_size,
+            "rejected_at": stat.st_mtime,
+            "reason": reason,
+            # feeds.yml may have moved on since this was rejected -- either
+            # of these means a re-drop into inbox is now the right move,
+            # not a sniff.
+            "now_claimed_by": feed.name if feed else None,
+            "now_routes_as_control": is_control,
+        })
+    return out
+
+
+def read_rejected(filename: str) -> bytes:
+    """Bytes of one file in `.rejected/`, for the console to sniff.
+
+    `filename` reaches this from an HTTP request, so it is validated as a
+    bare filename before being joined onto `INBOX` -- the same
+    directory-traversal concern `ingest/normalize.py`'s `_safe_member_name`
+    guards against for an archive member, here for a name coming over the
+    API instead of out of a zip.
+    """
+    if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+        raise ValueError(f"{filename!r} is not a bare filename")
+    path = INBOX / REJECTED / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"no {filename!r} in .rejected/")
+    return path.read_bytes()
+
+
 def _move(path: Path, folder: str, feed_name: str | None = None) -> Path:
     dest_dir = INBOX / folder / (feed_name or "")
     dest_dir.mkdir(parents=True, exist_ok=True)

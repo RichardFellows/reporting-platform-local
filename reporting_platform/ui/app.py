@@ -339,6 +339,52 @@ def api_columns_from_header(payload: dict):
     return _columns_from_headers([str(h).strip() for h in headers])
 
 
+# ------------------------------------------------------------------- sniff
+# docs/DELIVERY-SHAPES.md step 5: propose a feed's whole shape from a real
+# delivered file (delimiter, encoding, per-column TYPES read from real
+# values rather than guessed from names, business-key candidates, and for a
+# zip, its member layout) rather than just a header row. See
+# reporting_platform/ingest/sniff.py and DECISIONS.md#the-sniffer.
+def _sniff_or_400(filename: str, data: bytes) -> dict:
+    from reporting_platform.ingest import sniff
+
+    try:
+        return sniff.propose_feed(filename, data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/sniff")
+async def api_sniff(file: UploadFile = File(...)):
+    """Sniff an uploaded sample -- the same upload control `/api/infer-columns`
+    uses, one door down on the form, but reading real values rather than
+    only the header row.
+    """
+    return _sniff_or_400(file.filename or "upload.csv", await file.read())
+
+
+@app.get("/api/unclaimed")
+def api_unclaimed():
+    """Files in the inbox's `.rejected/` folder -- landed nowhere, claimed by
+    no feed. The console's entry point into "a file nobody expected"; see
+    ingest/inbox.py:list_rejected.
+    """
+    from reporting_platform.ingest import inbox
+
+    return {"unclaimed": inbox.list_rejected()}
+
+
+@app.post("/api/unclaimed/{filename}/sniff")
+def api_sniff_unclaimed(filename: str):
+    from reporting_platform.ingest import inbox
+
+    try:
+        data = inbox.read_rejected(filename)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return _sniff_or_400(filename, data)
+
+
 @app.get("/api/links")
 def api_links():
     """Host-side URLs for the header links.

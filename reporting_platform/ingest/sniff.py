@@ -6,11 +6,16 @@ per-column types and business-key candidates -- a starting point for the
 console form, never a value written without a human looking at it.
 
 USES DUCKDB'S sniff_csv() rather than hand-rolled frequency analysis: it is
-a real, tested CSV sniffer, and `scripts/duckdb_console.py` /
-`notebooks/explore.py` already depend on DuckDB being installed and able to
-read `s3://lakehouse/...` directly (`REPORTING_DUCKDB_S3_SECRET`), so this
-adds no new dependency and no new connection recipe -- callers pass in a
-connection made with `scripts.duckdb_console.connect()`.
+a real, tested CSV sniffer, and `scripts/duckdb_console.py` already depends
+on DuckDB being installed, so this adds no new dependency. `sniff_delivery`
+takes ANY path a duckdb connection can read -- a local temp file or an
+`s3://...` URI. The console-facing entry points (`sniff_bytes`,
+`sniff_archive`) always sniff a LOCAL temp file, fetching the delivery's
+bytes with the same boto3 client `ingest/arrival.py` already uses rather
+than through DuckDB's own S3 support -- simpler, and it needs no
+`REPORTING_DUCKDB_S3_SECRET` or Iceberg attach for something that is just
+reading one object. A bare `duckdb.connect()` is enough; nothing here
+requires `scripts.duckdb_console.connect()`.
 
 What sniff_csv does NOT do, verified against a real duckdb 1.5.5 rather than
 assumed:
@@ -276,3 +281,116 @@ def sniff_delivery(con, path: str) -> dict:
         "column_types": types,
         "business_key_candidates": keys,
     }
+
+
+# ------------------------------------------------------ from raw bytes
+def sniff_bytes(con, data: bytes, filename: str) -> dict:
+    """`sniff_delivery`, given the delivery's bytes directly rather than a
+    path `con` can already read -- an upload, or a file already fetched from
+    object storage. `.zip` dispatches to `sniff_archive`; everything else is
+    written to a local temp file (`sniff_csv` needs a real path) and sniffed
+    from there.
+    """
+    import tempfile
+
+    if filename.lower().endswith(".zip"):
+        return sniff_archive(con, data)
+    suffix = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(data)
+    return sniff_delivery(con, f.name)
+
+
+def _member_pattern_candidate(names: list[str]) -> str | None:
+    """A regex matching the archive's most common member extension, as a
+    STARTING GUESS for `delivery.member_pattern` -- a human still decides
+    which members actually belong to this feed. None if nothing in the
+    archive has an extension to group by.
+    """
+    from collections import Counter
+
+    exts = Counter(n.rsplit(".", 1)[-1] for n in names if "." in n)
+    if not exts:
+        return None
+    ext, _count = exts.most_common(1)[0]
+    return rf".*\.{re.escape(ext)}"
+
+
+def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> dict:
+    """Propose a feeds.yml `delivery: {kind: archive, ...}` shape.
+
+    Extracts matching members to a local temp file and sniffs the FIRST one
+    (sorted by name, matching `ingest/normalize.py`'s own member ordering)
+    -- `parts: concat` (the only mode this platform builds, see
+    DECISIONS.md#archive-normalizer) means every member in a delivery is
+    assumed to share the same shape, so looking at one is looking at all of
+    them.
+
+    `member_pattern` is optional: absent, every member is a candidate, which
+    is the ONBOARDING case -- there is no feed yet to have declared one, and
+    `member_pattern_candidate` in the result is a starting guess grouped by
+    extension. Passed, only matching members are considered, which is the
+    re-sniff-an-existing-feed case.
+
+    Only proposes `business_date_from: "container"`, the one value this
+    platform actually reads (`context.NOT_BUILT` rejects `member`/`path` at
+    load) -- see `_container_has_a_date`.
+    """
+    import io
+    import zipfile as _zipfile
+
+    with _zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = sorted(i.filename for i in zf.infolist() if not i.is_dir())
+        candidates = names
+        if member_pattern:
+            rx = re.compile(member_pattern)
+            candidates = [n for n in names if rx.fullmatch(n)]
+        if not candidates:
+            raise ValueError(
+                "archive holds no member matching "
+                f"{member_pattern!r}" if member_pattern else "archive is empty")
+        member = candidates[0]
+        data = zf.read(member)
+
+    proposal = sniff_bytes(con, data, member)
+    proposal["archive_members"] = names
+    proposal["sniffed_member"] = member
+    proposal["member_pattern_candidate"] = _member_pattern_candidate(names)
+    return proposal
+
+
+def _container_has_a_date(filename: str) -> bool:
+    """Whether the CONTAINER's own name has an 8-digit run to anchor a
+    `business_date` group to -- reusing `ui.registry.derive_pattern`'s own
+    check, since that is exactly what decides whether
+    `business_date_from: container` (the only value this platform reads) is
+    even proposable. If not, this platform genuinely cannot onboard the
+    archive yet -- `member`/`path` sourcing is real, described in
+    docs/DELIVERY-SHAPES.md, and NOT BUILT (`context.NOT_BUILT`) -- and the
+    proposal says so rather than suggesting a value that will fail at load.
+    """
+    from reporting_platform.ui.registry import derive_pattern
+
+    return derive_pattern(filename) is not None
+
+
+def propose_feed(filename: str, data: bytes) -> dict:
+    """The whole onboarding proposal for one delivered file: everything
+    `sniff_bytes`/`sniff_archive` return, plus the `filename_pattern`
+    `ui.registry.derive_pattern` would suggest from `filename` and, for an
+    archive, whether the container's own name has a date to source
+    `business_date_from: container` from at all.
+
+    What the console calls. Opens its own `duckdb.connect()` -- callers pass
+    a filename and bytes, not a connection to manage.
+    """
+    import duckdb
+
+    from reporting_platform.ui.registry import derive_pattern
+
+    con = duckdb.connect()
+    proposal = sniff_bytes(con, data, filename)
+    proposal["filename_pattern"] = derive_pattern(filename)
+    if filename.lower().endswith(".zip"):
+        proposal["container_has_date"] = _container_has_a_date(filename)
+    return proposal

@@ -1561,17 +1561,23 @@ encoding, per-column types and business-key candidates from a real delivered
 file. It is a normalizer that writes nothing -- a human decides.
 
 **Uses DuckDB's `sniff_csv()` rather than hand-rolled frequency analysis.**
-`scripts/duckdb_console.py` and `notebooks/explore.py` already depend on
-DuckDB being installed and able to read `s3://lakehouse/...` directly
-(`httpfs`, an S3 secret gated on `REPORTING_DUCKDB_S3_SECRET`), so this adds
-no new dependency and no new connection recipe -- `sniff_delivery(con, path)`
-takes a connection made with `scripts.duckdb_console.connect()`. Verified
-against real data on the live stack: pointed at a landed `fo_trade` delivery
-in MinIO, correct delimiter and correct per-column types read from real
-values. `REPORTING_DUCKDB_S3_SECRET` is now also set for `feed-ui` in
-`docker-compose.yml`, not only `notebook` -- the prerequisite for the
-console to eventually call this, not the console wiring itself, which this
-change does not include.
+`scripts/duckdb_console.py` already depends on DuckDB being installed, so
+this adds no new dependency. `sniff_delivery(con, path)` takes ANY path a
+duckdb connection can read -- verified once against real MinIO data by
+pointing a `scripts.duckdb_console.connect()` session (`httpfs`, S3 secret)
+straight at `s3://lakehouse/...`, correct delimiter and correct per-column
+types read from real values.
+
+**The console-facing entry points do not use that connection recipe at
+all**, and an earlier draft of this section said `REPORTING_DUCKDB_S3_SECRET`
+on `feed-ui` was the prerequisite for them -- corrected here rather than
+carried forward. `sniff_bytes`/`sniff_archive`/`propose_feed` fetch the
+delivery's bytes with the same boto3 client `ingest/arrival.py` already
+uses (or read a local file, for `.rejected/`) and sniff a LOCAL temp copy
+with a bare `duckdb.connect()` -- no Iceberg attach, no S3 secret, for
+something that is just reading one object. The env var was removed from
+`feed-ui` in `docker-compose.yml` rather than left set for a feature that
+does not read it.
 
 **`sniff_csv`'s type names are DuckDB's own SQL types, not Arrow's.** Asked
 directly and checked rather than assumed: `sniff_csv` on a real duckdb 1.5.5
@@ -1636,9 +1642,96 @@ persisting this into `feeds.yml` is expected to call
 reduction every other write path already uses, so a column this sniffer
 agrees with `infer_type` about still produces no diff.
 
-Not built, and not started: archive-layout sniffing, date-source detection
-(container vs. member vs. path), and everything on the console side -- no
-route, no form, no unclaimed-deliveries queue reading `inbox`'s
-`.rejected/` or landing's unrecognised-object count. The backend this
-section describes is a library function nothing in the running platform
-calls yet.
+### Archives, and the console side
+
+`sniff_archive` extracts matching members to a local temp file and sniffs
+the FIRST one, sorted by name -- the same ordering `ingest/normalize.py`'s
+own archive normalizer uses. This is a real assumption, not an oversight:
+`parts: concat` (the only mode this platform builds) means every member in
+a delivery is the same logical shape cut into files, so one member's shape
+IS the delivery's shape. `member_pattern` is optional -- absent (the
+onboarding case; there is no feed yet to have declared one), every member
+is a candidate and `member_pattern_candidate` groups them by extension as a
+starting guess; passed (the re-sniff-an-existing-feed case), only matching
+members are considered.
+
+**Only `business_date_from: container` is ever proposed.** `member`/`path`
+sourcing is real, described in `docs/DELIVERY-SHAPES.md`, and NOT BUILT
+(`context.NOT_BUILT` rejects it at load) -- proposing it would suggest a
+value guaranteed to fail. `_container_has_a_date` reuses
+`ui.registry.derive_pattern`'s own check (does the container's filename
+have an 8-digit run to anchor a group to?) and `propose_feed` surfaces the
+answer as `container_has_date`, honestly, rather than pretending
+`member`/`path` were an option.
+
+**The console side is built, around a concrete mechanism rather than a
+general "any unclaimed object anywhere" scanner.** "Unclaimed deliveries" in
+`docs/DELIVERY-SHAPES.md`'s original description does not say how such an
+object would be discovered in general, and a bucket-wide scan is a real,
+unsolved design question this change does not answer. What DOES already
+exist in this codebase is `inbox/.rejected/`: a file dropped into the local
+inbox that `route()` could not match to any feed's `filename_pattern` or
+control pattern. `list_rejected` (`ingest/inbox.py`) lists it, **re-running
+`route()` rather than trusting a stored reason** -- feeds.yml may have
+changed since rejection, and a file that would now land is flagged
+(`now_claimed_by`, `now_routes_as_control`) rather than offered up to
+sniff, which would silently create a second, divergent feed for something
+an existing one already claims. `read_rejected` validates its `filename`
+argument as a bare name before joining it onto `INBOX` -- the same
+directory-traversal concern `ingest/normalize.py`'s `_safe_member_name`
+guards for an archive member, here for a name arriving over HTTP instead of
+out of a zip.
+
+`feed-ui` gained a read-only `./inbox` mount in `docker-compose.yml`
+(`inbox` itself keeps the read-write one, since it is the process that
+moves files into `.rejected/`) and three routes: `GET /api/unclaimed`,
+`POST /api/unclaimed/{filename}/sniff`, and `POST /api/sniff` for a plain
+upload -- the same upload control the "new feed" form always had, now
+reading real values via `sniff_bytes` instead of only the header row via
+the older `/api/infer-columns` (kept, unused by the console's own JS now,
+since it is still a reasonable simpler alternative over the API and
+deleting a public route is a bigger call than this change makes). The
+proposal pre-fills `feedForm` directly -- its fields already read `f?.xxx`
+for an existing feed, and a sniffed proposal is shaped the same way, so no
+new form-rendering path was needed, only a caller that hands it a proposal
+instead of `null`.
+
+**Business key CANDIDATES are surfaced as a note, never auto-selected.**
+Several independently-unique columns is not the same claim as "together
+they are the key" -- auto-checking all of them would silently propose a
+composite key nobody asserted.
+
+**One real bug found by wiring this up rather than by reading the code:**
+`feedForm` sets `completeness.checked = f ? f.completeness : true` -- a
+truthy check on `f`, not `f?.completeness ?? true`. A sniffed proposal is a
+real (truthy) object that never sets `completeness` at all, so passing one
+straight through would have silently unchecked it -- opting the new feed
+OUT of the completeness/gap check with nothing on screen explaining why.
+`newFeed` now defaults `draft.completeness` before handing it to
+`feedForm`. Grepped for the same `f ? f.x : default` shape across the rest
+of the function afterward; only `header` uses it besides `completeness`,
+and every sniffed proposal always sets `header`, so it was not at risk.
+
+**A real gap this surfaced, not fixed here:** `feedForm`/`FeedSpec` has no
+`delivery:` field at all -- the console cannot create an archive or
+control-gated feed through the form, full stop, independent of sniffing.
+An archive proposal says so in its note (`This form cannot create an
+archive feed yet...`) rather than silently dropping `archive_members` /
+`member_pattern_candidate` on the floor. Adding console support for
+`delivery:` is real work -- a kind selector, member-pattern and
+control-pattern fields, validation matching `context.resolve_delivery_config`
+-- and is its own change, not a sniffer concern.
+
+Verified end to end against the real console (`feed-ui`, host port
+overridden past a pre-existing, unrelated port-8082 conflict on the
+verification host -- see the session notes, not a platform concern): a
+`.rejected/MarginCall_20260904.csv` and a `.rejected/custodyPositions_20260904.zip`
+both listed correctly via `/api/unclaimed`, sniffed correctly via
+`/api/unclaimed/{filename}/sniff` (plain file and archive), and
+`/api/sniff` (the upload path) sniffed both a plain CSV and a zip. Path
+traversal in the filename was rejected. **Not verified**: an actual
+in-browser click-through of the new "Unclaimed deliveries" panel and the
+pre-filled form -- the JS was syntax-checked (`node --check`) and traced by
+hand against `feedForm`'s exact field-reading conventions (catching the
+`completeness` bug above), but no browser was available in the session that
+built this.
