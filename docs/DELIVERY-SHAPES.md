@@ -1,11 +1,12 @@
 # Delivery shapes
 
-**Status: steps 1 and 2 built, steps 3-5 proposed.** Sections in the future
+**Status: steps 1-3 built, steps 4-5 proposed.** Sections in the future
 tense describe work that does not exist yet. When a step lands, its section
 moves to the present tense and the reasoning moves to
 [DECISIONS.md](DECISIONS.md) — step 1 at
 [#feed-conventions](DECISIONS.md#feed-conventions), step 2 at
-[#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index).
+[#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index). Step 3's
+reasoning has not moved yet — its section below is still the write-up.
 
 Today a feed is [five files and no DAG edit](ADDING-A-FEED.md). That is cheap
 enough — until the delivery is a zip with the date on the container and no date
@@ -267,7 +268,7 @@ before ingest is not data loss — landing still has the container — but nothi
 would re-normalize it automatically, so it is a silent drop, which is worse
 than a loud one.
 
-## 3. The archive normalizer
+## 3. The archive normalizer — **BUILT**, for `concat`/`container` only
 
 ```yaml
 delivery:
