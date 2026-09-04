@@ -1413,11 +1413,18 @@ empty day.** `expected_min_rows` exists to catch a truncated file; landing a
 delivery with no parts would pass that floor by accident rather than by
 having actually delivered rows.
 
-Verified so far only against `tests/fakes3.py` (`tests/test_archive.py`),
-with real zip bytes through Python's `zipfile` -- no feed in `feeds.yml` uses
-`kind: archive` yet, so this has not been driven through MinIO, Spark, and a
-real `ingest` end to end. That is the next thing to do before trusting it,
-not an assumption to carry forward.
+Verified against `tests/fakes3.py` (`tests/test_archive.py`) with real zip
+bytes through Python's `zipfile`, AND end to end on the live stack: a
+throwaway `cus_position` feed (`kind: archive`, matching the test fixture)
+landed a real two-member zip in MinIO, `pending` reconciled it into a
+manifest at `ready/cus_position/custodyPositions_20260904.zip.json` with
+both members extracted under `ready/cus_position/custodyPositions_20260904/`,
+and `ingest` merged 3 rows to `main` -- `duckdb_console` against the
+published table showed `_source_file` set to each MEMBER's `ready/` key,
+never the container's or the manifest's, confirming the property
+`already_ingested` depends on. A second `pending` came back empty. The feed,
+raw table and landed/ready objects were all removed afterward -- this was
+verification, not onboarding.
 
 ## control-file-gate
 
@@ -1515,12 +1522,36 @@ also incidentally fixes the earlier-triggered, now-skipped run for the data
 file: nothing was going to re-trigger it, and the control file's own arrival
 now does.
 
-Not yet verified on the live stack, for the same reason as the archive
-normalizer: no feed in `feeds.yml` uses `delivery.control` yet, only
-`tests/test_control.py` against `tests/fakes3.py`. In particular, whether an
-inbox-triggered run genuinely skips cleanly rather than failing -- the whole
-point of the `AirflowSkipException` change -- has not been watched happen
-against a real Airflow scheduler.
+Verified against `tests/test_control.py` (`tests/fakes3.py`), AND end to end
+on the live stack with a throwaway `trs_margin_call` feed against a real
+Airflow scheduler -- the one claim that mattered most, because it is the one
+`tests/fakes3.py` cannot make at all:
+
+* A data file landed with no control file. `airflow dags trigger
+  ingest_trs_margin_call -c '{"object_key": "landing/trs_margin_call/..."}'`
+  -- the exact conf `inbox._trigger` sends -- produced a DAG run in state
+  **`success`**, not `failed`: `normalize` shows `skipped` in
+  `airflow tasks states-for-dag-run`, every downstream task cascaded to
+  `skipped`, and the task log reads exactly the `NotReady` message written
+  above. No retry was spent on it.
+* The control file then landed. `pending` (the safety-net poll) picked the
+  delivery up on its own with no new trigger -- reconciling it into a
+  manifest carrying `control_object` and `declared_row_count: 2` -- and
+  `ingest` merged both rows to `main`.
+* A second delivery landed with a control file DECLARING THE WRONG COUNT
+  (`ROWS=99` against 1 actual row). `ingest` raised the equality-check
+  `ValueError` immediately, and `main` provably still held only the first
+  delivery's rows afterward -- confirming the branch was abandoned exactly
+  as `expected_min_rows`'s failure already does.
+* `inbox.route()` was checked directly against the real `feeds.yml`:
+  `MarginCall_...csv` routes as data, `MarginCall_...ctl` routes as this
+  feed's control file, and an unrelated filename is still rejected.
+
+One thing this did NOT need to prove separately: `arrival_timeout_hours`
+still reads nowhere, which the skip-then-poll behavior above does not
+depend on and was not exercised to depend on it. The feed, raw table and
+landed/ready objects were all removed afterward -- this was verification,
+not onboarding.
 
 ## the-sniffer
 

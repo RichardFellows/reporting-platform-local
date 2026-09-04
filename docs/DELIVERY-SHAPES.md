@@ -292,11 +292,12 @@ live in `ready/`, where short retention and rebuildability apply, never under
 recognised keys that raise a "NOT BUILT" error naming the gap rather than
 being silently accepted (`context.NOT_BUILT`).
 
-**Not yet verified on the live stack.** `tests/test_archive.py` exercises real
-zip bytes through Python's `zipfile`, but against `tests/fakes3.py`; no feed
-in `feeds.yml` uses `kind: archive` yet, so this has not been driven through
-MinIO, Spark and a real `ingest` end to end. That is the next thing to do
-before the BUILT marker above is fully earned.
+**Verified on the live stack**, not only against `tests/fakes3.py`: a
+throwaway feed drove a real zip through MinIO, `pending` and `ingest` end to
+end, merged rows to `main` with `_source_file` on each MEMBER's key, and
+`pending` empty afterward. See
+[DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) for what
+was checked and the numbers.
 
 ## 4. Control files — **BUILT**
 
@@ -339,8 +340,15 @@ control file matches no feed's `filename_pattern` and would otherwise be
 rejected to `.rejected/` and never reach `landing/`, permanently starving
 the delivery it belongs to.
 
-Not yet verified on the live stack — same caveat as step 3, and for the same
-reason: no feed in `feeds.yml` uses `delivery.control` yet.
+**Verified on the live stack**, against a real Airflow scheduler in
+particular: a data file landed with no control file, and the exact conf
+`inbox` sends produced a DAG run that ended in state `success` with
+`normalize` (and everything downstream) `skipped` -- not a hard failure
+burning retries. The control file then landed and the safety-net poll
+picked the delivery up with no new trigger; a second delivery with a control
+file declaring the wrong count aborted cleanly with `main` untouched. See
+[DECISIONS.md#control-file-gate](DECISIONS.md#control-file-gate) for what
+was checked.
 
 ## 5. Onboard from a real file — **PARTIALLY BUILT**: the sniffer backend
 
@@ -392,8 +400,8 @@ actually appears in real life -- not as a ticket, as a file nobody expected
 |---|---|---|
 | 1 | `conventions:` tier | **Built.** No new runtime concept. Makes 2-5 cheap to express. Useful even if nothing else is built. |
 | 2 | `ready/` + manifest + normalize stage, pass-through only | **Built.** The architecture. Behaviour-preserving, verified against the live stack before anything new depends on it. |
-| 3 | Archive normalizer | **Built**, not yet live-verified. The zip case. First normalizer that copies bytes. |
-| 4 | Control-file normalizer | **Built**, not yet live-verified. Readiness in one place, and the exact-count assertion. |
+| 3 | Archive normalizer | **Built and live-verified.** The zip case. First normalizer that copies bytes. |
+| 4 | Control-file normalizer | **Built and live-verified**, against a real Airflow scheduler. Readiness in one place, and the exact-count assertion. |
 | 5 | Sniffer + unclaimed queue | **Sniffer backend built**, live-verified; console wiring and the unclaimed queue not built. A normalizer in propose mode. Turns onboarding from a form into a reviewable diff. |
 
 Steps 3-5 are each *one normalizer* because step 2 built the stage. That is the
