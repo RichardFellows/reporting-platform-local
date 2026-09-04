@@ -108,6 +108,7 @@ def _summary(fd) -> dict[str, Any]:
         "completeness": fd.completeness,
         "schema_drift": fd.schema_drift,
         "convention": fd.convention,
+        "delivery": dict(fd.delivery or {}),
         "raw_table": fd.raw_table,
         "asset_uri": fd.asset_uri,
         "landing_prefix": f"{fd.landing_prefix}/{fd.name}/",

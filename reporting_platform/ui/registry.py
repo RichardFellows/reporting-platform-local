@@ -70,7 +70,7 @@ def platform_names(headers: list[str]) -> tuple[list[str], dict[str, str]]:
 # presents them. Anything not listed here is left alone -- a per-feed
 # `arrival_timeout_hours` set by hand survives an edit through the UI.
 BLOCK_ORDER = ["name", "description", "source_system", "convention",
-               "filename_pattern",
+               "filename_pattern", "delivery",
                "delimiter", "quote_char", "header", "file_encoding",
                "business_key", "expected_min_rows", "cadence", "completeness",
                "schema_drift", "columns", "column_types"]
@@ -136,6 +136,14 @@ class FeedSpec:
     # Every key the convention supplies is then omitted from the feed's own
     # block, so the convention stays the single place that value is written.
     convention: str = ""
+    # How a landed object becomes units of work -- absent/empty means
+    # `kind: file`, one object, one delivery. Validated with the SAME
+    # function feeds.yml load does (context.resolve_delivery_config), not a
+    # second copy of the rules: an archive/control-gated feed created here
+    # must fail in the form on exactly what would otherwise fail silently at
+    # the next Airflow parse. See docs/DECISIONS.md#archive-normalizer and
+    # #control-file-gate.
+    delivery: dict[str, Any] = field(default_factory=dict)
     # How to READ the file. All four default to the `defaults:` block and are
     # written only when they differ -- see OPTIONAL_WITH_DEFAULT. They reach
     # Spark's reader unchanged (ingest_feed.py), so a wrong delimiter lands one
@@ -181,7 +189,53 @@ class FeedSpec:
             source_columns={str(k): str(v) for k, v in
                             (payload.get("source_columns") or {}).items()
                             if v and str(v) != str(k)},
+            delivery=_delivery_from_payload(payload.get("delivery")),
         )
+
+
+def _delivery_from_payload(raw: Any) -> dict[str, Any]:
+    """The form's `delivery` object -> the sparse dict `resolve_delivery_config`
+    expects, blank fields dropped.
+
+    Deliberately permissive about SHAPE here -- an unknown `kind`, a bad
+    `member_pattern` regex, `control` combined with `kind: archive` -- all of
+    that is `resolve_delivery_config`'s job in `validate()` below, not this
+    function's. This only strips blanks, so an empty `control: {pattern: "",
+    row_count: ""}` sent by a form that has the control fields present but
+    unused becomes `{}` and is genuinely absent, not a delivery block that
+    validates as broken.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    kind = str(raw.get("kind") or "").strip()
+    # "file" is the implicit default (resolve_delivery_config treats an
+    # absent `kind` the same way) -- writing it explicitly for the ordinary
+    # case would put `delivery: {kind: file}` in every feed the form
+    # creates, noise the four original feeds' blocks have never carried.
+    if kind and kind != "file":
+        out["kind"] = kind
+    member_pattern = str(raw.get("member_pattern") or "").strip()
+    if member_pattern:
+        out["member_pattern"] = member_pattern
+    business_date_from = str(raw.get("business_date_from") or "").strip()
+    if business_date_from:
+        out["business_date_from"] = business_date_from
+    parts = str(raw.get("parts") or "").strip()
+    if parts:
+        out["parts"] = parts
+    control = raw.get("control")
+    if isinstance(control, dict):
+        c: dict[str, Any] = {}
+        pattern = str(control.get("pattern") or "").strip()
+        if pattern:
+            c["pattern"] = pattern
+        row_count = str(control.get("row_count") or "").strip()
+        if row_count:
+            c["row_count"] = row_count
+        if c:
+            out["control"] = c
+    return out
 
 
 def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> None:
@@ -240,6 +294,22 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
                     "must contain a named group (?P<business_date>...) -- "
                     "arrival routing reads the business date out of the "
                     "filename and has nowhere else to get it")
+
+    if spec.delivery:
+        # THE SAME FUNCTION feeds.yml load calls, not a second copy of the
+        # rules -- an archive/control feed created here fails in the form on
+        # exactly what would otherwise fail silently at the next Airflow
+        # parse (an unknown kind falls through to the pass-through
+        # normalizer and ingests a zip as one column of binary rubbish).
+        # `feed_name` in the message is spec.name, which may still be
+        # invalid at this point (checked above) -- resolve_delivery_config
+        # does not care, it only reads it for the message.
+        from reporting_platform.common import context
+
+        try:
+            context.resolve_delivery_config(spec.name or "(unnamed)", spec.delivery)
+        except ValueError as exc:
+            errors["delivery"] = str(exc)
 
     if not spec.columns:
         errors["columns"] = "at least one column is required"
@@ -353,6 +423,34 @@ def _inherited(spec: FeedSpec) -> dict[str, Any]:
         return dict(OPTIONAL_WITH_DEFAULT)
 
 
+def _delivery_block(value: dict[str, Any]) -> CommentedMap:
+    """`spec.delivery` -> the nested YAML mapping, in the order
+    docs/DELIVERY-SHAPES.md's own examples use: kind, member_pattern,
+    business_date_from, parts, control.
+
+    `member_pattern` and `control.pattern`/`control.row_count` are regexes,
+    single-quoted like `filename_pattern` so their backslashes stay literal.
+    """
+    dv = CommentedMap()
+    if "kind" in value:
+        dv["kind"] = value["kind"]
+    if "member_pattern" in value:
+        dv["member_pattern"] = SQ(value["member_pattern"])
+    if "business_date_from" in value:
+        dv["business_date_from"] = value["business_date_from"]
+    if "parts" in value:
+        dv["parts"] = value["parts"]
+    control = value.get("control")
+    if isinstance(control, dict) and control:
+        cv = CommentedMap()
+        if "pattern" in control:
+            cv["pattern"] = SQ(control["pattern"])
+        if "row_count" in control:
+            cv["row_count"] = SQ(control["row_count"])
+        dv["control"] = cv
+    return dv
+
+
 def _block(spec: FeedSpec) -> CommentedMap:
     """The YAML mapping for one feed, inherited values omitted."""
     block = CommentedMap()
@@ -381,6 +479,13 @@ def _block(spec: FeedSpec) -> CommentedMap:
             # Single-quoted so the regex backslashes stay literal and the block
             # keeps looking like the ones around it.
             block[key] = SQ(value)
+        elif key == "delivery":
+            # Omitted entirely for `kind: file` with no control block -- the
+            # ordinary case, and how the four original feeds' blocks have
+            # always looked. See docs/DELIVERY-SHAPES.md for the shape.
+            if not value:
+                continue
+            block[key] = _delivery_block(value)
         elif key == "column_types":
             # Omitted entirely when there is nothing to override, which is the
             # normal case -- an empty mapping in the diff would be noise.
@@ -522,4 +627,5 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         schema_drift=fd.schema_drift, convention=fd.convention,
         column_types=dict(fd.column_types or {}),
         source_columns=dict(fd.source_columns or {}),
+        delivery=dict(fd.delivery or {}),
     )

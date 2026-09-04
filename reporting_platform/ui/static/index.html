@@ -414,6 +414,82 @@ function feedForm(f, creating) {
       "simply never has anything pending."),
   );
 
+  // ------------------------------------------------------- delivery shape
+  // Absent, or kind: file, is a plain object per delivery -- the ordinary
+  // case and every feed before this section existed. See
+  // docs/DELIVERY-SHAPES.md and DECISIONS.md#archive-normalizer /
+  // #control-file-gate for what each field actually does; validated here
+  // with the exact same function feeds.yml load calls
+  // (context.resolve_delivery_config), so a typo fails in the form instead
+  // of at the next Airflow parse.
+  const deliveryKind = el("select", {}, [
+    el("option", {value: "file",
+                  selected: (f?.delivery?.kind ?? "file") === "file" ? "selected" : null},
+       "plain file"),
+    el("option", {value: "archive",
+                  selected: f?.delivery?.kind === "archive" ? "selected" : null},
+       "zip archive"),
+  ]);
+  const memberPattern = el("input", {class: "mono",
+    value: f?.delivery?.member_pattern ?? "", placeholder: "positions_.*\\.csv"});
+  const controlPattern = el("input", {class: "mono",
+    value: f?.delivery?.control?.pattern ?? "", placeholder: "{stem}\\.ctl"});
+  const controlRowCount = el("input", {class: "mono",
+    value: f?.delivery?.control?.row_count ?? "",
+    placeholder: "ROWS=(?P<rows>\\d+)  (optional)"});
+
+  const memberPatternField = el("div", {class: "field", style: "margin-top:10px"}, [
+    el("label", {}, "Member pattern"),
+    memberPattern,
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+      "Which members inside the zip belong to this feed, required -- a zip " +
+      "routinely carries a checksum, a manifest or another feed's file " +
+      "alongside the data, and a wrong guess would silently ingest the wrong " +
+      "files. Every member is assumed to share the delivery's business date, " +
+      "read from the CONTAINER's own filename above -- member- or " +
+      "path-sourced dates are described in DELIVERY-SHAPES.md but not built."),
+  ]);
+  const controlPatternField = el("div", {class: "field", style: "margin-top:10px"}, [
+    el("label", {}, "Control file pattern (optional)"),
+    controlPattern,
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+      "A regex with {stem} standing for this delivery's own filename minus its " +
+      "extension, e.g. '{stem}\\.ctl' for TRADE_20260901.ctl next to " +
+      "TRADE_20260901.csv. Leave blank for an ordinary feed with no control " +
+      "file. While set, a delivery is not normalized until a sibling matching " +
+      "this pattern has also landed -- not a failure, a late feed."),
+  ]);
+  const controlRowCountField = el("div", {class: "field", style: "margin-top:10px"}, [
+    el("label", {}, "Declared row count pattern (optional)"),
+    controlRowCount,
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+      "A regex with a named group (?P<rows>...) to read the EXACT row count out " +
+      "of the control file's contents, checked against the count actually read " +
+      "at ingest -- next to the expected_min_rows floor below, not instead of " +
+      "it. Leave blank for a control file that only gates readiness."),
+  ]);
+
+  function syncDeliveryVisibility() {
+    const isArchive = deliveryKind.value === "archive";
+    memberPatternField.style.display = isArchive ? "" : "none";
+    // Gating an archive on a control file is described in DELIVERY-SHAPES.md
+    // but NOT BUILT -- context.resolve_delivery_config rejects the
+    // combination, so the form does not offer it rather than let someone
+    // fill it in and hit that error at save.
+    controlPatternField.style.display = isArchive ? "none" : "";
+    controlRowCountField.style.display = isArchive ? "none" : "";
+  }
+  deliveryKind.addEventListener("change", syncDeliveryVisibility);
+  syncDeliveryVisibility();
+
+  node.append(
+    field("delivery", "Delivery shape", deliveryKind,
+      "Plain file: one object, one delivery -- the ordinary case. Zip archive: a " +
+      "dated container holding one or more members, exploded into ready/ at " +
+      "normalize time."),
+    memberPatternField, controlPatternField, controlRowCountField,
+  );
+
   // ------------------------------------------------------------- columns
   const colsBox = el("div");
   const addColRow = (nm = "", ty = "", src = "") => {
@@ -501,15 +577,19 @@ function feedForm(f, creating) {
     if (r.encoding_confidence === "low")
       bits.push(`encoding guessed as ${r.file_encoding} -- low confidence, double-check it`);
     if (r.archive_members) {
+      deliveryKind.value = "archive";
+      if (r.member_pattern_candidate) memberPattern.value = r.member_pattern_candidate;
+      syncDeliveryVisibility();
       bits.push(`archive: ${r.archive_members.length} member(s), sniffed from ` +
-        `"${r.sniffed_member}". member_pattern candidate: ` +
-        `${r.member_pattern_candidate || "(none)"}. This form cannot create an ` +
-        "archive feed yet -- add a delivery: block to feeds.yml by hand after " +
-        "creating this feed with the columns/types above. See docs/DELIVERY-SHAPES.md.");
+        `"${r.sniffed_member}". Member pattern pre-filled below -- ` +
+        (r.member_pattern_candidate
+          ? `check it actually picks out the data members, not the whole archive.`
+          : `nothing to guess it from, fill it in by hand.`));
       if (!r.container_has_date)
         bits.push("the container's filename has no 8-digit date -- " +
           "business_date_from: container, the only value this platform reads, " +
-          "will not work for it");
+          "will not work for it, so this feed cannot be onboarded until it has " +
+          "one");
     }
     sniffNote.textContent = "Sniffed from real values." + (bits.length ? " " + bits.join(" · ") : "");
     sniffNote.style.color = "var(--muted)";
@@ -664,6 +744,23 @@ function feedForm(f, creating) {
     return out;
   };
 
+  // Mirrors ui.registry._delivery_from_payload: blanks are dropped here too,
+  // so submitting the form twice without touching these fields produces the
+  // same {} (or the same archive/control shape) both times.
+  const readDelivery = () => {
+    if (deliveryKind.value === "archive") {
+      const d = {kind: "archive"};
+      if (memberPattern.value.trim()) d.member_pattern = memberPattern.value.trim();
+      return d;
+    }
+    const pat = controlPattern.value.trim();
+    if (!pat) return {};
+    const control = {pattern: pat};
+    const rc = controlRowCount.value.trim();
+    if (rc) control.row_count = rc;
+    return {control};
+  };
+
   refreshKeyChoices();
 
   return {
@@ -687,6 +784,7 @@ function feedForm(f, creating) {
       quote_char: quote.value,
       file_encoding: encoding.value.trim(),
       header: hasHeader.checked,
+      delivery: readDelivery(),
     }),
     clearErrors: () => Object.values(errBoxes).forEach(e => e.textContent = ""),
     showErrors: (err) => {
@@ -728,15 +826,19 @@ function newFeed(draft) {
     if (draft.encoding_confidence === "low")
       bits.push(`encoding guessed as ${draft.file_encoding} -- low confidence, double-check it`);
     if (draft.archive_members) {
+      // feedForm reads f?.delivery?.kind / f?.delivery?.member_pattern --
+      // build that shape from the sniff proposal's own fields before handing
+      // the draft to it, the same way readDelivery() builds it from the form.
+      draft.delivery = {kind: "archive", member_pattern: draft.member_pattern_candidate || ""};
       bits.push(`archive: ${draft.archive_members.length} member(s), sniffed from ` +
-        `"${draft.sniffed_member}". member_pattern candidate: ` +
-        `${draft.member_pattern_candidate || "(none)"}. This form cannot create an ` +
-        "archive feed yet -- add a delivery: block to feeds.yml by hand after " +
-        "creating this feed with the columns/types below. See docs/DELIVERY-SHAPES.md.");
+        `"${draft.sniffed_member}". Member pattern pre-filled below -- ` +
+        (draft.member_pattern_candidate
+          ? "check it actually picks out the data members, not the whole archive."
+          : "nothing to guess it from, fill it in by hand."));
       if (!draft.container_has_date)
         bits.push("the container's filename has no 8-digit date -- " +
           "business_date_from: container, the only value this platform reads, " +
-          "will not work for it");
+          "will not work for it, so this feed cannot be onboarded until it has one");
     }
     d.append(el("div", {class: "note"}, bits.join(" · ")));
   }

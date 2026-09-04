@@ -1712,15 +1712,9 @@ OUT of the completeness/gap check with nothing on screen explaining why.
 of the function afterward; only `header` uses it besides `completeness`,
 and every sniffed proposal always sets `header`, so it was not at risk.
 
-**A real gap this surfaced, not fixed here:** `feedForm`/`FeedSpec` has no
-`delivery:` field at all -- the console cannot create an archive or
-control-gated feed through the form, full stop, independent of sniffing.
-An archive proposal says so in its note (`This form cannot create an
-archive feed yet...`) rather than silently dropping `archive_members` /
-`member_pattern_candidate` on the floor. Adding console support for
-`delivery:` is real work -- a kind selector, member-pattern and
-control-pattern fields, validation matching `context.resolve_delivery_config`
--- and is its own change, not a sniffer concern.
+**The gap this surfaced -- `feedForm`/`FeedSpec` having no `delivery:` field
+at all -- is now closed.** See `#console-delivery-support` below for what
+was built.
 
 Verified end to end against the real console (`feed-ui`, host port
 overridden past a pre-existing, unrelated port-8082 conflict on the
@@ -1735,3 +1729,69 @@ pre-filled form -- the JS was syntax-checked (`node --check`) and traced by
 hand against `feedForm`'s exact field-reading conventions (catching the
 `completeness` bug above), but no browser was available in the session that
 built this.
+
+## console-delivery-support
+
+`ui.registry.FeedSpec` gained a `delivery` field, `BLOCK_ORDER` gained the
+key (right after `filename_pattern`), and `feedForm` gained the UI for it --
+closing the gap `#the-sniffer` surfaced: the console previously had no way
+to CREATE an archive or control-gated feed at all, sniffing one
+notwithstanding.
+
+**Validation reuses `context.resolve_delivery_config` directly, called from
+`ui.registry.validate`, rather than a second copy of the rules.** The same
+function feeds.yml load calls -- so a typo or an unbuilt combination
+(`control:` with `kind: archive`, a `member_pattern`-less archive) fails in
+the form with the SAME message it would raise at the next Airflow parse,
+verified by posting both through `TestClient` and reading the `422` back:
+`"...NOT BUILT -- only kind: file reads control:."`, byte for byte what
+`resolve_delivery_config` itself raises.
+
+**`kind: file` is never written explicitly.** It is the implicit default --
+`resolve_delivery_config` treats an absent `kind` the same way -- and
+writing it for the ordinary case would put `delivery: {kind: file}` in
+every feed the form creates, noise the four original feeds' blocks have
+never carried. `_delivery_from_payload` drops it; a blank `control:
+{pattern: "", row_count: ""}` (the fields present on the form but unused)
+similarly collapses to `{}`, not a delivery block that validates as broken.
+
+**Editing preserves an existing `delivery:` block it was not asked to
+change, and removes one that was cleared.** Both directions matter and
+neither was free: `spec_from_feed` (used by `/api/scaffold/{name}` and
+available to any future caller) now round-trips `fd.delivery`, or ANY edit
+through the console -- renaming a description, say -- would have silently
+deleted an archive feed's `delivery:` block, since `update()`'s generic
+loop already deletes a `BLOCK_ORDER` key the new spec does not set.
+Clearing the form's control fields on an edit correctly deletes the key
+rather than leaving a stale one, the same generic mechanism working in the
+other direction -- both asserted in `tests/test_delivery_form.py`.
+
+**The sniffed proposal now feeds the new fields instead of only describing
+them.** An archive sniff's `member_pattern_candidate` sets
+`deliveryKind.value = "archive"` and pre-fills `memberPattern` (both in the
+upload handler and in `newFeed(draft)`, which builds the `f?.delivery`
+shape `feedForm` expects from the proposal's flatter fields before handing
+it over) -- the note that used to say "add a delivery: block to feeds.yml
+by hand" now says "check it actually picks out the data members".
+Gating an archive on a control file stays off the table on the form itself
+(hidden, not merely unvalidated) since `resolve_delivery_config` rejects
+the combination outright.
+
+**Verified against the real HTTP layer**, not just the registry functions
+in isolation -- `starlette.testclient.TestClient` against the real
+`app.py`, config pointed at a container-writable temp copy of `feeds.yml`
+rather than the checked-out one, because writing to the latter from inside
+`feed-ui` in this development environment hits a pre-existing, unrelated
+permission mismatch (the file is host-uid-owned; the container runs as
+uid 50000) that a plain `curl` against the running container hit first and
+that this verification worked around rather than "fixed" by touching the
+repository's file permissions. Confirmed: creating an archive feed
+end-to-end (response carries the fully-resolved `delivery`, defaults
+filled in); the same NOT-BUILT rejection a hand-edit would get; creating,
+then editing away, a control-gated feed's `delivery:` block. The dbt
+scaffold steps (`_sources.yml`, the prepared model) failed in this same
+run on that identical permission mismatch -- for a PLAIN feed with no
+`delivery:` too, confirming it is unrelated to this change and not
+something introduced by it.
+
+11 new tests in `tests/test_delivery_form.py`.

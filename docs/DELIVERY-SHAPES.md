@@ -1,11 +1,12 @@
 # Delivery shapes
 
-**Status: all five steps built**, except one real gap step 5 surfaced but
-did not fix: the console has no `delivery:` field, so it cannot CREATE an
-archive or control-gated feed through the form. Sections in the future
-tense describe work that does not exist yet. When a step lands, its section
-moves to the present tense and the reasoning moves to
-[DECISIONS.md](DECISIONS.md) — step 1 at
+**Status: all five steps built**, including console support for creating an
+archive or control-gated feed through the form -- a gap step 5 surfaced but
+did not originally fix; it is closed now
+([DECISIONS.md#console-delivery-support](DECISIONS.md#console-delivery-support)).
+Sections in the future tense describe work that does not exist yet. When a
+step lands, its section moves to the present tense and the reasoning moves
+to [DECISIONS.md](DECISIONS.md) — step 1 at
 [#feed-conventions](DECISIONS.md#feed-conventions), step 2 at
 [#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index), step 4 at
 [#control-file-gate](DECISIONS.md#control-file-gate), the sniffer at
@@ -394,17 +395,22 @@ from it. The form's own upload control now calls the same sniffer
 (`POST /api/sniff`) instead of only reading the header row. Business key
 CANDIDATES are shown as a note, never auto-selected.
 
-**Except**: `feedForm`/`FeedSpec` has no `delivery:` field at all, so the
-console cannot create an archive or control-gated feed through the form --
-independent of sniffing, and a real remaining gap. A sniffed archive
-proposal says so rather than silently dropping what it found; the feed
-still has to be created plain and `delivery:` added to feeds.yml by hand
-afterward. Also not built: date-source detection for member/path sourcing
-(nothing to detect towards, since neither is built either) and landing's
-own unrecognised-object count folded into the same queue -- only `inbox`'s
-`.rejected/` backlog is surfaced, a concrete existing mechanism rather than
-a general "any unclaimed object anywhere in the bucket" scanner, which
-remains an open design question.
+**`feedForm`/`FeedSpec` now has a `delivery:` field** -- the console can
+create AND edit an archive or control-gated feed through the form, not
+only sniff one and describe what a human would have to add by hand. See
+[DECISIONS.md#console-delivery-support](DECISIONS.md#console-delivery-support).
+An archive sniff pre-fills the new fields directly (`kind: archive`, the
+member-pattern candidate) instead of only describing them in a note.
+Validation reuses `context.resolve_delivery_config` -- the exact function
+feeds.yml load calls -- so a typo or an unbuilt combination fails in the
+form with the same message it would raise at the next Airflow parse.
+
+Also not built: date-source detection for member/path sourcing (nothing to
+detect towards, since neither is built either) and landing's own
+unrecognised-object count folded into the same unclaimed-deliveries queue
+-- only `inbox`'s `.rejected/` backlog is surfaced, a concrete existing
+mechanism rather than a general "any unclaimed object anywhere in the
+bucket" scanner, which remains an open design question.
 
 Verified against real data on the live stack, backend and console API
 alike: a landed `fo_trade` delivery in MinIO sniffed correctly via
@@ -417,6 +423,14 @@ click-through** -- no browser was available in the session that built this
 syntax-checked and traced by hand instead, which is how a real bug
 (`completeness` silently defaulting to unchecked for any sniffed draft) was
 caught before it shipped.
+
+Creating and editing an archive/control-gated feed through `delivery:` was
+verified against the real HTTP layer (`TestClient` against the actual
+`app.py`, config pointed at a container-writable copy of feeds.yml rather
+than the checked-out one -- see
+[DECISIONS.md#console-delivery-support](DECISIONS.md#console-delivery-support)
+for why): create, the same NOT-BUILT rejection a hand-edit would get, and
+edit-to-add / edit-to-remove the block, all correct.
 
 ---
 
