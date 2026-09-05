@@ -34,10 +34,12 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
 from reporting_platform.common.context import Feed, feeds, retention_policy
+from reporting_platform.ingest import conform
 
 log = logging.getLogger("retention.landing")
 
@@ -91,17 +93,65 @@ def keep_years() -> int:
     return years
 
 
-def _expiry(feed: Feed, key: str, cutoff: date) -> date | None:
+def _business_date(feed: Feed, filename: str,
+                   siblings: set[str] | None = None) -> date | None:
+    """The business date of one landed object: delivery, metadata or control.
+
+    THREE KINDS OF OBJECT LIVE IN A LANDING PREFIX NOW, and this sweep deletes
+    things, so each has to be dated correctly or not at all.
+
+    A DELIVERY dates from its own name -- `parse_filename`, unchanged.
+
+    A METADATA sibling is named `<delivery>.meta.json`, so its date is inside
+    its own name and needs no lookup. That is why the suffix convention was
+    chosen over a parallel prefix: an orphaned metadata object still expires
+    rather than accumulating forever.
+
+    A CONTROL file cannot do either. `TRADE_20260801.ctl` matches no
+    `filename_pattern` -- it is not a delivery -- and stripping a suffix does
+    not help, because the data file is `TRADE_20260801.csv` and the extension
+    is not guessable. It is dated from the SIBLING it gates: the delivery in
+    the same prefix whose stem its `delivery.control.pattern` matches. Found
+    with no extra S3 call, because the sweep has already listed the prefix.
+
+    Searching the control filename for an 8-digit run would be simpler and is
+    deliberately not done: this function authorises DELETION from the evidence
+    copy, and a name with two 8-digit runs would pick the wrong one. No
+    sibling means None, which means keep -- the same "never delete on a guess"
+    rule the rest of this module follows.
+    """
+    if conform.is_metadata_key(filename):
+        filename = conform.delivery_of_metadata(filename)
+    parsed = feed.parse_filename(filename)
+    if parsed:
+        return parsed[0]
+
+    from reporting_platform.ingest import normalize as norm
+
+    if siblings and norm.is_control_file(feed, filename):
+        pattern = (feed.delivery.get("control") or {}).get("pattern", "")
+        for candidate in sorted(siblings):
+            dated = feed.parse_filename(candidate)
+            if not dated:
+                continue
+            stem = candidate[:candidate.rindex(".")] if "." in candidate \
+                else candidate
+            if re.fullmatch(pattern.format(stem=re.escape(stem)), filename):
+                return dated[0]
+    return None
+
+
+def _expiry(feed: Feed, key: str, cutoff: date,
+            siblings: set[str] | None = None) -> date | None:
     """Business date of `key` if it is past `cutoff`, else None.
 
     Returns None for anything unparseable, which means "leave it alone". The
     landing prefix is the evidence copy; an object whose name this platform
     does not recognise is exactly the object not to delete on a guess.
     """
-    parsed = feed.parse_filename(key.rsplit("/", 1)[-1])
-    if parsed is None:
+    bd = _business_date(feed, key.rsplit("/", 1)[-1], siblings)
+    if bd is None:
         return None
-    bd = parsed[0]
     return bd if bd < cutoff else None
 
 
@@ -120,17 +170,31 @@ def sweep_landing(dry_run: bool = True) -> dict:
     for feed in feeds().values():
         prefix = f"{feed.landing_prefix}/{feed.name}/"
         expired, kept, unknown, freed = [], 0, 0, 0
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                bd = _expiry(feed, obj["Key"], cutoff)
-                if bd is None:
-                    if feed.parse_filename(obj["Key"].rsplit("/", 1)[-1]) is None:
-                        unknown += 1
-                    else:
-                        kept += 1
-                    continue
-                expired.append((obj["Key"], obj["Size"], bd))
-                freed += obj["Size"]
+
+        # THE WHOLE PREFIX IS COLLECTED BEFORE ANYTHING IS DATED, because a
+        # control file is dated from the delivery it gates and that sibling
+        # may be on any page. Costs one list of keys already being paged
+        # through, and no extra request.
+        objects = [obj for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+                   for obj in page.get("Contents", [])]
+        siblings = {o["Key"].rsplit("/", 1)[-1] for o in objects}
+
+        for obj in objects:
+            bd = _expiry(feed, obj["Key"], cutoff, siblings)
+            if bd is None:
+                # `_business_date`, not `parse_filename`: a metadata sibling
+                # dates through its delivery's name and a control file
+                # through the delivery it gates, and counting either as
+                # `unrecognised` would report a configuration error for every
+                # conformed delivery in the prefix.
+                if _business_date(feed, obj["Key"].rsplit("/", 1)[-1],
+                                  siblings) is None:
+                    unknown += 1
+                else:
+                    kept += 1
+                continue
+            expired.append((obj["Key"], obj["Size"], bd))
+            freed += obj["Size"]
 
         for key, _size, _bd in expired:
             if not dry_run:

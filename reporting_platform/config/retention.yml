@@ -20,22 +20,31 @@ environments:
     # longer hold. Sampling it by keep-set would destroy exactly the evidence
     # it exists to preserve, for a saving on the cheapest bytes in the estate.
     #
-    # MUST BE >= the raw layer's window (keep_month_ends/12 years), or
-    # find_pending starts computing its keep-set from a landing prefix that no
-    # longer holds every date and treats live business dates as expired.
-    # landing.py warns if that is violated.
+    # TWO LOWER BOUNDS, and the second is the binding one now.
+    #
+    # >= the raw layer's window (keep_month_ends/12 years), or find_pending
+    # starts computing its keep-set from a landing prefix that no longer holds
+    # every date and treats live business dates as expired. landing.py WARNS
+    # if that is violated -- gradual, and recoverable by raising this.
+    #
+    # >= the longest `references.published_tags` window below, because a
+    # published tag pins the TABLES and landing is the only copy of what the
+    # upstream actually sent. A pin that outlives its landing evidence is a
+    # pin that cannot be fully honoured. retention.py REFUSES to sweep if that
+    # is violated -- unrecoverable, and the sweep runs nightly and unattended.
+    # Raised from 8 to 10 when the tag window was corrected; see
+    # docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
     landing:
-      keep_years: 8
+      keep_years: 10
 
     # THE WORK QUEUE, and a cache: manifests and any parts a normalizer
     # derived, all rebuildable by re-normalizing from landing/. Days, not
     # years, and unlike `landing:` it constrains nothing -- nothing computes
-    # a keep-set from it. The only floor is operational: comfortably longer
-    # than `arrival_timeout_hours` (26h), or a delivery could be swept
-    # between being normalized and being ingested by a late run.
+    # a keep-set from it, and it has no correctness floor either.
     #
-    # A manifest whose parts are not yet in the raw table is never swept
-    # regardless of age. See reporting_platform/retention/ready.py.
+    # What protects a delivery waiting to be ingested is not this number: a
+    # manifest whose parts are not yet in the raw table is never swept, at
+    # any age. See reporting_platform/retention/ready.py.
     ready:
       keep_days: 7
 
@@ -76,10 +85,67 @@ environments:
 # commit pins every data file that commit referenced, and expire_snapshots
 # cannot reclaim it.
 references:
-  # published/<business_date>/<run_id> — cut on main after each publication
+  # published/<business_date>/<run_id>, or published/<report>/<business_date>/
+  # <run_id> once a publication knows which report it is for — cut on main
+  # after each publication by feed_ingest.record_publication.
+  #
+  # FLAT AGE IN YEARS, NOT A KEEP-SET, and that is the whole point of this
+  # block. It was `keep_business_days: 10 / keep_month_ends: 80` — the numbers
+  # the TABLES use — which is a category error: a table window says how much
+  # history is queryable today, a tag says how far back a published result can
+  # be REPRODUCED. Under the old values an ordinary daily publication lost its
+  # pin after ten more published business dates, roughly a fortnight, and
+  # month-end pins lasted 80/12 ≈ 6.7 years against a period assumed to be
+  # longer than that. The evidence was expiring on the wrong schedule and had
+  # been since publication started.
+  #
+  # `landing:` above is the same kind of object and already says why: it is
+  # the evidence copy, kept by flat age, because "sampling it by keep-set
+  # would destroy exactly the evidence it exists to preserve".
+  #
+  # A tag pins every data file its commit referenced. Verified against the
+  # running Nessie: a tag's own state stays live at ANY `nessie_gc`
+  # `default_cutoff` — even P0D — because the identify phase walks each
+  # reference from its HEAD and the cutoff only bounds how much history
+  # BEHIND it stays live. So the tag's lifetime, set here, is the only thing
+  # that decides whether a published run can still be reproduced.
+  # See docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
   published_tags:
-    keep_business_days: 10
-    keep_month_ends: 80
+    # Applies to every tag with no `per_report` entry, which today is all of
+    # them — nothing cutting a tag yet knows which report it is for.
+    #
+    # TEN YEARS IS PROVISIONAL. The regulatory period is not confirmed, and
+    # over-retaining tags costs storage while under-retaining costs the
+    # evidence permanently, so this is deliberately the longest plausible
+    # value rather than the assumed seven. Confirm it and revisit.
+    #
+    # A bare number or a map keyed by REPORTING_ENV, like
+    # `nessie_gc.deferred_delete_after_hours` below. It is a map because
+    # `landing.keep_years` is per environment and `dev` deliberately shortens
+    # it: a globally fixed window would leave dev pinning published runs for a
+    # decade whose source evidence it discarded after a year, and the
+    # interlock would then refuse every dev sweep.
+    default_keep_years:
+      local: 10
+      dev: 1          # matches dev's landing keep_years, which is also 1
+      uat: 10
+      prod: 10
+
+    # Per-report windows, for reports whose period genuinely differs. The key
+    # is the report name as it appears in the tag; anything not listed gets
+    # `default_keep_years`.
+    #
+    # NOTHING MATCHES THIS TODAY, and it is written down as a forward hook
+    # rather than presented as a working mechanism: no publication yet carries
+    # a report identity, so every tag resolves to the default. The resolver
+    # and the three-segment tag shape are built and tested so that the day a
+    # publication does name its report, retention already honours it instead
+    # of silently applying the default to a report that declared otherwise.
+    #
+    # A value below `default_keep_years` is allowed — a shorter period can be
+    # a real answer — but it is logged loudly, because it is the direction
+    # that loses evidence.
+    per_report: {}
   # ingest/* and build/* working branches
   working_branches:
     # NOT READ BY ANY CODE. ingest_feed.py deletes the branch immediately

@@ -49,7 +49,11 @@ Two corollaries worth holding on to:
 - **Compose builds a separate image per service.** `docker compose build
   airflow` does NOT rebuild `airflow-init`; build them together.
 - Editing `.env` or `docker-compose.yml` does nothing until the container is
-  **recreated**.
+  **recreated**. Neither does editing a module a LONG-RUNNING process already
+  imported: `feeds()` re-reads config on mtime, which covers a feed being
+  added, but the `inbox` watcher holds the code it imported at start. Restart
+  it after touching `ingest/` or `common/`, or it reports config as broken
+  that is valid on disk.
 - A DAG run left in a non-terminal state makes the scheduler spin on it and
   starve every other run. If DAGs sit `queued` with `start=None`, look for a
   stale run first.
@@ -141,6 +145,38 @@ Two corollaries worth holding on to:
   `dbt_packages`, because `dbt deps` rmtree's that directory and a mount point
   cannot be removed. If packages ever come back missing or root-owned, remove
   the volume — rebuilding the image will not re-seed one that already exists.
+- **`landing/` has a contract: everything in it is correctly named and
+  classified.** Two ways in — an approved sender that adheres to the contract
+  writes there directly, and everything else goes through the **inbox
+  conformance gate** (`ingest/conform.py`, driven by `ingest/inbox.py`). A feed
+  with an **`arrival:`** block is the second kind.
+  **THE INBOX ESTABLISHES IDENTITY; INGESTION VERIFIES INTEGRITY**, and the
+  keys are split to enforce it: `arrival.control` carries `business_date` and
+  `version` (what the file must be NAMED) and rejects `row_count`/`md5` at
+  load; `delivery.control` carries `row_count` and `md5`, is read in landing
+  and checked at ingest — once, for every delivery however it arrived, so the
+  trusted path is never the less-verified one.
+  **The control file is PROMOTED, not consumed**: the delivery is the data
+  file and its control file together, so the gate renames both into landing
+  and `delivery.control` reads it there. The two blocks are therefore
+  *complementary* — a legacy feed needs both, and an `arrival.control` with no
+  `delivery.control` is rejected. Such a feed has **two filenames and they are
+  different strings**: `Feed.claims_source` for the upstream's,
+  `Feed.parse_filename` for landing's; the rename is built FROM
+  `filename_pattern` by `common/filenames.render_filename` and fed back through
+  `parse_filename`, so a name landing would reject cannot be produced. A
+  re-delivery for a date already landed gets `_v2` rather than overwriting the
+  evidence. **An identity failure (cannot be named) goes to `.rejected/`; an
+  integrity failure LANDS and fails at ingest**, because landing is the
+  evidence copy and a bad delivery is exactly what it exists to prove.
+  **A zip is unpacked AT THE GATE** (`arrival.archive.member_pattern`) and its
+  members land as ordinary deliveries — one inbox file in, N deliveries out,
+  container never landed but recorded in each member's metadata. Each member
+  must carry its own business date; members that are *parts* of one date are a
+  different shape and NOT BUILT here. That leaves `landing/` holding only
+  objects Spark can read, and `ready/` holding only manifests.
+  See `docs/DECISIONS.md#the-inbox-is-the-conformance-gate` and
+  `#unpacking-happens-at-the-gate`.
 - **`landing/` is the evidence copy; `ready/` is the work queue.** A
   **normalize** stage between them turns a delivery into a MANIFEST -- one
   JSON object naming the business date, the objects holding the rows, and the
@@ -204,6 +240,17 @@ Two corollaries worth holding on to:
   them or a new feed will never reach the DAG processor.
 - Retention and GC delete data. `dry_run` first, always. GC defers its deletes
   by design; the deferred-delete pass is the deliberate second step.
+- **A published tag is DATA retention, sized in years, not by the table
+  keep-set.** `references.published_tags` in `retention.yml` is the
+  reproducibility window: a tag pins every data file its commit referenced, so
+  its lifetime is how long a published run can still be read. It carried the
+  tables' `keep_business_days: 10 / keep_month_ends: 80` and was expiring pins
+  after about a fortnight. `landing.keep_years` must be >= the longest tag
+  window and `retention.py` **refuses to sweep** if it is not — landing is the
+  only copy of what the upstream sent, so a pin outliving its evidence is one
+  that cannot be honoured. Verified: a tag's own state stays live at any
+  `nessie_gc` cutoff, so the tag's lifetime is the only thing that decides
+  reproducibility. See `docs/DECISIONS.md#published-tags-are-the-reproducibility-window`.
 
 ## Quick reference
 
@@ -223,6 +270,10 @@ docker compose exec -T airflow python -m reporting_platform.retention.ready --dr
 # build + test both layers on a throwaway branch
 $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).Trim()
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select path:models/prepared path:models/reporting --vars "{nessie_ref: $branch}"
+
+# can a published run still be read at its own pin? (REQ-702)
+# reports `not_yet_meaningful` until a pin is older than recent_partition_days
+docker compose exec -T airflow python -m reporting_platform.monitoring.reproducibility
 
 # retention / maintenance -- dry run first, --all-managed covers every table
 docker compose exec -T airflow python -m reporting_platform.retention.retention --all-managed --dry-run

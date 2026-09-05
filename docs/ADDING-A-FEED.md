@@ -43,7 +43,10 @@ Four things that are easy to get wrong:
 - **`filename_pattern` must yield a `business_date` named group**, and it is
   matched with `re.fullmatch`, not `search` — a pattern that does not cover
   the whole filename silently matches nothing, and the feed simply never has
-  anything pending. The `(?:_v(?P<version>\d+))?` group is optional but you
+  anything pending. It describes the name the file has **in `landing/`**. If
+  the upstream sends something else — no date at all, a wrong prefix — set
+  this to the name you want and add an `arrival:` block (below): the inbox
+  renames it on the way in. The `(?:_v(?P<version>\d+))?` group is optional but you
   want it: it is how a re-delivery lands as a new `_file_version` instead of
   a duplicate. The pattern is per-feed precisely so a source system with its
   own naming convention (`marginCalls_`, lowerCamelCase, unlike the other
@@ -69,11 +72,14 @@ Optional, and worth a thought rather than a default:
 | Key | When |
 |---|---|
 | `convention: <name>` | Another feed from this source system already exists and shares its delivery arrangement. Inherits everything the convention sets; anything the convention supplies is then left OUT of this block, so it stays in one place. Naming one that is not defined is an error at load, not a silent fallback. See [DECISIONS.md#feed-conventions](DECISIONS.md#feed-conventions). |
-| `cadence: weekly` | The feed does not deliver every business date. Without it the completeness check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
-| `completeness: false` | Monthly or ad-hoc. Opts out of the gap check entirely. |
+| `cadence: weekly` | The feed does not deliver every business date. Without it the gap check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
+| `delivery_expected: false` | Monthly or ad-hoc. Opts out of the gap check entirely. It answers "is a delivery expected on every business date", which is not the same question as whether a given delivery is *complete* — the reason it is not called `completeness`. |
 | `schema_drift: fail` | Abort the load on an extra *or* missing column instead of landing and warning. The default `warn` is usually right — a rejected file is a file nobody looks at. |
 | `column_types:` | A column whose prepared-layer treatment is not what its *name* implies. `haircut_pct` reads as a string to the inference but should be `decimal`; `settlement_ccy` is a code, not free text. Only list the disagreements — anything absent falls back to the inference. It is what the feed console writes when you change a type on the form, and what the sample-data generator reads, so the two cannot drift apart. Raw is still all strings; this describes the **prepared** model. |
-| `delivery:` | The delivery is a zip (`kind: archive`, plus `member_pattern`) or gates on a second, control file (`control: {pattern, row_count}`) rather than one plain CSV. See [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) for the shapes, and [DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) / [#control-file-gate](DECISIONS.md#control-file-gate) for what each key actually does. The console validates it with the exact function feeds.yml load does, so a typo here fails in the form rather than at the next Airflow parse. |
+| `arrival:` | The upstream does **not** send a correctly named file. `landing/` accepts only conformant names, so a legacy sender goes through the inbox gate instead: `source_pattern` recognises the name as sent, and `control:` (`pattern`, `business_date`, `version`) says how to find the control file and what it declares about the delivery's **identity**. The gate renames the delivery *and its control file* to match, writes both into `landing/` with a `.meta.json` sibling, and a re-delivery for a date already landed becomes `_v2`. It verifies nothing — row count and checksum belong to `delivery.control` and are checked at ingest, so a feed with `arrival:` needs `delivery.control` too. Omit both for any upstream that already names files correctly, which is every feed here today. See [DECISIONS.md#the-inbox-is-the-conformance-gate](DECISIONS.md#the-inbox-is-the-conformance-gate). |
+| `arrival.archive:` | The upstream sends a **zip**. The gate unpacks it and lands each member as its own delivery; the container never reaches `landing/`, and its name and md5 are recorded in each member's `.meta.json`. `member_pattern` says which members belong to this feed and must capture `(?P<business_date>...)` — each member is a complete delivery for its own date. Members that are *parts* of one date are a different shape and are not built. |
+| `delivery.control:` | The delivery is gated on a control file landing beside it, and that file states the row count (`row_count`) or a checksum (`md5`). Checked at ingest for **every** delivery — one an approved sender wrote straight into landing, and one the inbox renamed and promoted — so there is one implementation of the check and the trusted path is not the less-verified one. A mismatch abandons the build branch and leaves `main` untouched. |
+| `delivery:` | The delivery is a zip (`kind: archive`, plus `member_pattern`) rather than one plain CSV. See [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) for the shapes, and [DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) / [#control-file-gate](DECISIONS.md#control-file-gate) for what each key actually does. The console validates it with the exact function feeds.yml load does, so a typo here fails in the form rather than at the next Airflow parse. |
 
 Verify before moving on:
 

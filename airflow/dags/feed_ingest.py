@@ -146,8 +146,11 @@ def build_feed_dag(feed):
             of docs/DELIVERY-SHAPES.md) SKIPS rather than fails. `DEFAULT_ARGS`
             retries twice at `RETRY_DELAY` -- seconds, tuned for a transient
             infra hiccup -- which would turn "the control file has not landed
-            yet" into a hard failure long before `arrival_timeout_hours` (26h)
-            says this delivery is actually late. Skipping leaves this run
+            yet" into a hard failure in well under a minute, for the
+            ordinary case this whole mechanism exists to handle gracefully.
+            Nothing declares when a delivery is actually late -- there is no
+            timeout here, by decision, see
+            docs/DECISIONS.md#no-arrival-timeout. Skipping leaves this run
             asking nothing further; the safety-net poll path
             (`resolve_arrival`'s `find_pending` fallback above, or
             `scripts.bulk_ingest`) is what picks the delivery up once the

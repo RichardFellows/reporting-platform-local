@@ -130,6 +130,58 @@ def platform_housekeeping():
         return _spark_subprocess("retention", mode, *specs)
 
     @task
+    def reproducibility_check(**context) -> dict:
+        """Can a published run still be read at its own pin? REQ-702.
+
+        AFTER THE MAINTENANCE CHAIN, and that ordering is the whole test.
+        `maintain` compacts partitions older than `recent_partition_days`,
+        which rewrites their data files; `enforce_retention` then expires tags,
+        runs Nessie GC and expires snapshots. Every one of those can break a
+        pin while leaving a catalog that looks healthy, and none of them
+        announces it. Running the check first would exercise yesterday's
+        state and pass on the night the damage was done.
+
+        FAILS THE RUN, unlike `completeness_check` beside it, and the
+        difference is what the red means. A completeness gap is an upstream
+        missing a Tuesday — real, but not the platform's own doing, and a red
+        run there would be indistinguishable to the watchdog from housekeeping
+        being down. A pin that no longer resolves IS the platform destroying
+        its own evidence, in the step that just ran, and it is unrecoverable:
+        every further night makes it worse and less diagnosable.
+
+        A pin younger than `recent_partition_days` reports
+        `not_yet_meaningful` and does not fail. It has not been through a
+        compaction cycle, so it still shares its files with main and would read
+        successfully whether pinning worked or not — a green result there would
+        be a check whose window does not contain the thing it describes.
+        """
+        import logging
+
+        from airflow.exceptions import AirflowException
+
+        log = logging.getLogger("airflow.task")
+        report = _spark_subprocess("reproducibility")
+        status = report.get("status")
+        if status == "not_yet_meaningful":
+            log.info("reproducibility: %s", report.get("detail"))
+            return report
+        if status == "no_published_tags":
+            log.info("reproducibility: nothing has been published yet")
+            return report
+        if not report.get("ok", False):
+            raise AirflowException(
+                f"REPRODUCIBILITY BROKEN at {report.get('tag')}: "
+                f"{len(report.get('unreadable', []))} table(s) can no longer "
+                f"be read at a published pin. The maintenance chain that just "
+                f"ran destroyed evidence a published run depends on. Do not "
+                f"ignore this — every further night makes it less diagnosable."
+            )
+        log.info("reproducibility: %s reproduced, %d table(s) read, "
+                 "%d absent at that pin", report.get("tag"),
+                 len(report.get("tables", [])), len(report.get("absent", [])))
+        return report
+
+    @task
     def completeness_check(**context) -> dict:
         """Business dates a feed is missing that other feeds prove existed.
 
@@ -310,6 +362,10 @@ def platform_housekeeping():
     retained = enforce_retention()
     metrics >> maintained >> retained
     storage_report(metrics, retained)
+    # AFTER retention, and depending on it: this asks whether the chain that
+    # just ran destroyed a published pin, so it has to observe the state that
+    # chain left behind.
+    retained >> reproducibility_check()
     # No dependency on the chain above, on purpose: a data gap must not block
     # reclamation, and reclamation failing must not hide a data gap.
     completeness_check()

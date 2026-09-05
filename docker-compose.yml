@@ -32,6 +32,27 @@ x-airflow-common: &airflow-common
     dockerfile: Dockerfile.airflow
     args:
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.99.0}
+  # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own
+  # `id -u`; `.env.example` says how and why.
+  #
+  # Half the bind mounts here are READ-WRITE by design -- the feed console
+  # writes feeds.yml, the dbt sources and a scaffolded model; the inbox
+  # watcher creates `.processed/` and moves files into it -- and a bind mount
+  # keeps the HOST's ownership, which no `chown` in the image can reach. As
+  # uid 50000 the container could not write any of them, and the symptom was
+  # never "permissions": it was a 500 from the console with the traceback only
+  # in `docker compose logs`, and an inbox watcher that uploaded a delivery
+  # correctly and then died moving the file.
+  #
+  # The group stays 0 and that is the load-bearing half. Everything the image
+  # needs to write -- /home/airflow, /opt/airflow/logs, /opt/platform/run and
+  # the named volumes under it -- is owned `airflow:0` with `g+rwX`
+  # (Dockerfile.airflow's last layer says so explicitly), which is precisely
+  # the arrangement that lets an ARBITRARY uid run this image. So the uid may
+  # change freely; the gid may not.
+  #
+  # Default 50000 keeps the previous behaviour for anyone with no .env entry.
+  user: "${AIRFLOW_UID:-50000}:0"
   environment:
     # A sequence: YAML allows only one merge key per mapping and this block
     # needs both anchors. Neither defines a key the other does.
@@ -109,10 +130,29 @@ services:
       /bin/sh -c "
       mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin123};
       mc mb --ignore-existing local/lakehouse;
-      mc mb --ignore-existing local/lakehouse/landing;
-      mc mb --ignore-existing local/lakehouse/warehouse;
-      echo 'buckets ready';
+      echo 'bucket ready';
       "
+    # THE BUCKET ONLY. `landing/` and `warehouse/` are PREFIXES, not
+    # directories -- S3 has no directories, and a prefix exists exactly when
+    # an object whose key starts with it exists. `mc mb local/lakehouse/landing`
+    # therefore could not create one; what it actually did was PUT a zero-byte
+    # object whose key is literally `landing/`, a "folder marker" that makes
+    # the MinIO console draw a folder icon.
+    #
+    # Those markers are a small lie with a real cost: they are objects that no
+    # feed owns, no `filename_pattern` matches and nothing reads, so any sweep
+    # over the bare `landing/` prefix counts them as unrecognised objects it
+    # must never delete. `retention/landing.py` and `retention/orphan_storage.py`
+    # both happen to miss them today -- the first is scoped to
+    # `landing/<feed>/`, the second skips keys with fewer than four segments --
+    # which is luck, not design, and exactly the kind of thing a later
+    # bucket-wide sweep would trip over.
+    #
+    # Nothing needs them. Iceberg writes through `S3FileIO`, which PUTs keys
+    # directly and has no notion of a parent directory, and the only S3A use is
+    # READING landing CSVs that already exist. Verified by creating a bucket
+    # with no prefixes at all and building a table into it.
+    # See docs/DECISIONS.md#no-folder-markers
 
   # ------------------------------------------------------- catalog + stores
   postgres:

@@ -11,10 +11,11 @@ of the data.
 
 THE FLOOR IS OPERATIONAL, NOT POLICY. `landing:` must be >= the raw window
 because `find_pending` computes its retention keep-set from the dates present
-in landing. Nothing computes anything from `ready/`, so its only constraint is
-that it comfortably exceeds `arrival_timeout_hours` (26h, deliberately longer
-than a day) -- otherwise a delivery can be swept between being normalized and
-being ingested by a late run.
+in landing. Nothing computes anything from `ready/`, so `keep_days` has no
+correctness floor at all -- the rule below is what stops a delivery being
+swept between being normalized and being ingested, and it holds at any age.
+Seven days is a convenience: it keeps a recent manifest readable while
+diagnosing something, and re-normalizing is what rebuilds an older one.
 
 ONE RULE, AND IT USES THE DERIVED LEDGER. A manifest is only swept once every
 one of its parts appears in the raw table's `_source_file` values. Sweeping an

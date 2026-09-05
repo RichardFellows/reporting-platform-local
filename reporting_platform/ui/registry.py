@@ -68,11 +68,12 @@ def platform_names(headers: list[str]) -> tuple[list[str], dict[str, str]]:
 
 # Keys the UI writes into a feed block, in the order docs/ADDING-A-FEED.md
 # presents them. Anything not listed here is left alone -- a per-feed
-# `arrival_timeout_hours` set by hand survives an edit through the UI.
+# `raw_namespace` set by hand survives an edit through the UI.
 BLOCK_ORDER = ["name", "description", "source_system", "convention",
-               "filename_pattern", "delivery",
+               "filename_pattern", "arrival", "delivery",
                "delimiter", "quote_char", "header", "file_encoding",
-               "business_key", "expected_min_rows", "cadence", "completeness",
+               "business_key", "expected_min_rows", "cadence",
+               "delivery_expected",
                "schema_drift", "columns", "column_types"]
 
 # Keys only written when they differ from what the feed would INHERIT, because
@@ -84,9 +85,9 @@ BLOCK_ORDER = ["name", "description", "source_system", "convention",
 # THESE VALUES ARE THE FALLBACK, NOT THE ANSWER. What a feed actually inherits
 # is `defaults:` overlaid with its convention, which only feeds.yml knows --
 # see `_inherited()` below. This map supplies the two keys that have no entry
-# in `defaults:` at all (`cadence`, `completeness`, which default in the Feed
+# in `defaults:` at all (`cadence`, `delivery_expected`, which default in the Feed
 # dataclass) and covers the case where feeds.yml cannot be read.
-OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "completeness": True,
+OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "delivery_expected": True,
                          "schema_drift": "warn", "delimiter": ",",
                          "quote_char": '"', "header": True,
                          "file_encoding": "utf-8"}
@@ -130,7 +131,9 @@ class FeedSpec:
     columns: list[str]
     expected_min_rows: int = 10
     cadence: str = "daily"
-    completeness: bool = True
+    # "expected to deliver on every business date" -- see Feed.delivery_expected
+    # for why it is not called `completeness`.
+    delivery_expected: bool = True
     schema_drift: str = "warn"
     # The `conventions:` entry this feed inherits from, or "" to stand alone.
     # Every key the convention supplies is then omitted from the feed's own
@@ -144,6 +147,12 @@ class FeedSpec:
     # the next Airflow parse. See docs/DECISIONS.md#archive-normalizer and
     # #control-file-gate.
     delivery: dict[str, Any] = field(default_factory=dict)
+    # How the delivery arrives in the INBOX when it is not already conformant
+    # -- absent/empty means the upstream writes a correctly named file to
+    # landing/ directly, which is every feed here today. Validated with the
+    # SAME function feeds.yml load does (context.resolve_arrival_config).
+    # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
+    arrival: dict[str, Any] = field(default_factory=dict)
     # How to READ the file. All four default to the `defaults:` block and are
     # written only when they differ -- see OPTIONAL_WITH_DEFAULT. They reach
     # Spark's reader unchanged (ingest_feed.py), so a wrong delimiter lands one
@@ -177,7 +186,7 @@ class FeedSpec:
             columns=_list(payload.get("columns")),
             expected_min_rows=int(payload.get("expected_min_rows") or 0),
             cadence=str(payload.get("cadence") or "daily").strip(),
-            completeness=bool(payload.get("completeness", True)),
+            delivery_expected=bool(payload.get("delivery_expected", True)),
             schema_drift=str(payload.get("schema_drift") or "warn").strip(),
             convention=str(payload.get("convention") or "").strip(),
             delimiter=unescape_char(str(payload.get("delimiter") or ",")),
@@ -190,7 +199,41 @@ class FeedSpec:
                             (payload.get("source_columns") or {}).items()
                             if v and str(v) != str(k)},
             delivery=_delivery_from_payload(payload.get("delivery")),
+            arrival=_arrival_from_payload(payload.get("arrival")),
         )
+
+
+def _arrival_from_payload(raw: Any) -> dict[str, Any]:
+    """The form's `arrival` object -> the sparse dict `resolve_arrival_config`
+    expects, blank fields dropped.
+
+    Same division of labour as `_delivery_from_payload`: this strips blanks
+    and nothing else. Whether the block makes sense -- a date source that is
+    named twice or not at all, a control pattern with no `{stem}` -- is
+    `resolve_arrival_config`'s job in `validate()`, which is the same function
+    feeds.yml load calls, so the form and the loader cannot disagree about
+    which feeds are legal.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    source_pattern = str(raw.get("source_pattern") or "").strip()
+    if source_pattern:
+        out["source_pattern"] = source_pattern
+    control = raw.get("control")
+    if isinstance(control, dict):
+        c: dict[str, Any] = {}
+        for key in ("pattern", "business_date", "version"):
+            value = str(control.get(key) or "").strip()
+            if value:
+                c[key] = value
+        if c:
+            out["control"] = c
+    # An `arrival:` block with only a control block and no source_pattern is
+    # meaningless -- nothing would ever match it -- and returning {} for it
+    # means a form whose arrival fields are present but unused produces a feed
+    # with no arrival block at all, rather than one that validates as broken.
+    return out if source_pattern else {}
 
 
 def _delivery_from_payload(raw: Any) -> dict[str, Any]:
@@ -230,9 +273,10 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
         pattern = str(control.get("pattern") or "").strip()
         if pattern:
             c["pattern"] = pattern
-        row_count = str(control.get("row_count") or "").strip()
-        if row_count:
-            c["row_count"] = row_count
+        for key in ("row_count", "md5"):
+            value = str(control.get(key) or "").strip()
+            if value:
+                c[key] = value
         if c:
             out["control"] = c
     return out
@@ -292,8 +336,25 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
             if "business_date" not in compiled.groupindex:
                 errors["filename_pattern"] = (
                     "must contain a named group (?P<business_date>...) -- "
-                    "arrival routing reads the business date out of the "
-                    "filename and has nowhere else to get it")
+                    "this is the name the file has IN LANDING, and everything "
+                    "downstream reads the business date out of it. If the "
+                    "UPSTREAM sends no date in the name, leave this as the "
+                    "name you want and describe the real one under Arrival "
+                    "below; the inbox renames it on the way in")
+
+    if spec.arrival:
+        # THE SAME FUNCTION feeds.yml load calls -- see the delivery block
+        # below for why that matters. `filename_pattern` is passed because
+        # the gate's whole job is producing a name that pattern accepts, so a
+        # landing pattern with no date to write into is an arrival error too,
+        # and saying so here names which of the two patterns is wrong.
+        from reporting_platform.common import context
+
+        try:
+            context.resolve_arrival_config(spec.name or "(unnamed)",
+                                           spec.arrival, spec.filename_pattern)
+        except ValueError as exc:
+            errors["arrival"] = str(exc)
 
     if spec.delivery:
         # THE SAME FUNCTION feeds.yml load calls, not a second copy of the
@@ -308,6 +369,23 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
 
         try:
             context.resolve_delivery_config(spec.name or "(unnamed)", spec.delivery)
+        except ValueError as exc:
+            errors["delivery"] = str(exc)
+
+    # The two control-file gates are mutually exclusive, and setting both
+    # stalls the feed silently rather than failing -- see
+    # context.check_gates_are_coherent. Checked after both blocks so the
+    # message names the collision rather than one half of it.
+    if "arrival" not in errors and "delivery" not in errors:
+        from reporting_platform.common import context
+
+        try:
+            context.check_gates_are_coherent(
+                spec.name or "(unnamed)",
+                context.resolve_arrival_config(spec.name or "(unnamed)",
+                                               spec.arrival),
+                context.resolve_delivery_config(spec.name or "(unnamed)",
+                                                spec.delivery))
         except ValueError as exc:
             errors["delivery"] = str(exc)
 
@@ -423,6 +501,29 @@ def _inherited(spec: FeedSpec) -> dict[str, Any]:
         return dict(OPTIONAL_WITH_DEFAULT)
 
 
+def _arrival_block(value: dict[str, Any]) -> CommentedMap:
+    """`spec.arrival` -> the nested YAML mapping.
+
+    Every value here is a regex, so all of them are single-quoted like
+    `filename_pattern` and for the same reason: a double-quoted
+    `'{stem}\\.ctl'` would have YAML eat the backslash, and the pattern would
+    then match a literal dot only by accident.
+    """
+    av = CommentedMap()
+    if "source_pattern" in value:
+        av["source_pattern"] = SQ(value["source_pattern"])
+    control = value.get("control")
+    if isinstance(control, dict) and control:
+        cv = CommentedMap()
+        # Fixed order rather than dict order: pattern first because it is what
+        # finds the file, then what is read out of it.
+        for key in ("pattern", "business_date", "version"):
+            if key in control:
+                cv[key] = SQ(control[key])
+        av["control"] = cv
+    return av
+
+
 def _delivery_block(value: dict[str, Any]) -> CommentedMap:
     """`spec.delivery` -> the nested YAML mapping, in the order
     docs/DELIVERY-SHAPES.md's own examples use: kind, member_pattern,
@@ -445,8 +546,9 @@ def _delivery_block(value: dict[str, Any]) -> CommentedMap:
         cv = CommentedMap()
         if "pattern" in control:
             cv["pattern"] = SQ(control["pattern"])
-        if "row_count" in control:
-            cv["row_count"] = SQ(control["row_count"])
+        for key in ("row_count", "md5"):
+            if key in control:
+                cv[key] = SQ(control[key])
         dv["control"] = cv
     return dv
 
@@ -479,6 +581,12 @@ def _block(spec: FeedSpec) -> CommentedMap:
             # Single-quoted so the regex backslashes stay literal and the block
             # keeps looking like the ones around it.
             block[key] = SQ(value)
+        elif key == "arrival":
+            # Omitted entirely for a conformant upstream, which is the
+            # ordinary case and how every feed block looks today.
+            if not value:
+                continue
+            block[key] = _arrival_block(value)
         elif key == "delivery":
             # Omitted entirely for `kind: file` with no control block -- the
             # ordinary case, and how the four original feeds' blocks have
@@ -522,7 +630,7 @@ def _position_for(block: CommentedMap, key: str) -> int:
 
     Keys the UI does not manage keep their relative position: this only looks
     for the first MANAGED key that should come after `key` and inserts before
-    it, so a hand-added `arrival_timeout_hours` is not stepped over.
+    it, so a hand-added `raw_namespace` is not stepped over.
     """
     after = BLOCK_ORDER[BLOCK_ORDER.index(key) + 1:]
     for i, existing in enumerate(block.keys()):
@@ -623,9 +731,10 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         delimiter=fd.delimiter, quote_char=fd.quote_char,
         header=fd.header, file_encoding=fd.file_encoding, business_key=list(fd.business_key),
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
-        cadence=fd.cadence, completeness=fd.completeness,
+        cadence=fd.cadence, delivery_expected=fd.delivery_expected,
         schema_drift=fd.schema_drift, convention=fd.convention,
         column_types=dict(fd.column_types or {}),
         source_columns=dict(fd.source_columns or {}),
         delivery=dict(fd.delivery or {}),
+        arrival=dict(fd.arrival or {}),
     )

@@ -23,6 +23,7 @@ Usage:
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
     python -m scripts._spark_task completeness [lookback_business_days]
+    python -m scripts._spark_task reproducibility [published_tag]
 
 `pending` returns MANIFEST keys under ready/; `ingest` takes one of those or a
 landing object key. See reporting_platform/ingest/normalize.py.
@@ -80,6 +81,13 @@ def main() -> int:
 
         lookback = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
         print(json.dumps(run(lookback), default=str))
+        return 0
+
+    if op == "reproducibility":
+        from reporting_platform.monitoring.reproducibility import run
+
+        tag = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+        print(json.dumps(run(tag), default=str))
         return 0
 
     if op == "retention":

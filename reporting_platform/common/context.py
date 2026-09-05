@@ -73,8 +73,6 @@ class Feed:
     # See docs/DELIVERY-SHAPES.md.
     ready_prefix: str = "ready"
     raw_namespace: str = "raw"
-    arrival_poke_seconds: int = 60
-    arrival_timeout_hours: int = 26
     delimiter: str = ","
     quote_char: str = '"'
     header: bool = True
@@ -118,10 +116,17 @@ class Feed:
     # normalised. See docs/DECISIONS.md#source-column-names
     source_columns: dict[str, str] = field(default_factory=dict)
     # Whether this feed is expected to deliver on every business date. False
-    # opts it out of the completeness check, which infers the
-    # business calendar from what other feeds delivered -- a feed that does
+    # opts it out of the gap check in monitoring/completeness.py, which infers
+    # the business calendar from what other feeds delivered -- a feed that does
     # not deliver daily would otherwise show every non-delivery day as a gap.
-    completeness: bool = True
+    #
+    # NAMED FOR THE QUESTION IT ANSWERS, not for the check that reads it. It
+    # was `completeness` until "completeness" acquired a second, per-DELIVERY
+    # meaning -- is this delivery whole, and by what evidence (a declared row
+    # count, a checksum) -- which is a different question about a different
+    # subject. Two meanings under one key, in the file every team edits, is
+    # how one of them gets set to answer the other.
+    delivery_expected: bool = True
     # How often the feed is expected to deliver: "daily" (a business date is
     # expected whenever another feed delivered on it) or "weekly" (only that
     # each week containing business dates saw at least one delivery).
@@ -138,6 +143,61 @@ class Feed:
     # Validated at load by `resolve_delivery_config`.
     # See docs/DECISIONS.md#ready-is-a-derived-index and docs/DELIVERY-SHAPES.md
     delivery: dict[str, Any] = field(default_factory=dict)
+    # How this feed's delivery arrives in the INBOX, when it does not already
+    # arrive conformant. Absent means the upstream sends a correctly named
+    # file straight into `landing/` -- which is every feed here today, so an
+    # absent block is the default forever.
+    #
+    # `landing/` HAS A CONTRACT: everything in it is correctly named and
+    # classified, so `parse_filename` answers for every object and landing
+    # retention can date every object. A legacy upstream that sends
+    # `positions.csv` with the date inside a control file does not satisfy
+    # that contract, and the answer is to make it conformant AT THE DOOR
+    # rather than to teach the whole platform a second shape. This block is
+    # what the door needs: how to recognise the delivery, where its control
+    # file is, and what the control file declares.
+    # Validated at load by `resolve_arrival_config`.
+    # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
+    arrival: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def needs_conforming(self) -> bool:
+        """Whether this feed's deliveries reach landing via the inbox gate."""
+        return bool(self.arrival)
+
+    def claims_source(self, filename: str) -> bool:
+        """Whether `filename` is this feed's delivery AS THE UPSTREAM SENDS IT.
+
+        Distinct from `parse_filename`, which asks the same question of a name
+        that has already been made conformant. A legacy feed's two names are
+        genuinely different strings -- `positions.csv` in the inbox,
+        `trs_position_20260801.csv` in landing -- and conflating them is how
+        the inbox would start rejecting the files it exists to accept.
+
+        A feed with no `arrival:` block claims nothing at the door: its
+        upstream writes to `landing/` directly.
+        """
+        pattern = (self.arrival or {}).get("source_pattern")
+        return bool(pattern) and re.fullmatch(pattern, filename) is not None
+
+    def source_control_pattern(self) -> str | None:
+        return ((self.arrival or {}).get("control") or {}).get("pattern")
+
+    def source_business_date(self, filename: str) -> date | None:
+        """The business date the SOURCE filename carries, if it carries one.
+
+        Some legacy names are wrong without being dateless -- `POS_20260801.TXT`
+        for a feed whose landing convention is `trs_position_20260801.csv`.
+        Those need renaming but no control file to date them, so the gate reads
+        the date here and never opens one.
+        """
+        pattern = (self.arrival or {}).get("source_pattern")
+        if not pattern:
+            return None
+        m = re.fullmatch(pattern, filename)
+        if not m or "business_date" not in m.groupdict():
+            return None
+        return datetime.strptime(m.group("business_date"), "%Y%m%d").date()
 
     def source_column(self, name: str) -> str:
         """The name this platform column has in the delivered file."""
@@ -206,7 +266,7 @@ DELIVERY_KINDS = ("file", "archive")
 BUSINESS_DATE_FROM = ("container",)
 PARTS_MODES = ("concat",)
 DELIVERY_KEYS = {"kind", "member_pattern", "business_date_from", "parts", "control"}
-CONTROL_KEYS = {"pattern", "row_count"}
+CONTROL_KEYS = {"pattern", "row_count", "md5"}
 
 # Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
 # error can say "not built" rather than "unknown", which are different
@@ -341,21 +401,306 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, str]:
             f"a valid regex once `{{stem}}` is filled in: {exc}") from exc
 
     out = {"pattern": pattern}
-    row_count = control.get("row_count")
-    if row_count is not None:
+    # The INTEGRITY checks, both optional -- a control file may be a pure
+    # readiness gate. Read on the landing side and checked at ingest, so they
+    # run once for every delivery however it arrived: one an approved sender
+    # wrote straight into the bucket, and one the inbox renamed and promoted.
+    # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
+    for key, group in (("row_count", "rows"), ("md5", "md5")):
+        value = control.get(key)
+        if value is None:
+            continue
         try:
-            compiled = re.compile(row_count)
+            compiled = re.compile(value)
         except re.error as exc:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.control.row_count` "
+                f"feeds.yml: feed {feed_name!r} `delivery.control.{key}` "
                 f"is not a valid regex: {exc}") from exc
-        if "rows" not in compiled.groupindex:
+        if group not in compiled.groupindex:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.control.row_count` "
-                f"{row_count!r} has no `(?P<rows>...)` group -- that is the "
+                f"feeds.yml: feed {feed_name!r} `delivery.control.{key}` "
+                f"{value!r} has no `(?P<{group}>...)` group -- that is the "
                 f"only thing normalize reads out of a match.")
-        out["row_count"] = row_count
+        out[key] = value
     return out
+
+
+# --------------------------------------------------------------- the gate
+# What `arrival:` may say. Same rule as `delivery:`: every key here is read by
+# ingest/conform.py, and a key nothing dispatches on does not go in this table.
+#
+# IDENTITY ONLY. The inbox exists to establish that a delivery is correctly
+# named and has its prerequisites -- which feed, which source system, which
+# business date, which version. It does NOT verify content: `row_count` and
+# `md5` live on `delivery.control` and are checked at ingest, once, the same
+# way for a legacy delivery and for one an approved sender wrote straight into
+# landing. Putting them here too would be a second implementation of the same
+# check on one of the two paths.
+# See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
+ARRIVAL_KEYS = {"source_pattern", "control", "archive"}
+ARRIVAL_CONTROL_KEYS = {"pattern", "business_date", "version"}
+
+
+def resolve_arrival_config(feed_name: str, arrival: Any,
+                           filename_pattern: str | None = None) -> dict[str, Any]:
+    """Validate an `arrival:` block and fill its defaults.
+
+    Checked at LOAD, like `delivery:` and `conventions:`, because every way
+    this can be wrong is otherwise silent: a `source_pattern` that matches
+    nothing means the inbox rejects the feed's real deliveries to
+    `.rejected/` forever, and nothing says why.
+    """
+    if not arrival:
+        return {}
+    if not isinstance(arrival, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival:` must be a mapping, got "
+            f"{type(arrival).__name__}")
+
+    unknown = set(arrival) - ARRIVAL_KEYS
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival:` has unknown key(s) "
+            f"{', '.join(sorted(unknown))}. Valid: "
+            f"{', '.join(sorted(ARRIVAL_KEYS))}")
+
+    source_pattern = arrival.get("source_pattern")
+    if not source_pattern or not isinstance(source_pattern, str):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} sets `arrival:` with no "
+            f"`source_pattern`. That pattern is how the inbox recognises this "
+            f"feed's delivery under the name the UPSTREAM sends, which is by "
+            f"definition not the name landing will hold.")
+    try:
+        compiled = re.compile(source_pattern)
+    except re.error as exc:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.source_pattern` is not a "
+            f"valid regex: {exc}") from exc
+
+    out: dict[str, Any] = {"source_pattern": source_pattern}
+    # `in`, not `.get() is not None`: `control:` with nothing under it parses
+    # as None, and skipping it silently would let the block fall through to
+    # the business-date rule below and fail with a message about dates rather
+    # than about the empty block that actually caused it.
+    for key, resolver in (("control", _resolve_arrival_control),
+                          ("archive", _resolve_arrival_archive)):
+        if key not in arrival:
+            continue
+        if not arrival[key]:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} has an empty "
+                f"`arrival.{key}:` block. Fill it in, or remove the key -- an "
+                f"empty one reads as configured and does nothing.")
+        out[key] = resolver(feed_name, arrival[key])
+
+    # EXACTLY ONE SOURCE FOR THE BUSINESS DATE, and both failures are real.
+    # Neither, and the gate cannot name the file it is meant to produce.
+    # Both, and one fact has two sources that can disagree, with the winner
+    # decided by whichever the gate happens to read first.
+    # AN ARCHIVE IS THE THIRD CASE. Each member is its own delivery carrying
+    # its own date, so `member_pattern` is where the date comes from and the
+    # container needs none -- it is a transport wrapper, not a delivery. The
+    # container may still carry one (senders often name the zip by run date),
+    # and it is simply not read, so this rule stops short of forbidding it.
+    if "archive" in out:
+        return _finish_arrival(feed_name, out, filename_pattern)
+
+    in_name = "business_date" in compiled.groupindex
+    in_control = "business_date" in out.get("control", {})
+    if in_name and in_control:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} takes its business date from both "
+            f"`arrival.source_pattern` and `arrival.control.business_date`. "
+            f"One fact, one source -- drop whichever is not the real one.")
+    if not in_name and not in_control:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival:` gives the gate no way "
+            f"to find the business date. Either `source_pattern` captures "
+            f"(?P<business_date>\\d{{8}}), or `arrival.control.business_date` "
+            f"reads it out of the control file -- without one the delivery "
+            f"cannot be given the name landing requires.")
+
+    # The gate's whole job is producing a name `parse_filename` accepts, so a
+    # feed whose landing pattern has no date to write into is unservable. It
+    # is already an error for any feed (checked where filename_pattern is),
+    # but failing here says which of the two patterns is the problem.
+    return _finish_arrival(feed_name, out, filename_pattern)
+
+
+def _finish_arrival(feed_name: str, out: dict[str, Any],
+                    filename_pattern: str | None) -> dict[str, Any]:
+    """The gate's whole job is producing a name `parse_filename` accepts, so a
+    feed whose landing pattern has no date to write into is unservable. That is
+    already an error for any feed; failing here says which of the two patterns
+    is the problem."""
+    if filename_pattern is not None:
+        try:
+            if "business_date" not in re.compile(filename_pattern).groupindex:
+                raise ValueError(
+                    f"feeds.yml: feed {feed_name!r} has an `arrival:` block, so "
+                    f"the inbox renames its deliveries to match "
+                    f"`filename_pattern` -- but that pattern captures no "
+                    f"(?P<business_date>...), so there is nowhere to write the "
+                    f"date the gate just went and found.")
+        except re.error:
+            pass          # reported as a filename_pattern error elsewhere
+    return out
+
+
+def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
+    """Validate `arrival.archive` -- a container the gate unpacks.
+
+    A ZIP IS NOT A DELIVERY, it is a transport wrapper, and removing wrappers
+    is what the gate is for. So the container is unpacked at the door and its
+    MEMBERS are landed as ordinary deliveries; `landing/` never holds an
+    archive, and nothing downstream needs a reader for one.
+
+    Each member is a complete delivery for its own business date, which is why
+    `member_pattern` must capture one: unpacking turns one inbox file into N
+    inbox files, and each then follows the ordinary single-file path with no
+    grouping, no `parts` list and no manifest to hold them together.
+    """
+    if not isinstance(archive, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.archive` must be a "
+            f"mapping, got {type(archive).__name__}")
+    unknown = set(archive) - {"member_pattern"}
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.archive` has unknown "
+            f"key(s) {', '.join(sorted(unknown))}. Valid: member_pattern")
+
+    pattern = archive.get("member_pattern")
+    if not pattern or not isinstance(pattern, str):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.archive` sets no "
+            f"`member_pattern`. Which members belong to this feed is not "
+            f"guessable -- a zip routinely carries a checksum, a manifest or "
+            f"another feed's file alongside the data, and a wrong guess would "
+            f"silently land the wrong files.")
+    try:
+        compiled = re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.archive.member_pattern` "
+            f"is not a valid regex: {exc}") from exc
+    if "business_date" not in compiled.groupindex:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.archive.member_pattern` "
+            f"{pattern!r} captures no (?P<business_date>...). Each member is "
+            f"landed as its own delivery, so each must say which day it is "
+            f"for -- a date on the CONTAINER instead would mean the members "
+            f"are parts of one delivery, which is a different shape and is "
+            f"not built.")
+    return {"member_pattern": pattern}
+
+
+def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, str]:
+    """Validate `arrival.control` -- the control file AS IT ARRIVES.
+
+    A separate block from `delivery.control`, because they answer different
+    questions and a legacy feed needs BOTH.
+
+    This one is about IDENTITY: which control file belongs to this delivery,
+    and what does it say the delivery's business date and version are -- the
+    facts the inbox needs to give the file its correct name. It is read at the
+    door and then the control file is promoted to `landing/` alongside its
+    data file, renamed to match.
+
+    `delivery.control` is about INTEGRITY: it gates the landed delivery until
+    its control file is beside it and checks the row count and checksum at
+    ingest. That runs for EVERY delivery -- legacy or from an approved sender
+    that wrote straight to landing -- which is what makes the two paths
+    identical from landing onwards.
+    """
+    if not isinstance(control, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.control` must be a "
+            f"mapping, got {type(control).__name__}")
+
+    unknown = set(control) - ARRIVAL_CONTROL_KEYS
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.control` has unknown "
+            f"key(s) {', '.join(sorted(unknown))}. Valid: "
+            f"{', '.join(sorted(ARRIVAL_CONTROL_KEYS))}")
+
+    pattern = control.get("pattern")
+    if not pattern or not isinstance(pattern, str):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.control` sets no "
+            f"`pattern`. Which control file belongs to a delivery is not "
+            f"guessable.")
+    if "{stem}" not in pattern:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.control.pattern` "
+            f"{pattern!r} does not reference `{{stem}}` -- without it every "
+            f"delivery for this feed would look for the same control filename.")
+    try:
+        re.compile(pattern.format(stem="X"))
+    except re.error as exc:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `arrival.control.pattern` is not a "
+            f"valid regex once `{{stem}}` is filled in: {exc}") from exc
+
+    out = {"pattern": pattern}
+    # Each of these is a regex over the control file's TEXT with one named
+    # group, and the group name is the only thing read out of a match.
+    # IDENTITY ONLY -- `row_count` and `md5` belong to `delivery.control`.
+    for key, group in (("business_date", "business_date"),
+                       ("version", "version")):
+        value = control.get(key)
+        if value is None:
+            continue
+        try:
+            compiled = re.compile(value)
+        except re.error as exc:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `arrival.control.{key}` is not "
+                f"a valid regex: {exc}") from exc
+        if group not in compiled.groupindex:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `arrival.control.{key}` "
+                f"{value!r} has no `(?P<{group}>...)` group -- that is the "
+                f"only thing the gate reads out of a match.")
+        out[key] = value
+    return out
+
+
+def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
+                             delivery: dict[str, Any]) -> None:
+    """A feed that arrives through the inbox needs BOTH control blocks.
+
+    They are complementary, not alternatives, and an earlier draft of this
+    function had that exactly backwards -- it REJECTED the combination,
+    because at the time the inbox consumed the control file and never
+    promoted it, so `delivery.control` really would have waited forever. The
+    inbox now passes the control file through to `landing/` renamed, which is
+    what makes the two arrival paths identical from landing onwards, and the
+    combination is not merely legal but required:
+
+      * `arrival.control` says how to find the control file at the door and
+        what it declares about IDENTITY (business date, version) -- the facts
+        needed to name the file correctly.
+      * `delivery.control` gates the landed delivery on that control file
+        being beside it and checks INTEGRITY (row count, md5) at ingest, for
+        every delivery however it arrived.
+
+    So the error is the other way round: an `arrival.control` with no
+    `delivery.control` promotes a control file into landing that nothing ever
+    reads, and quietly loses the row-count and checksum checks for exactly
+    the feeds least likely to deserve that trust.
+    """
+    if arrival.get("control") and not (delivery or {}).get("control"):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} sets `arrival.control` but no "
+            f"`delivery.control`. The inbox promotes the control file into "
+            f"landing/ alongside the renamed delivery, and `delivery.control` "
+            f"is what reads it there -- without it the control file lands and "
+            f"nothing checks the row count or checksum, for a legacy feed, "
+            f"which is the last place to skip them. Add "
+            f"`delivery: {{control: {{pattern: ...}}}}`.")
 
 
 # A convention may set anything a feed block may, EXCEPT these two.
@@ -475,6 +820,10 @@ def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
         merged = {**effective_defaults(cname, cfg), **block}
         merged["delivery"] = resolve_delivery_config(
             block["name"], merged.get("delivery"))
+        merged["arrival"] = resolve_arrival_config(
+            block["name"], merged.get("arrival"), merged.get("filename_pattern"))
+        check_gates_are_coherent(block["name"], merged["arrival"],
+                                   merged["delivery"])
         names, sources = split_columns(merged.get("columns") or [])
         merged["columns"] = names
         # An explicit source_columns: block wins over the inline form, so a
@@ -575,6 +924,111 @@ def retention_policy(layer: str) -> dict[str, Any]:
 
 def reference_policy(kind: str) -> dict[str, Any]:
     return _load("retention.yml")["references"][kind]
+
+
+# How long a published tag is kept, in years. Its own function rather than a
+# `.get()` at the call site because the answer depends on the report and the
+# resolution order is a policy decision, not a lookup.
+DEFAULT_TAG_KEEP_YEARS = 10
+
+
+def tag_retention_years(report: str | None = None) -> int:
+    """Years a published tag for `report` is kept. `None` = no report named.
+
+    THIS IS DATA RETENTION. A tag pins every data file its commit referenced,
+    so this number is the reproducibility window for everything published
+    under it -- not a table window, and deliberately not the keep-set the
+    table layers use. See retention.yml's `references.published_tags` block
+    and docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
+
+    Resolution is `per_report[report]` then `default_keep_years`. A report
+    with no entry is the ordinary case and is not an error: the default exists
+    precisely so an unnamed or newly added report is over-retained rather than
+    silently dropped.
+
+    EITHER WINDOW MAY BE PER-ENVIRONMENT, a bare number or a map keyed by
+    `REPORTING_ENV`, exactly as `nessie_gc.deferred_delete_after_hours`
+    already is. That is not decoration: `landing.keep_years` is per
+    environment and `dev` deliberately shortens it, so a globally fixed tag
+    window would leave dev pinning published runs for a decade whose source
+    evidence it threw away after one year -- and the interlock in
+    retention.py, which refuses exactly that combination, would refuse every
+    dev sweep.
+
+    REFUSES BAD CONFIG RATHER THAN FALLING BACK. A missing, non-integer or
+    non-positive window would otherwise be read as "expire everything", and
+    the deletion it authorises is unrecoverable -- the same reason the GC
+    cutoff interlock in retention.py raises instead of warning. A shorter
+    per-report window is permitted, because a shorter period can be a real
+    answer, but it is logged: it is the direction that loses evidence.
+    """
+    policy = reference_policy("published_tags")
+
+    def _years(value: Any, what: str) -> int:
+        if isinstance(value, dict):
+            if ENV not in value:
+                raise ValueError(
+                    f"retention.yml: references.published_tags {what} has no "
+                    f"entry for env {ENV!r} (has {sorted(value)}). Add one, or "
+                    f"use a bare number of years.")
+            value = value[ENV]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"retention.yml: references.published_tags {what} is "
+                f"{value!r}, which is not a whole number of years. A published "
+                f"tag pins every data file its commit referenced, so an "
+                f"unreadable window here would authorise deleting the evidence "
+                f"a published run is reproduced from.")
+        if value <= 0:
+            raise ValueError(
+                f"retention.yml: references.published_tags {what} is {value}. "
+                f"A window of zero or less expires every pin immediately, "
+                f"which is never what is meant -- remove the entry to fall "
+                f"back to default_keep_years instead.")
+        return value
+
+    if "default_keep_years" not in policy:
+        raise ValueError(
+            "retention.yml: references.published_tags has no "
+            "`default_keep_years`. It used to carry the table keep-set "
+            "(`keep_business_days`/`keep_month_ends`), which is the wrong "
+            "shape for a reproducibility pin -- see the block's comment. "
+            "Refusing rather than guessing a window.")
+    default = _years(policy["default_keep_years"], "default_keep_years")
+
+    per_report = policy.get("per_report") or {}
+    if not isinstance(per_report, dict):
+        raise ValueError(
+            f"retention.yml: references.published_tags.per_report is "
+            f"{type(per_report).__name__}, expected a mapping of report name "
+            f"to years.")
+    if report is None or report not in per_report:
+        return default
+
+    years = _years(per_report[report], f"per_report[{report!r}]")
+    if years < default:
+        # Local import to match the rest of this module: context.py has no
+        # module-level logger, and adding one here would be the only caller.
+        import logging as _logging
+        _logging.getLogger("retention").warning(
+            "published tag retention for report %r is %d years, shorter than "
+            "default_keep_years (%d). Pins for that report expire first; this "
+            "is the direction that loses evidence permanently.",
+            report, years, default)
+    return years
+
+
+def longest_tag_retention_years() -> int:
+    """The longest published-tag window any report resolves to.
+
+    What the reproducibility interlock is measured against: retention must not
+    destroy the source evidence for a published run while ANY report's pin
+    still survives, so the binding number is the maximum, not the default.
+    """
+    policy = reference_policy("published_tags")
+    reports = list((policy.get("per_report") or {}))
+    return max([tag_retention_years(None)]
+               + [tag_retention_years(r) for r in reports])
 
 
 def nessie_gc_config() -> dict[str, Any]:

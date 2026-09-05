@@ -36,11 +36,12 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
-from reporting_platform.common.calendar_rules import expire_set, keep_set
+from reporting_platform.common.calendar_rules import expire_set
 from reporting_platform.common.context import (
     CATALOG, ENV, Nessie, all_snapshot_retention_days, gc_window_hours,
-    maintenance_config, managed_tables, nessie_gc_config, reference_policy,
-    retention_policy, spark_session,
+    longest_tag_retention_years, maintenance_config, managed_tables,
+    nessie_gc_config, reference_policy, retention_policy, spark_session,
+    tag_retention_years,
 )
 
 log = logging.getLogger("retention")
@@ -48,8 +49,63 @@ log = logging.getLogger("retention")
 HELPTEXT = ("every table the platform manages, from managed_tables() -- the "
             "same list platform_housekeeping uses")
 
-TAG_RE = re.compile(r"^published/(?P<bd>\d{4}-\d{2}-\d{2})/(?P<run>.+)$")
+# TWO SHAPES, and the second one nothing cuts yet. `published/<bd>/<run>` is
+# what `feed_ingest.record_publication` writes today; `published/<report>/<bd>/
+# <run>` is what a publication that knows its report will write, and matching
+# it here is what lets `references.published_tags.per_report` mean anything
+# when that lands. A report name may not contain "/", so the two alternatives
+# cannot both match one name.
+TAG_RE = re.compile(
+    r"^published/"
+    r"(?:(?P<report>[^/]+)/)?"
+    r"(?P<bd>\d{4}-\d{2}-\d{2})/(?P<run>.+)$")
+
+# Matches landing.py, and for the same reason: a whole number of years turned
+# into a timedelta avoids the 29 February case that calendar arithmetic hits.
+DAYS_PER_YEAR = 365.25
 WORKING_RE = re.compile(r"^(ingest|build)/")
+
+
+def check_reproducibility_window() -> int:
+    """REFUSE to sweep if landing expires before the published pins do.
+
+    A published tag pins the TABLES. Reproducing a published run means being
+    able to show its inputs as well, and `landing/` is the only copy of what
+    the upstream actually sent -- so a pin that outlives its landing evidence
+    is a pin you cannot fully honour. The window that matters is the LONGEST
+    any report resolves to, because one report over-retaining is enough to
+    require the evidence.
+
+    THIS ONE REFUSES, where `landing.keep_years()`'s own interlock warns. The
+    difference is what the failure costs. Landing running short of the raw
+    window degrades `find_pending` gradually and is recoverable by raising it.
+    Deleting landing evidence a live pin depends on is not recoverable at all,
+    and the sweep that would do it runs nightly and unattended.
+
+    NOT REQ-602 IN FULL, and the gap is stated rather than papered over. The
+    complete interlock is "retention must not delete anything a published RUN
+    depends on", and a run record enumerating its delivery set is what makes
+    that checkable per delivery. Until that exists, the honest approximation
+    is the window comparison: it catches the configuration that guarantees the
+    loss, and it cannot catch a specific delivery expiring early inside an
+    otherwise coherent window.
+
+    Returns the landing window, so a caller can log what it checked.
+    """
+    tag_years = longest_tag_retention_years()
+    landing_years = int(retention_policy("landing")["keep_years"])
+    if landing_years < tag_years:
+        raise ValueError(
+            f"retention.yml (env {ENV!r}): landing.keep_years is "
+            f"{landing_years} but published tags are kept for up to "
+            f"{tag_years} years. A published run would stay pinned and "
+            f"reproducible for {tag_years} years while the landing evidence "
+            f"it was built from is deleted after {landing_years}. Raise "
+            f"landing.keep_years to at least {tag_years}, or lower "
+            f"references.published_tags -- both are per-environment. "
+            f"Refusing to sweep in this state."
+        )
+    return landing_years
 
 
 # ----------------------------------------------------------- 1. branch hygiene
@@ -160,67 +216,104 @@ def clean_working_branches(nessie: Nessie, dry_run: bool = False) -> list[str]:
 
 # --------------------------------------------------------------- 2. tag expiry
 def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
-    """Tag retention IS data retention — a tag pins every file its commit used."""
-    policy = reference_policy("published_tags")
-    # fetch_all=True for the same reason clean_working_branches needs it: the
-    # commit time only appears in the metadata block, and without it "newest"
-    # below silently degrades to a string sort.
-    tags: dict[date, list[tuple[str, str]]] = {}
+    """Published-tag retention. TAG RETENTION IS DATA RETENTION.
+
+    A tag pins every data file its commit referenced, and `expire_snapshots`
+    cannot reclaim a pinned file. So this sweep decides, for every published
+    run, how long that run stays REPRODUCIBLE -- which is a different question
+    from how much history the tables serve, and it used to be answered with
+    the tables' own keep-set (`keep_business_days: 10 / keep_month_ends: 80`).
+
+    Two things were wrong with that, and both were live:
+
+      * an ordinary daily publication lost its pin once ten more business
+        dates had been published -- about a fortnight -- and month-end pins
+        lasted 80/12 ~ 6.7 years against a longer assumed period. The
+        evidence expired on a table schedule.
+      * within a RETAINED date, only the newest tag survived. The tag name
+        carries no feed (`published/<bd>/<run_id>`) and
+        `record_publication` runs in every per-feed ingest DAG, so N feeds
+        publishing one business date cut N tags for it and N-1 were deleted
+        the same night. Observed on the live catalog: three tags for
+        2026-08-01, all inside the keep-set, two of them scheduled for
+        deletion. The code called them "earlier reruns of the same date"
+        pinning "files for no benefit"; they were other feeds' publications.
+
+    Now: FLAT AGE, per report, and every tag is judged on its own.
+
+    THE AGE IS THE COMMIT TIME -- when the publication was MADE -- not the
+    business date it is about. A retention period runs from the creation of
+    the record, and a restatement published today for a business date years
+    old is a new record that must survive its own full window. Measuring from
+    the business date instead would expire it on arrival.
+
+    The business date is the FALLBACK, used only when a tag carries no
+    readable commit time. It is conservative by construction: a publication
+    cannot precede the date it reports on, so the business date is never later
+    than the commit time and can only ever keep a tag the commit time would
+    also have kept.
+
+    Deleting a tag is unrecoverable, so everything ambiguous here keeps.
+    """
+    now = datetime.now(timezone.utc)
+    removed: list[str] = []
+    kept = 0
+
     for ref in nessie.list_references("published/", fetch_all=True):
         if ref.get("type") != "TAG":
             continue
-        m = TAG_RE.match(ref["name"])
+        name = ref["name"]
+        m = TAG_RE.match(name)
         if not m:
+            # Under `published/` but not shaped like a publication. Never
+            # swept: this sweep only removes what it positively recognises,
+            # the same rule `clean_working_branches` follows for hold/.
+            log.info("tag %s does not match the published shape; leaving it",
+                     name)
             continue
+
+        report = m.group("report")
+        try:
+            years = tag_retention_years(report)
+        except ValueError:
+            # A window that cannot be resolved must not fall back to a guess:
+            # the fallback would authorise deletion. Re-raised so the whole
+            # sweep refuses, matching the GC cutoff interlock.
+            log.error("cannot resolve the retention window for %s; refusing "
+                      "to sweep published tags", name)
+            raise
+        cutoff = (now - timedelta(days=years * DAYS_PER_YEAR)).date()
+
         bd = datetime.strptime(m.group("bd"), "%Y-%m-%d").date()
         meta = ref.get("metadata") or {}
-        committed = (meta.get("commitMetaOfHEAD") or {}).get("commitTime") or ""
-        tags.setdefault(bd, []).append((ref["name"], committed))
+        committed = (meta.get("commitMetaOfHEAD") or {}).get("commitTime")
+        commit_date = None
+        if committed:
+            try:
+                commit_date = datetime.fromisoformat(
+                    committed.replace("Z", "+00:00")).date()
+            except ValueError:
+                commit_date = None
+        if committed and commit_date is None:
+            log.warning("tag %s has an unreadable commit time %r; judging it "
+                        "on its business date alone", name, committed)
 
-    if not tags:
-        return []
+        judged_on, age_date = ("commit time", commit_date) \
+            if commit_date is not None else ("business date", bd)
+        keep = age_date >= cutoff
+        log.info("published tag %s: business date %s, published %s, window "
+                 "%dy (cutoff %s), judged on %s%s -> %s",
+                 name, bd, commit_date or "unknown", years, cutoff, judged_on,
+                 f", report {report!r}" if report else "",
+                 "keep" if keep else "expire")
+        if keep:
+            kept += 1
+            continue
+        if not dry_run:
+            nessie.delete_reference(name)
+        removed.append(name)
 
-    keep = keep_set(
-        sorted(tags),
-        keep_business_days=policy.get("keep_business_days", 0),
-        keep_month_ends=policy.get("keep_month_ends", 0),
-    )
-    removed = []
-    for bd, entries in sorted(tags.items()):
-        if bd in keep:
-            # Keep only the newest tag for a retained date; earlier reruns of
-            # the same date pin files for no benefit.
-            #
-            # "Newest" must mean newest by COMMIT TIME. Sorting the tag names
-            # instead ranks an arbitrary run_id suffix lexicographically, and
-            # that deletes the wrong tag the moment two run_id formats coexist
-            # -- observed doing exactly that: a real
-            # `published/<date>/20260821T001056-904f03` was dropped in favour
-            # of a `published/<date>/synthetic000` because '2' sorts before
-            # 's'. The tag you actually care about is the one destroyed.
-            # Secondary key on name keeps the outcome deterministic when two
-            # tags point at the SAME commit -- which can happen if a date is
-            # re-tagged without rebuilding. That case is immaterial for
-            # retention: identical commit means identical pinned files, so
-            # whichever survives reclaims exactly the same bytes. It is only
-            # the audit trail's name that differs.
-            if all(c for _, c in entries):
-                ordered = [n for n, _ in sorted(entries, key=lambda e: (e[1], e[0]))]
-            else:
-                log.warning(
-                    "%s: missing commit time on some tags; falling back to "
-                    "name order, which may keep the wrong one", bd)
-                ordered = sorted(n for n, _ in entries)
-            for name in ordered[:-1]:
-                if not dry_run:
-                    nessie.delete_reference(name)
-                removed.append(name)
-        else:
-            for name, _ in entries:
-                if not dry_run:
-                    nessie.delete_reference(name)
-                removed.append(name)
-    log.info("published tags removed: %d", len(removed))
+    log.info("published tags: %d kept, %d removed", kept, len(removed))
     return removed
 
 
@@ -877,6 +970,13 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
     nessie = Nessie()
     report: dict = {"env": ENV, "dry_run": dry_run,
                     "started": datetime.now(timezone.utc).isoformat()}
+
+    # FIRST, and before a dry-run check, because this refuses on
+    # CONFIGURATION rather than on anything observed -- a dry run that passes
+    # here while the real run would refuse teaches the wrong thing. Raising
+    # aborts the whole chain, which is the point: every step below this line
+    # deletes something.
+    report["landing_keep_years"] = check_reproducibility_window()
 
     report["working_branches_removed"] = clean_working_branches(nessie, dry_run)
     report["tags_removed"] = expire_tags(nessie, dry_run)

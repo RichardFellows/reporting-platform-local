@@ -131,6 +131,10 @@ Nessie reference retention lives in the same file under a separate top-level
 deliberate: tag retention is data retention (see above), but it is not a
 per-layer property.
 
+**Published tags are sized in years, not by keep-set**, and that is the one
+place where the shape of the policy differs from everything else in this file.
+See *The reproducibility window* below.
+
 ### `keep_business_days`
 
 The N most recent **business dates actually present in the table**, not the last
@@ -153,12 +157,17 @@ is again the safer choice.
 The stated desire to extend to 8 years of *all* dates is a separate,
 much larger commitment — see "Open question: extended retention" below.
 
-### Landing: everything, for eight years
+### Landing: everything, for ten years
 
 **The evidence copy, and it does not follow the table rule.** Every CSV every
-feed has ever delivered is kept for `landing.keep_years` (8) and then removed —
+feed has ever delivered is kept for `landing.keep_years` (10) and then removed —
 including superseded re-deliveries. `TRADE_20260813.csv` and
-`TRADE_20260813_v2.csv` both live out their eight years.
+`TRADE_20260813_v2.csv` both live out their ten years.
+
+Raised from eight when the published-tag window was corrected: landing must
+outlast the pins, or a published run stays reproducible after the evidence it
+was built from is gone. `retention.py` refuses to sweep if it does not — see
+*The reproducibility window*.
 
 That is deliberate, and it is the opposite of what an earlier draft of this
 document specified. Landing exists to answer *"what did the file we actually
@@ -180,7 +189,7 @@ Three properties worth knowing:
 
 - **Age means business date, not upload time.** A file re-delivered late
   carries an old business date and a recent `LastModified`; the data in it is
-  still eight years old, and retention is a question about the data.
+  still ten years old, and retention is a question about the data.
 - **An object whose name matches no feed pattern is never deleted.** It is
   counted and warned about, not swept. Deleting something unidentifiable out
   of the evidence prefix is not this job's call.
@@ -191,6 +200,8 @@ Three properties worth knowing:
   landing below the raw window and live month-ends start looking expired.
   `landing.py` warns; it does not refuse, because the failure is gradual and
   an operator shortening landing in a sandbox should not be blocked.
+- **`keep_years` must also be ≥ the longest published-tag window**, and *that*
+  one refuses. See *The reproducibility window*.
 
 ### Ready: the work queue, for a week
 
@@ -207,9 +218,8 @@ docker compose exec -T airflow python -m reporting_platform.retention.ready --ap
 ```
 
 Unlike `landing:`, this window constrains nothing — nothing computes a
-keep-set from `ready/`. Its only floor is operational: comfortably longer than
-`arrival_timeout_hours` (26h, deliberately more than a day), or a delivery
-could be swept between being normalized and being ingested by a late run.
+keep-set from `ready/`, and it has no correctness floor either. What protects
+a delivery waiting on a late control file is the rule below, not this number.
 
 **One rule, and it is the reason this is its own module: a manifest whose parts
 are not yet in the raw table is never swept, at any age.** That is a read of
@@ -227,6 +237,114 @@ code read, and this section described behaviour that had never run. The policy i
 described — `latest_version_only`, a `superseded_grace_days`
 window — has been replaced rather than implemented, for the evidential reason
 above.
+
+### The reproducibility window
+
+**A published tag pins every data file its commit referenced.** So how long a
+tag lives is how long a published run can still be *reproduced* — a different
+question from how much history the tables serve, and it must not be answered
+with the tables' policy.
+
+It was, until this was corrected. `references.published_tags` carried
+`keep_business_days: 10` and `keep_month_ends: 80` — the numbers the table
+layers use. In practice that meant:
+
+- an ordinary daily publication lost its pin once ten more business dates had
+  been published, roughly a fortnight;
+- month-end pins lasted 80 ÷ 12 ≈ 6.7 years, short of the assumed period;
+- and within a *retained* date, only the newest tag survived. The tag name
+  carries no feed (`published/<business_date>/<run_id>`) and
+  `record_publication` runs in every per-feed ingest DAG, so N feeds
+  publishing one business date cut N tags for it and N−1 were deleted the same
+  night. Observed on the live catalog: three tags for `2026-08-01`, all inside
+  the keep-set, two of them scheduled for deletion.
+
+The policy is now **flat age in years, resolved per report**, on the same
+reasoning `landing:` already uses — sampling evidence by keep-set destroys
+exactly what it exists to preserve:
+
+```yaml
+references:
+  published_tags:
+    default_keep_years:          # bare number, or per REPORTING_ENV
+      local: 10
+      dev: 1
+      uat: 10
+      prod: 10
+    per_report: {}               # <report>: <years>
+```
+
+Ten years is **provisional**: the regulatory period is not confirmed, and
+over-retaining costs storage while under-retaining costs the evidence
+permanently, so it is set to the longest plausible value rather than the
+assumed seven.
+
+`per_report` matches nothing today — no publication yet knows which report it
+is for, so every tag resolves to the default. It is written down as a forward
+hook, and `TAG_RE` accepts `published/<report>/<business_date>/<run_id>`
+alongside today's shape, so the day a publication does name its report,
+retention honours it rather than silently applying the default.
+
+**Age is measured from the commit time**, not the business date: a retention
+period runs from when the record was made, and a restatement published today
+for an old business date is a new record that must survive its own full
+window. The business date is the fallback when a tag carries no readable
+commit time, and it is conservative by construction — a publication cannot
+precede the date it reports on.
+
+#### The interlock
+
+`check_reproducibility_window()` **refuses** to run retention when
+`landing.keep_years` is shorter than the longest published-tag window. A tag
+pins the *tables*; reproducing a published run also means showing its inputs,
+and `landing/` is the only copy of what the upstream actually sent.
+
+It refuses where `landing.keep_years()`'s own interlock only warns, and the
+difference is what the failure costs: landing running short of the raw window
+degrades `find_pending` gradually and is fixed by raising it, whereas deleting
+landing evidence a live pin depends on is not recoverable, and the sweep that
+would do it runs nightly and unattended.
+
+**This is not the full REQ-602 interlock**, and the gap is worth stating. The
+complete rule is "retention must not delete anything a published *run* depends
+on", which needs a run record enumerating its delivery set. Until that exists,
+the window comparison catches the configuration that guarantees the loss; it
+cannot catch one delivery expiring early inside an otherwise coherent window.
+
+#### Verified
+
+Against the running Nessie and MinIO, not inferred:
+
+- A tag's own state stays live at **any** GC cutoff. `mark-live` at `NONE`,
+  `P30D` and `P0D` gave `numContents` 171, 171 and 41: the identify phase
+  walks each reference from its HEAD and stops at "the first non-live commit",
+  so the cutoff bounds how much history *behind* a reference stays live, never
+  whether the reference's own state does. The tag's lifetime is therefore the
+  only thing that decides reproducibility.
+- All five published tags on the catalog pin distinct commits, none equal to
+  `main`.
+- Reading `lakehouse.raw.fo_trade` at the oldest of them returns its rows.
+- The old policy would have deleted two of the five that night; the new one
+  keeps all five.
+
+**Not verified**: the full reclamation chain across the deferral window —
+`maintain.py`, snapshot expiry, GC identify, then the deferred-delete pass —
+with a tagged snapshot surviving it. No sweep or delete phase was run.
+
+#### The standing check
+
+`reporting_platform/monitoring/reproducibility.py` reads every managed table at
+a published pin and fails the night if one that exists can no longer be read.
+It runs as the last task of `platform_housekeeping`, *after* the maintenance
+chain, so it observes the state that chain left behind; and it only counts a
+pin older than `recent_partition_days`, because a younger one still shares its
+files with `main` and would resolve whether pinning worked or not. See
+[DECISIONS.md#reproducibility-is-exercised-not-asserted](DECISIONS.md#reproducibility-is-exercised-not-asserted).
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.monitoring.reproducibility
+docker compose exec -T airflow python -m reporting_platform.monitoring.reproducibility --tag published/2026-08-01/<run_id>
+```
 
 ## Implementation
 
@@ -249,8 +367,8 @@ Steps 1–3 run on a Nessie branch and are merged, so the expiry itself is a
 reviewable commit. Steps 4–5 run against `main` because snapshot expiry is not
 a branchable operation.
 
-Tag expiry runs separately in `retention_tags`, driven by the same keep-set
-logic applied to `published/<business_date>/<run_id>` tag names.
+Tag expiry runs separately in `retention_tags`. See *The reproducibility
+window* below for what it does and why it is not the keep-set.
 
 ### Nessie GC
 

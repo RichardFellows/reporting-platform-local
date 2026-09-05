@@ -52,6 +52,30 @@ def _at_branch(table: str, branch: str | None) -> str:
     return f"{catalog}.{namespace}.`{name}@{branch}`"
 
 
+def _parts_md5(manifest: dict) -> str:
+    """md5 of the delivery's bytes, as landed.
+
+    Read through boto3 rather than Spark: this is a checksum of the OBJECT,
+    which is what the sender hashed, not of the rows Spark parsed out of it.
+    Going through the dataframe would hash a re-serialisation and never match.
+
+    Concatenated in `parts` order for a multi-part delivery, which is the same
+    order `read_landing` unions them in. A single-part delivery -- every
+    `kind: file` feed, which is every feed that can have a control file at all
+    -- is just that one object's hash.
+    """
+    import hashlib
+
+    from reporting_platform.ingest.arrival import _bucket, _client
+
+    digest = hashlib.md5()
+    s3, bucket = _client(), _bucket()
+    for part in manifest["parts"]:
+        digest.update(s3.get_object(Bucket=bucket,
+                                    Key=part["object_key"])["Body"].read())
+    return digest.hexdigest()
+
+
 def _landing_uri(object_key: str) -> str:
     bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
     root = bucket.rsplit("/", 1)[0] if bucket.endswith("/landing") else bucket
@@ -408,6 +432,31 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
                 f"{manifest.get('control_object')} declared {declared}. "
                 f"Branch {branch} left for inspection; main is untouched."
             )
+
+        # The checksum, next to the count. It catches what the count cannot: a
+        # delivery truncated or re-encoded in transit that still happens to
+        # hold the right NUMBER of rows. Hashed from the parts as landed,
+        # which for a delivery the inbox promoted is byte-identical to what
+        # the upstream sent -- the gate renames, it never rewrites.
+        #
+        # THIS RUNS FOR EVERY DELIVERY, whichever way it arrived. That is the
+        # point of checking here rather than at the door: an approved sender
+        # writing straight into landing/ gets exactly the same verification as
+        # a legacy feed coming through the inbox, and there is one
+        # implementation of it. See
+        # docs/DECISIONS.md#the-inbox-is-the-conformance-gate
+        declared_md5 = manifest.get("declared_md5")
+        if declared_md5 is not None:
+            actual_md5 = _parts_md5(manifest)
+            if actual_md5 != declared_md5:
+                raise ValueError(
+                    f"{fd.name} {bdate}: delivery hashes to {actual_md5}, "
+                    f"control file {manifest.get('control_object')} declared "
+                    f"{declared_md5}. The file is not the file the sender "
+                    f"checksummed -- truncated, re-encoded in transit, or a "
+                    f"different file altogether. Branch {branch} left for "
+                    f"inspection; main is untouched."
+                )
 
         if dry_run:
             log.info("dry run: would append %s rows to %s", row_count, raw_at_branch)

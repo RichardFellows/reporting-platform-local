@@ -377,7 +377,7 @@ would only give the next retention run something to delete.
 
 Editing rewrites one block in `feeds.yml` in place, keeping its position and
 comments, and keeping any key the console does not manage — a hand-tuned
-`arrival_timeout_hours` survives an edit here. A field returned to its default
+`raw_namespace` survives an edit here. A field returned to its default
 has its override **removed** rather than left behind.
 
 **Renaming is not offered.** The name is the raw table, the DAG id, the S3

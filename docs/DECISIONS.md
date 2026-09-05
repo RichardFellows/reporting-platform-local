@@ -729,7 +729,8 @@ bought nothing even on its own terms.
 The accepted cost: a feed arriving mid-compaction queues behind it rather than
 running concurrently. That is the right trade -- maintenance is scheduled after
 the last publication of the day, and a feed is late, not lost
-(`arrival_timeout_hours: 26`).
+(and nothing declares it lost — see
+[#no-arrival-timeout](#no-arrival-timeout)).
 
 Without the pool, every task sits `queued` forever with nothing to say why,
 which is why `airflow-init` creates it -- see
@@ -1499,10 +1500,12 @@ gracefully. Skipping leaves nothing further asked of that run; the delivery
 is picked up later by the same safety-net poll path that already exists for
 every other feed -- `resolve_arrival`'s `find_pending` fallback, or
 `scripts.bulk_ingest` -- which reconciles `ready/` again and finds the
-control file whenever it actually lands. `arrival_timeout_hours` remains
-exactly as unenforced as it was before this step; nothing here reads it
+control file whenever it actually lands. `arrival_timeout_hours` remained
+exactly as unenforced as it was before this step; nothing there read it
 either, and turning it into an actual timeout -- distinguishing "still
 waiting" from "will now never arrive" -- is a real gap, not a solved one.
+The field has since been DELETED rather than left sitting there looking like
+the answer: see [#no-arrival-timeout](#no-arrival-timeout).
 
 **Inbox routing is a second gap `route()`'s data-file-only matching created,
 and it had to be closed for this to work at all locally.** A control file
@@ -1548,7 +1551,7 @@ Airflow scheduler -- the one claim that mattered most, because it is the one
   feed's control file, and an unrelated filename is still rejected.
 
 One thing this did NOT need to prove separately: `arrival_timeout_hours`
-still reads nowhere, which the skip-then-poll behavior above does not
+read nowhere, which the skip-then-poll behavior above does not
 depend on and was not exercised to depend on it. The feed, raw table and
 landed/ready objects were all removed afterward -- this was verification,
 not onboarding.
@@ -1702,15 +1705,17 @@ they are the key" -- auto-checking all of them would silently propose a
 composite key nobody asserted.
 
 **One real bug found by wiring this up rather than by reading the code:**
-`feedForm` sets `completeness.checked = f ? f.completeness : true` -- a
-truthy check on `f`, not `f?.completeness ?? true`. A sniffed proposal is a
-real (truthy) object that never sets `completeness` at all, so passing one
-straight through would have silently unchecked it -- opting the new feed
-OUT of the completeness/gap check with nothing on screen explaining why.
-`newFeed` now defaults `draft.completeness` before handing it to
+`feedForm` sets `deliveryExpected.checked = f ? f.delivery_expected : true`
+-- a truthy check on `f`, not `f?.delivery_expected ?? true`. A sniffed
+proposal is a real (truthy) object that never sets `delivery_expected` at
+all, so passing one straight through would have silently unchecked it --
+opting the new feed OUT of the gap check with nothing on screen explaining
+why. `newFeed` now defaults `draft.delivery_expected` before handing it to
 `feedForm`. Grepped for the same `f ? f.x : default` shape across the rest
-of the function afterward; only `header` uses it besides `completeness`,
-and every sniffed proposal always sets `header`, so it was not at risk.
+of the function afterward; only `header` uses it besides
+`delivery_expected`, and every sniffed proposal always sets `header`, so it
+was not at risk. (The field was called `completeness` when this was found;
+see `#delivery-expected-not-completeness`.)
 
 **The gap this surfaced -- `feedForm`/`FeedSpec` having no `delivery:` field
 at all -- is now closed.** See `#console-delivery-support` below for what
@@ -1727,8 +1732,8 @@ traversal in the filename was rejected. **Not verified**: an actual
 in-browser click-through of the new "Unclaimed deliveries" panel and the
 pre-filled form -- the JS was syntax-checked (`node --check`) and traced by
 hand against `feedForm`'s exact field-reading conventions (catching the
-`completeness` bug above), but no browser was available in the session that
-built this.
+`delivery_expected` bug above), but no browser was available in the session
+that built this.
 
 ## console-delivery-support
 
@@ -1795,3 +1800,771 @@ run on that identical permission mismatch -- for a PLAIN feed with no
 something introduced by it.
 
 11 new tests in `tests/test_delivery_form.py`.
+
+## the-inbox-is-the-conformance-gate
+
+`landing/` has a CONTRACT: every object in it is correctly named and
+classified. `Feed.parse_filename` answers for every delivery, landing
+retention can date every object, and `find_pending` can compute its retention
+keep-set from the dates it sees there. Every simplification downstream rests
+on that one property.
+
+Two ways in, and the contract holds either way:
+
+| Path | For | What happens |
+|---|---|---|
+| direct `PutObject` into `landing/` | an **approved** sender that adheres to the contract | nothing; it already meets the standard |
+| the **inbox gate** | a legacy sender that does not | classify, wait for the control file, name it correctly, promote |
+
+`arrival:` in `feeds.yml` marks the second, and a feed without one is the
+first. Opt-in, because making it mandatory would demand a control file from
+senders who have no reason to ship one -- and every feed here today is the
+first kind.
+
+### The inbox establishes IDENTITY. Ingestion verifies INTEGRITY.
+
+This is the line the whole design turns on, and the first implementation got
+it wrong. The inbox exists to ensure a delivery is correctly named and has its
+prerequisites: which source system, which feed, which business date, which
+version. It does **not** check the row count or the checksum.
+
+The first version did check them, at the door, and rejected a mismatch before
+anything landed. Two things were wrong with that:
+
+* **it put a second implementation of the same check on one of the two
+  paths.** `delivery.control` already checked the row count in `landing/`;
+  adding a parallel check in `conform.py` meant two code paths that had to be
+  kept in step by discipline.
+* **it left the trusted path less verified than the untrusted one.** An
+  approved sender writing straight to landing got no checksum check at all
+  (`delivery.control` had no `md5` key), while a legacy feed got one at the
+  door. Exactly backwards.
+
+So the keys are split by responsibility, and neither block may carry the
+other's:
+
+```yaml
+arrival:                       # IDENTITY -- read by the inbox
+  source_pattern: 'positions\.csv'
+  control:
+    pattern: '{stem}\.ctl'
+    business_date: 'ReportingDate\|(?P<business_date>\d{8})'
+delivery:                      # INTEGRITY -- read in landing, checked at ingest
+  control:
+    pattern: '{stem}\.ctl'
+    row_count: 'ROWS=(?P<rows>\d+)'
+    md5: 'MD5=(?P<md5>[0-9a-fA-F]{32})'
+```
+
+`arrival.control` rejects `row_count`/`md5` at load, as unknown keys. Both
+paths now verify identically, once, at ingest -- which is what "the process
+continues the same from there" actually requires.
+
+### The control file is PROMOTED, not consumed
+
+The delivery is the data file and its control file **together**. So the inbox
+renames both and writes both into `landing/`, and `landing/` always holds the
+whole delivery whichever way it arrived. That is what lets `delivery.control`
+read it there for a legacy feed exactly as it does for an approved sender.
+
+The first version consumed the control file at the door. Combined with
+`delivery.control` that stalled the delivery **forever, silently** -- the
+inbox ate the control file, landing never saw one, and `normalize` waited on a
+sibling that could not arrive, reported as `awaiting_control` and logged at
+INFO because from `reconcile`'s side nothing was wrong and the sender was
+merely late. CLAUDE.md's own warning: a check whose window does not contain
+the thing it describes never stops. Verified by construction before it was
+fixed.
+
+The consequence is that the two blocks are **complementary, not
+alternatives**: a legacy feed needs both, and `check_gates_are_coherent`
+rejects an `arrival.control` with no `delivery.control` -- which would promote
+a control file into landing that nothing ever reads, quietly losing the row
+count and checksum for the feeds least likely to deserve that trust. An
+earlier draft of that same function asserted the exact opposite; it is kept as
+a named example of a guard written against a design rather than against the
+working mechanism.
+
+**The promoted control file is named from `delivery.control.pattern`, not
+from the name it had in the inbox**, because `delivery.control` is what has to
+find it, and it is checked against that same regex before being used.
+
+### Two names, and the rename cannot be wrong
+
+`positions.csv` in the inbox; `trs_position_20260801.csv` in landing.
+`Feed.claims_source` answers the first, `Feed.parse_filename` the second, and
+`ingest/conform.py` is the only thing that crosses between them. Conflating
+them is how the inbox would start rejecting the files it exists to accept.
+
+`common/filenames.render_filename` -- moved out of `ui/sampledata.py`, where
+it already existed to generate sample deliveries -- builds the landing name
+FROM `filename_pattern` and feeds it back through `parse_filename` before
+returning it. "The inbox renamed a file to something landing will not match"
+is therefore structurally impossible rather than something a test has to
+remember, and that failure is the silent kind: the file lands, `find_pending`
+never matches it, and the feed reports nothing pending forever.
+
+### Versions, so a re-delivery cannot overwrite evidence
+
+A corrected file for a business date already landed must not overwrite the
+first one -- `landing/` is the evidence copy and the original is the evidence
+of what was originally ingested. The gate renders the unversioned name, and if
+the listing shows it taken, tries `_v2`, `_v3` and so on. A version the
+control file itself declares wins outright: the sender said which restatement
+this is, and second-guessing that is worse than obeying it.
+
+### Two failure modes, and they land differently
+
+* **IDENTITY failure** -- no feed claims the name, or no business date can be
+  found. The file cannot be NAMED, so there is no landing key to write it to
+  and it cannot land at all. `.rejected/`.
+* **INTEGRITY failure** -- wrong row count, wrong checksum. Nothing to do with
+  naming. The delivery **lands**, because `landing/` is the evidence copy and
+  "the upstream sent us a truncated file on the 3rd" is precisely what it
+  exists to prove, and then the ingest refuses, abandons its Nessie branch and
+  leaves `main` untouched, exactly as `expected_min_rows` already does.
+
+A missing control file is neither: nothing is wrong and the sender is not
+done, so the delivery is HELD in the inbox for the next pass. `NotReady` and
+`ConformanceError` stay separate types for the reason
+[#control-file-gate](#control-file-gate) gives.
+
+### The metadata sibling
+
+`landing/<feed>/<delivery>.meta.json`. The landed objects are byte-identical
+to what the upstream sent but carry the PLATFORM's names, so the originals --
+and everything else about the arrival -- survive only here: source filename,
+source control filename, source system, received and promoted times, and the
+bytes/rows/md5 as measured at the door. Those measurements are **recorded, not
+compared**; if the ingest later disputes the row count, they say whether the
+file changed after arrival or arrived wrong.
+
+It no longer embeds the control file's text. An earlier version did, correctly,
+because the gate consumed the control file and it reached landing no other way.
+It is promoted now, so a copy here would be a second version of the same bytes
+with nothing keeping them in step.
+
+**The `.meta.json` suffix is load-bearing**, for the same reason the control
+file's name is: `retention/landing.py` dates an object from its own name and
+refuses to delete anything it cannot date. A metadata object carries its
+delivery's name inside its own, so it dates by stripping the suffix, with no
+lookup, and an orphaned one still expires instead of accumulating forever.
+
+### A pre-existing bug this surfaced
+
+**Landing retention could not date a control file at all.** `TRADE_20260801.ctl`
+matches no `filename_pattern` -- it is not a delivery -- so `_expiry` returned
+None, the sweep counted it as `unrecognised`, and it would never be deleted.
+Latent while no feed used `delivery.control`; permanent accumulation once
+control files routinely land, which this change makes the normal case.
+
+Fixed by dating a control file from the SIBLING it gates -- the delivery in
+the same prefix whose stem its `delivery.control.pattern` matches -- found with
+no extra S3 call, because the sweep has already listed the prefix. Searching
+the control filename for an 8-digit run would be simpler and is deliberately
+not done: this authorises deletion from the evidence copy, and a name with two
+8-digit runs would pick the wrong one. No sibling means keep.
+
+### Verified on the live stack
+
+Real MinIO, real Spark, a real Airflow scheduler and the real inbox watcher
+container, with a throwaway `trs_position` feed carrying BOTH blocks -- removed
+afterwards along with its table, DAG, landing objects and processed files.
+
+* A good delivery (`positions.csv` + `positions.ctl` declaring
+  `ReportingDate|20260801`, `ROWS=2` and a real md5) produced
+  `conformed positions.csv -> landing/trs_position/trs_position_20260801.csv`,
+  and landing held **all three** objects: the renamed data file, the renamed
+  control file, and the `.meta.json`. `reconcile` then read the PROMOTED
+  control file through `delivery.control` and wrote a manifest carrying
+  `declared_row_count: 2` and `declared_md5`. The DAG reached `success` and
+  `main` held 2 rows.
+* A delivery that was **identifiable but corrupt** (`ROWS=99` against 1 row,
+  a bogus md5) was NOT rejected: it landed, with its control file and metadata,
+  and the DAG run went **`failed`** with
+  `1 rows read, control file ... declared 99. Branch left for inspection; main
+  is untouched.` `main` provably still held only the first date.
+* A **re-delivery for a date already landed** produced
+  `trs_position_20260801_v2.csv` (plus its control file and metadata) with the
+  original untouched, and ingested as `_file_version` 2 alongside version 1.
+* `sweep_landing --dry-run` reported `retained: 9, unrecognised: 0` -- three
+  deliveries times three objects, every one recognised and dated.
+
+One operational note worth having: **the inbox watcher must be restarted after
+a code change.** `feeds()` re-reads config on mtime, which covers a feed being
+added, but a long-running process holds the module code it imported at start.
+A stale watcher reported a config key as unknown that was valid on disk.
+
+30 new tests in `tests/test_conform.py`.
+
+## containers-run-as-the-host-uid
+
+`docker-compose.yml` sets `user: "${AIRFLOW_UID:-50000}:0"` on the
+`x-airflow-common` anchor, and `.env` carries `AIRFLOW_UID=$(id -u)` on Linux.
+
+**Half the bind mounts here are READ-WRITE by design**, which is what makes
+this necessary rather than cosmetic. The feed console writes `feeds.yml`, the
+dbt source file and a scaffolded model; the inbox watcher creates
+`.processed/` and moves delivered files into it. A bind mount takes its
+ownership from the HOST, which no `chown` in the image can reach -- the same
+constraint [#dbt-working-directories](#dbt-working-directories) solved for
+dbt's own working directories by moving them OUT of the bind mount. That
+escape is not available here: writing to the checkout is the point.
+
+**The symptom never says "permissions."** The console returns a bare HTTP 500
+with the traceback only in `docker compose logs feed-ui`, and the inbox
+watcher uploads a delivery to landing correctly and THEN dies moving the local
+file -- leaving a delivery that is landed, correctly renamed, and still
+sitting in the inbox. Both were hit during the work on
+[#the-inbox-is-the-conformance-gate](#the-inbox-is-the-conformance-gate) and
+worked around locally before being fixed properly here.
+
+**The gid stays 0 and that is the load-bearing half.** Everything the image
+needs to write -- `/home/airflow` (`drwxrwx--- 50000:0`), `/opt/airflow/logs`,
+`/opt/platform/run` and the named volumes under it -- is owned `airflow:0`
+with `g+rwX`. `Dockerfile.airflow`'s last layer says so in as many words:
+"airflow:0 with g+rwX, so an arbitrary assigned uid in group 0 can still
+write." The image was already built for this; it was simply never switched on
+at the compose level. So the uid may change freely and the gid may not.
+
+Default `50000` preserves the old behaviour for anyone with no `.env` entry,
+and macOS/Windows should leave it unset -- Docker Desktop's VM maps ownership
+and 50000 is correct there.
+
+Verified by recreating all eight services: `id` reports `uid=1000 gid=0(root)`
+in each, `feeds.yml` is writable, `inbox/.processed/` is creatable, and a feed
+created through the console over HTTP returned 200 having written all five
+files with `dbt parse` clean -- the exact call that returned 500 before.
+
+### Two unrelated things this turned up
+
+**The feed console was never reachable on this machine.** Port 8082 was held
+by an unrelated `frigate` container bound to `127.0.0.1:8082`, so
+`docker compose up feed-ui` failed to bind and every request to
+`localhost:8082` was answered by Frigate's own error page -- which is what a
+"500 from the console" looked like before anyone had recreated the container.
+`FEED_UI_HOST_PORT` already existed for exactly this; it is set to 8092 in
+`.env` here. Worth knowing that a port conflict presents as a *plausible
+response from the wrong service*, not as a connection refused.
+
+**`_summary` omitted five fields the edit form can set**, and a console edit
+therefore destroyed them. Found by the serialiser round-trip test written for
+`arrival:` (below), then reproduced deliberately before fixing: a feed created
+with `delimiter: "|"`, `file_encoding: latin-1` and
+`source_columns: {k: "The Key"}` came back from one console edit as
+comma/utf-8 with no renames. The form reads `f?.delimiter ?? ","`, so a
+missing key is not blank -- it is the DEFAULT, posted straight back. `_block`
+then removes the feed's own `delimiter: "|"` rather than changing it, leaving
+a diff that reads as tidying up, and the ingest lands one column holding the
+whole row (`docs/DELIVERY-SHAPES.md`: "A pipe feed is `delimiter: "|"` and
+nothing else"). No shipped feed had a non-default format, so this was latent
+-- and legacy onboarding is exactly where pipes and renamed headers appear.
+
+This is the third time this shape of bug has appeared: `column_types` had it
+(the comment in `_summary` records the cost), `arrival:` would have had it,
+and these five did. **The guard is now structural**:
+`test_the_api_returns_every_block_the_form_can_edit` compares every
+`FeedSpec` field against the literal keys of the dict `_summary` returns,
+read out of the source with `ast` so it needs no fastapi on the host.
+Adding a field to the form without adding it to the response now fails a test
+instead of quietly deleting data.
+
+## no-folder-markers
+
+`minio-init` creates the **bucket** and nothing else. It used to also run
+
+```
+mc mb --ignore-existing local/lakehouse/landing;
+mc mb --ignore-existing local/lakehouse/warehouse;
+```
+
+which reads as "make the two prefixes" and is not what it did. S3 has no
+directories: a prefix exists exactly when an object whose key starts with it
+exists, so those commands could not create one. What they actually did was PUT
+a **zero-byte object whose key is literally `landing/`** -- a folder marker,
+which makes the MinIO console draw a folder icon and is otherwise a lie.
+
+### Why bother removing two empty objects
+
+They are objects that no feed owns, no `filename_pattern` matches and nothing
+reads. Any sweep over the bare `landing/` prefix therefore has to classify
+them, and the honest classification is "unrecognised, never delete" -- the
+category reserved for a delivery whose name is wrong, which is a
+configuration error worth chasing. Two permanent false entries in that count
+is exactly the kind of noise that trains people to ignore it.
+
+Both existing sweeps happen to miss them, and that is luck rather than design:
+`retention/landing.py` is scoped to `landing/<feed>/` and never sees the bare
+prefix, and `retention/orphan_storage.py` skips keys with fewer than four
+segments (`warehouse/` has two). Neither was written with a marker in mind.
+The next bucket-wide sweep would not be so lucky.
+
+### Nothing needs them, and that was checked rather than assumed
+
+Iceberg writes through `S3FileIO` (`spark.sql.catalog.lakehouse.io-impl`,
+set identically in `common/context.py` and `dbt/profiles.yml`), which PUTs
+keys directly and has no notion of a parent directory. The only S3A use is
+`spark.read.csv("s3a://...")` READING a landing object that already exists.
+
+Verified in a bucket created with **no objects at all**: `CREATE NAMESPACE` /
+`CREATE TABLE` / `INSERT` against `s3a://lakehouse-fresh/warehouse` wrote six
+objects -- two parquet, four metadata -- under a `warehouse/` prefix that had
+never been "created", and left no marker of its own. Then, in the real bucket
+with both markers deleted, `minio-init` re-run produced none, an s3a read of a
+real landing CSV returned its 400 rows, and `lakehouse.raw.fo_trade` read back
+15,255 rows.
+
+### One mistake worth recording
+
+The fresh-bucket probe was run against a redirected `REPORTING_WAREHOUSE` but
+the SHARED Nessie catalog, so `CREATE TABLE` wrote a `probe` namespace into
+`main`. The bucket was then deleted before the table was dropped, which made
+`DROP TABLE` unfixable through Spark -- it loads the table to resolve it, and
+loading needs a `metadata.json` that no longer existed. Removed with a direct
+Nessie `DELETE` commit on the content keys instead.
+
+**Redirecting the warehouse location does not redirect the catalog.** A
+throwaway Iceberg table is only throwaway if the catalog entry goes too, and
+the drop has to happen before the storage does.
+
+### Removing the markers from an existing stack
+
+They are not cleaned up automatically, on purpose: an init container that
+deletes objects is a footgun, and the obvious `mc rm local/lakehouse/landing/`
+is a RECURSIVE delete of every delivery this platform has ever received. Use
+an exact-key delete, which cannot recurse:
+
+```bash
+docker compose exec -T airflow python -c "
+from reporting_platform.ingest.arrival import _client, _bucket
+s3, b = _client(), _bucket()
+for key in ('landing/', 'warehouse/'):
+    assert s3.head_object(Bucket=b, Key=key)['ContentLength'] == 0
+    s3.delete_object(Bucket=b, Key=key)
+    print('deleted', key)"
+```
+
+
+## unpacking-happens-at-the-gate
+
+`arrival.archive: {member_pattern: '...'}`. A container dropped into the inbox
+is unpacked there, and its MEMBERS are landed as ordinary deliveries. The zip
+never reaches `landing/`.
+
+**A zip is not a delivery, it is a transport wrapper**, and removing wrappers
+is exactly what the gate is for. Once that is said out loud the shape follows:
+unpacking turns ONE inbox file into N inbox files, each of which takes the
+ordinary single-file path. There is no grouping to invent, no `parts` list, no
+manifest holding members together, and nothing downstream needs to know an
+archive was ever involved.
+
+That is only true because **each member is a complete delivery for its own
+business date** -- `member_pattern` must capture one, and a pattern that does
+not is rejected at load naming the gap. Members that are PARTS of one delivery
+(a single date split for size) are a genuinely different shape: they would
+have to stay grouped, which needs something to record the grouping, and that
+is the `parts: concat` design the old archive normalizer implements. It stays
+NOT BUILT at the gate.
+
+### Why not keep unpacking where it was
+
+The archive normalizer (`normalize._normalize_archive`) extracts members into
+`ready/` at normalize time, which works and is verified. Moving it left is
+better for one reason that outweighs the churn: **it is the only thing left
+that puts data in `ready/`.** With unpacking at the gate, `ready/` holds
+nothing but manifests -- and since the conformance gate guarantees every
+landing object is correctly named, every field of a `kind: file` manifest is
+now derivable from `landing/` alone. `ready/` becomes a pure cache of a
+derivation, which is a much easier thing to reason about, and a candidate for
+removal entirely.
+
+It also fixes a smaller thing. `landing/` was documented as holding "exactly
+what the upstream sent, byte for byte", and for an archive feed that meant an
+object **Spark cannot read** -- the one kind of landed object that needed a
+whole extra stage before it was usable. Landing the members restores the
+property that everything in `landing/` is directly readable.
+
+### The container is recorded, not landed
+
+The members are the evidence: they hold the rows the upstream sent, byte for
+byte, and landing them loses nothing that the rows themselves carried. What
+would be lost is the fact that a container existed at all, so the metadata
+sibling records `source_container`, `source_container_bytes` and
+`source_container_md5`. What arrived stays provable -- and provable against
+the original bytes, since the md5 is of the zip as received -- without keeping
+an object in the evidence prefix that nothing ever reads and that landing
+retention would have to learn to date.
+
+The container itself survives in `inbox/.processed/<feed>/` for as long as
+that directory is kept, which is an operational choice rather than a platform
+guarantee.
+
+### Two details that are easy to get wrong
+
+**`taken` advances as members land, it is not read once.** Two members
+resolving to the same business date inside one zip would otherwise both render
+the unversioned name and the second would silently overwrite the first, inside
+the evidence copy. The set is seeded from `list_landing` and added to after
+each member, so the second becomes `_v2`.
+
+**One bad member does not discard the rest.** A member that cannot be named is
+reported and skipped; the others land. Rejecting a whole week of files because
+one of them is misnamed would turn a small upstream error into an outage, and
+the good members are real deliveries that arrived.
+
+The traversal guard moved across with the unpacking: a member named
+`../../etc/passwd` would be written outside the feed's landing prefix, into
+another feed's evidence. Only a flat filename is accepted, rejected outright
+rather than normalised into something that looks safe. Note a strict
+`member_pattern` filters such a name out before the guard is reached -- the
+guard exists for a permissive one, and the test uses a permissive pattern for
+exactly that reason.
+
+### An adjacent bug this surfaced
+
+An **empty sub-block was silently ignored**. `arrival.control:` or
+`arrival.archive:` with nothing under it parses as `None`, and the resolver
+skipped it with `.get(key) is not None` -- so the feed loaded as though the
+block were absent. For `archive:` that fell through to the plain-file
+business-date rule and failed with a message about dates, which is not the
+problem. Both are now checked with `in` and an empty block is its own error
+naming itself.
+
+### Verified on the live stack
+
+A real zip -- `weekly_20260803.zip`, holding `POS_20260801.csv`,
+`POS_20260802.csv` and a `checksums.txt` -- dropped into `./inbox`:
+
+* the watcher logged `unpacked weekly_20260803.zip -> 2 delivery(ies)`;
+* `landing/cust_position/` held **four objects and no zip**: two dated CSVs and
+  their metadata siblings, with `checksums.txt` skipped as unclaimed;
+* the metadata recorded `source_container: weekly_20260803.zip` and a
+  `source_container_md5` that matches the zip in `.processed/` byte for byte;
+* both members ingested as ordinary deliveries, `_source_file` a plain landing
+  key, no `parts` grouping and no archive normalizer involved.
+
+12 new tests in `tests/test_conform.py` (158 total).
+
+## an-unchanged-resend-is-a-no-op
+
+A byte-identical file delivered twice through the inbox gate used to land as
+`_v2`. It should land as nothing.
+
+`_free_name` versions a landing name that is already `taken`, which is right
+for a *corrected* file — `landing/` is the evidence copy, and overwriting the
+original destroys the evidence of what was originally ingested. It was wrong
+for a resend, and the cost is not an extra object. `_v2` is a `_source_file`
+value the raw table has never seen, so `already_ingested` does not match it,
+`next_file_version` gives it `MAX+1`, and `dedupe_rank` — which ranks
+`_file_version DESC, _row_number DESC` within `(_business_date,
+business_key)` — lets the copy **supersede the delivery it is a copy of**.
+The rows are identical, so nothing looks wrong anywhere: the only artefact is
+a restatement in the history that the upstream never made.
+
+Reproduced as a pure function before it was fixed, same bytes, same control
+file, first name in `taken`:
+
+```
+first  -> trs_position_20260801.csv     517263d1618098b81bb21c1cb7cfed25
+resend -> trs_position_20260801_v2.csv  517263d1618098b81bb21c1cb7cfed25
+```
+
+**Sameness is decided on the bytes, not on the name**, and only against
+deliveries already landed for the same business date. `conform()` and
+`conform_member()` take a `landed_md5` callable beside `taken`; `_free_name`
+compares every candidate that is already taken — including one a control file
+declared a `version` for — and raises `DuplicateDelivery` on a match instead
+of stepping past it. That exception is deliberately **not** a
+`ConformanceError`: `inbox._promote` routes one of those to `.rejected/`, and
+nothing is wrong with a retried transfer. The inbox copy moves to
+`.processed/`, where `_move` timestamps a colliding name, so the resend stays
+on disk as evidence that it happened — just not as evidence of a new delivery.
+
+**None means unknown, and unknown versions.** `landed_md5` returns None when
+there is no record, and the caller must not read that as "different bytes"
+either way round. Versioning is the fail-open direction: a needless `_v2`
+costs one object, a suppressed restatement costs the evidence permanently.
+
+`arrival.landed_md5_lookup` reads the `.meta.json` sibling's recorded `md5`
+first and falls back to hashing the landed object. The fallback is not
+redundant — `_promote` writes the data file *before* the metadata and treats a
+failed metadata write as the survivable failure, an approved sender writing
+straight into `landing/` has no sibling at all, and neither does anything
+landed before this existed. The feed's landing listing is already in hand, so
+a name with nothing under it costs no request.
+
+**A container resent whole is the expensive case**, and it forced one further
+change. `_promote_archive` left the container in the inbox when nothing
+landed, so a zip whose members were all duplicates would be unpacked again on
+every pass forever. Duplicates now count as handled.
+
+This does not *record* the resend anywhere but the log and the sweep outcome.
+The delivery registry is what makes a rejected or duplicate delivery a row
+rather than a moved file; until then, a no-op is the whole requirement.
+
+Seven tests in `tests/test_conform.py` (49 in that module). A conformant
+upstream needs none of this: it writes the same key twice and object storage
+makes it idempotent for free.
+
+## delivery-expected-not-completeness
+
+`Feed.completeness` is now `Feed.delivery_expected`.
+
+It is a boolean meaning "a delivery is expected on every business date",
+read only by `monitoring/completeness.py` to opt a feed out of gap detection.
+"Completeness" separately means "is *this delivery* whole, and by what
+evidence" — a declared row count, a checksum, a control file. Different
+subject, different lifetime, different reader.
+
+Two meanings under one key, in the one file every team edits, is how one of
+them ends up set to answer the other — and the failure is silent in both
+directions: a monthly feed left in the gap check reports a false gap every
+day, and a daily feed opted out stops being checked with nothing on screen
+saying so. The names were separated before the second meaning acquired any
+config of its own, which is the only cheap moment to do it.
+
+The check keeps its name: `monitoring/completeness.py`, the `completeness` op
+in `scripts/_spark_task.py` and the `completeness_check` housekeeping task all
+still do business-date completeness, and that is what they are called.
+
+A hard rename with no compatibility shim. No feed block in `feeds.yml` set the
+key, and the YAML allowlist is derived from `Feed.__dataclass_fields__`, so a
+hand-added `completeness:` is now a load-time error naming itself rather than
+a silently ignored line. Nine files: `common/context.py`, `ui/registry.py`
+(field, `from_payload`, `spec_from_feed`, `BLOCK_ORDER`,
+`OPTIONAL_WITH_DEFAULT`), `ui/app.py`, `ui/static/index.html`,
+`monitoring/completeness.py`, and the four docs that describe the key.
+
+## no-arrival-timeout
+
+`arrival_timeout_hours` and `arrival_poke_seconds` are deleted. Nothing read
+either of them.
+
+`arrival_timeout_hours` was a `Feed` field with a default of 26 and twelve
+references, every one a comment or a docstring — including three that cited it
+as the *floor* for `ready.keep_days`. A number that appears in reasoning but
+in no code path is worse than an absent one: it reads as a mechanism, and
+[#control-file-gate](#control-file-gate) records a draft of
+`docs/DELIVERY-SHAPES.md` that claimed a late control file "times out through
+the existing `arrival_timeout_hours: 26` path" before that was checked against
+the code. CLAUDE.md's own rule, one level up: a guard written against a
+documented mechanism rather than the working one can only produce false
+alarms, and a *rationale* written against one produces false confidence.
+
+Deleted rather than implemented, on purpose. The requirements introduce
+`expected_by` as the lateness concept, with a named owner and an action.
+Building a second, weaker one now and superseding it in a phase's time repeats
+the `completeness` collision knowingly — see
+[#delivery-expected-not-completeness](#delivery-expected-not-completeness).
+
+What actually prevents a late control file from failing a run is unchanged and
+was never this field: `feed_ingest.normalize_task` catches `NotReady` and
+raises `AirflowSkipException` rather than letting `DEFAULT_ARGS` turn "not here
+yet" into a hard failure in under a minute, and the safety-net poll path
+(`find_pending`, or `scripts.bulk_ingest`) picks the delivery up whenever the
+control file lands, however long that takes.
+
+The three retention comments are re-anchored to the guard that actually holds.
+`ready/` has no correctness floor at all: `retention/ready.py` never sweeps a
+manifest whose parts are not yet in the raw table, **at any age**, which is a
+stronger statement than "seven days comfortably exceeds twenty-six hours" and
+was already written two paragraphs below each of them. Seven days is now
+described as what it is — a convenience for reading a recent manifest, with
+re-normalization rebuilding an older one.
+
+`arrival_poke_seconds` had exactly two references, the dataclass default and
+`feeds.yml`, and is the same defect one size smaller.
+
+## published-tags-are-the-reproducibility-window
+
+`references.published_tags` was `keep_business_days: 10 / keep_month_ends: 80`
+— the same keep-set the *table* layers use. A published tag pins every data
+file its commit referenced, so that is a category error, and it was destroying
+evidence nightly.
+
+Two effects, both live and both observed on the running catalog rather than
+inferred:
+
+* an ordinary daily publication lost its pin once ten more business dates had
+  been published — about a fortnight — and month-end pins lasted 80/12 ≈ 6.7
+  years against a period assumed to be longer;
+* within a **retained** date, only the newest tag survived. The tag name
+  carries no feed (`published/<business_date>/<run_id>`) and
+  `record_publication` runs in *every* per-feed ingest DAG, so N feeds
+  publishing one business date cut N tags for it. The code called the others
+  "earlier reruns of the same date" pinning "files for no benefit"; they were
+  other feeds' publications. A dry run against the live catalog said:
+
+  ```
+  WOULD DELETE 2 of 5 tags:
+     published/2026-08-01/e__20260904T154139084306
+     published/2026-08-01/e__20260904T190724822363
+  ```
+
+  Both inside the ten-business-day keep-set, deleted purely by the
+  newest-per-date rule. All five tags pin distinct commits, none equal to
+  `main`.
+
+### The GC cutoff is not a second threat, and that had to be checked first
+
+Before sizing anything: `nessie_gc.default_cutoff` is documented as "how far
+back each reference's commit log is treated as live. Content referenced ONLY
+by commits older than this is collectable." If a tag's own state were subject
+to it, the window set here would be decoration and `P30D` would be the real
+limit. `mark-live` against the running Nessie at three cutoffs:
+
+```
+NONE  -> numReferences=10, numCommits=1503, numContents=171
+P30D  -> numReferences=10, numCommits=1503, numContents=171
+P0D   -> numReferences=10, numCommits=20,   numContents=41
+        "...after 2 commits, commit f11ec7fb... is the first non-live commit"
+```
+
+Even at `P0D` the walk takes the HEAD before stopping. The cutoff bounds how
+much history *behind* a reference stays live; it never decides whether the
+reference's own state does. So a published tag protects what it pins at any
+cutoff, and **the tag's lifetime is the only thing that decides whether a
+published run can be reproduced**. Reading `lakehouse.raw.fo_trade` at the
+oldest tag returned its rows. No sweep or delete phase was run, and the three
+probe live-sets were deleted afterwards.
+
+### The policy
+
+Flat age in years, resolved per report — the reasoning `landing:` already
+carries, that sampling evidence by keep-set destroys exactly what it exists to
+preserve. `default_keep_years` is a bare number or a map keyed by
+`REPORTING_ENV`, the shape `nessie_gc.deferred_delete_after_hours` already
+uses, because `landing.keep_years` is per environment and `dev` deliberately
+shortens it.
+
+**Ten years is provisional.** The regulatory period is unconfirmed;
+over-retaining costs storage and under-retaining costs the evidence
+permanently, so it is the longest plausible value rather than the assumed
+seven.
+
+**`per_report` matches nothing today**, and it is written down as a forward
+hook rather than presented as a working mechanism: no publication yet knows
+which report it is for, so every tag resolves to the default. `TAG_RE` accepts
+`published/<report>/<business_date>/<run_id>` beside today's shape, so when a
+publication does name its report, retention already honours it instead of
+silently applying the default to a report that declared otherwise. Naming that
+plainly is the point — a guard written against a mechanism that does not exist
+is the failure mode this repo keeps rediscovering.
+
+**Age is the commit time**, not the business date. A retention period runs from
+when the record was made, and a restatement published today for an old business
+date is a new record that needs its own full window; measuring from the
+business date would expire it on arrival. The business date is the fallback for
+a tag with no readable commit time, and it is conservative by construction —
+a publication cannot precede the date it reports on, so it can only ever keep a
+tag the commit time would also have kept.
+
+### The interlock refuses
+
+`check_reproducibility_window()` aborts the whole chain when
+`landing.keep_years` is shorter than the longest published-tag window. A tag
+pins the *tables*; reproducing a published run also means showing its inputs,
+and `landing/` is the only copy of what the upstream sent.
+
+Refuses rather than warns, unlike `landing.keep_years()`'s own interlock, on
+the same test the GC cutoff already applies: landing running short of the raw
+window degrades gradually and is fixed by raising it, whereas deleting landing
+evidence a live pin depends on is unrecoverable and happens nightly and
+unattended. It runs first in `run()` and before the dry-run branch — it refuses
+on *configuration*, and a dry run that passed where the real run would refuse
+would teach the wrong thing.
+
+It fired immediately on the shipped config (`landing: 8` against tags `10`),
+which is what raised `landing.keep_years` to 10 and made the tag window
+per-environment so `dev` (landing 1) stays coherent rather than refusing every
+sweep. All four environments now resolve `landing >= tags`.
+
+**This is not REQ-602 in full.** The complete rule is "retention must not
+delete anything a published RUN depends on", which needs a run record
+enumerating its delivery set — Phase 2. The window comparison catches the
+configuration that guarantees the loss; it cannot catch a single delivery
+expiring early inside an otherwise coherent window. Stated here so the
+approximation is not later mistaken for the requirement.
+
+24 tests in `tests/test_tag_retention.py`. Expiry cannot be exercised against
+the live catalog — every real tag is days old and a ten-year window keeps
+everything for a decade, which is the point — so the sweep is driven against a
+fake catalog whose commit times are whatever the test needs, with one test
+pinning the shipped config's coherence in all four environments.
+
+## reproducibility-is-exercised-not-asserted
+
+REQ-702. `reporting_platform/monitoring/reproducibility.py`, run as the last
+task of `platform_housekeeping`.
+
+Everything that makes a published run reproducible is a *pin*, and nothing
+about a pin announces its own failure. A tag deleted too early, a GC cutoff
+that collected a file the tag still referenced, a compaction that rewrote data
+before a snapshot expiry removed what the tag pointed at — each leaves a
+catalog that looks healthy and a pin that no longer resolves, and the first
+person to find out is whoever was asked to reproduce a figure from years ago.
+So the pin is READ, on a schedule, against the real catalog: resolving the
+reference, opening the commit's metadata and reading the data files it names is
+the whole check, and a collected link raises rather than returning wrong
+numbers.
+
+**It runs after the maintenance chain, and that ordering is the test.**
+`maintain` compacts, `enforce_retention` expires tags, runs GC and expires
+snapshots. Running the check first would exercise yesterday's state and pass on
+the night the damage was done.
+
+**Older than `recent_partition_days`, or it reports `not_yet_meaningful` and
+does not pass.** A tag cut this morning proves almost nothing: its files are
+the ones main is still using, so it resolves whether pinning works or not.
+`maintain.py` compacts partitions older than that cutoff, rewriting their data
+files while the tag keeps referencing the old ones — which is exactly the state
+a too-eager GC destroys. A run past the cutoff has been through at least one
+such cycle, so it is the youngest whose survival means anything. This is
+CLAUDE.md's own rule about a check whose window does not contain the thing it
+describes, and the honest answer is a third outcome rather than a green one.
+The oldest eligible pin is chosen, because it has survived the most cycles.
+
+**It fails the run, where `completeness_check` beside it only warns.** A
+completeness gap is an upstream missing a Tuesday: real, not the platform's
+doing, and a red run there would be indistinguishable to the watchdog from
+housekeeping being down. A pin that no longer resolves is the platform
+destroying its own evidence in the step that just ran.
+
+A table ABSENT at a pin is not a failure. The platform gains tables over time,
+and a run published before `reporting.exposure_by_country` existed cannot be
+expected to contain it. A table that exists and cannot be READ is what this
+looks for.
+
+### What it does not claim
+
+That the numbers match what was published. It asserts the tables are READABLE
+at the pin and reports their row counts; comparing against the figures actually
+published needs the run record — which deliveries, which code, which report
+version — and that is Phase 2/5. Until then this is a liveness check on the
+pin, which is the failure mode that actually occurs and the one that is silent.
+
+### Verified
+
+Against the live catalog. The scheduled path returned, correctly:
+
+```
+"status": "not_yet_meaningful",
+"detail": "no published tag is older than recent_partition_days (7d).
+           Every pin still shares its files with main, so a successful read
+           would not prove the pin holds."
+```
+
+Forced onto a real pin with `--tag published/2026-08-01/e__20260904T154139084306`,
+it read four raw tables at that commit — `fo_trade` 15255 rows,
+`ref_counterparty` 2340, `ref_rating` 5425, `ref_collateral` 975 — with zero
+unreadable and the seven prepared/reporting tables correctly classified as
+absent at that pin rather than as failures. `airflow dags list-import-errors`
+is clean and `airflow tasks list platform_housekeeping` renders
+`reproducibility_check`.
+
+**Not verified**: a genuinely broken pin. Producing one means deleting a tag
+and then GC-sweeping and executing deferred deletes against real warehouse
+files, which is destructive on a catalog holding the seed data. The failure
+branch is exercised by construction (any read exception that is not
+`TABLE_OR_VIEW_NOT_FOUND` lands in `unreadable`, which clears `ok`) but has not
+been observed firing.

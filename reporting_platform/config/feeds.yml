@@ -14,8 +14,6 @@ defaults:
   # it. See docs/DELIVERY-SHAPES.md.
   ready_prefix: ready
   raw_namespace: raw
-  arrival_poke_seconds: 60
-  arrival_timeout_hours: 26      # deliberately > 24h: a feed is late, not lost
   file_encoding: utf-8
   delimiter: ","
   quote_char: '"'
@@ -92,7 +90,7 @@ feeds:
     description: External agency credit ratings.
     filename_pattern: 'RATING_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [counterparty_id, agency]
-    # Agency ratings arrive weekly, not daily. Without this the completeness
+    # Agency ratings arrive weekly, not daily. Without this the gap
     # check infers the business calendar from the daily feeds and
     # reports every non-delivery day as a gap -- it did exactly that on its
     # first run, five false gaps in a ten-day window. `weekly` asks only that

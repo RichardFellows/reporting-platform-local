@@ -156,25 +156,41 @@ def _find_control_key(feed: Feed, object_key: str) -> str | None:
     return None
 
 
-def _declared_row_count(feed: Feed, control_key: str) -> int | None:
-    """The exact row count a control file declares, or None if it declares none.
+def _declared(feed: Feed, control_key: str) -> dict[str, Any]:
+    """What the landed control file declares about the delivery's INTEGRITY.
 
-    `row_count` is optional on `delivery.control` -- some control files are
-    pure readiness gates with nothing to parse out of them.
+    `row_count` and `md5`, both optional -- some control files are pure
+    readiness gates with nothing to parse out of them. Read HERE, on the
+    landing side, so they are checked once for every delivery: one an approved
+    sender wrote straight into the bucket, and one the inbox renamed and
+    promoted. The inbox reads the same file for the delivery's IDENTITY
+    (business date, version) and deliberately checks none of this.
+    See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
     """
-    row_count = feed.delivery["control"].get("row_count")
-    if row_count is None:
-        return None
+    control = feed.delivery["control"]
+    if not any(k in control for k in ("row_count", "md5")):
+        return {}
     body = _client().get_object(Bucket=_bucket(), Key=control_key)["Body"].read()
     text = body.decode(feed.file_encoding, errors="replace")
-    m = re.search(row_count, text)
-    if not m:
-        raise ValueError(
-            f"{feed.name}: control file {control_key} does not match "
-            f"`delivery.control.row_count` {row_count!r}. The control file "
-            f"arrived but does not say what it was validated to say -- a "
-            f"format change upstream, not a timing problem.")
-    return int(m.group("rows"))
+
+    out: dict[str, Any] = {}
+    for key, group in (("row_count", "rows"), ("md5", "md5")):
+        pattern = control.get(key)
+        if pattern is None:
+            continue
+        m = re.search(pattern, text)
+        if not m:
+            raise ValueError(
+                f"{feed.name}: control file {control_key} does not match "
+                f"`delivery.control.{key}` {pattern!r}. The control file "
+                f"arrived but does not say what it was validated to say -- a "
+                f"format change upstream, not a timing problem.")
+        out[key] = m.group(group)
+    if "row_count" in out:
+        out["row_count"] = int(out["row_count"])
+    if "md5" in out:
+        out["md5"] = out["md5"].lower()
+    return out
 
 
 def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
@@ -194,7 +210,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
     business_date, _version = parsed
 
     control_key = None
-    declared_row_count = None
+    declared: dict[str, Any] = {}
     if "control" in feed.delivery:
         control_key = _find_control_key(feed, object_key)
         if control_key is None:
@@ -203,7 +219,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
                 f"matching {feed.delivery['control']['pattern']!r} (stem "
                 f"{_stem(filename)!r}) in the same landing folder. Not a "
                 f"failure -- a late feed, not a failed one.")
-        declared_row_count = _declared_row_count(feed, control_key)
+        declared = _declared(feed, control_key)
 
     head = _head(_bucket(), object_key)
     return {
@@ -233,7 +249,8 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
         # never holds derived state, only what arrived. None for a feed with
         # no `delivery.control`, or one whose control file sets no row_count.
         "control_object": control_key,
-        "declared_row_count": declared_row_count,
+        "declared_row_count": declared.get("row_count"),
+        "declared_md5": declared.get("md5"),
         "normalizer": NORMALIZERS["file"],
     }
 
@@ -343,6 +360,7 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
         # (context.resolve_delivery_config), so both are always None here.
         "control_object": None,
         "declared_row_count": None,
+        "declared_md5": None,
         "normalizer": NORMALIZERS["archive"],
     }
 

@@ -39,6 +39,31 @@ an error.
 already out of the way and recorded as landed, so the next pass does not
 re-upload it as a new `_file_version`. The DAG can be retriggered by hand; a
 duplicate ingest is much harder to undo.
+
+AND IT IS THE CONFORMANCE GATE. `landing/` has a contract -- every object in
+it is correctly named and classified -- and a legacy upstream that sends
+`positions.csv` with the date inside `positions.ctl` does not satisfy it. For
+a feed with an `arrival:` block this watcher waits for the control file,
+verifies what it declares (row count, md5), derives the business date, and
+promotes the delivery under the name `filename_pattern` describes, with a
+`.meta.json` sibling recording what actually arrived. A feed with no
+`arrival:` block is a conformant upstream: its file is uploaded under its own
+name, exactly as before.
+
+**An unchanged file sent twice lands nothing.** The gate compares the bytes
+against what is already landed for that business date and reports `duplicate`
+-- nothing uploaded, nothing triggered, the inbox copy moved to
+`.processed/`. A conformant upstream gets this free by writing the same key
+twice; the gate had to be taught it, because its rename would otherwise turn
+the second copy into `_v2` and the raw table into a restatement that never
+happened. See `conform.DuplicateDelivery`.
+
+That gate is why the two names in play are different strings and must stay
+so. `positions.csv` is what the upstream sends; `trs_position_20260801.csv`
+is what landing holds. `Feed.claims_source` answers the first,
+`Feed.parse_filename` the second, and `ingest/conform.py` is the only thing
+that crosses between them.
+See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
 """
 from __future__ import annotations
 
@@ -53,8 +78,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from reporting_platform.common.context import Feed, feeds
+from reporting_platform.ingest import conform
 from reporting_platform.ingest import normalize as norm
-from reporting_platform.ingest.arrival import put_landing
+from reporting_platform.ingest.arrival import (
+    landed_md5_lookup, list_landing, put_landing, put_landing_bytes,
+)
 
 log = logging.getLogger("inbox")
 
@@ -77,34 +105,65 @@ def route(filename: str) -> tuple[Feed | None, str | None, bool]:
     """Which feed claims this filename, by the feeds' own patterns.
 
     Returns (feed, reason-it-was-rejected, is_control). Exactly one of the
-    first two is set. A CONTROL file never matches `filename_pattern` -- it
-    names no business date, only says something about a delivery that does --
-    so it is checked separately, after data files, once no feed's
-    filename_pattern claims it. See ingest/normalize.py:is_control_file.
-    """
-    matched = [fd for fd in feeds().values() if fd.parse_filename(filename)]
-    if len(matched) > 1:
-        return None, ("matches more than one feed ("
-                      + ", ".join(sorted(f.name for f in matched))
-                      + ") -- overlapping filename_patterns are a "
-                        "configuration error, and guessing would put the "
-                        "delivery in the wrong raw table"), False
-    if matched:
-        return matched[0], None, False
+    first two is set.
 
-    control_matched = [fd for fd in feeds().values()
-                       if norm.is_control_file(fd, filename)]
+    FOUR THINGS CAN CLAIM A NAME, checked in this order:
+
+    1. `filename_pattern` -- an ALREADY-CONFORMANT delivery, dropped into the
+       inbox rather than PUT straight to landing. Uploaded under its own name.
+    2. `arrival.source_pattern` -- a legacy delivery under the name its
+       upstream sends. Goes through the conformance gate and is renamed.
+    3. `arrival.control.pattern` -- a legacy delivery's control file, consumed
+       at the door.
+    4. `delivery.control.pattern` -- a conformant upstream's control file,
+       which passes through to landing and gates the delivery there.
+
+    Conformant first, on purpose: a feed can have both patterns, and a file
+    that already satisfies `filename_pattern` needs no renaming, no control
+    file and no verification. Making it take the legacy path would demand a
+    control file that a conformant sender has no reason to include.
+
+    A CONTROL FILE MATCHES NO DATA PATTERN -- it names no business date, it
+    says something about a delivery that does -- so it is checked only once no
+    data pattern claims the name. Without that, the inbox would reject it to
+    `.rejected/` and the delivery it belongs to would wait forever on a file
+    that can never arrive.
+    """
+    registry = list(feeds().values())
+
+    for claimant, what, why in (
+        (lambda fd: fd.parse_filename(filename) is not None,
+         "filename_pattern",
+         "overlapping filename_patterns are a configuration error, and "
+         "guessing would put the delivery in the wrong raw table"),
+        (lambda fd: fd.claims_source(filename),
+         "arrival.source_pattern",
+         "overlapping arrival.source_patterns are a configuration error, and "
+         "guessing would put the delivery in the wrong raw table"),
+    ):
+        matched = [fd for fd in registry if claimant(fd)]
+        if len(matched) > 1:
+            return None, (f"matches more than one feed's {what} ("
+                          + ", ".join(sorted(f.name for f in matched))
+                          + f") -- {why}"), False
+        if matched:
+            return matched[0], None, False
+
+    control_matched = [fd for fd in registry
+                       if conform.is_source_control_file(fd, filename)
+                       or norm.is_control_file(fd, filename)]
     if len(control_matched) > 1:
         return None, ("matches more than one feed's control pattern ("
                       + ", ".join(sorted(f.name for f in control_matched))
-                      + ") -- overlapping delivery.control.pattern is a "
+                      + ") -- overlapping control patterns are a "
                         "configuration error, and guessing would gate the "
                         "wrong feed's delivery"), False
     if control_matched:
         return control_matched[0], None, True
 
-    return None, ("matches no feed's filename_pattern or control pattern -- "
-                  "check the name, or the pattern in feeds.yml"), False
+    return None, ("matches no feed's filename_pattern, arrival.source_pattern "
+                  "or control pattern -- check the name, or the patterns in "
+                  "feeds.yml"), False
 
 
 def list_rejected() -> list[dict]:
@@ -242,9 +301,39 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
                             "reason": reason})
             continue
 
-        if dry_run:
-            results.append({"file": path.name, "status": "would ingest",
+        # A LEGACY CONTROL FILE IS NOT PROMOTED ON ITS OWN. It is consumed at
+        # the door as part of its data file's delivery, so it is left in place
+        # here and picked up when that data file is processed -- which may be
+        # this same pass (the loop is sorted, and `.csv` sorts before `.ctl`
+        # for the usual naming, so it is usually the NEXT pass) or a later one
+        # if the data file has not arrived yet. Its own arrival is what
+        # unblocks a data file that was waiting.
+        #
+        # A CONFORMANT feed's control file is different: it belongs in landing,
+        # where `delivery.control` gates the delivery, so it falls through to
+        # the ordinary upload below.
+        if is_control and conform.is_source_control_file(feed, path.name):
+            results.append({"file": path.name, "status": "held (control file)",
                             "feed": feed.name})
+            continue
+
+        if dry_run:
+            results.append({"file": path.name,
+                            "status": "would conform" if feed.needs_conforming
+                                      and not feed.parse_filename(path.name)
+                                      else "would ingest",
+                            "feed": feed.name})
+            continue
+
+        # Already-conformant names take the plain path even for a feed that
+        # HAS an arrival block -- see route()'s docstring.
+        if feed.needs_conforming and feed.parse_filename(path.name) is None:
+            if conform.is_archive(feed):
+                results.extend(_promote_archive(feed, path, seen))
+                continue
+            outcome = _promote(feed, path, seen)
+            if outcome is not None:
+                results.append(outcome)
             continue
 
         try:
@@ -272,6 +361,219 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
                  f" (NOT triggered: {outcome.get('reason')})")
         results.append(outcome)
 
+    return results
+
+
+def _promote(feed: Feed, path: Path,
+             seen: dict[str, tuple[int, float, int]]) -> dict | None:
+    """Run one legacy delivery through the conformance gate.
+
+    Returns the outcome, or None when the delivery is simply not ready yet and
+    nothing should be reported -- `NotReady` is the ordinary case this whole
+    mechanism exists for, and reporting it every few seconds would bury the
+    outcomes that matter.
+
+    THREE OBJECTS GO TO LANDING, not one: the renamed data file, the renamed
+    control file, and the metadata sibling. The delivery is the data file and
+    its control file together, so landing holds the pair -- which is what lets
+    `delivery.control` verify it there exactly as it verifies a delivery an
+    approved sender wrote straight into the bucket. Nothing is consumed here.
+
+    ORDER OF WRITES: control file, then data file, then metadata. The data
+    file is what a triggered run acts on, so writing it last means a run can
+    never find a delivery whose control file has not arrived yet. If the
+    metadata write then fails, the delivery is complete and will ingest with
+    its provenance missing -- the failure to prefer over the reverse.
+    Originals stay in the inbox on any failure, so the next pass retries;
+    every write is a PutObject to a derived key, so a retry overwrites rather
+    than duplicating.
+    """
+    control_name = conform.find_control(
+        feed, path.name, [p.name for p in INBOX.iterdir() if not _skip(p)])
+    control_path = INBOX / control_name if control_name else None
+    control_text = None
+    if control_path is not None:
+        try:
+            control_text = control_path.read_text(
+                encoding=feed.file_encoding, errors="replace")
+        except OSError as exc:
+            log.error("cannot read control file %s: %s", control_name, exc)
+            return {"file": path.name, "status": "control unreadable",
+                    "feed": feed.name, "error": str(exc)[:300]}
+
+    content = path.read_bytes()
+    landed = list_landing(feed)
+    try:
+        plan = conform.conform(
+            feed, path.name, content,
+            control_filename=control_name,
+            control_text=control_text,
+            received_at=datetime.fromtimestamp(path.stat().st_mtime,
+                                               tz=timezone.utc),
+            # A re-delivery for a date already landed must not overwrite the
+            # original -- landing is the evidence copy. The listing is what
+            # lets the gate pick the next free `_vN`.
+            taken={k.rsplit("/", 1)[-1] for k in landed},
+            # ...and this is what stops it picking one for a delivery that is
+            # not a re-delivery at all, only the same file sent twice.
+            landed_md5=landed_md5_lookup(feed, landed))
+    except conform.NotReady as exc:
+        log.debug("%s", exc)
+        return None
+    except conform.DuplicateDelivery as exc:
+        # NOT a rejection. The delivery is already landed and already
+        # ingested; there is nothing to write and nothing to trigger. The
+        # inbox copy still moves to `.processed/`, where `_move` timestamps a
+        # colliding name, so the resend itself remains on disk as evidence it
+        # happened -- it is simply not evidence of a new delivery.
+        log.info("%s", exc)
+        _move(path, PROCESSED, feed.name)
+        if control_path is not None and control_path.exists():
+            _move(control_path, PROCESSED, feed.name)
+            seen.pop(control_name, None)
+        seen.pop(path.name, None)
+        return {"file": path.name, "status": "duplicate", "feed": feed.name,
+                "landed_as": exc.landing_filename, "reason": str(exc)}
+    except conform.ConformanceError as exc:
+        # AN IDENTITY FAILURE, and the only kind that can happen here. The
+        # delivery cannot be NAMED -- no business date, or a pattern no
+        # concrete filename can be built from -- so there is no landing key to
+        # write it to and no amount of waiting fixes it. Content failures are
+        # not checked here at all: they land and the ingest refuses.
+        log.warning("rejecting %s: %s", path.name, exc)
+        _move(path, REJECTED)
+        if control_path is not None and control_path.exists():
+            _move(control_path, REJECTED)
+        seen.pop(path.name, None)
+        return {"file": path.name, "status": "rejected", "feed": feed.name,
+                "reason": str(exc)}
+
+    try:
+        if plan["control_landing_filename"] and control_text is not None:
+            put_landing_bytes(feed, plan["control_landing_filename"],
+                              control_path.read_bytes())
+        key = put_landing_bytes(feed, plan["landing_filename"], content)
+        put_landing_bytes(feed, plan["metadata_filename"],
+                          conform.metadata_bytes(plan["metadata"]),
+                          content_type="application/json")
+    except Exception as exc:                            # noqa: BLE001
+        log.error("upload failed for %s: %s", path.name, str(exc)[:300])
+        return {"file": path.name, "status": "upload failed",
+                "feed": feed.name, "error": str(exc)[:300]}
+
+    moved = _move(path, PROCESSED, feed.name)
+    if control_path is not None and control_path.exists():
+        _move(control_path, PROCESSED, feed.name)
+        seen.pop(control_name, None)
+    seen.pop(path.name, None)
+
+    outcome = {"file": path.name, "status": "conformed", "feed": feed.name,
+               "key": key, "landed_as": plan["landing_filename"],
+               "control_landed_as": plan["control_landing_filename"],
+               "business_date": plan["business_date"].isoformat(),
+               "moved_to": str(moved.relative_to(INBOX))}
+    outcome.update(_trigger(feed, key))
+    log.info("conformed %s -> %s (%s)%s", path.name, key,
+             plan["business_date"].isoformat(),
+             "" if outcome.get("triggered") else
+             f" (NOT triggered: {outcome.get('reason')})")
+    return outcome
+
+
+def _promote_archive(feed: Feed, path: Path,
+                     seen: dict[str, tuple[int, float, int]]) -> list[dict]:
+    """Unpack one container and land every member as its own delivery.
+
+    ONE INBOX FILE BECOMES N LANDED DELIVERIES. That is the whole idea: a zip
+    is a transport wrapper, the gate removes it, and every member then follows
+    the ordinary single-file path -- so `landing/` holds only objects Spark can
+    read, and no stage downstream needs to know an archive was ever involved.
+
+    The container itself is NOT landed. The members are byte-for-byte what the
+    upstream sent; the metadata records the container's name, size and md5, so
+    what arrived stays provable without keeping an object nothing reads.
+
+    `taken` is advanced as members land, not read once: two members for the
+    same business date inside one zip would otherwise both render the
+    unversioned name and the second would overwrite the first.
+
+    A CONTAINER RESENT WHOLE is the commonest duplicate here, and it is the
+    expensive one: without the md5 check every member restates its own
+    business date at once. Duplicates count as HANDLED -- if they did not, a
+    zip whose members are all already landed would find nothing to land, stay
+    in the inbox, and be unpacked again on every pass forever.
+    """
+    content = path.read_bytes()
+    received = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    try:
+        members = conform.unpack(feed, path.name, content)
+    except conform.ConformanceError as exc:
+        log.warning("rejecting %s: %s", path.name, exc)
+        _move(path, REJECTED)
+        seen.pop(path.name, None)
+        return [{"file": path.name, "status": "rejected", "feed": feed.name,
+                 "reason": str(exc)}]
+
+    landing_keys = list_landing(feed)
+    taken = {k.rsplit("/", 1)[-1] for k in landing_keys}
+    landed_md5 = landed_md5_lookup(feed, landing_keys)
+    results, landed, duplicates = [], [], 0
+    for member_name, member_bytes in members:
+        try:
+            plan = conform.conform_member(
+                feed, path.name, content, member_name, member_bytes,
+                received_at=received, taken=taken, landed_md5=landed_md5)
+            key = put_landing_bytes(feed, plan["landing_filename"], member_bytes)
+            put_landing_bytes(feed, plan["metadata_filename"],
+                              conform.metadata_bytes(plan["metadata"]),
+                              content_type="application/json")
+        except conform.DuplicateDelivery as exc:
+            log.info("%s member %s: %s", path.name, member_name, exc)
+            duplicates += 1
+            results.append({"file": f"{path.name}!{member_name}",
+                            "status": "duplicate", "feed": feed.name,
+                            "landed_as": exc.landing_filename,
+                            "reason": str(exc)})
+            continue
+        except conform.ConformanceError as exc:
+            # ONE BAD MEMBER DOES NOT DISCARD THE REST. The others are real
+            # deliveries that arrived and can be ingested; reporting the
+            # failure and continuing beats rejecting a whole week of files
+            # because one of them is misnamed.
+            log.warning("%s member %s rejected: %s", path.name, member_name, exc)
+            results.append({"file": f"{path.name}!{member_name}",
+                            "status": "rejected", "feed": feed.name,
+                            "reason": str(exc)})
+            continue
+        except Exception as exc:                        # noqa: BLE001
+            log.error("upload failed for %s!%s: %s", path.name, member_name,
+                      str(exc)[:300])
+            results.append({"file": f"{path.name}!{member_name}",
+                            "status": "upload failed", "feed": feed.name,
+                            "error": str(exc)[:300]})
+            continue
+        taken.add(plan["landing_filename"])
+        landed.append((member_name, plan, key))
+
+    if not landed and not duplicates:
+        # Nothing reached landing and nothing was already there, so the
+        # container is still worth another pass or an operator's attention --
+        # leave it where it is.
+        return results
+
+    moved = _move(path, PROCESSED, feed.name)
+    seen.pop(path.name, None)
+    for member_name, plan, key in landed:
+        outcome = {"file": f"{path.name}!{member_name}", "status": "conformed",
+                   "feed": feed.name, "key": key,
+                   "landed_as": plan["landing_filename"],
+                   "business_date": plan["business_date"].isoformat(),
+                   "moved_to": str(moved.relative_to(INBOX))}
+        outcome.update(_trigger(feed, key))
+        results.append(outcome)
+    log.info("unpacked %s -> %d delivery(ies) for %s%s", path.name, len(landed),
+             feed.name,
+             f" ({duplicates} already landed, skipped)" if duplicates else "")
     return results
 
 
