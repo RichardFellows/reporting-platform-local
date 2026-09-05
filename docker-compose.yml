@@ -20,6 +20,16 @@ x-s3-env: &s3-env
   NESSIE_ICEBERG_URI: http://nessie:19120/iceberg
   REPORTING_CATALOG: lakehouse
   REPORTING_ENV: ${REPORTING_ENV:-local}
+  # The delivery registry (REQ-101). The `platform` database has existed since
+  # the first compose file with nothing connected to it; this is its first
+  # user. Here rather than on each service's own `environment:` block because
+  # four of them redefine that key and so inherit nothing from the anchor
+  # above -- the registry is written by the inbox and by every normalize, and
+  # read by the console, so one definition merged everywhere is the only shape
+  # that cannot drift. `registry/db.py` refuses to run without it rather than
+  # defaulting, so a container started before this line was added fails
+  # loudly; recreate it, restarting is not enough.
+  REGISTRY_DSN: postgresql://platform:platform@postgres:5432/platform
 
 # One place per jar version, from .env. See docs/DECISIONS.md#jar-versions
 x-versions: &versions
@@ -247,14 +257,21 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    # Runs once; everything else waits on it COMPLETING. Four steps, each of
+    # Runs once; everything else waits on it COMPLETING. Five steps, each of
     # which once broke the platform silently when skipped.
+    #
+    # The registry schema is here so a cold stack has its tables before any
+    # DAG parses. `registry/db.py` also ensures it on first connect, and that
+    # is not redundant: `inbox`, `feed-ui` and `watchdog` share this image but
+    # not this container's `depends_on`, so they can be up and recording
+    # deliveries while this has never run.
     # See docs/DECISIONS.md#airflow-init-four-things
     command: >
       bash -euc "
       airflow db migrate &&
       { airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true; } &&
       { airflow pools set lakehouse_write 1 'serialise all Iceberg writers, incl. maintenance' || true; } &&
+      python -m reporting_platform.registry schema &&
       dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
       "
     restart: "no"

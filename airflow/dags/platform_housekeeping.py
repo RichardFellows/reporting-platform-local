@@ -181,6 +181,112 @@ def platform_housekeeping():
                  len(report.get("tables", [])), len(report.get("absent", [])))
         return report
 
+    @task(pool="lakehouse_write")
+    def migrate_raw_schema(**context) -> dict:
+        """Give every raw table the current provenance columns. Idempotent.
+
+        FIRST IN THE CHAIN, and it is not maintenance -- it is the guard
+        against a lazy migration. `ingest` adds a missing provenance column on
+        the branch it is already writing, for the one feed it is ingesting, so
+        a feed that has not delivered since the column was added keeps the old
+        schema. Every prepared model selects those columns, so the next build
+        fails for every feed that has not happened to deliver -- observed, on
+        three of four models, which is why this task exists.
+
+        Costs one schema read per feed and commits nothing when they are all
+        current, which is every night after the first.
+        """
+        import logging
+
+        log = logging.getLogger("airflow.task")
+        mode = "dry" if context["params"].get("dry_run") else "real"
+        report = _spark_subprocess("migrate-raw", mode)
+        if report.get("migrated"):
+            log.warning("migrated %d raw table(s) to the current provenance "
+                        "schema: %s", report["migrated"],
+                        [f["feed"] for f in report["feeds"]
+                         if f["status"] == "migrated"])
+        return report
+
+    @task
+    def registry_reconcile(**context) -> dict:
+        """Register every delivery object storage holds that has no row yet.
+
+        NO SPARK, so it runs in the task process rather than through
+        `scripts/_spark_task.py` -- boto3, json and psycopg2 only, the same
+        reason `normalize` is an ordinary task in the ingest DAGs.
+
+        BEFORE the evidence check below and after retention, and both halves
+        of that matter. After, because the landing sweep may have removed
+        deliveries and this must describe what is left; before, because a
+        delivery with no registry row looks to the evidence check exactly like
+        a pinned date whose evidence is gone.
+
+        Ingest already registers each delivery inline as it normalizes it, so
+        on an ordinary night this finds nothing. It exists for the nights it
+        does: a registry write that failed while Postgres was restarting, or a
+        file an upstream agent pushed straight into the bucket while nothing
+        of ours was running.
+        """
+        import logging
+
+        from reporting_platform.registry.deliveries import reconcile_all
+
+        log = logging.getLogger("airflow.task")
+        report = reconcile_all()
+        log.info("registry: %d newly registered, %d failed",
+                 report["registered"], report["failed"])
+        return report
+
+    @task
+    def evidence_check(**context) -> dict:
+        """Does every published pin still have its deliveries? REQ-602.
+
+        The per-delivery half of the interlock.
+        `retention.check_reproducibility_window` compares two windows and
+        refuses the sweep if they disagree; that runs first, inside retention,
+        and cannot see a single delivery missing inside a coherent window.
+        This can, because the registry says what was received and object
+        storage says what is left.
+
+        FAILS THE RUN when a pinned delivery's landing object is gone, for the
+        same reason `reproducibility_check` fails: it is the platform having
+        destroyed its own evidence, and it does not get better by itself.
+
+        WARNS, and does not fail, when a pinned business date has no
+        registered deliveries at all. That is what an unreconciled registry
+        looks like -- indistinguishable from the real thing on the evidence
+        available here -- and failing the chain on it would make the first
+        red the one everybody learns to ignore.
+        """
+        import logging
+
+        from airflow.exceptions import AirflowException
+
+        from reporting_platform.monitoring import evidence
+
+        log = logging.getLogger("airflow.task")
+        report = evidence.run()
+        if report.get("status") == "no_published_tags":
+            log.info("evidence: nothing has been published yet")
+            return report
+        if not report.get("ok", False):
+            raise AirflowException(
+                f"EVIDENCE MISSING behind a published pin: "
+                f"{len(report.get('missing_evidence', []))} delivery(ies) "
+                f"registered as received are no longer in landing/. The pin "
+                f"still resolves, so the tables read -- what the upstream "
+                f"actually sent does not. REQ-602.")
+        if report.get("unbacked_dates"):
+            log.warning("evidence: %d pinned date(s) have no registered "
+                        "deliveries: %s", len(report["unbacked_dates"]),
+                        report["unbacked_dates"][:5])
+            return report
+        log.info("evidence: %d delivery(ies) behind %d pinned date(s), all "
+                 "still landed", report.get("deliveries_checked"),
+                 report.get("dates_checked"))
+        return report
+
     @task
     def completeness_check(**context) -> dict:
         """Business dates a feed is missing that other feeds prove existed.
@@ -357,15 +463,25 @@ def platform_housekeeping():
             "published tag or an open branch. Do not ignore this."
         )
 
+    # BEFORE the maintenance chain, and before anything reads a raw table:
+    # a raw table missing a provenance column breaks every prepared build,
+    # not just its own feed's model.
+    migrated = migrate_raw_schema()
     metrics = collect_metrics()
     maintained = maintain()
     retained = enforce_retention()
-    metrics >> maintained >> retained
+    migrated >> metrics >> maintained >> retained
     storage_report(metrics, retained)
     # AFTER retention, and depending on it: this asks whether the chain that
     # just ran destroyed a published pin, so it has to observe the state that
     # chain left behind.
     retained >> reproducibility_check()
+    # Same reasoning, different question: reproducibility asks whether the
+    # TABLES can still be read at the pin, this asks whether the DELIVERIES
+    # behind it are still in landing. Both have to observe the state the
+    # retention chain left, and the registry has to be current before the
+    # second one can tell "evidence gone" from "never recorded".
+    retained >> registry_reconcile() >> evidence_check()
     # No dependency on the chain above, on purpose: a data gap must not block
     # reclamation, and reclamation failing must not hide a data gap.
     completeness_check()

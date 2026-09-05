@@ -50,6 +50,7 @@ cleaned as (
         end                                                            as is_eligible,
         _source_file                                                   as source_file,
         _file_version                                                  as source_file_version,
+        {{ source_provenance() }}
         {{ audit_columns() }}
 
     from deduped

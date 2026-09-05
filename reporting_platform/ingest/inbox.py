@@ -166,6 +166,34 @@ def route(filename: str) -> tuple[Feed | None, str | None, bool]:
                   "feeds.yml"), False
 
 
+def _quarantine(feed, path, reason_class: str, reason: str,
+                dry_run: bool = False) -> None:
+    """Copy a refused file to `quarantine/` and record why (REQ-106).
+
+    BEFORE `_move`, always. `_move` is what makes the file stop being
+    reprocessed, and once it has happened the bytes are on this container's
+    bind mount and nowhere else; doing the durable copy first means a crash
+    between the two leaves the file to be rejected again rather than leaves no
+    record of it at all.
+
+    Never raises -- see `registry.rejections.quarantine_quietly`. Keeping a
+    bad file out of `landing/` is this function's caller's actual job, and it
+    must still happen when Postgres or MinIO is unreachable.
+    """
+    if dry_run:
+        return
+    from reporting_platform.registry.rejections import quarantine_quietly
+
+    try:
+        content = path.read_bytes()
+        received = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError as exc:
+        log.warning("cannot read %s to quarantine it: %s", path.name, exc)
+        return
+    quarantine_quietly(feed, path.name, content, reason_class=reason_class,
+                       reason=reason, received_at=received)
+
+
 def list_rejected() -> list[dict]:
     """Files sitting in `.rejected/` -- landed nowhere, claimed by no feed.
 
@@ -295,6 +323,13 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
         if feed is None:
             log.warning("rejecting %s: %s", path.name, reason)
             if not dry_run:
+                # `route` returns one string for two different situations, and
+                # they are worth counting apart: nothing claimed the name
+                # (usually a name nobody has onboarded) versus two feeds
+                # claiming it (always a configuration error in feeds.yml).
+                _quarantine(None, path,
+                            "ambiguous" if "more than one" in (reason or "")
+                            else "unroutable", reason or "", dry_run)
                 _move(path, REJECTED)
             seen.pop(path.name, None)
             results.append({"file": path.name, "status": "rejected",
@@ -441,8 +476,14 @@ def _promote(feed: Feed, path: Path,
         # write it to and no amount of waiting fixes it. Content failures are
         # not checked here at all: they land and the ingest refuses.
         log.warning("rejecting %s: %s", path.name, exc)
+        _quarantine(feed, path, "identity", str(exc))
         _move(path, REJECTED)
         if control_path is not None and control_path.exists():
+            # The control file is quarantined with the delivery it gates: on
+            # its own it is unreadable evidence, and the commonest identity
+            # failure is that the two disagree.
+            _quarantine(feed, control_path, "identity",
+                        f"control file for {path.name}: {exc}")
             _move(control_path, REJECTED)
         seen.pop(path.name, None)
         return {"file": path.name, "status": "rejected", "feed": feed.name,
@@ -509,6 +550,7 @@ def _promote_archive(feed: Feed, path: Path,
         members = conform.unpack(feed, path.name, content)
     except conform.ConformanceError as exc:
         log.warning("rejecting %s: %s", path.name, exc)
+        _quarantine(feed, path, "identity", str(exc))
         _move(path, REJECTED)
         seen.pop(path.name, None)
         return [{"file": path.name, "status": "rejected", "feed": feed.name,
@@ -541,6 +583,16 @@ def _promote_archive(feed: Feed, path: Path,
             # failure and continuing beats rejecting a whole week of files
             # because one of them is misnamed.
             log.warning("%s member %s rejected: %s", path.name, member_name, exc)
+            # THE MEMBER'S OWN BYTES, not the container's. The container is
+            # never landed -- the members are the deliveries -- so quarantining
+            # the zip would keep the nineteen good members alongside the one
+            # bad one and make the evidence harder to read, not easier. The
+            # container is named in the reason instead.
+            from reporting_platform.registry.rejections import quarantine_quietly
+            quarantine_quietly(
+                feed, f"{path.name}!{member_name}", member_bytes,
+                reason_class="member",
+                reason=f"member of {path.name}: {exc}", received_at=received)
             results.append({"file": f"{path.name}!{member_name}",
                             "status": "rejected", "feed": feed.name,
                             "reason": str(exc)})

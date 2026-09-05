@@ -854,7 +854,8 @@ what it does and does not prove:
   read it before trusting any claim in this file. `CLAUDE.md` is the
   orientation for picking the work up fresh.
 - **No serving-layer export.** The Postgres `serving` database is created but
-  nothing writes to it. The PoC's DuckDB→pyodbc→the legacy RDBMS export would slot in
+  nothing writes to it. (The `platform` database is no longer idle — the
+  delivery registry writes there; see `docs/DECISIONS.md#the-registry-records-observations-not-verdicts`.) The PoC's DuckDB→pyodbc→the legacy RDBMS export would slot in
   after `reporting_build`, gated on the same asset.
 - **No semantic layer.** The design constraint that the BI tool must be
   replaceable means a semantic layer belongs between `reporting` and the tool.

@@ -37,6 +37,31 @@ environments:
     landing:
       keep_years: 10
 
+    # REFUSED DELIVERIES (REQ-106). What an upstream sent that the conformance
+    # gate would not accept: an unroutable name, a name two feeds claim, a
+    # delivery that cannot be given a landing name at all. The bytes go to
+    # `quarantine/` and `registry.rejection` says what was wrong with them.
+    #
+    # THE SAME CLASS OF EVIDENCE AS `landing:`, and kept the same way -- flat
+    # age, everything, no keep-set -- because it answers the same question
+    # from the other side: "what did they actually send us?", asked about a
+    # delivery that never arrived. A rejected file is frequently the whole
+    # explanation for a missing business date, and the explanation is needed
+    # for as long as the date it is missing from.
+    #
+    # A SEPARATE KEY, not a reference to landing's, even though the value is
+    # the same today. The two windows answer to different things: landing's
+    # has a hard floor from the published-tag interlock and the raw keep-set,
+    # and this one has neither -- nothing is reproduced from a delivery that
+    # never landed. Shortening this is a policy call somebody can make on its
+    # own; shortening landing is not.
+    #
+    # Dated from the object's own key -- `quarantine/<feed>/<yyyy>/<mm>/...`
+    # -- because a quarantined file frequently has no parsable business date,
+    # not being nameable being a common reason it is here at all.
+    quarantine:
+      keep_years: 10
+
     # THE WORK QUEUE, and a cache: manifests and any parts a normalizer
     # derived, all rebuildable by re-normalizing from landing/. Days, not
     # years, and unlike `landing:` it constrains nothing -- nothing computes
@@ -75,8 +100,9 @@ environments:
   # the ability to reproduce a production month-end issue in a lower
   # environment without an explicit restore procedure.
   dev:
-    landing:   {keep_years: 1}
-    ready:     {keep_days: 2}
+    landing:    {keep_years: 1}
+    quarantine: {keep_years: 1}
+    ready:      {keep_days: 2}
     raw:       {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
     prepared:  {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
     reporting: {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 5, snapshot_retain_last: 3}

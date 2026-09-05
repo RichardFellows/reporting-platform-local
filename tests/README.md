@@ -33,6 +33,14 @@ genuine engine rather than a stand-in of it. What it cannot tell you is
 whether `s3://lakehouse/...` reads work the same way over `httpfs` against
 real MinIO -- that is verified by running it, same as everything else.
 
+`test_registry.py` covers the registry's PURE parts only -- the projection
+from (feed, manifest, sidecar) to a row, the `schema_version` digest, the
+quarantine key shape and the date retention reads back out of it. Nothing that
+talks to Postgres is covered here, deliberately: a fake database would agree
+with whatever the code asked it, which is the one thing a registry test must
+not do. The insert, the conflict clause, the sequence and the reconcile
+gap-fill were exercised against the live stack instead.
+
 Everything else in this repo is verified by running it against the live stack,
 which is the habit `CLAUDE.md` opens with. These tests do not replace that and
 should not grow to try: a test that mocks Spark would prove the mock works.

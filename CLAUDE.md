@@ -166,8 +166,8 @@ Two corollaries worth holding on to:
   `filename_pattern` by `common/filenames.render_filename` and fed back through
   `parse_filename`, so a name landing would reject cannot be produced. A
   re-delivery for a date already landed gets `_v2` rather than overwriting the
-  evidence. **An identity failure (cannot be named) goes to `.rejected/`; an
-  integrity failure LANDS and fails at ingest**, because landing is the
+  evidence. **An identity failure (cannot be named) is QUARANTINED and goes
+  to `.rejected/`; an integrity failure LANDS and fails at ingest**, because landing is the
   evidence copy and a bad delivery is exactly what it exists to prove.
   **A zip is unpacked AT THE GATE** (`arrival.archive.member_pattern`) and its
   members land as ordinary deliveries — one inbox file in, N deliveries out,
@@ -238,6 +238,35 @@ Two corollaries worth holding on to:
   a running Airflow is reading, `feeds()` and `_load()` in `common/context.py`
   are cached on the file's **mtime** — do not put a plain `@lru_cache` back on
   them or a new feed will never reach the DAG processor.
+- **The delivery registry is an INDEX, not a ledger** (`reporting_platform/
+  registry/`, Postgres `platform`). One row per delivery -- business date,
+  arrival time, size, md5, the name the upstream used, the column contract it
+  was read against -- and **no verdicts**: no `ingested`, no `superseded`, no
+  `status`. Whether a delivery reached raw stays derived from `_source_file`;
+  whether it supersedes another stays `dedupe_rank`'s answer. It is Postgres
+  because `sequence_no` needs a serialising authority, and it is **rebuildable
+  from object storage by the same code that writes it** -- `normalize()`
+  registers inline and best-effort, `deliveries.reconcile()` is the authority,
+  `coverage()` is what makes a lag visible. `REGISTRY_DSN` lives on the
+  `x-s3-env` anchor, so **a container predating it needs recreating, not
+  restarting**. See `docs/DECISIONS.md#the-registry-records-observations-not-verdicts`.
+- **A refused delivery is evidence too.** Bytes to `quarantine/` in object
+  storage, a row in `registry.rejection`, `.rejected/` kept as the console's
+  working copy. The rejection DATE IS IN THE KEY, because a quarantined file
+  frequently has no parsable name -- that is the whole reason it is there.
+  Only an IDENTITY failure is quarantined; an integrity failure still lands
+  and fails at ingest. See `docs/DECISIONS.md#quarantine-is-where-a-refused-delivery-goes`.
+- **Raw carries four provenance columns and `prepared` selects them through
+  `source_provenance()`** -- `_delivery_id`, `_received_at`, `_schema_version`,
+  `_source_system`. **Added, never backfilled**: history reads NULL, and an
+  as-of query must fall back to `_source_file` to reach past the change.
+  `ensure_raw_columns` runs inside `ingest()` for the ONE feed being ingested,
+  so the migration is LAZY -- a feed that has not delivered keeps the old
+  schema and **every prepared model then fails, not just its own**. Run
+  `python -m reporting_platform.ingest.migrate_raw` when deploying a new
+  provenance column, before the next ingest; `platform_housekeeping` runs it
+  first every night for the same reason.
+  See `docs/DECISIONS.md#provenance-is-added-not-backfilled`.
 - Retention and GC delete data. `dry_run` first, always. GC defers its deletes
   by design; the deferred-delete pass is the deliberate second step.
 - **A published tag is DATA retention, sized in years, not by the table
@@ -275,8 +304,21 @@ docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profi
 # reports `not_yet_meaningful` until a pin is older than recent_partition_days
 docker compose exec -T airflow python -m reporting_platform.monitoring.reproducibility
 
+# the delivery registry -- reconcile is the rebuild path and is idempotent
+docker compose exec -T airflow python -m reporting_platform.registry reconcile
+docker compose exec -T airflow python -m reporting_platform.registry coverage
+docker compose exec -T airflow python -m reporting_platform.registry rejections
+
+# is every published pin's landing evidence still there? (REQ-602, per delivery)
+docker compose exec -T airflow python -m reporting_platform.monitoring.evidence
+
+# give every raw table the current provenance columns (idempotent; needed
+# BEFORE the next ingest whenever a provenance column is added)
+docker compose exec -T airflow python -m reporting_platform.ingest.migrate_raw --dry-run
+
 # retention / maintenance -- dry run first, --all-managed covers every table
 docker compose exec -T airflow python -m reporting_platform.retention.retention --all-managed --dry-run
+docker compose exec -T airflow python -m reporting_platform.retention.quarantine --dry-run
 docker compose exec -T airflow python -m reporting_platform.maintenance.maintain --all-managed --dry-run
 
 # DAGs

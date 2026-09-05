@@ -91,6 +91,34 @@ def ensure_raw_namespace(spark, fd) -> None:
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{fd.raw_namespace}")
 
 
+# PROVENANCE COLUMNS, added together and listed once (REQ-101, REQ-303,
+# REQ-304). Every one of them answers a question about the DELIVERY the row
+# came from rather than about the row:
+#
+#   _delivery_id     which delivery, joinable to `registry.delivery` on
+#                    (feed, delivery_id). Not the same as `_source_file`,
+#                    which is the PART -- for an archive those differ, and
+#                    `already_ingested` depends on `_source_file` staying the
+#                    part, so the delivery needed a column of its own.
+#   _received_at     when it arrived, which is not `_ingest_ts`. A delivery
+#                    landed on Friday and ingested on Monday has two different
+#                    and both interesting timestamps.
+#   _schema_version  the declared column contract it was read against, so a
+#                    value can be traced to the column list in force when it
+#                    landed. See `Feed.schema_version`.
+#   _source_system   which upstream, without a join to config that moves.
+#
+# Four at once rather than one now and three at the next requirement: an
+# `ALTER TABLE ... ADD COLUMNS` is cheap in Iceberg but it is still a commit
+# on every raw table, and prepared has to be edited to carry each of them.
+_PROVENANCE_COLUMNS = (
+    ("_delivery_id", "STRING"),
+    ("_received_at", "TIMESTAMP"),
+    ("_schema_version", "STRING"),
+    ("_source_system", "STRING"),
+)
+
+
 def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     """Create the raw table if absent.
 
@@ -110,7 +138,11 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
         _source_file   STRING,
         _file_version  INT,
         _row_number    BIGINT,
-        _batch_id      STRING
+        _batch_id      STRING,
+        _delivery_id   STRING,
+        _received_at   TIMESTAMP,
+        _schema_version STRING,
+        _source_system STRING
         )
         USING iceberg
         PARTITIONED BY (days(_business_date))
@@ -124,6 +156,39 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
         )
         """
     )
+
+
+def ensure_raw_columns(spark, table: str) -> list[str]:
+    """Add any provenance column the table does not have yet. Returns them.
+
+    THE MIGRATION FOR TABLES THAT ALREADY EXIST. `ensure_raw_table` is
+    `CREATE TABLE IF NOT EXISTS`, so a column added to it reaches new tables
+    only; every raw table already in the catalog would keep the old schema
+    forever and `prepared` would start selecting a column half of them do not
+    have.
+
+    ADDED, NOT BACKFILLED. Iceberg adds a column as metadata -- no data files
+    are touched -- so rows ingested before this read NULL. That is a deliberate
+    choice and it has a consequence worth stating: an as-of query cannot use
+    `_delivery_id` to reach back past this change, and must fall back to
+    `_source_file`, which resolves to the delivery for both shapes that exist
+    today. The alternative was rewriting every partition of every raw table --
+    new data files under five live published tags, interacting with snapshot
+    expiry and the pins retention was only just corrected to keep.
+
+    Reads the current column list rather than relying on `ADD COLUMNS IF NOT
+    EXISTS`, which Iceberg's Spark extensions do not accept: an unconditional
+    ADD of an existing column fails the whole statement, and this runs on
+    every ingest.
+    """
+    have = {c.lower() for c in spark.sql(f"SELECT * FROM {table} LIMIT 0").columns}
+    missing = [(n, t) for n, t in _PROVENANCE_COLUMNS if n.lower() not in have]
+    if missing:
+        cols = ", ".join(f"{n} {t}" for n, t in missing)
+        spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({cols})")
+        log.info("added provenance columns to %s: %s", table,
+                 ", ".join(n for n, _ in missing))
+    return [n for n, _ in missing]
 
 
 def read_landing(spark, fmt: dict, uri: str):
@@ -353,6 +418,11 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     raw_at_branch = _at_branch(fd.raw_table, branch)
     try:
         ensure_raw_table(spark, fd, raw_at_branch)
+        # ON THE BRANCH, like the CREATE above: a schema change is a commit,
+        # and a commit against `main` outside the merge is exactly what
+        # write-audit-publish exists to prevent. If the ingest then fails, the
+        # branch is abandoned and the column was never added to main either.
+        added = ensure_raw_columns(spark, raw_at_branch)
         version = next_file_version(spark, fd, bdate, raw_at_branch)
 
         # ONE DATAFRAME PER PART, each tagged with its OWN object key, then
@@ -410,6 +480,17 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
               .withColumn("_file_version", F.lit(version).cast("int"))
               .withColumn("_row_number", F.row_number().over(row_win).cast("bigint"))
               .withColumn("_batch_id", F.lit(run_id))
+              # Provenance, from the MANIFEST and the feed's declared
+              # contract, not from the filename. `received_at` is the
+              # delivery's arrival time -- the landing object's LastModified
+              # -- and is null only for the hand-built manifest of the
+              # `--business-date` escape hatch, which has no landed object to
+              # take it from.
+              .withColumn("_delivery_id", F.lit(manifest["delivery_id"]))
+              .withColumn("_received_at",
+                          F.lit(manifest.get("received_at")).cast("timestamp"))
+              .withColumn("_schema_version", F.lit(fd.schema_version))
+              .withColumn("_source_system", F.lit(fd.source_system))
         )
 
         row_count = df.count()
@@ -481,6 +562,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             "manifest": (object_key if object_key != parts[0]["object_key"]
                          else None),
             "parts": len(parts),
+            "delivery_id": manifest["delivery_id"],
+            "schema_version": fd.schema_version,
+            "columns_added": added,
             "asset_uri": fd.asset_uri,
             **drift,
         }

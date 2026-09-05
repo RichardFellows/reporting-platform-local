@@ -5,6 +5,7 @@ job module contains an endpoint, a credential or a policy value.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import uuid
@@ -211,6 +212,39 @@ class Feed:
         and what an uploaded header is compared to.
         """
         return [self.source_column(c) for c in self.columns]
+
+    @property
+    def schema_version(self) -> str:
+        """A short digest of this feed's DECLARED COLUMN CONTRACT.
+
+        What REQ-303 needs to tell "the upstream did not supply this column"
+        apart from "the upstream supplied it empty". `_extra_columns` and
+        `schema_drift` already record the drift itself; what was missing was a
+        name for the contract the drift was measured AGAINST. Stamped on every
+        raw row and every registry row, so a value read years later can be
+        traced to the column list that was in force when it landed.
+
+        DERIVED, NOT DECLARED. There is no `schema_version:` key in feeds.yml
+        and there should not be: a version somebody has to remember to bump is
+        a version that is wrong the first time somebody forgets, and the thing
+        it describes -- the ordered list of columns and the names they have in
+        the file -- is right there to be hashed. Adding, removing, renaming or
+        reordering a column changes it; nothing else does.
+
+        `column_types` is deliberately NOT in the digest. It says what the
+        PREPARED model should do with a column, not what the file contains, so
+        retyping a column in the console would otherwise look like the
+        upstream having changed its schema. Nor is `delimiter`/`quote_char`/
+        `header`: the manifest already records the format each delivery was
+        actually read with, per delivery, which is the stronger statement.
+
+        Twelve hex characters. Long enough that a collision is not a practical
+        concern across the number of column lists an estate has, short enough
+        to read in a table.
+        """
+        material = "\n".join(f"{c}\t{self.source_column(c)}"
+                             for c in self.columns)
+        return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
     @property
     def raw_table(self) -> str:

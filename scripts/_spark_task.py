@@ -61,6 +61,13 @@ def main() -> int:
         print(json.dumps(result, default=str))
         return 0
 
+    if op == "migrate-raw":
+        from reporting_platform.ingest.migrate_raw import migrate
+
+        dry = len(sys.argv) > 2 and sys.argv[2] == "dry"
+        print(json.dumps(migrate(dry_run=dry), default=str))
+        return 0
+
     if op == "maintain":
         from reporting_platform.maintenance.maintain import run
 

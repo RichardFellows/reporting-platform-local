@@ -213,6 +213,12 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
     unique_key = ", ".join(f"'{c}'" for c in ["business_date", *spec.business_key])
     tag = "reference" if len(spec.business_key) == 1 else "transactional"
 
+    # `source_provenance()` goes in beside `audit_columns()` below rather than
+    # being rendered column by column here. Both are macros for the same
+    # reason: a scaffolded model that omitted the delivery provenance would
+    # reopen REQ-304 once per feed, quietly, in the file nobody re-reads after
+    # the console writes it.
+    #
     # Align every `as <alias>` in one column, the way the hand-written models
     # do -- computed from the widest expression rather than fixed, so a long
     # safe_cast does not push its own alias out of line with the rest.
@@ -273,6 +279,7 @@ cleaned as (
 
     select
 {body}
+        {{{{ source_provenance() }}}}
         {{{{ audit_columns() }}}}
 
     from deduped

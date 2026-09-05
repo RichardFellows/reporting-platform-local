@@ -238,6 +238,41 @@ described — `latest_version_only`, a `superseded_grace_days`
 window — has been replaced rather than implemented, for the evidential reason
 above.
 
+### Quarantine: refused deliveries, for ten years
+
+`quarantine/` holds what an upstream sent that the conformance gate would not
+accept — an unroutable name, a name two feeds claim, a delivery that cannot be
+given a landing name at all — and `registry.rejection` says what was wrong with
+it (see
+[DECISIONS.md#quarantine-is-where-a-refused-delivery-goes](DECISIONS.md#quarantine-is-where-a-refused-delivery-goes)).
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.retention.quarantine --dry-run
+```
+
+**Kept the way `landing:` is** — flat age, everything, no keep-set — because it
+answers the same question from the other side: *what did they actually send
+us?*, asked about a delivery that never arrived. A rejected file is frequently
+the whole explanation for a missing business date, and the explanation is
+needed for as long as the date it is missing from.
+
+**Its own key, not a reference to landing's**, even though the value is the
+same today. Landing's window has two hard floors — the raw keep-set and the
+published-tag interlock. This one has neither: nothing is reproduced from a
+delivery that never landed, so shortening it is a policy call somebody can make
+on its own.
+
+**Dated from the object's own key**, `quarantine/<feed>/<yyyy>/<mm>/
+<timestamp>_<name>`, rather than from the filename. Landing dates a delivery by
+parsing its name and refuses to delete what it cannot parse; nothing here is
+parsable by contract — *not being nameable* is a common reason a file is in
+quarantine — so the platform puts the date in when it writes the object. A key
+whose folders and timestamp disagree is still left alone.
+
+**The rows are not swept.** `registry.rejection` is small, and keeping it after
+the bytes expire is what leaves "has this upstream sent us something broken
+before?" answerable.
+
 ### The reproducibility window
 
 **A published tag pins every data file its commit referenced.** So how long a

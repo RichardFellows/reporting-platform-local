@@ -8,7 +8,7 @@ normally asked after a restatement, about a business date the table layers have
 long since expired. So this sweep keeps **everything** for `keep_years` and
 then removes it, rather than sampling by the "10 business days plus 80
 month-ends" keep-set the tables use. Superseded re-deliveries are kept too:
-`TRADE_20260813.csv` and `TRADE_20260813_v2.csv` both survive their eight
+`TRADE_20260813.csv` and `TRADE_20260813_v2.csv` both survive their ten
 years, because the interesting question is usually about the first one.
 
 That is a policy decision, not an implementation detail. It costs the cheapest
@@ -21,7 +21,7 @@ tense, and no code read any of it — so the landing prefix grew without bound
 and "we keep every delivery forever" was being decided by omission.
 
 AGE MEANS BUSINESS DATE, NOT UPLOAD TIME. A file re-delivered late carries an
-old business date and a recent `LastModified`; the data in it is still eight
+old business date and a recent `LastModified`; the data in it is still ten
 years old and the retention question is about the data. Parsing also means a
 key whose name this platform does not recognise is never deleted — see
 `_expiry` below, where that is a deliberate skip rather than a fallback to
@@ -44,8 +44,8 @@ from reporting_platform.ingest import conform
 log = logging.getLogger("retention.landing")
 
 # Average days per year including leap years. Landing retention is a coarse
-# "about eight years" policy, not a calendar computation -- being a day out on
-# an eight-year boundary changes nothing anyone cares about, whereas pretending
+# "about ten years" policy, not a calendar computation -- being a day out on
+# a ten-year boundary changes nothing anyone cares about, whereas pretending
 # to calendar precision invites someone to depend on it.
 DAYS_PER_YEAR = 365.25
 

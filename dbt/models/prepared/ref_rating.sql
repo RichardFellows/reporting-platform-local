@@ -61,6 +61,7 @@ cleaned as (
         {{ clean_string('outlook') }}                   as outlook,
         _source_file                                    as source_file,
         _file_version                                   as source_file_version,
+        {{ source_provenance() }}
         {{ audit_columns() }}
 
     from deduped
@@ -121,6 +122,7 @@ ranged as (
 
         source_file,
         source_file_version,
+        {{ source_provenance_columns() }}
         source_batch_id,
         dbt_invocation_id,
         nessie_ref,

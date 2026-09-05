@@ -82,13 +82,17 @@ def check_reproducibility_window() -> int:
     Deleting landing evidence a live pin depends on is not recoverable at all,
     and the sweep that would do it runs nightly and unattended.
 
-    NOT REQ-602 IN FULL, and the gap is stated rather than papered over. The
-    complete interlock is "retention must not delete anything a published RUN
-    depends on", and a run record enumerating its delivery set is what makes
-    that checkable per delivery. Until that exists, the honest approximation
-    is the window comparison: it catches the configuration that guarantees the
-    loss, and it cannot catch a specific delivery expiring early inside an
-    otherwise coherent window.
+    NOT REQ-602 IN FULL, and the gap is stated rather than papered over. This
+    compares two WINDOWS, so it catches the configuration that guarantees the
+    loss and cannot catch a specific delivery expiring early inside an
+    otherwise coherent one. `monitoring/evidence.py` is the per-delivery half
+    -- it asks the registry which deliveries a pinned business date received
+    and checks each one is still landed -- and it runs after this chain rather
+    than before it, because it has to observe what the sweep left behind.
+
+    Even together they are an approximation: a published tag names one
+    business date and a published run reads more than one. The exact input set
+    needs the run record, REQ-400.
 
     Returns the landing window, so a caller can log what it checked.
     """
@@ -1041,6 +1045,17 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
     except Exception as e:                     # never fail retention over this
         log.warning("ready sweep failed: %s", str(e)[:200])
         report["ready"] = {"error": str(e)[:200]}
+
+    # And again for refused deliveries. Same prefix-sweep shape; the window
+    # is its own key in retention.yml because nothing is reproduced from a
+    # delivery that never landed, so this one has no correctness floor.
+    try:
+        from reporting_platform.retention.quarantine import sweep_quarantine
+
+        report["quarantine"] = sweep_quarantine(dry_run=dry_run)
+    except Exception as e:                     # never fail retention over this
+        log.warning("quarantine sweep failed: %s", str(e)[:200])
+        report["quarantine"] = {"error": str(e)[:200]}
 
     # Step 6: prefixes no reference points at. Runs LAST, after GC has had its
     # chance -- GC can only collect files of content it enumerates from live

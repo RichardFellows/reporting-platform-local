@@ -2568,3 +2568,200 @@ files, which is destructive on a catalog holding the seed data. The failure
 branch is exercised by construction (any read exception that is not
 `TABLE_OR_VIEW_NOT_FOUND` lands in `unreadable`, which clears `ok`) but has not
 been observed firing.
+
+## the-registry-records-observations-not-verdicts
+
+REQ-101, as amended. `reporting_platform/registry/`, in the Postgres
+`platform` database that had existed since the first compose file with nothing
+connected to it.
+
+The registry is the platform's record of what arrived: one row per delivery,
+carrying the business date, arrival time, size, checksum, the name the upstream
+used, the control file's declarations and the column contract it was read
+against. It is the first thing that can answer "did they send it, and what was
+in it?" without listing object storage by hand.
+
+**Postgres, because `sequence_no` needs a serialising authority.** The order in
+which the platform saw deliveries cannot be allocated by `MAX(...)+1` over a
+table several writers append to — that is `next_file_version`'s read-then-write,
+correct today only because the `lakehouse_write` pool has one slot, which is
+precisely what the concurrency work intends to change. A database sequence is
+serialised at any pool size. An Iceberg replica for analytical joins is the
+other half of the recommendation and is deliberately not built yet: it needs a
+namespace outside the dbt project, which `managed_tables()` derives from, so
+maintenance and retention would not cover it without explicit registration.
+
+**It records no verdicts, and that is the whole difference from the `stg`
+load-control tables this platform refuses by name.** There is no `ingested`,
+no `superseded`, no `status`. Whether a delivery reached the raw table stays
+derived from that table's own `_source_file`, where it cannot drift; whether
+one delivery supersedes another stays `dedupe_rank`'s answer, computed at read
+time. Every column is a fact about an object that exists in `landing/` right
+now. `tests/test_registry.py` asserts the absence of the forbidden names,
+because it is a rule about what must not be added and a comment does not fail
+when somebody adds it.
+
+**Rebuildable from object storage, by construction rather than by a second
+implementation.** `deliveries.reconcile()` walks `landing/` and `ready/` and
+registers everything missing, and it is the same `register()` the inline path
+calls. That is `arrival.py`'s own rule applied one layer up: *events are an
+optimisation, the poll is the correctness guarantee.* `normalize()` registers a
+delivery the moment it writes its manifest, best-effort — a failed registry
+write is logged and counted, never fatal, because `landing/` is the evidence
+and the raw table is the ledger, and taking ingestion down to protect an index
+would be the wrong way round. `coverage()` is what makes the resulting lag
+visible; verified by deleting a row, seeing it reported missing, and seeing
+reconcile put it back.
+
+**What a rebuild does not preserve is the integers in `sequence_no`.**
+Reconcile inserts in `received_at` order, so the ORDER is reproduced and the
+values are not. Nothing may key on the value: `_delivery_id` on the raw table
+references `(feed, delivery_id)`, which is the landing filename and is stable.
+
+**The md5 is measured once.** A landing object is immutable, so the hash comes
+from the `.meta.json` sidecar where the gate wrote one, otherwise from the
+object's ETag — MinIO and S3 both return the content md5 for a single-part
+upload, verified against this stack — and only from reading the object when the
+ETag is a multipart hash of hashes. A row already registered is never
+re-hashed: `md5`, `bytes`, `received_at` and `sequence_no` are left alone on
+conflict, and only what config can legitimately change is refreshed.
+
+## quarantine-is-where-a-refused-delivery-goes
+
+REQ-106. `registry/rejections.py`, `retention/quarantine.py`, and a
+`quarantine:` block in `retention.yml`.
+
+A delivery the conformance gate refused used to be moved to `.rejected/` — a
+directory on the inbox container's bind mount — with a line in that container's
+log. Nothing recorded what it was, what was wrong with it, or that it had ever
+arrived; the evidence lived on one host, under no retention policy, and
+`docker compose down -v` took it with it. A rejected delivery is evidence
+exactly as much as an accepted one: it is frequently the entire explanation for
+a missing business date.
+
+So the bytes go to `quarantine/` in object storage and `registry.rejection`
+says what they were and why. `.rejected/` stays and is written second — it is
+what the console's unclaimed queue reads and what the sniffer offers to onboard,
+and both want a local file to open. It is now a working copy of something
+durable rather than the only copy.
+
+**The rejection date goes into the key**, `quarantine/<feed>/<yyyy>/<mm>/
+<timestamp>_<name>`. `landing.py` dates an object by parsing its filename and
+refuses to delete anything it cannot parse — correct there, where everything is
+conformant by contract. Nothing in `quarantine/` is: *not being nameable* is one
+of the commonest reasons a file is here, so filename parsing would decline to
+delete essentially the whole prefix and the sweep would do nothing forever. The
+property that mattered is kept — the date is in the object's own name, needs no
+lookup — and what changes is that the platform chose the name. A key whose
+folders and timestamp disagree is still left alone, because this platform did
+not write it.
+
+**The timestamp makes each ATTEMPT its own object.** An upstream resending the
+same broken file every morning is producing a new event each time, and
+collapsing those onto one key would keep only the last and hide the pattern.
+The filename is sanitised, not trusted — the inbox is a directory anyone can
+write to, and this is the same traversal `normalize._safe_member_name` refuses.
+
+**A separate `keep_years` from `landing`, with the same value today.** The two
+answer to different things: landing's has a hard floor from the published-tag
+interlock and the raw keep-set, and this one has neither, because nothing is
+reproduced from a delivery that never landed. Shortening this is a policy call
+somebody can make on its own; shortening landing is not. **The row outlives the
+bytes** — `registry.rejection` is small and is not swept, so "has this upstream
+sent us something broken before?" stays answerable.
+
+**An INTEGRITY failure is never quarantined.** A delivery whose declared row
+count or checksum does not match LANDS and fails at ingest, because landing is
+the evidence copy and a bad delivery is exactly what it exists to prove. Only
+an IDENTITY failure — one that cannot be named — comes here. See
+`#the-inbox-is-the-conformance-gate`.
+
+## provenance-is-added-not-backfilled
+
+REQ-303, REQ-304. Four columns on every raw table — `_delivery_id`,
+`_received_at`, `_schema_version`, `_source_system` — carried into `prepared`
+by `source_provenance()` in `dbt/macros/engine.sql`.
+
+`prepared` previously dropped all of them by selecting named columns, so a
+typed value could be traced to the file it came from and not to the delivery,
+the contract it was read against, or when it arrived. Retrofitting that across
+ten teams' models later is not a day of work, which is why it landed before
+there are ten teams' models. `_delivery_id` is not `_source_file`: the latter
+is the PART, and `already_ingested` depends on it staying the part, so for an
+archive the two differ.
+
+**`_schema_version` is derived, not declared.** A twelve-character digest of
+the ordered `(platform name, name in the file)` pairs. There is no
+`schema_version:` key in feeds.yml and there should not be: a version somebody
+has to remember to bump is wrong the first time somebody forgets, and the thing
+it describes is right there to be hashed. `column_types` is deliberately not in
+the digest — it says what the prepared model does with a column, not what the
+file contains, so retyping one in the console must not look like the upstream
+having changed its schema.
+
+**Added, never backfilled.** Iceberg adds a column as metadata, so rows
+ingested before the change read NULL. Backfilling would rewrite every partition
+of every raw table — new data files under live published tags, interacting with
+snapshot expiry and the pins retention was only just corrected to keep. The
+consequence is stated rather than discovered: an as-of query cannot use
+`_delivery_id` to reach back past the change and must fall back to
+`_source_file`, which resolves to the delivery for both shapes that exist
+today.
+
+**The migration is lazy, and that broke the build.** `ensure_raw_columns` runs
+inside `ingest()`, on the branch, for the one feed being ingested — the right
+place, because that is where a table is guaranteed to exist and where a schema
+change can be abandoned with a failed load. But a feed that has not delivered
+since the column was added keeps the old schema, and every prepared model
+selects the new columns, so the next build fails for every feed that has not
+happened to deliver:
+
+    [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with
+    name `_delivery_id` cannot be resolved.
+
+— observed on three of four models, which is how
+`reporting_platform/ingest/migrate_raw.py` came to exist. It ensures the
+columns on every feed's raw table in one pass, on a branch, merged; it is
+idempotent, commits nothing when they are all current, and runs first in
+`platform_housekeeping` so a future provenance column cannot leave the build
+broken overnight. Run it by hand when deploying one, BEFORE the next ingest.
+
+## the-evidence-interlock-is-two-halves
+
+REQ-602. `retention.check_reproducibility_window()` and
+`monitoring/evidence.py`, and neither is the whole requirement.
+
+The first compares two numbers — `landing.keep_years` against the longest
+`references.published_tags` window — and refuses the whole sweep if landing is
+shorter. That catches the CONFIGURATION that guarantees evidence loss, which
+was the live defect, and it is cheap enough to run before every delete. What it
+structurally cannot catch is one delivery going missing inside an otherwise
+coherent window: a landing object deleted by hand, a sweep that ran against a
+shorter window last month, an upload that was never actually made. The numbers
+still agree; the evidence is still gone.
+
+So the second half is per delivery. For each live published tag it takes the
+business date the tag names, asks the registry which deliveries were received
+for that date, and checks each one's landing object is still there. It runs
+AFTER the retention chain, because it has to observe what that chain left
+behind, and after `registry_reconcile`, because a delivery with no row looks
+exactly like a pinned date whose evidence is gone.
+
+**It fails the run on a missing object and only warns on a date with no
+registered deliveries at all.** The second is what an unreconciled registry
+looks like, indistinguishable from the real thing on the evidence available
+there, and failing the chain the first time a tag is cut before reconcile has
+run would make the first red the one everybody learns to ignore. On its first
+run against the live catalog it reported two pinned dates as unbacked — the
+tags of a throwaway probe feed from an earlier session whose landing objects
+were deliberately removed, which is exactly the condition, correctly placed in
+the weaker category because nothing left can prove which it was.
+
+**Together they are still an approximation, and this is the honest limit.** A
+published tag names ONE business date, because `record_publication` cuts it
+from the date of the ingest that triggered the build, and a published run reads
+more than that date. So the check can miss a delivery from another date the run
+depended on; it cannot raise a false alarm, because everything it does check
+genuinely was received for that date. The exact input set needs the run record
+enumerating its deliveries — REQ-400 — and until that exists REQ-602 is closer,
+not done.

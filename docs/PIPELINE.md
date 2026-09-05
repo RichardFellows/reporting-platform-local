@@ -129,6 +129,16 @@ the rows**, and **how to read them**.
 makes `ready/` a **derived index** rather than a queue someone must remember to
 fill — a file pushed straight into the bucket is never stranded.
 
+Writing a manifest is also the moment the delivery is recorded in the
+**delivery registry** (`reporting_platform/registry/`, Postgres `platform`):
+one row saying what arrived, when, how big, what it hashed to, the name the
+upstream used and the column contract it was read against. Best-effort — a
+failed registry write is logged, never fatal — because
+`registry reconcile` rebuilds the whole thing from `landing/` and `ready/` with
+the same code. It records **observations only**; whether a delivery was
+ingested stays derived from raw's own `_source_file`. See
+[DECISIONS.md#the-registry-records-observations-not-verdicts](DECISIONS.md#the-registry-records-observations-not-verdicts).
+
 ## 4. `ingest` — raw, on a branch
 
 `ingest/ingest_feed.py`, run through `scripts/_spark_task.py` as a subprocess
@@ -194,9 +204,10 @@ to `keep_failed_branch` instead, so the branch survives for inspection.
 
 | Stage | Failure | Result |
 |---|---|---|
-| inbox | no feed claims the name | `.rejected/` — surfaced in the console's unclaimed queue |
+| inbox | no feed claims the name | `quarantine/` + a `registry.rejection` row, and `.rejected/` — surfaced in the console's unclaimed queue |
+| inbox | two feeds claim the name | same, classed `ambiguous` — a configuration error, never guessed |
 | inbox | control file not here yet | **held**, silently, retried next poll |
-| inbox | cannot determine a business date | `.rejected/` — it cannot be named, so it cannot land |
+| inbox | cannot determine a business date | quarantined and `.rejected/` — it cannot be named, so it cannot land |
 | normalize | control file not beside it in landing | `awaiting_control`, INFO — picked up by the next poll |
 | normalize | unreadable / unroutable object | counted and skipped; one bad file never blocks the rest |
 | ingest | below `expected_min_rows` | branch kept, `main` untouched |
@@ -210,7 +221,8 @@ to `keep_failed_branch` instead, so the branch survives for inspection.
 | Prefix / layer | Kept | Rebuildable from |
 |---|---|---|
 | `inbox/.processed/` | until removed by hand | — |
-| `landing/` | `keep_years` — 8 by default | nothing — this is the evidence |
+| `landing/` | `keep_years` — 10 by default, and ≥ the longest published-tag window | nothing — this is the evidence |
+| `quarantine/` | `keep_years` — 10 by default | nothing — what was refused, kept |
 | `ready/` | days | `landing/`, by re-running normalize |
 | `raw` | recent business days + month-ends | `landing/` |
 | `prepared` / `reporting` | per `retention.yml` | the layer below, by rebuilding |

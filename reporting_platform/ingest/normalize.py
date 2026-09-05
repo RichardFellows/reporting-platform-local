@@ -413,6 +413,13 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
     `write=False` builds the manifest without storing it, which is what the
     single-file CLI path uses so that `--object landing/...` keeps working
     without leaving a queue entry behind.
+
+    A STORED MANIFEST IS ALSO REGISTERED. Producing one is the moment the
+    platform accepts a landed object as a readable delivery -- it has a
+    business date, parts and a format -- so it is the moment the delivery
+    registry (REQ-101) can describe it. Best-effort and never fatal: see
+    `registry.deliveries.register_quietly`. `write=False` registers nothing,
+    because nothing was accepted into the queue either.
     """
     kind = _kind(feed)
     if kind not in NORMALIZERS:
@@ -429,7 +436,8 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
         # the `ready/` sweep -- which iterates manifests -- could never
         # collect. Cheaper to enqueue and let it be marked ingested.
         manifest = _normalize_archive(feed, object_key)
-        write_manifest(feed, manifest)
+        key = write_manifest(feed, manifest)
+        _register(feed, manifest, key)
         return manifest
 
     manifest = _normalize_file(feed, object_key)
@@ -437,7 +445,25 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
         key = manifest_key(feed, object_key)
         if force or not _exists(key):
             write_manifest(feed, manifest)
+        # Outside the `_exists` guard on purpose. The manifest is written once
+        # and the registry row may still be missing -- a registry that was
+        # down when this delivery first normalized is exactly the case
+        # `register_quietly` tolerates, and re-registering an already-known
+        # delivery is an upsert that changes nothing.
+        _register(feed, manifest, key)
     return manifest
+
+
+def _register(feed: Feed, manifest: dict[str, Any], key: str) -> None:
+    """Record the delivery, without letting the registry break normalization.
+
+    Imported here rather than at module scope: this module is imported by
+    `retention/landing.py` and by the config-level tests, neither of which has
+    a database, and an import-time psycopg2 dependency would reach both.
+    """
+    from reporting_platform.registry.deliveries import register_quietly
+
+    register_quietly(feed, manifest, key)
 
 
 def _exists(key: str) -> bool:

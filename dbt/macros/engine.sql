@@ -123,6 +123,53 @@
 {# Standard audit columns on every prepared/reporting model.
    Lineage back to the exact ingest batch is what makes a published figure
    explainable six months later. #}
+{#
+  ---------------------------------------------------- delivery provenance
+  Where the row CAME FROM, as opposed to what this build did with it.
+
+  Distinct from `audit_columns` and the distinction is the point: those
+  describe the dbt invocation that wrote the row -- batch, invocation id,
+  Nessie ref, timestamp -- and change every time the model is rebuilt. These
+  describe the DELIVERY, and do not change however often the row is rebuilt
+  from it. REQ-303 and REQ-304.
+
+  `prepared` previously dropped all four by selecting named columns, so a
+  typed value could be traced to the file it came from (`_source_file` was
+  kept) but not to the delivery, the contract it was read against, or when it
+  arrived. Retrofitting that across ten teams' models later is not a day of
+  work, which is why it is here before there are ten teams' models.
+
+  ONE PAIR LIST, TWO MACROS. `source_provenance()` projects them out of raw;
+  `source_provenance_columns()` names them again for the SCD2 models, which
+  enumerate their output columns explicitly rather than `select *`. A fifth
+  provenance column added to the list below reaches both.
+#}
+{% macro provenance_pairs() %}
+  {{ return([('delivery_id',    '_delivery_id'),
+             ('received_at',    '_received_at'),
+             ('schema_version', '_schema_version'),
+             ('source_system',  '_source_system')]) }}
+{% endmacro %}
+
+
+{# Emits a TRAILING COMMA: it is always placed before `audit_columns()`,
+   which is always last in the select. #}
+{% macro source_provenance() %}
+  {%- for alias, column in provenance_pairs() %}
+  {{ column }}                                AS {{ alias }},
+  {%- endfor %}
+{% endmacro %}
+
+
+{# The same columns by their prepared-layer names, for a model that lists its
+   output columns rather than selecting *. Also trailing-comma'd. #}
+{% macro source_provenance_columns() %}
+  {%- for alias, _column in provenance_pairs() %}
+  {{ alias }},
+  {%- endfor %}
+{% endmacro %}
+
+
 {% macro audit_columns(batch_source='_batch_id') %}
   {{ batch_source }}                          AS source_batch_id,
   -- STRING, not VARCHAR: Spark 3.x requires an explicit length on
