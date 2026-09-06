@@ -21,7 +21,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from reporting_platform.common.context import CATALOG, conventions, feeds
+from reporting_platform.common.context import (CATALOG, conventions, feeds,
+                                               retention_classes)
 from . import (dbt_check, feeddata, feedtest, jobs, orchestration,
                registry, sampledata, scaffold)
 from .registry import FeedSpec, FeedValidationError
@@ -122,6 +123,12 @@ def _summary(fd) -> dict[str, Any]:
         "expected_min_rows": fd.expected_min_rows,
         "cadence": fd.cadence,
         "delivery_expected": fd.delivery_expected,
+        # REQ-201 and REQ-600. Both are plain scalars on the feed rather than
+        # blocks, but they are subject to the same rule as everything above:
+        # the form posts back what this endpoint gave it, so an omission here
+        # is a silent revert to the inherited value on the next save.
+        "expected_by": fd.expected_by,
+        "retention_class": fd.retention_class,
         "schema_drift": fd.schema_drift,
         "convention": fd.convention,
         "delivery": dict(fd.delivery or {}),
@@ -153,8 +160,13 @@ def api_feeds():
     # a closed list. A free-text field here would make a typo an invisible
     # revert to `defaults:` -- the feed would load, and read its files with the
     # wrong delimiter.
+    # `retention_classes` rides along for the same reason `conventions` does,
+    # and with a sharper edge: a class name feeds.yml carries but retention.yml
+    # does not declare is refused at LOAD, so a free-text field here would let
+    # the console write a feeds.yml the next Airflow parse will not read.
     return {"catalog": CATALOG,
             "conventions": sorted(conventions()),
+            "retention_classes": sorted(retention_classes()),
             "feeds": [_summary(fd) for fd in feeds().values()]}
 
 

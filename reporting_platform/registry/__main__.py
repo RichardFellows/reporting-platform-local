@@ -9,6 +9,14 @@
     python -m reporting_platform.registry versions [--report NAME]
     python -m reporting_platform.registry inputs --run-id RUN
     python -m reporting_platform.registry submissions
+    python -m reporting_platform.registry state [--report NAME] [--as-at DATE]
+    python -m reporting_platform.registry lock --report NAME --as-at DATE \
+        --actor WHO --reason WHY
+    python -m reporting_platform.registry reopen --report NAME --as-at DATE \
+        --actor WHO --reason WHY [--approved-by OWNER]
+    python -m reporting_platform.registry lifecycle [--report NAME]
+    python -m reporting_platform.registry diff --report NAME --as-at DATE \
+        [--from N] [--to N]
     python -m reporting_platform.registry submit --destination D --by WHO \
         --version report:2026-08-01:3 [--version ...] [--family NAME]
 
@@ -28,7 +36,9 @@ from datetime import date
 
 from reporting_platform.common.context import feed as get_feed
 from reporting_platform.common.context import feeds
-from reporting_platform.registry import db, deliveries, rejections, runs
+from reporting_platform.registry import (
+    db, deliveries, lifecycle, rejections, runs,
+)
 
 
 def main(argv=None) -> int:
@@ -69,6 +79,45 @@ def main(argv=None) -> int:
 
     sub.add_parser("submissions", help="recorded submissions")
 
+    # ------------------------------------------------------ the lifecycle
+    # REQ-500..503. `state` is the read, `lock`/`reopen` are the two writes,
+    # `lifecycle` is every date that has one. There is no `open` command: open
+    # is the ABSENCE of a transition, so a date returns to it by being reopened
+    # rather than by being set back.
+    st = sub.add_parser("state", help="the state of one (report, as-at date)")
+    st.add_argument("--report", required=True)
+    st.add_argument("--as-at", required=True, dest="as_at",
+                    type=lambda s: date.fromisoformat(s))
+
+    lk = sub.add_parser("lock", help="close an as-at date to routine republication")
+    lk.add_argument("--report", required=True)
+    lk.add_argument("--as-at", required=True, dest="as_at",
+                    type=lambda s: date.fromisoformat(s))
+    lk.add_argument("--actor", required=True, help="who is doing this")
+    lk.add_argument("--reason", required=True, help="why")
+
+    ro = sub.add_parser("reopen", help="reopen a locked or submitted as-at date")
+    ro.add_argument("--report", required=True)
+    ro.add_argument("--as-at", required=True, dest="as_at",
+                    type=lambda s: date.fromisoformat(s))
+    ro.add_argument("--actor", required=True)
+    ro.add_argument("--reason", required=True)
+    ro.add_argument("--approved-by", dest="approved_by",
+                    help="required to reopen a SUBMITTED date; must be the "
+                         "owner declared on the report's dbt exposure")
+
+    lc = sub.add_parser("lifecycle", help="every as-at date with a state")
+    lc.add_argument("--report")
+    lc.add_argument("--history", action="store_true",
+                    help="every transition rather than the current states")
+
+    df = sub.add_parser("diff", help="what changed between two versions")
+    df.add_argument("--report", required=True)
+    df.add_argument("--as-at", required=True, dest="as_at",
+                    type=lambda s: date.fromisoformat(s))
+    df.add_argument("--from", dest="from_version", type=int)
+    df.add_argument("--to", dest="to_version", type=int)
+
     sb = sub.add_parser("submit", help="record that versions were submitted")
     sb.add_argument("--destination", required=True)
     sb.add_argument("--by", required=True, dest="submitted_by")
@@ -95,6 +144,41 @@ def main(argv=None) -> int:
         return 0
     if a.command == "submissions":
         print(json.dumps(runs.submissions(), indent=2, default=str))
+        return 0
+    if a.command == "state":
+        print(json.dumps(lifecycle.state(a.report, a.as_at), indent=2,
+                         default=str))
+        return 0
+    if a.command in ("lock", "reopen"):
+        try:
+            out = (lifecycle.lock(a.report, a.as_at, actor=a.actor,
+                                  reason=a.reason)
+                   if a.command == "lock" else
+                   lifecycle.reopen(a.report, a.as_at, actor=a.actor,
+                                    reason=a.reason,
+                                    approved_by=a.approved_by))
+        except (lifecycle.LifecycleRefused, ValueError) as exc:
+            # Exit 2, not a traceback: a refusal is the tool working. The
+            # message names what to do next, and a stack trace would bury it.
+            #
+            # ValueError is here because the most likely refusal of all is a
+            # MISTYPED REPORT NAME, and that one comes from `context.report()`
+            # rather than from the state machine -- verified live, where it
+            # printed forty lines of traceback ending in a message that
+            # already listed the two valid names. The refusals are the same
+            # kind of thing whichever layer noticed.
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    if a.command == "lifecycle":
+        out = (lifecycle.history(a.report) if a.history
+               else lifecycle.open_dates(a.report))
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    if a.command == "diff":
+        print(json.dumps(runs.diff(a.report, a.as_at, a.from_version,
+                                   a.to_version), indent=2, default=str))
         return 0
     if a.command == "submit":
         items = []

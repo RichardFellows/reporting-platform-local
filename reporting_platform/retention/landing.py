@@ -38,7 +38,9 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
-from reporting_platform.common.context import Feed, feeds, retention_policy
+from reporting_platform.common.context import (
+    Feed, class_keep_years, feeds, retention_policy,
+)
 from reporting_platform.ingest import conform
 
 log = logging.getLogger("retention.landing")
@@ -67,29 +69,44 @@ def _bucket() -> str:
     return warehouse.replace("s3a://", "").replace("s3://", "").split("/")[0]
 
 
-def keep_years() -> int:
-    """The landing window, with the interlock against the raw layer's window.
+def keep_years(feed: Feed | None = None) -> int:
+    """The landing window for `feed`, with the interlock against raw's window.
 
+    PER FEED SINCE RETENTION CLASSES (REQ-600/601). `feed.retention_class`
+    names the obligation and retention.yml gives it a window; a feed in the
+    default `standard` class resolves to exactly the `landing.keep_years` this
+    function used to return for everything, so nothing moved for an existing
+    feed. `None` asks for that prefix default, which is what a caller with no
+    feed in hand -- the CLI banner, a test -- actually wants.
+
+    THE INTERLOCK IS NOW PER FEED TOO, and it had to move with the window.
     `find_pending` computes the retention keep-set from the business dates it
-    can see in LANDING, precisely so a date expired from the table is
-    recognised as expired rather than re-ingested. That only
-    works while landing still holds every date the tables might hold. Set
-    landing shorter than the raw window and the keep-set is computed from a
-    truncated history, so genuinely live month-ends start looking expired.
+    can see in LANDING, per feed, from that feed's own prefix -- precisely so a
+    date expired from the table is recognised as expired rather than
+    re-ingested. That only works while a feed's landing prefix still holds
+    every date its raw table might hold. Left global, this check would have
+    compared the DEFAULT class against the raw window and gone quiet about
+    exactly the feed a short class was applied to: a guard whose window no
+    longer contains the thing it describes.
 
     Warn rather than refuse: unlike the GC cutoff interlock, the failure is
-    gradual and recoverable, and an operator deliberately shortening landing in
-    a sandbox should not be blocked.
+    gradual and recoverable, and an operator deliberately shortening a class in
+    a sandbox should not be blocked. The published-tag interlock in
+    `retention.check_reproducibility_window` is the one that refuses, and it is
+    per feed for the same reason.
     """
-    years = int(retention_policy("landing")["keep_years"])
+    years = (class_keep_years("landing", feed.retention_class) if feed
+             else int(retention_policy("landing")["keep_years"]))
     raw_months = int(retention_policy("raw").get("keep_month_ends", 0))
     raw_years = raw_months / 12
     if raw_years and years < raw_years:
         log.warning(
-            "landing keep_years=%d is shorter than the raw layer's window "
-            "(%d month-ends = %.1f years). find_pending derives its keep-set "
-            "from the dates present in landing, so live business dates will "
-            "start being treated as expired.", years, raw_months, raw_years)
+            "landing keep_years=%d for %s is shorter than the raw layer's "
+            "window (%d month-ends = %.1f years). find_pending derives its "
+            "keep-set from the dates present in that feed's landing prefix, so "
+            "live business dates will start being treated as expired.",
+            years, f"feed {feed.name} (class {feed.retention_class})" if feed
+            else "the default class", raw_months, raw_years)
     return years
 
 
@@ -156,18 +173,37 @@ def _expiry(feed: Feed, key: str, cutoff: date,
 
 
 def sweep_landing(dry_run: bool = True) -> dict:
-    """Remove landed objects whose business date is older than the window."""
+    """Remove landed objects whose business date is older than the window.
+
+    ONE CUTOFF PER FEED, not one for the sweep. A feed's retention class
+    decides how long its evidence is kept, so the cutoff is resolved inside the
+    loop and reported per feed.
+
+    THE TOP-LEVEL WINDOW IS NAMED `default_*`, and the rename is the point.
+    They were `keep_years`/`cutoff`, which read as the window this sweep
+    applied -- and after classes they are only the DEFAULT class's. Verified on
+    this stack, where the summary said `keep_years: 10, cutoff: 2016-09-05`
+    while `ref_collateral` was swept at 7 years against a 2019 cutoff: a reader
+    of the summary would have concluded nothing after 2016 could have been
+    deleted. `classes_applied` is the honest one-line answer, and the per-feed
+    entries carry the rest. Nothing outside this module read the old keys.
+    """
     years = keep_years()
     cutoff = (datetime.now(timezone.utc)
               - timedelta(days=years * DAYS_PER_YEAR)).date()
     s3, bucket = _client(), _bucket()
     paginator = s3.get_paginator("list_objects_v2")
 
-    result: dict = {"keep_years": years, "cutoff": cutoff.isoformat(),
-                    "dry_run": dry_run, "feeds": [], "objects_deleted": 0,
-                    "bytes_deleted": 0, "unrecognised": 0}
+    result: dict = {"default_keep_years": years,
+                    "default_cutoff": cutoff.isoformat(),
+                    "classes_applied": {}, "dry_run": dry_run, "feeds": [],
+                    "objects_deleted": 0, "bytes_deleted": 0,
+                    "unrecognised": 0}
 
     for feed in feeds().values():
+        feed_years = keep_years(feed)
+        feed_cutoff = (datetime.now(timezone.utc)
+                       - timedelta(days=feed_years * DAYS_PER_YEAR)).date()
         prefix = f"{feed.landing_prefix}/{feed.name}/"
         expired, kept, unknown, freed = [], 0, 0, 0
 
@@ -180,7 +216,7 @@ def sweep_landing(dry_run: bool = True) -> dict:
         siblings = {o["Key"].rsplit("/", 1)[-1] for o in objects}
 
         for obj in objects:
-            bd = _expiry(feed, obj["Key"], cutoff, siblings)
+            bd = _expiry(feed, obj["Key"], feed_cutoff, siblings)
             if bd is None:
                 # `_business_date`, not `parse_filename`: a metadata sibling
                 # dates through its delivery's name and a control file
@@ -203,18 +239,28 @@ def sweep_landing(dry_run: bool = True) -> dict:
                 # to ignore, and this prefix is the evidence copy.
                 s3.delete_object(Bucket=bucket, Key=key)
 
-        entry = {"feed": feed.name, "expired": len(expired), "retained": kept,
+        entry = {"feed": feed.name, "retention_class": feed.retention_class,
+                 "keep_years": feed_years, "cutoff": feed_cutoff.isoformat(),
+                 "expired": len(expired), "retained": kept,
                  "unrecognised": unknown, "bytes": freed}
         if expired:
             entry["oldest"] = min(bd for _, _, bd in expired).isoformat()
             entry["newest_expired"] = max(bd for _, _, bd in expired).isoformat()
         result["feeds"].append(entry)
+        # Which windows this sweep ACTUALLY applied, and to how many feeds.
+        # One number cannot describe a per-feed sweep, so this is the smallest
+        # true summary: {"standard": {"keep_years": 10, "feeds": 3}, ...}.
+        klass = result["classes_applied"].setdefault(
+            feed.retention_class, {"keep_years": feed_years, "feeds": 0,
+                                   "cutoff": feed_cutoff.isoformat()})
+        klass["feeds"] += 1
         result["objects_deleted"] += len(expired) if not dry_run else 0
         result["bytes_deleted"] += freed if not dry_run else 0
         result["unrecognised"] += unknown
-        log.info("landing %s: %d expired (before %s), %d retained, %d "
-                 "unrecognised%s", feed.name, len(expired), cutoff, kept,
-                 unknown, " [dry run]" if dry_run else "")
+        log.info("landing %s [%s, %dy]: %d expired (before %s), %d retained, "
+                 "%d unrecognised%s", feed.name, feed.retention_class,
+                 feed_years, len(expired), feed_cutoff, kept, unknown,
+                 " [dry run]" if dry_run else "")
 
     if result["unrecognised"]:
         log.warning(

@@ -103,7 +103,7 @@ def _spark_subprocess(*args: str) -> dict:
     default_args=DEFAULT_ARGS,
     tags=["reporting-platform", "platform", "housekeeping"],
     params={"dry_run": False, "force_compaction": False,
-            "fail_on_gap": False},
+            "fail_on_gap": False, "fail_on_late": False},
 )
 def platform_housekeeping():
 
@@ -347,6 +347,44 @@ def platform_housekeeping():
         return report
 
     @task
+    def lateness_check(**context) -> dict:
+        """Deliveries that arrived after the time the feed promised. REQ-201.
+
+        BESIDE `completeness_check`, NOT INSIDE IT, and the split is the
+        point: that one asks which business dates are MISSING, this asks which
+        of the deliveries that arrived were late. A date with nothing
+        registered is a gap and is not judged here, so an outage is reported
+        once rather than by both checks in different words.
+
+        WARNS RATHER THAN FAILING, for `completeness_check`'s reason exactly:
+        a red here would be indistinguishable, to the watchdog, from
+        housekeeping being down, and an upstream missing a deadline is not
+        reclamation failing. `fail_on_late` is there for a platform where it
+        should stop the night.
+
+        No Spark: the arrival time is `registry.delivery.received_at`, so this
+        runs in the task process rather than through `_spark_task`.
+        """
+        import logging
+
+        from airflow.exceptions import AirflowException
+
+        from reporting_platform.monitoring import lateness
+
+        log = logging.getLogger("airflow.task")
+        report = lateness.run()
+        for f in report.get("feeds", []):
+            for entry in f.get("late", []):
+                log.warning("feed %s: %s arrived %.1fh after its %s deadline",
+                            f["feed"], entry["business_date"],
+                            entry["hours_late"], f["expected_by"])
+        if report.get("total_late") and context["params"].get("fail_on_late"):
+            raise AirflowException(
+                f"{report['total_late']} delivery(ies) arrived late; see the "
+                "per-feed detail above")
+        return report
+
+    @task
     def storage_report(before: dict, after: dict) -> dict:
         """Prove the reclamation actually happened.
 
@@ -502,8 +540,11 @@ def platform_housekeeping():
     # second one can tell "evidence gone" from "never recorded".
     retained >> registry_reconcile() >> evidence_check()
     # No dependency on the chain above, on purpose: a data gap must not block
-    # reclamation, and reclamation failing must not hide a data gap.
+    # reclamation, and reclamation failing must not hide a data gap. The
+    # lateness check is beside it and independent of it for the same reason,
+    # and of it: a feed can be complete and late, or on time and full of holes.
     completeness_check()
+    lateness_check()
 
 
 platform_housekeeping()

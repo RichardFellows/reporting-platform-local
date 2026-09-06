@@ -140,13 +140,15 @@ const jpost = (path, body) => api(path, {
   method: "POST", headers: {"Content-Type": "application/json"},
   body: JSON.stringify(body ?? {})});
 
-let STATE = { feeds: [], conventions: [], selected: null, tab: "details", types: [] };
+let STATE = { feeds: [], conventions: [], retentionClasses: [], selected: null,
+              tab: "details", types: [] };
 
 // --------------------------------------------------------------- feed list
 async function loadFeeds(keep) {
   const data = await api("/api/feeds");
   STATE.feeds = data.feeds;
   STATE.conventions = data.conventions || [];
+  STATE.retentionClasses = data.retention_classes || [];
   const list = $("#feed-list");
   list.textContent = "";
   for (const f of data.feeds) {
@@ -345,6 +347,24 @@ function feedForm(f, creating) {
     ...(STATE.conventions || []).map(v =>
       el("option", {value: v, selected: (f?.convention ?? "") === v ? "selected" : null}, v)),
   ]);
+
+  // REQ-201. Text, not <input type="time">: the value written to feeds.yml is
+  // a QUOTED "HH:MM" string, and the browser's time widget localises its
+  // display, which would show an Asian desk a different number from the one
+  // the file holds. The platform's own `parse_expected_by` is what validates
+  // it on save, so the pattern here only saves a round trip.
+  const expectedBy = el("input", {class: "mono", placeholder: "07:00",
+                                  pattern: "([01][0-9]|2[0-3]):[0-5][0-9]"});
+  expectedBy.value = f?.expected_by ?? "";
+  // Closed list for the same reason `convention` is one, but failing harder:
+  // a class retention.yml does not declare is refused when feeds.yml LOADS,
+  // so a typo here does not degrade the feed, it stops Airflow parsing.
+  const RCLASSES = (STATE.retentionClasses || []).length
+    ? STATE.retentionClasses : ["standard"];
+  const retentionClass = el("select", {}, RCLASSES.map(v =>
+    el("option", {value: v,
+                  selected: (f?.retention_class ?? "standard") === v ? "selected" : null},
+       v)));
 
   // ---------------------------------------------------------- file format
   // These four reach Spark's reader unchanged. A wrong delimiter does not
@@ -816,6 +836,16 @@ function feedForm(f, creating) {
       ]),
     ]),
     el("div", {class: "grid2"}, [
+      field("expected_by", "Expected by", expectedBy,
+        "Wall-clock time (HH:MM, UTC) the upstream commits to, judged on the day AFTER the " +
+        "business date. Leave blank to assert no deadline \u2014 the lateness check then skips " +
+        "the feed rather than inventing an expectation for it."),
+      field("retention_class", "Retention class", retentionClass,
+        "How long this feed's landing and quarantine evidence is kept. The windows live in " +
+        "retention.yml; a class shorter than a report's tag window is refused for any feed " +
+        "that report is built from."),
+    ]),
+    el("div", {class: "grid2"}, [
       field("delimiter", "Delimiter", el("div", {class: "row"}, [delim, delimOther]),
         "Becomes Spark's `sep`, which takes a single character. A wrong one does not fail \u2014 " +
         "it lands one column holding the whole row. Only written to feeds.yml when it is not a comma."),
@@ -908,6 +938,8 @@ function feedForm(f, creating) {
       schema_drift: drift.value,
       convention: convention.value,
       delivery_expected: deliveryExpected.checked,
+      expected_by: expectedBy.value.trim(),
+      retention_class: retentionClass.value,
       delimiter: readDelim(),
       quote_char: quote.value,
       file_encoding: encoding.value.trim(),

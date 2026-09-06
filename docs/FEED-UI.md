@@ -84,6 +84,32 @@ is not an error anyone would see — the feed would load, having quietly
 inherited nothing. See
 [DECISIONS.md#feed-conventions](DECISIONS.md#feed-conventions).
 
+### Expected by, and the retention class
+
+Two scalars added with phases 6–7, both validated by **the platform's own
+functions** rather than by a second copy of the rules in the console. A form
+that accepted `7am`, or a retention class `retention.yml` does not declare,
+would write a `feeds.yml` the next Airflow parse refuses to load — and the
+console's whole point is that its diff is one you can merge.
+
+**Expected by** is a plain text field, not `<input type="time">`. The value
+written to `feeds.yml` is a quoted `"HH:MM"` string, and the browser's time
+widget localises what it displays — which would show an Asian desk a different
+number from the one the file holds. Leave it blank for a feed that has made no
+promise; the lateness check then skips it.
+
+**Retention class** is a `<select>` populated from the classes `retention.yml`
+declares, for the same reason **Convention** is a closed list, but failing
+harder: a typo'd convention degrades the feed, whereas a class nobody declared
+stops Airflow parsing `feeds.yml` at all.
+
+Both go through `_inherited()` like every other key, so a value the feed
+inherits from its convention is **left out** of the feed's block. That matters
+most for `expected_by`: `ref_src` declares it once for three feeds, and a save
+that pinned a copy into each block would leave the convention looking
+authoritative while changing it reached nothing.
+`tests/test_conform.py` asserts this against the shipped `feeds.yml`.
+
 ### The filename pattern
 
 The field most likely to be wrong, and it fails **silently**: `find_pending`

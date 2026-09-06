@@ -34,10 +34,27 @@ references:
 """
 
 
+# Every fragment below overwrites the shipped retention.yml wholesale, and the
+# shipped feeds.yml it is paired with names a retention class -- which is
+# refused at LOAD if retention.yml does not declare it. So the declaration is
+# prepended rather than repeated in each fragment: these tests are about tag
+# windows, and a class list in each one would read as though it mattered here.
+# The windows themselves are deliberately absent, so every class falls back to
+# the prefix default and each fragment's `landing.keep_years` still means what
+# it says.
+CLASSES_YML = """
+retention_classes:
+  standard: {}
+  operational: {}
+"""
+
+
 def _retention(references_yml: str = BASE_YML):
     """The retention module, pointed at a throwaway retention.yml."""
     import pathlib
     d = config_dir()
+    if "retention_classes:" not in references_yml:
+        references_yml = CLASSES_YML + references_yml
     (d / "retention.yml").write_text(references_yml, encoding="utf-8")
     import sys
     for name in [m for m in sys.modules if m.startswith("reporting_platform")]:
@@ -282,18 +299,56 @@ def test_landing_shorter_than_the_pin_refuses():
     try:
         _interlock(landing=8, default=10)()
     except ValueError as exc:
-        assert "landing.keep_years is 8" in str(exc), str(exc)
-        assert "10 years" in str(exc)
+        # Named per (report, feed) now, not as one global pair of numbers:
+        # with classes the answer to "how long is landing kept" depends on
+        # which feed you are asking about, and a message that did not say
+        # which would send you to the wrong line of retention.yml.
+        assert "keeps its landing evidence 8 years" in str(exc), str(exc)
+        assert "up to 10 years" in str(exc), str(exc)
+        assert "fo_trade (class standard)" in str(exc), str(exc)
     else:
         raise AssertionError("landing expiring before the pins was accepted")
 
 
+def _windows(result) -> set[tuple[int, int]]:
+    """(landing years, tag years) for every (report, feed) pair checked.
+
+    `check_reproducibility_window` returns what it checked rather than one
+    number, because with retention classes there is no single landing window
+    to return. These tests use the shipped feeds.yml, where every feed behind
+    a report is `standard`, so the pairs collapse to one -- but asserting over
+    the set rather than indexing row 0 keeps the test honest if a class is
+    ever applied to a feed that IS behind a report.
+    """
+    return {(c["landing_keep_years"], c["tag_keep_years"])
+            for c in result["checked"]}
+
+
 def test_landing_equal_to_the_pin_is_accepted():
-    assert _interlock(landing=10, default=10)() == 10
+    assert _windows(_interlock(landing=10, default=10)()) == {(10, 10)}
 
 
 def test_landing_longer_than_the_pin_is_accepted():
-    assert _interlock(landing=20, default=10)() == 20
+    assert _windows(_interlock(landing=20, default=10)()) == {(20, 10)}
+
+
+def test_every_feed_behind_a_report_is_checked_not_just_one():
+    """The interlock is per (report, feed) now. The shipped project has two
+    exposures over three feeds, and a check that resolved one pair would pass
+    while the other feed expired its evidence early."""
+    checked = _interlock(landing=10, default=10)()["checked"]
+    pairs = {(c["report"], c["feed"]) for c in checked}
+    assert len(pairs) >= 3, pairs
+    assert all(c["live_exposure"] for c in checked), checked
+
+
+def test_a_feed_behind_no_report_is_not_bound_by_any_pin():
+    """The whole point of classes. `ref_collateral` reaches no exposure, so
+    nothing published is reproduced from it and no window binds it -- if this
+    ever fails, either the lineage walk broke or a report started ref-ing it,
+    and in the second case its class is now a real constraint."""
+    result = _interlock(landing=10, default=10)()
+    assert "ref_collateral" in result["unbound_feeds"], result["unbound_feeds"]
 
 
 def test_the_longest_report_window_binds_not_the_default():
@@ -308,7 +363,21 @@ def test_the_longest_report_window_binds_not_the_default():
 
 
 def test_a_shorter_report_window_does_not_relax_the_interlock():
-    assert _interlock(landing=10, default=10, per_report="{brief: 2}")() == 10
+    # `brief` is not a live exposure, so it binds every feed -- at 2 years,
+    # which 10 clears. The default still applies to the real reports.
+    assert _windows(_interlock(landing=10, default=10,
+                               per_report="{brief: 2}")()) == {(10, 10), (10, 2)}
+
+
+def test_a_per_report_entry_naming_no_exposure_binds_every_feed():
+    """A report removed from the project keeps the tags it already cut, and
+    `expire_tags` still resolves their window by the name in the tag -- so the
+    entry is in force. Its lineage is gone, so the conservative answer is the
+    only available one: every feed, including ones behind no live report."""
+    result = _interlock(landing=10, default=10, per_report="{gone: 9}")()
+    bound = {c["feed"] for c in result["checked"] if c["report"] == "gone"}
+    assert "ref_collateral" in bound, bound
+    assert result["unbound_feeds"] == [], result["unbound_feeds"]
 
 
 # ------------------------------------------------------- per-environment windows
@@ -338,7 +407,8 @@ def test_the_window_can_be_per_environment():
             R = _retention(ENV_YML)
             from reporting_platform.common.context import tag_retention_years
             assert tag_retention_years() == expected, env
-            assert R.check_reproducibility_window() == expected, env
+            assert _windows(R.check_reproducibility_window()) == \
+                {(expected, expected)}, env
         finally:
             if before is None:
                 os.environ.pop("REPORTING_ENV", None)
@@ -375,10 +445,12 @@ def test_the_shipped_config_is_coherent_in_every_environment():
         for env in ("local", "dev", "uat", "prod"):
             os.environ["REPORTING_ENV"] = env
             R = _retention_shipped()
-            landing = R.check_reproducibility_window()
-            from reporting_platform.common.context import (
-                longest_tag_retention_years)
-            assert landing >= longest_tag_retention_years(), env
+            # It refuses rather than returning a bad number, so reaching the
+            # assertions at all is most of the test. They pin the shape.
+            result = R.check_reproducibility_window()
+            assert result["checked"], env
+            for c in result["checked"]:
+                assert c["landing_keep_years"] >= c["tag_keep_years"], (env, c)
     finally:
         if before is None:
             os.environ.pop("REPORTING_ENV", None)
@@ -489,5 +561,10 @@ def test_a_snapshot_window_longer_than_landing_is_allowed():
     from tests.support import CONFIG
     R = _retention((CONFIG / "retention.yml").read_text(encoding="utf-8"))
     # The shipped config is coherent; the point is that the interlock reads
-    # published_tags only.
-    assert R.check_reproducibility_window() >= R.longest_tag_retention_years()
+    # published_tags only. `snapshot_tags` is set independently and is not in
+    # `checked` at all -- if it ever appears there, binding it has crept back.
+    from reporting_platform.common.context import longest_tag_retention_years
+    result = R.check_reproducibility_window()
+    assert result["checked"]
+    for c in result["checked"]:
+        assert c["tag_keep_years"] <= longest_tag_retention_years(), c

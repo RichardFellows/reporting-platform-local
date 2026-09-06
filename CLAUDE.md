@@ -298,6 +298,42 @@ Two corollaries worth holding on to:
   before the merge, because only prepared knows which feed a delivery belongs
   to. Version numbering is per `(report, as-at date)`; a family is grouped on
   the SUBMISSION. See `docs/DECISIONS.md#a-run-is-the-first-thing-the-registry-cannot-rebuild`.
+- **AN AS-AT DATE HAS A LIFECYCLE, and `open` is the absence of a row.**
+  `registry.as_at_transition` is append-only: `open -> locked -> submitted`,
+  and back to `reopened` only deliberately. Storing `open` would need every
+  (report, date) pair seeded, and that set is DERIVED — a seeded table is a
+  second list of reports. Reopening a **submitted** date needs `approved_by`
+  to equal the report exposure's `owner.name`; reopening a merely **locked**
+  one needs only an actor and a reason. `actor`/`reason` are NOT NULL because
+  there is no identity provider here and that record is the whole of the
+  accountability. **The publish gate runs BEFORE the merge** — `publish()`
+  merges first and versions second, so a gate placed with the versioning fires
+  after `main` has moved. It bites only on a CLOSED date whose inputs for that
+  date MOVED; `restate` refuses, `carry_forward` publishes and records it, and
+  there is no platform-wide default (an exposure with no `meta.restatement` is
+  refused). REQ-503 is that nothing branches on what KIND of report it is, and
+  `tests/test_lifecycle.py` greps for that rather than asserting it in a
+  comment. See `docs/DECISIONS.md#the-as-at-date-has-a-lifecycle`.
+- **A feed's evidence window is its RETENTION CLASS**, named in `feeds.yml`
+  and sized in `retention.yml` per environment; an undeclared class is refused
+  at LOAD. Classes govern `landing/` and `quarantine/` **only** — table
+  keep-sets stay per layer, because a per-feed raw window would fight
+  `find_pending`. The reproducibility interlock is now per (report, feed) via
+  `feeds_behind_report()`, which walks the exposure's `ref()` closure: a feed
+  behind no published report is bound by no pin, which is the entire point —
+  under the old global rule no class could ever be shorter than the longest
+  pin. `snapshot_tags` stays outside it. The landing sweep's summary is
+  `default_keep_years`/`classes_applied`, not `keep_years`, because one number
+  cannot describe a per-feed sweep. See
+  `docs/DECISIONS.md#retention-classes-name-the-obligation`.
+- **`expected_by:` is the ONE lateness concept** — a wall-clock `"HH:MM"`,
+  judged on the day AFTER the business date (fixed at +1, forgiving on
+  purpose). **Quote it**: YAML 1.1 reads `7:00` as 420, and a leading zero
+  hides that until the first unpadded hour. A feed without one is skipped, not
+  defaulted to midnight. A backfill — every late date sharing one arrival day —
+  is reported as ONE event rather than N missed deadlines, described
+  differently but never suppressed. See
+  `docs/DECISIONS.md#lateness-is-a-wall-clock-time-not-a-duration`.
 - **`supersession:` in feeds.yml declares what `dedupe_rank` always assumed.**
   `full_snapshot` is the only built mode and the default; `delta_append` and
   `correction` raise NOT_BUILT at load. The value is the REFUSAL — a delta feed
@@ -344,6 +380,19 @@ docker compose exec -T airflow python -m reporting_platform.registry rejections
 docker compose exec -T airflow python -m reporting_platform.registry runs
 docker compose exec -T airflow python -m reporting_platform.registry versions
 docker compose exec -T airflow python -m reporting_platform.registry inputs --run-id <id>
+
+# the as-at lifecycle (REQ-500..503). `open` is the ABSENCE of a transition.
+docker compose exec -T airflow python -m reporting_platform.registry lifecycle
+docker compose exec -T airflow python -m reporting_platform.registry state --report <r> --as-at <d>
+docker compose exec -T airflow python -m reporting_platform.registry lock --report <r> --as-at <d> --actor WHO --reason WHY
+# reopening a SUBMITTED date needs --approved-by == the exposure's owner
+docker compose exec -T airflow python -m reporting_platform.registry reopen --report <r> --as-at <d> --actor WHO --reason WHY
+
+# what changed between two versions of one report+date: inputs AND code (§11)
+docker compose exec -T airflow python -m reporting_platform.registry diff --report <r> --as-at <d>
+
+# deliveries that arrived after their expected_by (REQ-201). No Spark.
+docker compose exec -T airflow python -m reporting_platform.monitoring.lateness
 
 # as of a knowledge time -- the same models, on a throwaway branch, NEVER merged.
 # --full-refresh is not optional: known_as_of() refuses an incremental run.

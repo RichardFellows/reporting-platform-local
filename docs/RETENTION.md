@@ -167,12 +167,12 @@ is again the safer choice.
 The stated desire to extend to 8 years of *all* dates is a separate,
 much larger commitment — see "Open question: extended retention" below.
 
-### Landing: everything, for ten years
+### Landing: everything, for ten years — or for its retention class
 
 **The evidence copy, and it does not follow the table rule.** Every CSV every
-feed has ever delivered is kept for `landing.keep_years` (10) and then removed —
-including superseded re-deliveries. `TRADE_20260813.csv` and
-`TRADE_20260813_v2.csv` both live out their ten years.
+feed has ever delivered is kept for its retention class's window and then
+removed — including superseded re-deliveries. `TRADE_20260813.csv` and
+`TRADE_20260813_v2.csv` both live out that window.
 
 Raised from eight when the published-tag window was corrected: landing must
 outlast the pins, or a published run stays reproducible after the evidence it
@@ -210,8 +210,67 @@ Three properties worth knowing:
   landing below the raw window and live month-ends start looking expired.
   `landing.py` warns; it does not refuse, because the failure is gradual and
   an operator shortening landing in a sandbox should not be blocked.
-- **`keep_years` must also be ≥ the longest published-tag window**, and *that*
-  one refuses. See *The reproducibility window*.
+- **`keep_years` must also be ≥ the published-tag window of every report the
+  feed is behind**, and *that* one refuses. See *The reproducibility window*.
+
+#### Retention classes
+
+A feed's window is chosen by its **retention class**. The class is named in
+`feeds.yml` (and is inheritable through `conventions:`); the windows live in
+`retention.yml`, per environment:
+
+```yaml
+# retention.yml — declared once, environment-independently
+retention_classes:
+  standard: {}
+  operational: {}
+
+environments:
+  local:
+    landing:
+      keep_years: 10                 # the default class
+      classes:
+        operational: {keep_years: 7}
+```
+
+```yaml
+# feeds.yml
+defaults:
+  retention_class: standard
+feeds:
+  - name: ref_collateral
+    retention_class: operational
+```
+
+Four things to know:
+
+- **Naming a class `retention.yml` does not declare is refused when `feeds.yml`
+  LOADS** — the same house rule as an undefined `convention`. Not defaulted and
+  not deferred to the sweep, because the fallback is the *longer* window and the
+  mistake would be silent storage nobody ever finds.
+- **Classes govern `landing/` and `quarantine/` only.** Table keep-sets stay per
+  layer. `quarantine:` deliberately ships with no `classes:` block, so a class
+  that shortens landing gets quarantine's own window — the over-retaining
+  direction.
+- **A class with no window for a prefix falls back to that prefix's default.**
+  Again, over-retaining.
+- **A class shorter than a report's pin window is refused for any feed that
+  report is built from** — see *The reproducibility window* below. That refusal
+  is the mechanism: a class cannot silently outlive its correctness.
+
+The sweep reports what it actually applied, per feed and per class:
+
+```json
+{"default_keep_years": 10, "default_cutoff": "2016-09-05",
+ "classes_applied": {"standard":    {"keep_years": 10, "feeds": 3, "cutoff": "2016-09-05"},
+                     "operational": {"keep_years": 7,  "feeds": 1, "cutoff": "2019-09-06"}}}
+```
+
+The top-level pair is named `default_*` on purpose. It used to be
+`keep_years`/`cutoff`, which read as the window the sweep applied and, after
+classes, described only the default class — a reader of the summary would have
+concluded nothing after 2016 could have been deleted while `ref_collateral` was
+being swept against a 2019 cutoff.
 
 ### Ready: the work queue, for a week
 
@@ -348,10 +407,36 @@ precede the date it reports on.
 
 #### The interlock
 
-`check_reproducibility_window()` **refuses** to run retention when
-`landing.keep_years` is shorter than the longest published-tag window. A tag
-pins the *tables*; reproducing a published run also means showing its inputs,
-and `landing/` is the only copy of what the upstream actually sent.
+`check_reproducibility_window()` **refuses** to run retention when a feed keeps
+its landing evidence for less time than a report built from it keeps its pins.
+A tag pins the *tables*; reproducing a published run also means showing its
+inputs, and `landing/` is the only copy of what the upstream actually sent.
+
+**It is asked per (report, feed), via the lineage.** It used to compare one
+landing window against the longest window any report resolved to. With
+retention classes there is no single landing window — and under the old rule no
+class could ever be shorter than the longest pin, which would have made classes
+decoration. So for each report it walks the exposure's `ref()` closure
+(`feeds_behind_report()`, the same derivation `reports()` and `managed_tables()`
+already use) and checks every feed behind it.
+
+**That is a deliberate relaxation**, and its cost is stated plainly: a feed's
+window is now only as protected as the lineage walk is correct, which is why
+`feeds_behind_report` raises on a ref it cannot resolve rather than returning a
+short list. A feed behind no published report — `ref_collateral` here — is bound
+by no pin, because nothing published is reproduced from it. If a report ever
+`ref()`s it, the nightly sweep refuses until its class is raised.
+
+**A `per_report` entry naming no live exposure binds every feed.** A report
+removed from the project keeps the tags it already cut and `expire_tags` still
+resolves their window by the name in the tag, so the entry is in force — while
+the lineage that would say which feeds were behind it is gone.
+
+**`snapshot_tags` is deliberately outside this**, and must stay outside it.
+Nothing is reproduced from a snapshot tag: it buys the ability to read a raw
+business date back after retention removed it, which is a storage decision
+rather than an evidence one. Binding it here would impose the published window
+on every feed again.
 
 It refuses where `landing.keep_years()`'s own interlock only warns, and the
 difference is what the failure costs: landing running short of the raw window
@@ -361,9 +446,11 @@ would do it runs nightly and unattended.
 
 **This is not the full REQ-602 interlock**, and the gap is worth stating. The
 complete rule is "retention must not delete anything a published *run* depends
-on", which needs a run record enumerating its delivery set. Until that exists,
-the window comparison catches the configuration that guarantees the loss; it
-cannot catch one delivery expiring early inside an otherwise coherent window.
+on". This compares *windows*, so it catches the configuration that guarantees
+the loss and cannot catch one delivery expiring early inside an otherwise
+coherent one. `monitoring/evidence.py` is the per-delivery half, and it runs
+*after* this chain rather than before it, because it has to observe what the
+sweep left behind.
 
 #### Verified
 

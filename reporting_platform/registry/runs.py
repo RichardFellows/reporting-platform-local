@@ -35,7 +35,7 @@ import logging
 from datetime import date
 from typing import Any
 
-from reporting_platform.registry import db
+from reporting_platform.registry import db, lifecycle
 
 log = logging.getLogger("registry.runs")
 
@@ -217,8 +217,124 @@ def record_submission(destination: str, submitted_by: str,
                 "(submission_id, report, as_at_date, version_no) "
                 "VALUES (%s, %s, %s, %s)",
                 (sid, report, as_at_date, version_no))
+
+    # REQ-500. Submitting CLOSES the as-at date, and it is written here rather
+    # than left to whoever submitted to remember. A date whose figure has left
+    # the building and is still `open` is the exact gap the lifecycle exists to
+    # close, and it would be created by omission every time.
+    #
+    # Written after the submission commits, in its own transaction: a
+    # lifecycle write that failed must not roll back the record that the
+    # submission happened. The submission is the event; the state is derived
+    # from it and can be re-derived by locking the date by hand.
+    for report, as_at_date, version_no in items:
+        try:
+            lifecycle.transition(
+                report, as_at_date, lifecycle.SUBMITTED,
+                actor=submitted_by,
+                reason=f"submitted v{version_no} to {destination}",
+                submission_id=sid)
+        except Exception as exc:                                # noqa: BLE001
+            log.error("submission %s recorded, but %s %s could not be moved "
+                      "to %s: %s -- lock it by hand", sid, report, as_at_date,
+                      lifecycle.SUBMITTED, f"{type(exc).__name__}: {exc}")
     return {"submission_id": sid, "family": family, "destination": destination,
             "items": len(items)}
+
+
+def diff(report: str, as_at_date: date, from_version: int | None = None,
+         to_version: int | None = None) -> dict[str, Any]:
+    """What changed between two published versions of one report and date.
+
+    §11. NEARLY FREE, because phase 5 made a run enumerate the deliveries
+    behind what it published: a v14 -> v15 comparison is the set difference of
+    two `run_input` sets, and the `change_ref` on each run says why. Nothing
+    here computes a diff of the DATA -- the published tables are pinned by
+    their tags and can be compared directly with `nessie_ref`; what was missing
+    was the ability to say which INPUTS differ, which no query over the tables
+    can answer.
+
+    THE DELIVERY JOIN IS A LEFT JOIN, because `run_input` deliberately has no
+    foreign key to `delivery` (see registry/db.py). A delivery the registry
+    cannot describe is reported with nulls rather than dropped -- dropping it
+    would remove it from both sides equally and make a real difference look
+    like agreement.
+
+    Defaults are "the last two versions", which is the comparison anybody
+    actually wants and the one that is tedious to type.
+    """
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT version_no, run_id, tag, created_at "
+            "FROM registry.report_version "
+            "WHERE report = %s AND as_at_date = %s ORDER BY version_no",
+            (report, as_at_date))
+        versions_here = [dict(zip(("version_no", "run_id", "tag", "created_at"), r))
+                         for r in cur.fetchall()]
+        if len(versions_here) < 2 and (from_version is None or to_version is None):
+            raise ValueError(
+                f"{report} {as_at_date} has "
+                f"{len(versions_here)} published version(s); a diff needs two. "
+                f"Name them explicitly if you meant a different pair.")
+
+        by_no = {v["version_no"]: v for v in versions_here}
+        lo = by_no.get(from_version if from_version is not None
+                       else versions_here[-2]["version_no"])
+        hi = by_no.get(to_version if to_version is not None
+                       else versions_here[-1]["version_no"])
+        for want, got in ((from_version, lo), (to_version, hi)):
+            if got is None:
+                raise ValueError(
+                    f"{report} {as_at_date} has no version {want}. Published: "
+                    f"{', '.join(str(v['version_no']) for v in versions_here)}")
+
+        def _inputs(run_id: str) -> dict[tuple[str, str], dict[str, Any]]:
+            cur.execute(
+                "SELECT i.feed, i.delivery_id, d.business_date, d.received_at, "
+                "       d.md5, d.source_filename "
+                "FROM registry.run_input i "
+                "LEFT JOIN registry.delivery d "
+                "  ON d.feed = i.feed AND d.delivery_id = i.delivery_id "
+                "WHERE i.run_id = %s", (run_id,))
+            cols = [c[0] for c in cur.description]
+            return {(r[0], r[1]): dict(zip(cols, r)) for r in cur.fetchall()}
+
+        old_inputs, new_inputs = _inputs(lo["run_id"]), _inputs(hi["run_id"])
+
+        cur.execute(
+            "SELECT run_id, code_ref, code_ref_kind, dbt_manifest_ref, "
+            "       change_ref, merged_hash, status, finished_at "
+            "FROM registry.run WHERE run_id = ANY(%s)",
+            ([lo["run_id"], hi["run_id"]],))
+        cols = [c[0] for c in cur.description]
+        run_rows = {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
+
+    lo_run = run_rows.get(lo["run_id"], {})
+    hi_run = run_rows.get(hi["run_id"], {})
+    added = sorted(new_inputs.keys() - old_inputs.keys())
+    removed = sorted(old_inputs.keys() - new_inputs.keys())
+    return {
+        "report": report, "as_at_date": as_at_date,
+        "from": {**lo, "run": lo_run}, "to": {**hi, "run": hi_run},
+        "deliveries": {
+            "added": [new_inputs[k] for k in added],
+            "removed": [old_inputs[k] for k in removed],
+            "unchanged": len(new_inputs.keys() & old_inputs.keys()),
+        },
+        "code": {
+            # Named rather than left to be compared by eye. A version pair
+            # whose deliveries are identical and whose code_ref differs is a
+            # rebuild, not a restatement, and that is the commonest real diff.
+            "code_ref_changed":
+                lo_run.get("code_ref") != hi_run.get("code_ref"),
+            "dbt_project_changed":
+                lo_run.get("dbt_manifest_ref") != hi_run.get("dbt_manifest_ref"),
+            "from_code_ref": lo_run.get("code_ref"),
+            "to_code_ref": hi_run.get("code_ref"),
+            "from_change_ref": lo_run.get("change_ref"),
+            "to_change_ref": hi_run.get("change_ref"),
+        },
+    }
 
 
 # ------------------------------------------------------------------ reading

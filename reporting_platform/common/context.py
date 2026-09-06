@@ -132,6 +132,26 @@ class Feed:
     # expected whenever another feed delivered on it) or "weekly" (only that
     # each week containing business dates saw at least one delivery).
     cadence: str = "daily"
+    # REQ-201. The time of day, in the platform's timezone, by which a
+    # delivery for a business date is expected to have ARRIVED. Empty means no
+    # expectation is declared and lateness is not asserted for this feed.
+    #
+    # THE ONE LATENESS CONCEPT, and it is deliberately a wall-clock time
+    # rather than a duration. `arrival_timeout_hours` and
+    # `arrival_poke_seconds` were both deleted in phase 0 for being config
+    # nothing read; the second of those had already been mistaken for a
+    # mechanism once. What an upstream actually commits to is "by 07:00", not
+    # "within six hours of something", and a duration needs an origin event
+    # that a feed arriving by PutObject does not have.
+    #
+    # It says nothing about whether the delivery is WHOLE -- that is
+    # `delivery.control`'s row count and md5 -- and nothing about whether one
+    # is expected at all, which is `delivery_expected`. Three questions, three
+    # keys, because the last time two of them shared one the answer to one was
+    # being used for the other.
+    #
+    # Validated at load by `parse_expected_by`: "HH:MM", 24-hour.
+    expected_by: str = ""
     # The `conventions:` entry this feed drew its defaults from, or "" for a
     # feed that stands alone. Recorded rather than discarded so the console can
     # round-trip it and so a resolved Feed can say where a surprising value
@@ -170,6 +190,30 @@ class Feed:
     # newest file does not mention, with nothing raising anywhere.
     # Validated at load by `resolve_supersession_config`.
     supersession: dict[str, Any] = field(default_factory=dict)
+    # REQ-600/601. Which retention class this feed's EVIDENCE belongs to --
+    # the `landing/` and `quarantine/` prefixes. Named here and defined in
+    # retention.yml; validated at load against the classes declared there, so
+    # a typo is an error naming itself rather than a silent fall back to the
+    # default window.
+    #
+    # THE NAME LIVES HERE AND THE WINDOWS LIVE THERE, and the split is the
+    # point. Listing feed names inside retention.yml would create a second
+    # registry of feeds that drifts from this one -- the failure
+    # `context.reports()` avoids by deriving reports from the exposures
+    # instead of restating them. Conversely, putting the YEARS here would put
+    # a per-environment policy value in the file every feed team edits.
+    #
+    # INHERITABLE THROUGH `conventions:`, and that is where it usually
+    # belongs: a retention obligation is a property of the source system and
+    # the agreement behind it far more often than of one feed.
+    #
+    # It governs the evidence prefixes ONLY. The raw/prepared/reporting
+    # keep-sets stay per LAYER: a table window says how much history is
+    # queryable, which is a decision about a layer, and making raw's per feed
+    # would put it in tension with `find_pending`, which derives one keep-set
+    # per feed from that feed's landing prefix.
+    # See docs/DECISIONS.md#retention-classes-name-the-obligation
+    retention_class: str = "standard"
 
     @property
     def needs_conforming(self) -> bool:
@@ -554,6 +598,49 @@ def resolve_supersession_config(feed_name: str, supersession: Any) -> dict[str, 
             f"(not built: {', '.join(sorted(SUPERSESSION_NOT_BUILT))})")
     return {"mode": mode}
 
+
+# ------------------------------------------------------------- expected_by
+_EXPECTED_BY_RE = re.compile(r"^(?P<h>[01]\d|2[0-3]):(?P<m>[0-5]\d)$")
+
+
+def parse_expected_by(feed_name: str, value: Any) -> str:
+    """Validate `expected_by:` and return it normalised, or "" if absent.
+
+    REQ-201. A WALL-CLOCK TIME, "HH:MM", 24-hour, in the platform's timezone.
+
+    Refused at LOAD rather than at the check, because a lateness expectation
+    nothing can parse is worse than none at all: `completeness.py` would skip
+    the feed, the check would go green, and the green would be read as "it
+    arrived on time". A feed that declares nothing is the honest absence and
+    is not an error; a feed that declares `7am` is a mistake and says so.
+
+    "24:00" is refused rather than folded to midnight. A delivery expected by
+    the end of the day is expected by 23:59, and accepting an hour that does
+    not exist invites the reader to believe some rollover rule is implemented
+    here. There is none.
+    """
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        # YAML 1.1 reads an unquoted `7:00` as SEXAGESIMAL -- the integer 420.
+        # Verified with the pyyaml this platform loads config with:
+        # `yaml.safe_load("a: 7:00")` is `{"a": 420}`, and `23:59` is 1439.
+        # A LEADING ZERO happens to block it (pyyaml's int resolver requires
+        # [1-9] first, so `07:00` stays a string), which makes this the worst
+        # kind of trap: it depends on whether somebody padded the hour, so it
+        # would work for every feed until the first one written `9:00`.
+        # Quoting is the rule; this branch is what makes forgetting it loud.
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `expected_by: {value!r}` is "
+            f"{type(value).__name__}, not a string. Quote it -- unquoted, "
+            f"YAML reads 7:00 as the integer 420 (sexagesimal).")
+    text = value.strip()
+    if not _EXPECTED_BY_RE.match(text):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `expected_by: {value!r}` is not a "
+            f"24-hour HH:MM time. Examples: '07:00', '18:30'. A delivery due "
+            f"at the end of the day is '23:59'; '24:00' is not a time.")
+    return text
 
 
 # --------------------------------------------------------------- the gate
@@ -955,6 +1042,10 @@ def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
             block["name"], merged.get("arrival"), merged.get("filename_pattern"))
         merged["supersession"] = resolve_supersession_config(
             block["name"], merged.get("supersession"))
+        merged["expected_by"] = parse_expected_by(
+            block["name"], merged.get("expected_by"))
+        merged["retention_class"] = check_retention_class(
+            block["name"], merged.get("retention_class"))
         check_gates_are_coherent(block["name"], merged["arrival"],
                                    merged["delivery"])
         names, sources = split_columns(merged.get("columns") or [])
@@ -1104,6 +1195,11 @@ def _reports_at(mtime_ns: int) -> dict[str, dict[str, Any]]:
                         m.split("'")[1] if "'" in m else m.strip()
                         for m in (exposure.get("depends_on") or [])
                         if isinstance(m, str)}),
+                    # Whatever the exposure declares about itself that the
+                    # platform reads: `restatement:` today. Carried through
+                    # raw rather than projected key by key, so an exposure can
+                    # be given a new policy without this derivation changing.
+                    "meta": dict(exposure.get("meta") or {}),
                 }
     return out
 
@@ -1122,8 +1218,256 @@ def reports() -> dict[str, dict[str, Any]]:
     return _reports_at(directory.stat().st_mtime_ns)
 
 
+def report(name: str) -> dict[str, Any]:
+    """One report, or a refusal naming what the project actually declares."""
+    known = reports()
+    if name not in known:
+        raise ValueError(
+            f"no report {name!r}. A report is a dbt EXPOSURE, so the ones "
+            f"that exist are the ones declared in "
+            f"{DBT_MODELS_DIR / _EXPOSURE_LAYERS[0]}: "
+            f"{', '.join(sorted(known)) or '(none)'}.")
+    return known[name]
+
+
+def report_owner(name: str) -> str:
+    """REQ-501's named owner: the exposure's `owner.name`.
+
+    NOT A NEW FIELD. An exposure already names an owner -- it is one of the
+    reasons an exposure is the right object for a report -- and REQ-501 asks
+    for somebody to be told when a report's as-at date needs an exception.
+    Two requirements, one derivation, and no second place for the name to be
+    wrong in.
+
+    Refuses an unnamed owner rather than returning "". `registry/lifecycle.py`
+    checks a reopening approver against this value, so an empty owner would
+    make that check vacuous -- it would accept every approver, quietly, which
+    is the failure mode a guard against an unsettable value always has.
+    """
+    owner = (report(name).get("owner") or "").strip()
+    if not owner:
+        raise ValueError(
+            f"report {name!r} declares no `owner: name:` in its exposure. "
+            f"That name is REQ-501's named owner and is what a reopening "
+            f"approver is checked against, so an absent one would make the "
+            f"check accept anybody. Add it to the exposure.")
+    return owner
+
+
+# REQ-502. What happens to a published as-at date whose inputs later change.
+#
+#   restate       -- the figure must be republished. A publish onto a locked
+#                    or submitted date whose input set has moved is REFUSED
+#                    until somebody reopens it, so the restatement is a
+#                    decision somebody made rather than one that happened.
+#   carry_forward -- the published figure stands and the change surfaces at
+#                    the current date instead. Recorded on the run, so
+#                    "why does last month's number not include this" has an
+#                    answer that is not somebody's memory.
+RESTATEMENT_POLICIES = ("restate", "carry_forward")
+
+
+def restatement_policy(name: str) -> str:
+    """A report's restatement policy, or a refusal. There is NO DEFAULT.
+
+    Open decision 2, settled as `fail`. A silent platform-wide default is how
+    a regulatory report gets carried forward when it should have been
+    restated: nothing raises, both behaviours look identical until somebody
+    asks why two published figures disagree, and by then the decision has been
+    made many times by omission.
+
+    DECLARED ON THE EXPOSURE, under `meta:`, because a report IS an exposure
+    here -- a separate config block would be a second list of reports to
+    disagree with `reports()` the first time one was added.
+
+    REFUSED HERE RATHER THAN IN `reports()`, and that is a deliberate choice
+    about blast radius. `reports()` is a pure derivation of the project and
+    the retention chain now calls it, through `feeds_behind_report`. Raising
+    inside it would take the nightly sweep down over an undeclared restatement
+    policy -- a failure with nothing to do with retention. So the refusal is
+    at the point of the decision, and `tests/test_lifecycle.py` asserts every
+    exposure declares one, which is what makes it un-forgettable rather than
+    merely documented.
+    """
+    meta = report(name).get("meta") or {}
+    value = meta.get("restatement")
+    if value is None:
+        raise ValueError(
+            f"report {name!r} declares no `meta: restatement:` on its "
+            f"exposure. There is deliberately no default: the two answers -- "
+            f"{' or '.join(RESTATEMENT_POLICIES)} -- differ only after a "
+            f"published date's inputs change, so a default would be a policy "
+            f"nobody chose, in force for years before anybody noticed. "
+            f"Declare it in the exposure.")
+    if value not in RESTATEMENT_POLICIES:
+        raise ValueError(
+            f"report {name!r}: `meta: restatement: {value!r}` is not "
+            f"recognised. Valid: {', '.join(RESTATEMENT_POLICIES)}.")
+    return str(value)
+
+
+def feeds_behind_report(name: str) -> list[str]:
+    """Every feed whose data reaches `name`, by walking the project's `ref()`s.
+
+    WHAT THIS IS FOR. `check_reproducibility_window` has to know whether a
+    feed's landing evidence outlives the pins of the reports built from it.
+    Before retention classes there was one landing window and one comparison;
+    with classes the question is per feed, and answering it needs the lineage
+    rather than a list somebody maintains.
+
+    DERIVED, LIKE EVERYTHING ELSE HERE. Exposure `depends_on` gives the
+    reporting models; each model's SQL gives its `ref()`s; a ref naming a
+    PREPARED model is a feed, by the platform's rule that model filename ==
+    table name == feed name, and a ref naming a reporting model is followed.
+    That is `managed_tables()`'s derivation applied transitively, and it uses
+    the project files rather than dbt's `manifest.json`, which Cosmos
+    overwrites once per model and which therefore records whichever task
+    finished last (see registry/runs.py on `dbt_manifest_ref`).
+
+    A ref that resolves to neither layer is REPORTED, not guessed at -- the
+    caller decides whether an unresolvable dependency is fatal. Returning it
+    silently as "no feeds" would make an under-retained feed invisible, which
+    is the direction that loses evidence.
+    """
+    reporting = set(models_in("reporting"))
+    prepared = set(models_in("prepared"))
+    known_feeds = set(feeds())
+
+    found: set[str] = set()
+    seen: set[str] = set()
+    queue = list(report(name)["models"])
+    while queue:
+        model = queue.pop()
+        if model in seen:
+            # dbt refuses a cyclic ref, but this walk reads files rather than
+            # a compiled graph, so it cannot rely on that having been checked.
+            continue
+        seen.add(model)
+        if model in prepared:
+            if model in known_feeds:
+                found.add(model)
+            continue
+        if model not in reporting:
+            raise ValueError(
+                f"report {name!r} depends on {model!r}, which is neither a "
+                f"prepared nor a reporting model in {DBT_MODELS_DIR}. The "
+                f"lineage behind this report cannot be resolved, so the "
+                f"feeds behind it cannot be named.")
+        path = DBT_MODELS_DIR / "reporting" / f"{model}.sql"
+        queue.extend(_REF_RE.findall(path.read_text(encoding="utf-8")))
+    return sorted(found)
+
+
+# `ref('x')` / `ref("x")`. Read off the model SQL rather than the compiled
+# manifest -- see feeds_behind_report on why the manifest is not trustworthy
+# here.
+_REF_RE = re.compile(r"""\bref\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
+
+
 def retention_policy(layer: str) -> dict[str, Any]:
     return _load("retention.yml")["environments"][ENV][layer]
+
+
+# ----------------------------------------------------------- retention classes
+# REQ-600/601. A retention class is a named EVIDENCE OBLIGATION that a feed is
+# in: how long what the upstream actually sent is kept, in `landing/` and in
+# `quarantine/`.
+#
+# THE NAME IS IN feeds.yml AND THE WINDOWS ARE HERE, which is the whole design.
+# A feed's class is a property of the feed and belongs beside it, inheritable
+# through `conventions:` because the obligation nearly always comes from the
+# source system rather than from one feed. The YEARS are a per-environment
+# policy value and belong in retention.yml with every other one. Listing feed
+# NAMES per class in retention.yml -- the obvious alternative -- would create a
+# second registry of feeds that drifts from the first, which is exactly what
+# deriving reports from the exposures exists to avoid.
+#
+# CLASSES ARE DECLARED ONCE, ENVIRONMENT-INDEPENDENTLY, at retention.yml's top
+# level, and each environment then gives windows only for the classes it wants
+# to move. If the declaration were per environment, a class declared in `local`
+# and forgotten in `dev` would make feeds.yml fail to load in dev alone -- a
+# config file breaking in one environment for a key that reads fine in the one
+# you are looking at.
+PREFIX_CLASSES = ("landing", "quarantine")
+
+
+def retention_classes() -> dict[str, dict[str, Any]]:
+    """The declared retention classes, keyed by name. Never empty.
+
+    `standard` is always present: it is `Feed.retention_class`'s default and
+    the window every feed had before classes existed, so a retention.yml that
+    declares nothing keeps behaving exactly as it did.
+    """
+    declared = _load("retention.yml").get("retention_classes") or {}
+    if not isinstance(declared, dict):
+        raise ValueError(
+            f"retention.yml: `retention_classes:` must be a mapping of class "
+            f"name to settings, got {type(declared).__name__}")
+    return {"standard": {"description": "The platform default."}, **declared}
+
+
+def check_retention_class(feed_name: str, value: Any) -> str:
+    """Validate a feed's `retention_class:` against what retention.yml declares.
+
+    REFUSED AT LOAD, like an undefined `convention:`, and for the same reason:
+    an unrecognised class would otherwise fall back to the default window
+    silently, and the direction of that fallback is over-retention -- which
+    looks fine forever and means the class somebody wrote was never in force.
+    """
+    text = str(value or "standard").strip() or "standard"
+    known = retention_classes()
+    if text not in known:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} names retention class {text!r}, "
+            f"which retention.yml does not declare. Available: "
+            f"{', '.join(sorted(known))}. Add it under `retention_classes:` "
+            f"there before naming it here.")
+    return text
+
+
+def class_keep_years(prefix: str, retention_class: str = "standard") -> int:
+    """Years the `prefix` evidence for a feed in `retention_class` is kept.
+
+    Resolution is `environments[ENV][prefix].classes[<class>].keep_years`,
+    falling back to `environments[ENV][prefix].keep_years` -- the block's own
+    value, which is what every feed used before classes existed.
+
+    THE FALLBACK IS PER PREFIX, NOT PER CLASS, deliberately. A class that
+    shortens `landing:` and says nothing about `quarantine:` gets quarantine's
+    ordinary window, because the two answer to different things and
+    retention.yml's own comment already says so: quarantine has neither of
+    landing's hard floors, so shortening one is a policy call somebody can
+    make without making the other.
+
+    Refuses an unreadable window rather than falling back, matching
+    `tag_retention_years`: the number authorises an unrecoverable deletion.
+    """
+    if prefix not in PREFIX_CLASSES:
+        raise ValueError(
+            f"retention classes govern {' and '.join(PREFIX_CLASSES)} only, "
+            f"not {prefix!r}. A table keep-set is a decision about a LAYER -- "
+            f"how much history is queryable -- not about one feed's evidence "
+            f"obligation. See docs/DECISIONS.md#retention-classes-name-the-obligation")
+    block = retention_policy(prefix)
+    classes = block.get("classes") or {}
+    if not isinstance(classes, dict):
+        raise ValueError(
+            f"retention.yml (env {ENV!r}): {prefix}.classes must be a mapping "
+            f"of class name to settings, got {type(classes).__name__}")
+    entry = classes.get(retention_class) or {}
+    value = entry.get("keep_years", block.get("keep_years"))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"retention.yml (env {ENV!r}): {prefix} keep_years for class "
+            f"{retention_class!r} is {value!r}, which is not a whole number of "
+            f"years. {prefix}/ is the evidence copy -- an unreadable window "
+            f"here would authorise deleting what the upstream actually sent.")
+    if value <= 0:
+        raise ValueError(
+            f"retention.yml (env {ENV!r}): {prefix} keep_years for class "
+            f"{retention_class!r} is {value}. A window of zero or less expires "
+            f"the whole prefix immediately, which is never what is meant.")
+    return value
 
 
 def reference_policy(kind: str) -> dict[str, Any]:

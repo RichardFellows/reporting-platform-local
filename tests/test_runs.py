@@ -171,3 +171,49 @@ def test_the_run_key_is_derived_from_the_branch_and_carries_the_purpose():
     assert ns["_run_key"]("build/prepared/2026-09-06/abc-123") == "prepared-abc-123"
     assert ns["_run_key"]("build/reporting/2026-09-06/abc-123") == "reporting-abc-123"
     assert spec is not None
+
+
+# --------------------------------------------------- the version diff (§11)
+# Postgres again, so what is checked here is the SHAPE of the query rather
+# than its result -- and the shape is where the two defects would be.
+RUNS_PY = REPO / "reporting_platform" / "registry" / "runs.py"
+
+
+def test_the_diff_left_joins_deliveries_rather_than_inner_joining_them():
+    """`run_input` has no foreign key to `delivery` on purpose, so a delivery
+    the registry cannot currently describe is a real possibility -- after a
+    registry rebuild, or for one whose landing object retention removed. An
+    INNER JOIN would drop it from BOTH sides equally, which turns a genuine
+    difference into agreement: the diff would report "nothing changed" for
+    exactly the case somebody is looking into."""
+    body = RUNS_PY.read_text(encoding="utf-8")
+    body = body[body.index("def diff("):]
+    assert "LEFT JOIN registry.delivery" in body, "diff inner-joins deliveries"
+    assert "INNER JOIN registry.delivery" not in body
+
+
+def test_the_diff_reports_code_movement_separately_from_delivery_movement():
+    """The interesting real case on this stack today is two versions of one
+    date with IDENTICAL input sets and different `code_ref`s. A diff that only
+    differenced deliveries would say "no change" about a rebuild that moved
+    every figure, so the honest answer needs both halves."""
+    body = RUNS_PY.read_text(encoding="utf-8")
+    body = body[body.index("def diff("):]
+    for key in ("code_ref_changed", "dbt_project_changed", "change_ref"):
+        assert key in body, key
+
+
+def test_the_diff_is_keyed_per_report_and_as_at_date_like_the_versions_are():
+    """Decision 5 again. A diff keyed on run ids would compare two runs that
+    published different dates and call the entire input set a change."""
+    import inspect
+    import sys
+    sys.path.insert(0, str(REPO))
+    from reporting_platform.registry import runs
+    params = list(inspect.signature(runs.diff).parameters)
+    assert params[:2] == ["report", "as_at_date"], params
+    # Both versions default, because "the last two" is what anybody wants and
+    # is the tedious thing to look up.
+    sig = inspect.signature(runs.diff)
+    assert sig.parameters["from_version"].default is None
+    assert sig.parameters["to_version"].default is None

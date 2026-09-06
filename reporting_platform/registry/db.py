@@ -34,12 +34,15 @@ values are not. Nothing may key on the value -- `_delivery_id` on the raw
 table references `(feed, delivery_id)`, which is the landing filename and is
 stable.
 
-RUNS, VERSIONS AND SUBMISSIONS ARE THE EXCEPTION, and it is the only one.
+RUNS, VERSIONS, SUBMISSIONS AND AS-AT TRANSITIONS ARE THE EXCEPTION, and it is
+the only one.
 Everything above is an observation about an object that exists in storage, so
 it can be recomputed from storage. A RUN is not: it is an event that happened
 once, at a time, from a particular commit of the code, and no object anywhere
 records that it happened. Neither is the version number a report was published
-under, nor the fact that somebody submitted it.
+under, nor the fact that somebody submitted it, nor that somebody locked or
+reopened an as-at date -- REQ-500's lifecycle is a sequence of human acts, and
+`registry.as_at_transition` is the only place any of them is written down.
 
 So these tables are the first rows in this database that a rebuild cannot
 reconstruct, and two things follow that are easy to get wrong:
@@ -322,6 +325,49 @@ CREATE TABLE IF NOT EXISTS registry.submission (
     submitted_by  TEXT        NOT NULL,
     note          TEXT
 );
+
+-- REQ-500..503. The LIFECYCLE of one (report, as-at date): whether it is still
+-- open to routine publication, closed, sent, or deliberately reopened.
+--
+-- APPEND-ONLY, AND THE CURRENT STATE IS THE NEWEST ROW. A mutable
+-- current-state row would answer "is this locked" and destroy "who reopened
+-- it, when, and why" every time it was updated -- and that history is the
+-- entire subject here. This is a third table in the family a rebuild cannot
+-- reconstruct (see the module header): a lock is an act somebody performed,
+-- and no object in storage records that it happened.
+--
+-- NO ROW MEANS `open`. An as-at date that nobody has locked is open, so the
+-- ordinary case costs no row and a report's first publication needs no
+-- lifecycle set-up. `lifecycle.state()` reads the absence as the state.
+--
+-- `actor` AND `reason` ARE NOT NULL, and that is the authority model, stated
+-- honestly: this platform has no identity provider, so it cannot enforce WHO
+-- may lock or reopen a date. What it can do is refuse a transition that does
+-- not say who made it and why, and check a reopening approver against the
+-- report's declared owner -- which is derivable from the dbt exposure and is
+-- therefore a real check rather than a log line. See registry/lifecycle.py.
+CREATE TABLE IF NOT EXISTS registry.as_at_transition (
+    transition_id BIGSERIAL   PRIMARY KEY,
+    report        TEXT        NOT NULL,
+    as_at_date    DATE        NOT NULL,
+    -- 'locked', 'submitted' or 'reopened'. There is no 'open' row: open is
+    -- the absence of any row, so nothing has to be written to create a date.
+    state         TEXT        NOT NULL,
+    occurred_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor         TEXT        NOT NULL,
+    reason        TEXT        NOT NULL,
+    -- Only on a reopening of a SUBMITTED date, where it must match the
+    -- report's exposure owner. Null everywhere else, because requiring an
+    -- approver for an ordinary lock would make the one place it matters
+    -- indistinguishable from routine.
+    approved_by   TEXT,
+    -- The submission this state came from, when it came from one. Set by
+    -- record_submission so that submitting is not a second thing to remember.
+    submission_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS as_at_transition_current
+    ON registry.as_at_transition (report, as_at_date, occurred_at DESC);
 
 CREATE TABLE IF NOT EXISTS registry.submission_item (
     submission_id TEXT NOT NULL

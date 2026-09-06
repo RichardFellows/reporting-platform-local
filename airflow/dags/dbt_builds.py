@@ -303,6 +303,9 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
 
               1. THE INPUT SET IS READ OFF THE BRANCH, before the merge, while
                  it is still exactly what was audited. REQ-400.
+              1b. THE AS-AT LIFECYCLE GATE runs between them, because it is
+                 the only check here that must be able to stop the
+                 publication -- and after the merge it could not. REQ-500/502.
               2. The merge carries a COMMIT MESSAGE naming the purpose, the
                  business date and the change reference. REQ-405. Nessie
                  otherwise synthesises "Merge <hash> into main", which names
@@ -349,6 +352,36 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             except Exception as exc:                            # noqa: BLE001
                 log.error("run %s: could not record the input set: %s", run_id,
                           f"{type(exc).__name__}: {exc}")
+
+            # 1b. THE AS-AT LIFECYCLE GATE, and it must be HERE -- after the
+            # input set (which is what makes the as-at date knowable) and
+            # BEFORE the merge. Placed with the versioning below it would fire
+            # after `main` had already moved, so the refusal would be a
+            # complaint about a publication that had happened. Refusing here
+            # fails the task with main untouched and the branch retained by
+            # keep_failed_branch, which is write-audit-publish doing its job.
+            #
+            # REQ-500/502. A LifecycleRefused is deliberately NOT caught: it is
+            # the one error in this task that must stop the publication. Every
+            # other failure here is best-effort because the tables are audited
+            # and correct; this one says the tables must not become main's.
+            carried_forward: list[dict] = []
+            if purpose == "reporting" and business_date:
+                from datetime import date as _date
+
+                from reporting_platform.registry import lifecycle
+
+                candidate = {(feed, delivery) for feed, delivery
+                             in inputs.get("inputs", [])}
+                for report in sorted(reports()):
+                    verdict = lifecycle.check_publishable(
+                        report, _date.fromisoformat(business_date), candidate)
+                    if verdict["carried_forward"]:
+                        # The policy said carry forward, so the publication
+                        # proceeds -- but "we knowingly did not restate this"
+                        # belongs on the run record, not in a task log that is
+                        # swept with the rest of them.
+                        carried_forward.append(verdict)
 
             # 2. The merge, with something written on it.
             n = Nessie()
@@ -407,11 +440,18 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             try:
                 from datetime import date as _date
 
+                notes = list(version_errors)
+                notes += [
+                    f"carried forward: {v['report']} {v['as_at_date']} is "
+                    f"{v['state']} with {len(v.get('added') or [])} added and "
+                    f"{len(v.get('removed') or [])} removed delivery(ies); "
+                    f"v{v.get('published_version')} stands"
+                    for v in carried_forward]
                 runs.finish_run(
                     run_id, runs.PUBLISHED, merged_hash=merged,
                     business_date=_date.fromisoformat(business_date)
                     if business_date else None,
-                    error="; ".join(version_errors) or None)
+                    error="; ".join(notes) or None)
             except Exception as exc:                            # noqa: BLE001
                 log.warning("could not close run %s: %s", run_id,
                             f"{type(exc).__name__}: {exc}")
@@ -419,6 +459,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             return {"merged": branch, "run_id": run_id, "hash": merged,
                     "business_date": business_date,
                     "inputs": len(inputs.get("inputs", [])),
+                    "carried_forward": carried_forward,
                     "published": published}
 
         @task(trigger_rule="all_done")

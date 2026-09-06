@@ -73,7 +73,7 @@ BLOCK_ORDER = ["name", "description", "source_system", "convention",
                "filename_pattern", "arrival", "delivery",
                "delimiter", "quote_char", "header", "file_encoding",
                "business_key", "expected_min_rows", "cadence",
-               "delivery_expected",
+               "delivery_expected", "expected_by", "retention_class",
                "schema_drift", "columns", "column_types"]
 
 # Keys only written when they differ from what the feed would INHERIT, because
@@ -90,7 +90,8 @@ BLOCK_ORDER = ["name", "description", "source_system", "convention",
 OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "delivery_expected": True,
                          "schema_drift": "warn", "delimiter": ",",
                          "quote_char": '"', "header": True,
-                         "file_encoding": "utf-8"}
+                         "file_encoding": "utf-8", "expected_by": "",
+                         "retention_class": "standard"}
 
 # Two-character sequences a person types into a one-character field, because
 # there is no other way to type a tab into a text input.
@@ -135,6 +136,15 @@ class FeedSpec:
     # for why it is not called `completeness`.
     delivery_expected: bool = True
     schema_drift: str = "warn"
+    # REQ-201. "HH:MM", or "" for a feed that has promised nothing. Usually
+    # inherited from the convention -- one delivery arrangement, one deadline
+    # -- so this is empty on most feeds and omitted from their blocks.
+    expected_by: str = ""
+    # REQ-600/601. The evidence obligation this feed's landing and quarantine
+    # objects are under. A `<select>` in the form rather than free text,
+    # populated from what retention.yml declares, because an unrecognised class
+    # is refused at LOAD and the form must not be able to write one.
+    retention_class: str = "standard"
     # The `conventions:` entry this feed inherits from, or "" to stand alone.
     # Every key the convention supplies is then omitted from the feed's own
     # block, so the convention stays the single place that value is written.
@@ -188,6 +198,9 @@ class FeedSpec:
             cadence=str(payload.get("cadence") or "daily").strip(),
             delivery_expected=bool(payload.get("delivery_expected", True)),
             schema_drift=str(payload.get("schema_drift") or "warn").strip(),
+            expected_by=str(payload.get("expected_by") or "").strip(),
+            retention_class=str(
+                payload.get("retention_class") or "standard").strip(),
             convention=str(payload.get("convention") or "").strip(),
             delimiter=unescape_char(str(payload.get("delimiter") or ",")),
             quote_char=unescape_char(str(payload.get("quote_char") or '"')),
@@ -280,6 +293,27 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
         if c:
             out["control"] = c
     return out
+
+
+_FILE_PREFIX_RE = re.compile(r"^feeds\.yml: ")
+
+
+def _form_message(exc: Exception) -> str:
+    """A load-time error, addressed to somebody looking at a form field.
+
+    The platform's messages name the FILE and the FEED because they are read
+    out of an Airflow log, where neither is otherwise knowable. On the form the
+    file is a given, so its name is stripped -- and only its name. The FEED
+    name stays, because several of these messages continue with a verb whose
+    subject it is ("feed 'x' names retention class 'gold', which..."), and
+    removing it leaves a dangling sentence. This used to be
+    `str(exc).split(": ", 2)[-1]`, which split on
+    every colon in the message: an unknown retention class came back as
+    "operational, standard. Add it under `retention_classes:` there before
+    naming it here", with the half that said what was wrong removed. Verified
+    against the running console before and after.
+    """
+    return _FILE_PREFIX_RE.sub("", str(exc)).strip()
 
 
 def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> None:
@@ -431,6 +465,22 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         errors["cadence"] = "must be 'daily' or 'weekly'"
     if spec.schema_drift not in ("warn", "fail"):
         errors["schema_drift"] = "must be 'warn' or 'fail'"
+
+    # BOTH VALIDATED WITH THE PLATFORM'S OWN FUNCTIONS, not a second copy of
+    # the rules -- the same discipline `delivery:` and `arrival:` already
+    # follow here. A form that accepted `7am` or a class retention.yml does not
+    # declare would write a feeds.yml the next Airflow parse refuses to load,
+    # and the console's whole point is that its diff is one you can merge.
+    from reporting_platform.common.context import (
+        check_retention_class, parse_expected_by,
+    )
+    for field, check, value in (
+            ("expected_by", parse_expected_by, spec.expected_by or ""),
+            ("retention_class", check_retention_class, spec.retention_class)):
+        try:
+            check(spec.name or "this feed", value)
+        except ValueError as exc:
+            errors[field] = _form_message(exc)
 
     # Spark's CSV reader takes a single character for `sep` and `quote`. A
     # two-character value is accepted by the form and then either throws inside
@@ -733,6 +783,7 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
         cadence=fd.cadence, delivery_expected=fd.delivery_expected,
         schema_drift=fd.schema_drift, convention=fd.convention,
+        expected_by=fd.expected_by, retention_class=fd.retention_class,
         column_types=dict(fd.column_types or {}),
         source_columns=dict(fd.source_columns or {}),
         delivery=dict(fd.delivery or {}),

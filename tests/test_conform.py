@@ -423,6 +423,43 @@ def test_the_api_returns_every_block_the_form_can_edit():
         f"editing such a feed through the console would silently drop them")
 
 
+def test_a_console_save_does_not_pin_an_inherited_expected_by_or_class():
+    """The two phase-7 scalars go through `_inherited`, like every other key.
+
+    THE FAILURE THIS CATCHES IS SILENT AND IN THE WRONG DIRECTION. `ref_src`
+    declares `expected_by: "07:30"` once for three feeds; if a console save
+    wrote it into each feed block, the convention would still be there and
+    still look authoritative, while changing it stopped reaching any of them.
+    Same for `retention_class`, where the pinned value is `standard` and would
+    quietly override a class the convention later adopted.
+
+    Run against the SHIPPED feeds.yml, because that is where the inheritance
+    actually is -- a synthetic fixture would only prove the fixture.
+    """
+    from tests.support import config_dir as real_config_dir
+    from tests.support import registry_on
+    d = real_config_dir()
+    registry = registry_on(d)
+    from reporting_platform.common.context import feeds
+
+    before = {n: (f.expected_by, f.retention_class)
+              for n, f in feeds().items()}
+    for name in sorted(before):
+        registry.update(registry.spec_from_feed(feeds()[name]))
+    after = {n: (f.expected_by, f.retention_class) for n, f in feeds().items()}
+    assert before == after, (before, after)
+
+    text = (d / "feeds.yml").read_text()
+    # Declared once on the convention, and once on the one feed that overrides
+    # it -- three feeds inherit it and none of them may have gained a copy.
+    assert text.count('expected_by: "07:30"') == 1, text.count(
+        'expected_by: "07:30"')
+    assert text.count("retention_class: operational") == 1
+    # `standard` is the default, so it is written on `defaults:` and nowhere
+    # else. A feed block carrying it is the pinning failure.
+    assert text.count("retention_class: standard") == 1
+
+
 def test_a_console_save_round_trips_the_arrival_block():
     """`_arrival_block` writes the nested YAML by hand, so a key it forgets is
     dropped on the first console edit of the feed."""

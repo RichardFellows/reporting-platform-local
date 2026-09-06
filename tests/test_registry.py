@@ -260,6 +260,57 @@ def test_a_report_version_is_keyed_per_report_and_as_at_date():
     assert "PRIMARY KEY (report, as_at_date, version_no)" in ddl
 
 
+# ------------------------------------------ the as-at lifecycle (phase 6)
+def test_the_transition_table_is_append_only_and_open_is_not_a_row():
+    """`open` is the ABSENCE of a transition. Storing it would need every
+    (report, date) pair seeded -- and that set is DERIVED from the exposures
+    and the calendar, so a seeded table is a second list that goes stale the
+    moment a report is added. The surrogate key is what makes it append-only:
+    there is no (report, as_at_date) primary key to update in place."""
+    ddl = _table_ddl("as_at_transition")
+    assert "transition_id BIGSERIAL   PRIMARY KEY" in ddl
+    assert "PRIMARY KEY (report, as_at_date)" not in ddl
+    assert "'open'" not in ddl.lower().replace("no 'open' row", "")
+
+
+def test_a_transition_cannot_be_written_without_an_actor_and_a_reason():
+    """Enforced in the schema as well as in `transition()`, because the CLI is
+    not the only thing that can reach this table -- and an unattributed lock
+    is one nobody can ask about later. There is no identity provider here, so
+    this record is the whole of the accountability."""
+    ddl = _table_ddl("as_at_transition")
+    assert "actor         TEXT        NOT NULL" in ddl
+    assert "reason        TEXT        NOT NULL" in ddl
+    # approved_by is deliberately nullable: requiring one for an ordinary lock
+    # would make the one place it matters indistinguishable from routine.
+    assert "approved_by   TEXT," in ddl
+
+
+def test_a_transition_is_not_foreign_keyed_to_anything_rebuildable():
+    """Same rule as `run_input`, and the reason is the same: transitions are
+    the unrebuildable event family. A reference to `delivery` or to
+    `report_version` would let a registry rebuild cascade away the only copy
+    of who locked a date and why."""
+    ddl = _table_ddl("as_at_transition")
+    assert "REFERENCES registry.delivery" not in ddl
+    assert "REFERENCES registry.report_version" not in ddl
+
+
+def test_reconcile_does_not_touch_the_unrebuildable_tables():
+    """`deliveries.reconcile()` is the rebuild path -- it is allowed to delete
+    and rewrite observations. Runs, versions, submissions and now transitions
+    are events that happened once, so a DELETE reaching one of them would
+    destroy the only copy. Checked as text because the failure would be one
+    added line in a module whose whole job is deleting and re-inserting."""
+    from tests.support import REPO
+    src = (REPO / "reporting_platform" / "registry" / "deliveries.py").read_text(
+        encoding="utf-8")
+    for table in ("registry.run", "registry.run_input", "registry.report_version",
+                  "registry.submission", "registry.as_at_transition"):
+        assert f"DELETE FROM {table}" not in src, table
+        assert f"UPDATE {table}" not in src, table
+
+
 def test_the_family_lives_on_the_submission_not_on_the_version():
     """Decision 5's other half: reports submitted together are a SUBMISSION
     concern, so grouping them must not touch how either one is numbered."""

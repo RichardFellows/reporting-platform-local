@@ -3027,3 +3027,215 @@ new config file, which would be a second declaration of something the dbt
 project already makes — and the two disagree the first time a model is renamed.
 An exposure is also already the thing that answers "what breaks if I change
 this model", and already names an owner.
+
+## the-as-at-date-has-a-lifecycle
+
+REQ-500..503. A `(report, as-at date)` pair moves `open -> locked ->
+submitted`, and back to `reopened` only deliberately. `registry.as_at_transition`
+is append-only and **`open` is the ABSENCE of a row**.
+
+Open is not stored because storing it would require every pair to be seeded,
+and that set is DERIVED — from the exposures and from whichever business dates
+have deliveries. A seeded table is a second list of reports, and it goes stale
+the moment somebody adds an exposure. Absence costs nothing and cannot drift.
+It also makes the table honestly append-only: there is no
+`(report, as_at_date)` primary key to update in place, so the history of who
+closed a date and why is the record rather than a column that was overwritten.
+
+**Reopening a SUBMITTED date needs the report's exposure owner to approve it;
+reopening a merely LOCKED date does not.** This is open decision 3, settled
+alongside REQ-501's named owner. A lock is an internal control and undoing one
+should cost a name and a reason. A submission has left the building: restating
+it changes a figure somebody else is holding, so the approver is checked — and
+it is checkable precisely because `owner.name` comes from the dbt exposure, not
+from the caller. There is no identity provider here and this does not pretend
+otherwise; `actor` and `reason` are `NOT NULL` because an unattributed lock is
+one nobody can ask about later, and that record is the whole of the
+accountability.
+
+**The gate runs BEFORE the merge, not with the versioning.** `publish()` merges
+the build branch into `main` first and cuts tags and allocates versions second.
+A refusal placed with the versioning would fire after `main` had already
+moved — honest and useless. It sits between reading the input set (which is
+what makes the as-at date knowable at all) and the merge, so a refusal fails
+the task with `main` untouched and `keep_failed_branch` retaining the branch
+for inspection. `tests/test_lifecycle.py` asserts the ordering, because it is
+invisible afterwards.
+
+**The policy only bites on a CLOSED date whose inputs have MOVED.** Every word
+is load-bearing. An open or reopened date publishes whatever changed — that is
+the ordinary daily path and it must not acquire a lifecycle cost. A closed date
+whose input set for that date is unchanged publishes too, because rebuilding a
+locked date after a code change is not a restatement of the data, and refusing
+it would make `lock` mean "this report may never be rebuilt". Verified on the
+live stack: with 2026-08-20 locked for both reports, a reporting build
+published v2 of each, `carried_forward: []`, and the diff reported 127
+unchanged deliveries with both code refs moved.
+
+**The comparison is restricted to deliveries for that as-at date**, and
+`unregistered` means unknown to the registry — not "for another date". A run's
+inputs are what it PUBLISHED, so an SCD2 reference feed contributes deliveries
+for many business dates: on this stack, 123 of a 127-delivery input set are
+legitimately off-date. An earlier version of `inputs_changed` called all of
+them `unregistered`, which would have sent somebody looking for a registry gap
+that was not there. They are counted as `off_date` instead. See
+`registry/inputs.py` for why the input set is shaped that way.
+
+**There is no platform-wide restatement default.** Open decision 2, settled as
+*fail*: `context.restatement_policy()` refuses a report whose exposure declares
+no `meta.restatement`, and `tests/test_lifecycle.py` asserts every shipped
+exposure declares one. The refusal is in `restatement_policy()` rather than in
+`reports()` because `reports()` is a pure derivation that the nightly retention
+chain now calls — putting the refusal there would let one undeclared exposure
+take the retention sweep down.
+
+REQ-503 falls out of there being no branch anywhere on what KIND of report this
+is. A daily internal dashboard and a quarterly regulatory return traverse the
+same functions; `country_exposure_dashboard` is `carry_forward` and
+`counterparty_exposure_report` is `restate`, and that is a per-report policy
+rather than a per-class one. The claim is checked structurally — a grep for
+`type` and `maturity` in the lifecycle and publish paths — the same shape as
+`test_supersession`'s grep for `known_as_of()`, because a comment claiming it
+would not survive the first convenient special case.
+
+## retention-classes-name-the-obligation
+
+REQ-600/601. A feed names a `retention_class` in `feeds.yml`; the windows live
+in `retention.yml`, per environment. Naming a class the windows file does not
+declare is refused at LOAD, like an undefined `convention` and an unreadable
+`tag_retention_years`.
+
+Two files because they are two decisions with two owners. The class is a
+property of the obligation a feed carries and is set by whoever onboards it;
+the window is retention policy and is set per environment by whoever owns that.
+Putting the years in `feeds.yml` would make a policy change a sweep through
+every feed block, and would have no way to be shorter in `dev`.
+
+**Classes govern the evidence prefixes only — `landing/` and `quarantine/`.**
+Table keep-sets stay per LAYER. A table window says how much history is
+queryable, which is a decision about a layer; and a per-feed raw window would
+fight `find_pending`, which already derives one keep-set per feed from that
+feed's own landing prefix. `PREFIX_CLASSES` is closed and `class_keep_years`
+refuses anything outside it, so this cannot spread by accident.
+
+**The interlock became per (report, feed) via the lineage, and that is a
+deliberate RELAXATION.** The old rule compared one landing window against the
+longest window any report resolved to. With classes there is no single landing
+window — and under the old rule no class could ever be shorter than the longest
+pin, which would have made the whole feature decoration. So the question is
+asked the way it should always have been asked: for each report, does every
+feed BEHIND that report keep its evidence at least as long as that report's
+pin? `feeds_behind_report()` answers it by walking the exposure's `ref()`
+closure, the same derivation `reports()` and `managed_tables()` already use.
+
+What it costs is that a feed's window is now only as protected as the lineage
+walk is correct, which is why `feeds_behind_report` raises on a ref it cannot
+resolve rather than returning a short list. On this stack both reports resolve
+to `fo_trade`, `ref_counterparty` and `ref_rating`; `ref_collateral` is behind
+neither, so it is legitimately `operational` at 7 years — above the raw layer's
+80 month-ends (≈6.7y) and below the 10-year pin window. If a report ever
+`ref()`s it, the nightly sweep refuses until the class is moved back. **That
+refusal is the mechanism**: the class cannot silently outlive its correctness.
+
+**A `per_report` entry naming no live exposure binds every feed.** A report
+removed from the project keeps the tags it already cut, and `expire_tags` still
+resolves their window by the name in the tag — so that entry is still in force
+for pins that still exist, while the lineage that would say which feeds were
+behind it is gone. The conservative answer is the only available one. Iterating
+live exposures alone would quietly stop honouring a window still being applied.
+
+**`snapshot_tags` stays outside the interlock**, and must not creep back in.
+Nothing is reproduced from a snapshot tag; it buys the ability to read a raw
+business date back after retention removed it, which is a storage decision
+rather than an evidence one. Binding it here would impose the published window
+on every feed again and undo the whole thing.
+
+**The second interlock moved too.** `landing.keep_years()`'s warning that
+landing is shorter than the raw layer's own window was comparing the DEFAULT
+class against the raw window — so it would have gone silent about exactly the
+feed a short class was applied to. It is per feed now, for the reason CLAUDE.md
+gives: a check whose window does not contain the thing it describes will either
+never fire or never stop.
+
+**`quarantine:` ships with no `classes:` block, and the absence is the point.**
+A class that shortens landing and says nothing about quarantine gets
+quarantine's own window — the over-retaining direction. The two answer to
+different things: a rejected delivery explains a missing business date whether
+or not anything published depends on the feed.
+
+**The sweep's summary was renamed.** It reported `keep_years` and `cutoff` at
+the top level, which read as the window the sweep applied and, after classes,
+were only the default class's. Verified: it said `keep_years: 10, cutoff:
+2016-09-05` while `ref_collateral` was swept at 7 years against a 2019 cutoff.
+They are `default_keep_years`/`default_cutoff` now, with `classes_applied`
+carrying the honest one-line answer and the per-feed entries carrying the rest.
+
+## lateness-is-a-wall-clock-time-not-a-duration
+
+REQ-201. `Feed.expected_by` is `"HH:MM"`, and it replaces two config keys —
+`arrival_timeout_hours` and `arrival_poke_seconds` — that were deleted in phase
+0 for being settings nothing read, one of which had already been mistaken for a
+mechanism once.
+
+A wall clock rather than a duration because what an upstream actually commits
+to is "by 07:00", and a duration needs an origin event that a delivery arriving
+by `PutObject` does not have. **The deadline is `expected_by` on the day AFTER
+the business date**, fixed rather than configurable: a delivery describes a
+business date, so that date has to have ended before the extract can be taken.
+Fixing it at +1 is a choice in the FORGIVING direction — a reference snapshot
+that legitimately arrives the same day is judged against a later deadline than
+it needed — so the check can under-report lateness and cannot invent it.
+
+**It must be quoted, and the refusal of a non-string is not pedantry.** YAML 1.1
+reads an unquoted `7:00` as sexagesimal: `yaml.safe_load("a: 7:00")` is
+`{"a": 420}`. A leading zero happens to block pyyaml's resolver, so `07:00`
+survives unquoted and `9:00` does not — which makes it the worst kind of trap,
+working for every padded hour until the first unpadded one. `24:00` is refused
+rather than folded to midnight: a delivery due at the end of the day is due at
+`23:59`, and accepting an hour that does not exist invites the reader to
+believe some rollover rule is implemented. There is none.
+
+**This is not the completeness check and must not become it.**
+`completeness.py` asks which business dates a feed is MISSING; this asks, of
+the deliveries that did arrive, which arrived late. A date with no delivery at
+all is a gap, not an infinitely late delivery, and reporting it in both places
+would double-report every outage. A feed with no `expected_by` has made no
+promise and is skipped — inventing a default of `00:00` to have something to
+measure is how a monitor starts reporting policy it made up.
+
+**A backfill is reported as ONE event.** If every late date for a feed arrived
+on the same calendar day, that is one bulk load — a seed, a migration, a
+re-delivery of history after an outage — and the log says so instead of listing
+ten missed deadlines. It is a derivation with nothing to tune: more than one
+business date, exactly one arrival day. The finding is described differently,
+never suppressed: `total_late` and `--fail-on-late` are unaffected, because a
+backfill of dates that were due weeks ago genuinely is late. The seeded stack
+is exactly this case — `generate_feeds.py` writes ~17 days of history in one
+write, so all four feeds report every date late with one timestamp — and it is
+what the behaviour was written against.
+
+No Spark: the arrival time is `registry.delivery.received_at`, the landing
+object's `LastModified`, so the check is psycopg2 and runs in the Airflow task
+process directly.
+
+## a-version-diff-is-inputs-and-code-not-data
+
+§11, and nearly free once phase 5 made a run enumerate the deliveries behind
+what it published. A v1→v2 comparison is the set difference of two `run_input`
+sets, plus the `code_ref` and `change_ref` on each run.
+
+**Nothing here diffs the DATA.** The published tables are pinned by their tags
+and can be compared directly with `nessie_ref`; what was missing was the
+ability to say which INPUTS differ, which no query over the tables can answer.
+
+**The delivery join is a LEFT JOIN**, because `run_input` deliberately carries
+no foreign key to `delivery`. A delivery the registry cannot currently describe
+is reported with nulls rather than dropped — an inner join would remove it from
+both sides equally and make a real difference look like agreement, reporting
+"nothing changed" for exactly the case somebody is investigating.
+
+**Both halves are reported because either alone lies.** The real case on this
+stack today is two versions of one date with identical 126-delivery input sets
+and different code refs (`1da75dbe51fed0eb` → `cf50684d0cf3d257`, change_ref
+`RPT-1421` → `RPT-1490`). A diff that only differenced deliveries would say "no
+change" about a rebuild that moved every figure.

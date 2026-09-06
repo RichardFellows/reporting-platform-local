@@ -7,6 +7,53 @@
 # observed in the table, not calendar days. A skipped upstream day does not
 # silently shorten the retained window.
 
+# RETENTION CLASSES (REQ-600/601). A named EVIDENCE OBLIGATION a feed is in.
+#
+# Before this, `landing:` and `quarantine:` had one window each and every feed
+# was in it. That is the right default and the wrong only option: the reason
+# landing is kept for ten years is that a PUBLISHED figure must be reproducible
+# from what the upstream actually sent, and a feed behind no published report
+# does not carry that obligation. Keeping its evidence for a decade anyway is
+# not caution, it is a policy nobody chose.
+#
+# A FEED NAMES ITS CLASS IN feeds.yml; THE WINDOWS ARE HERE. The name is a
+# property of the feed and belongs beside it, inheritable through
+# `conventions:` because the obligation nearly always comes from the source
+# system. The years are a per-environment policy value and belong here with
+# every other one. Listing feed NAMES under each class here would create a
+# second registry of feeds that drifts from feeds.yml -- the failure deriving
+# reports from the dbt exposures exists to avoid.
+#
+# DECLARED ONCE, NOT PER ENVIRONMENT. A class declared in `local` and forgotten
+# in `dev` would make feeds.yml fail to load in dev alone, for a key that reads
+# perfectly well in the environment you are looking at. Each environment below
+# then gives windows only for the classes it wants to MOVE; anything it does
+# not mention falls back to that prefix's own `keep_years`.
+#
+# CLASSES GOVERN THE EVIDENCE PREFIXES ONLY -- `landing:` and `quarantine:`.
+# The raw/prepared/reporting keep-sets stay per LAYER: a table window says how
+# much history is queryable, which is a decision about a layer, and a per-feed
+# raw window would fight `find_pending`, which derives one keep-set per feed
+# from that feed's landing prefix.
+# See docs/DECISIONS.md#retention-classes-name-the-obligation
+retention_classes:
+  # `standard` is always available even if this block is deleted -- it is
+  # Feed.retention_class's default and the window every feed had before classes
+  # existed, so a retention.yml that declares nothing behaves as it always did.
+  standard:
+    description: >
+      Evidence behind a published report. Kept for the full reproducibility
+      window, and bound by check_reproducibility_window() to outlive the
+      published tags of every report this feed reaches.
+
+  operational:
+    description: >
+      Evidence for a feed that reaches no published report, so no published
+      figure is reproduced from it. Still kept long enough to stay coherent
+      with the raw layer's own window (80 month-ends is about 6.7 years), and
+      find_pending derives its keep-set from landing -- so this is shorter
+      than `standard`, not short.
+
 environments:
   local:   &full
     # THE EVIDENCE COPY. Flat age, not a keep-set: everything every feed ever
@@ -35,7 +82,17 @@ environments:
     # Raised from 8 to 10 when the tag window was corrected; see
     # docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
     landing:
+      # The class every feed is in unless it says otherwise.
       keep_years: 10
+      classes:
+        # 7, not 10: nothing published is reproduced from an `operational`
+        # feed, so the published-tag interlock does not bind it. It is still
+        # above the raw layer's own window (keep_month_ends 80 = 6.7 years),
+        # because `find_pending` computes its keep-set per feed from that
+        # feed's landing prefix and a shorter window would start reporting
+        # live business dates as expired. That band -- under the pin window,
+        # over the raw window -- is the whole space a class has to move in.
+        operational: {keep_years: 7}
 
     # REFUSED DELIVERIES (REQ-106). What an upstream sent that the conformance
     # gate would not accept: an unroutable name, a name two feeds claim, a
@@ -61,6 +118,13 @@ environments:
     # not being nameable being a common reason it is here at all.
     quarantine:
       keep_years: 10
+      # NO `classes:` HERE, and the absence is the point. A class that shortens
+      # `landing:` and says nothing about quarantine gets quarantine's own
+      # window, because the two answer to different things -- this block's
+      # comment above already says quarantine has neither of landing's hard
+      # floors. A rejected delivery explains a missing business date whether or
+      # not the feed is behind a published report, so there is no reason yet
+      # for `operational` to shorten it. Add an entry here if that changes.
 
     # THE WORK QUEUE, and a cache: manifests and any parts a normalizer
     # derived, all rebuildable by re-normalizing from landing/. Days, not
@@ -100,7 +164,13 @@ environments:
   # the ability to reproduce a production month-end issue in a lower
   # environment without an explicit restore procedure.
   dev:
-    landing:    {keep_years: 1}
+    landing:
+      keep_years: 1
+      # dev shortens everything to a year, so `operational` has nowhere below
+      # that to go -- but it is written down rather than left to fall back, so
+      # `class_keep_years` reads the same shape in every environment.
+      classes:
+        operational: {keep_years: 1}
     quarantine: {keep_years: 1}
     ready:      {keep_days: 2}
     raw:       {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}

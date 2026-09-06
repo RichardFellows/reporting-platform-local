@@ -35,7 +35,9 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
-from reporting_platform.common.context import retention_policy
+from reporting_platform.common.context import (
+    class_keep_years, retention_policy,
+)
 from reporting_platform.registry.rejections import QUARANTINE_PREFIX
 from reporting_platform.retention.landing import DAYS_PER_YEAR, _bucket, _client
 
@@ -43,12 +45,29 @@ log = logging.getLogger("retention.quarantine")
 
 # quarantine/<feed>/<yyyy>/<mm>/<yyyymmdd>T<hhmmss>Z_<name>
 KEY_RE = re.compile(
-    rf"^{QUARANTINE_PREFIX}/[^/]+/(?P<year>\d{{4}})/(?P<month>\d{{2}})/"
+    rf"^{QUARANTINE_PREFIX}/(?P<feed>[^/]+)/(?P<year>\d{{4}})/(?P<month>\d{{2}})/"
     rf"(?P<stamp>\d{{8}})T\d{{6}}Z_.+$")
 
 
-def keep_years() -> int:
-    return int(retention_policy("quarantine")["keep_years"])
+def keep_years(feed: str | None = None) -> int:
+    """The quarantine window, per retention class since REQ-600/601.
+
+    `feed` is the FEED SEGMENT OF THE KEY, a string rather than a `Feed`,
+    because that is all a quarantined object has: it may be `_unclaimed` -- the
+    file matched no feed at all, which is one of the commonest reasons it is
+    here -- or it may name a feed that has since been removed from feeds.yml.
+    Both resolve to the prefix default, which is the OVER-RETAINING direction
+    and the only safe one for a prefix whose whole purpose is evidence about
+    deliveries the platform could not identify.
+    """
+    if not feed:
+        return int(retention_policy("quarantine")["keep_years"])
+    from reporting_platform.common.context import feeds
+
+    known = feeds().get(feed)
+    if known is None:
+        return int(retention_policy("quarantine")["keep_years"])
+    return class_keep_years("quarantine", known.retention_class)
 
 
 def rejected_on(key: str) -> date | None:
@@ -73,12 +92,29 @@ def rejected_on(key: str) -> date | None:
 
 
 def sweep_quarantine(dry_run: bool = True) -> dict:
-    """Remove quarantined objects older than the window."""
+    """Remove quarantined objects older than the window.
+
+    ONE CUTOFF PER RETENTION CLASS, resolved from the feed segment of each
+    key. The reported `keep_years`/`cutoff` stay the DEFAULT class's, which is
+    what every feed resolves to until one is moved and what every caller of
+    this result read before classes existed.
+    """
     years = keep_years()
     cutoff = (datetime.now(timezone.utc)
               - timedelta(days=years * DAYS_PER_YEAR)).date()
     s3, bucket = _client(), _bucket()
     paginator = s3.get_paginator("list_objects_v2")
+
+    # Resolved once per feed rather than once per object: the prefix is listed
+    # in full and a per-object feeds() lookup would be the only expensive thing
+    # in this sweep.
+    cutoffs: dict[str, date] = {}
+
+    def _cutoff_for(feed: str) -> date:
+        if feed not in cutoffs:
+            cutoffs[feed] = (datetime.now(timezone.utc) - timedelta(
+                days=keep_years(feed) * DAYS_PER_YEAR)).date()
+        return cutoffs[feed]
 
     expired, kept, unknown, freed = [], 0, 0, 0
     for page in paginator.paginate(Bucket=bucket,
@@ -88,7 +124,8 @@ def sweep_quarantine(dry_run: bool = True) -> dict:
             if when is None:
                 unknown += 1
                 continue
-            if when >= cutoff:
+            m = KEY_RE.match(obj["Key"])
+            if when >= _cutoff_for(m.group("feed") if m else ""):
                 kept += 1
                 continue
             expired.append(obj["Key"])

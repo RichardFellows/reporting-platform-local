@@ -38,10 +38,10 @@ from datetime import date, datetime, timedelta, timezone
 
 from reporting_platform.common.calendar_rules import expire_set
 from reporting_platform.common.context import (
-    CATALOG, ENV, Nessie, all_snapshot_retention_days, gc_window_hours,
-    longest_tag_retention_years, maintenance_config, managed_tables,
-    nessie_gc_config, reference_policy, retention_policy, spark_session,
-    tag_retention_years,
+    CATALOG, ENV, Nessie, all_snapshot_retention_days, class_keep_years,
+    feeds, feeds_behind_report, gc_window_hours, maintenance_config,
+    managed_tables, nessie_gc_config, reference_policy, reports,
+    retention_policy, spark_session, tag_retention_years,
 )
 
 log = logging.getLogger("retention")
@@ -78,15 +78,44 @@ DAYS_PER_YEAR = 365.25
 WORKING_RE = re.compile(r"^(ingest|build)/")
 
 
-def check_reproducibility_window() -> int:
+def check_reproducibility_window() -> dict:
     """REFUSE to sweep if landing expires before the published pins do.
 
     A published tag pins the TABLES. Reproducing a published run means being
     able to show its inputs as well, and `landing/` is the only copy of what
     the upstream actually sent -- so a pin that outlives its landing evidence
-    is a pin you cannot fully honour. The window that matters is the LONGEST
-    any report resolves to, because one report over-retaining is enough to
-    require the evidence.
+    is a pin you cannot fully honour.
+
+    PER FEED SINCE RETENTION CLASSES (REQ-600/601), and that changed what this
+    compares. It used to be two global numbers: `landing.keep_years` against
+    the longest window ANY report resolves to. With classes there is no single
+    landing window, so the question is asked the way it should always have been
+    asked -- for each report, does every feed BEHIND that report keep its
+    evidence at least as long as that report's pin? `feeds_behind_report`
+    answers it by walking the project's `ref()`s from the exposure, the same
+    derivation `managed_tables()` and `reports()` already use.
+
+    THIS IS A NARROWER REFUSAL THAN THE OLD ONE, deliberately. A feed behind no
+    published report -- `ref_collateral` here today -- is no longer bound by
+    any report's pin, because nothing published is reproduced from it. That is
+    the entire point of having classes: without it no class could ever be
+    shorter than the longest pin, and the feature would be decoration. What it
+    costs is that a feed's window is now only as protected as the lineage
+    derivation is correct, which is why `feeds_behind_report` raises on a ref
+    it cannot resolve rather than returning a short list.
+
+    A `per_report` ENTRY NAMING NO LIVE EXPOSURE binds every feed. A report
+    removed from the project keeps the tags it already cut, `expire_tags`
+    still resolves their window by the name in the tag, and the lineage that
+    would say which feeds were behind it is gone -- so the conservative answer
+    is the only available one. Iterating live exposures alone would quietly
+    stop honouring a window that is still being applied to real pins.
+
+    STILL NOT BOUND TO `snapshot_tags`, and that must not creep back in.
+    Nothing is reproduced from a snapshot tag; it buys the ability to read a
+    raw business date back after retention removed it, which is a storage
+    decision rather than an evidence one. Binding it here would silently
+    impose the published window on every feed again.
 
     THIS ONE REFUSES, where `landing.keep_years()`'s own interlock warns. The
     difference is what the failure costs. Landing running short of the raw
@@ -95,33 +124,70 @@ def check_reproducibility_window() -> int:
     and the sweep that would do it runs nightly and unattended.
 
     NOT REQ-602 IN FULL, and the gap is stated rather than papered over. This
-    compares two WINDOWS, so it catches the configuration that guarantees the
-    loss and cannot catch a specific delivery expiring early inside an
-    otherwise coherent one. `monitoring/evidence.py` is the per-delivery half
-    -- it asks the registry which deliveries a pinned business date received
-    and checks each one is still landed -- and it runs after this chain rather
-    than before it, because it has to observe what the sweep left behind.
+    compares WINDOWS, so it catches the configuration that guarantees the loss
+    and cannot catch a specific delivery expiring early inside an otherwise
+    coherent one. `monitoring/evidence.py` is the per-delivery half, and it
+    runs after this chain rather than before it, because it has to observe what
+    the sweep left behind.
 
-    Even together they are an approximation: a published tag names one
-    business date and a published run reads more than one. The exact input set
-    needs the run record, REQ-400.
-
-    Returns the landing window, so a caller can log what it checked.
+    Returns what it checked, so the caller can log the windows rather than a
+    single number that no longer exists.
     """
-    tag_years = longest_tag_retention_years()
-    landing_years = int(retention_policy("landing")["keep_years"])
-    if landing_years < tag_years:
+    known = reports()
+    every_feed = feeds()
+
+    # A `per_report` entry naming no live exposure is NOT ignored, and this is
+    # the subtle half. A report removed from the project keeps the tags it
+    # already cut -- `expire_tags` resolves their window by the report name in
+    # the tag, so that entry is still in force for pins that still exist -- and
+    # its lineage is gone, so which feeds were behind it can no longer be
+    # derived. It therefore binds EVERY feed. Iterating live exposures alone
+    # would quietly stop honouring a window that is still being applied.
+    orphans = sorted(set(
+        (reference_policy("published_tags").get("per_report") or {})) - set(known))
+
+    checked: list[dict] = []
+    problems: list[str] = []
+    for name in sorted(known) + orphans:
+        tag_years = tag_retention_years(name)
+        behind = (feeds_behind_report(name) if name in known
+                  else sorted(every_feed))
+        for feed_name in behind:
+            spec = every_feed[feed_name]
+            landing_years = class_keep_years("landing", spec.retention_class)
+            checked.append({"report": name, "feed": feed_name,
+                            "live_exposure": name in known,
+                            "retention_class": spec.retention_class,
+                            "landing_keep_years": landing_years,
+                            "tag_keep_years": tag_years})
+            if landing_years < tag_years:
+                where = ("" if name in known else
+                         " (no live exposure, so every feed binds)")
+                problems.append(
+                    f"{name} pins for up to {tag_years} years{where} but "
+                    f"{feed_name} (class {spec.retention_class}) keeps its "
+                    f"landing evidence {landing_years} years")
+
+    if problems:
         raise ValueError(
-            f"retention.yml (env {ENV!r}): landing.keep_years is "
-            f"{landing_years} but published tags are kept for up to "
-            f"{tag_years} years. A published run would stay pinned and "
-            f"reproducible for {tag_years} years while the landing evidence "
-            f"it was built from is deleted after {landing_years}. Raise "
-            f"landing.keep_years to at least {tag_years}, or lower "
-            f"references.published_tags -- both are per-environment. "
-            f"Refusing to sweep in this state."
-        )
-    return landing_years
+            f"retention.yml (env {ENV!r}): a published run would stay pinned "
+            f"and reproducible for longer than the landing evidence it was "
+            f"built from is kept -- " + "; ".join(problems) + ". Raise the "
+            f"landing window for those retention classes, or lower "
+            f"references.published_tags for those reports -- both are per "
+            f"environment. Refusing to sweep in this state.")
+
+    unbound = sorted(set(feeds()) - {c["feed"] for c in checked})
+    if unbound:
+        # NOT a problem, and said out loud so it is not read as one. These
+        # feeds reach no exposure, so no published figure is reproduced from
+        # them and no pin binds their window. It is also the list to look at
+        # first if a report was expected to depend on one of them.
+        log.info("landing evidence for %s is bound by no published tag: those "
+                 "feeds are behind no report", ", ".join(unbound))
+    return {"checked": checked, "unbound_feeds": unbound,
+            "default_landing_keep_years":
+                int(retention_policy("landing")["keep_years"])}
 
 
 # ----------------------------------------------------------- 1. branch hygiene
@@ -1071,7 +1137,7 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
     # here while the real run would refuse teaches the wrong thing. Raising
     # aborts the whole chain, which is the point: every step below this line
     # deletes something.
-    report["landing_keep_years"] = check_reproducibility_window()
+    report["reproducibility_window"] = check_reproducibility_window()
 
     report["working_branches_removed"] = clean_working_branches(nessie, dry_run)
     report["tags_removed"] = expire_tags(nessie, dry_run)
