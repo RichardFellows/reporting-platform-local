@@ -70,6 +70,34 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
     cutoff = (datetime.now(timezone.utc)
               - timedelta(days=defaults["recent_partition_days"])).date()
     strategy = layer_cfg.get("strategy", "binpack")
+    present = {f.name.lower() for f in spark.table(table).schema.fields}
+
+    # THE SCOPE COLUMN IS A PROPERTY OF THE TABLE, NOT OF THE LAYER. run()
+    # derives it from the layer -- right for every snapshot table, wrong for an
+    # SCD2 dimension, which holds one row per VERSION and has no business_date
+    # at all. Iceberg rejects the whole call:
+    #   Cannot parse predicates in where option: business_date >= date "..."
+    # and a failed action fails the maintenance task, which takes the entire
+    # nightly chain down with it -- retention, GC and reclamation included. It
+    # had never fired because no prepared table had ever reached `main`.
+    # Same shape as the sort_order intersection below: ask the table.
+    #
+    # `effective_from` is the version clock retention.is_scd2() already keys
+    # on. It is deliberately NOT the partition column (`effective_from_month`
+    # is), so it bounds the work without pruning partitions -- acceptable on a
+    # dimension of this size, and reclaiming the row-level delete files an SCD2
+    # expiry leaves behind is rewrite_deletes' job, not this one.
+    scope = next((c for c in (date_column, "effective_from")
+                  if c.lower() in present), None)
+    if scope is None:
+        # Skip rather than compact unscoped: an unscoped rewrite would touch
+        # every retained month-end, which is the thing the where clause exists
+        # to prevent.
+        log.warning("%s: neither %s nor effective_from is in the schema; "
+                    "skipping compaction rather than rewriting every "
+                    "partition", table, date_column)
+        return {"action": "rewrite_data_files",
+                "skipped": f"no scope column ({date_column} absent)"}
 
     opts = [
         f"'target-file-size-bytes','{defaults['target_file_size_bytes']}'",
@@ -91,7 +119,6 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
         #. Intersect the configured order with the columns
         # that actually exist, and fall back to binpack if none survive --
         # a layer-wide sort key is a preference, not a schema guarantee.
-        present = {f.name.lower() for f in spark.table(table).schema.fields}
         wanted = [c.strip() for c in layer_cfg["sort_order"].split(",") if c.strip()]
         usable = [c for c in wanted if c.split()[0].strip('"`').lower() in present]
         dropped = [c for c in wanted if c not in usable]
@@ -109,13 +136,14 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
         f"CALL {CATALOG}.system.rewrite_data_files("
         f"  table => '{_short(table)}',"
         f"  strategy => '{strategy}'{sort_clause},"
-        f"  where => '{date_column} >= date \"{cutoff}\"',"
+        f"  where => '{scope} >= date \"{cutoff}\"',"
         f"  options => map({', '.join(opts)}))"
     )
     row = spark.sql(sql).collect()
     out = row[0].asDict() if row else {}
-    log.info("compacted %s (%s): %s", table, strategy, out)
-    return {"action": "rewrite_data_files", "strategy": strategy, **out}
+    log.info("compacted %s (%s, scoped on %s): %s", table, strategy, scope, out)
+    return {"action": "rewrite_data_files", "strategy": strategy,
+            "scope_column": scope, **out}
 
 
 def rewrite_manifests(spark, table: str) -> dict:
