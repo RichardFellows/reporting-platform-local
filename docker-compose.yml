@@ -89,6 +89,32 @@ x-airflow-common: &airflow-common
     # a non-Spark value. See docs/DECISIONS.md#duckdb-is-not-an-engine
     DBT_TARGET: ${DBT_TARGET:-spark_local}
     PYTHONPATH: /opt/platform
+    # OPENLINEAGE -> MARQUEZ. On the anchor, so the scheduler, webserver and
+    # triggerer all get it and none of them can disagree; the four services
+    # that REPLACE this block wholesale (feed-ui, notebook, inbox, watchdog)
+    # deliberately do not, because none of them runs a DAG task and the
+    # provider only emits from the process that does.
+    #
+    # DISABLED BY DEFAULT, and that is the interlock. Marquez is behind the
+    # `lineage` compose profile, so on an ordinary `docker compose up` there
+    # is nothing listening on marquez-api:5000. The provider's HTTP transport
+    # retries and logs on a refused connection rather than failing the task,
+    # but a nightly chain that emits several hundred failed POSTs is noise
+    # that trains people to ignore task logs. One variable turns both on
+    # together -- see .env.example.
+    #
+    # apache-airflow-providers-openlineage is ALREADY in the image (2.0.0,
+    # openlineage-python 1.27.0) as a transitive dependency. Do NOT install it
+    # explicitly under Airflow's constraint file: that pins
+    # typing_extensions==4.12.2, and dbt's mashumaro needs evaluate_forward_ref
+    # from 4.13+. Verified by dry run -- it is the cosmos trap exactly.
+    # See docs/DECISIONS.md#openlineage-is-an-export-not-a-record
+    AIRFLOW__OPENLINEAGE__DISABLED: ${OPENLINEAGE_DISABLED:-true}
+    AIRFLOW__OPENLINEAGE__NAMESPACE: ${OPENLINEAGE_NAMESPACE:-reporting-platform-local}
+    # One line deliberately: a folded scalar whose continuation is indented
+    # further keeps the newline (YAML's more-indented-line rule). JSON tolerates
+    # it, so this was working and looked wrong, which is the worst combination.
+    AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type": "http", "url": "http://marquez-api:5000", "endpoint": "api/v1/lineage", "timeout": 5}'
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./reporting_platform:/opt/platform/reporting_platform
@@ -426,6 +452,66 @@ services:
       # this runs as `airflow`. Also readable without entering a container.
       - ./var/watchdog:/var/lib/reporting-watchdog
     restart: unless-stopped
+
+  # ------------------------------------------------------------------ lineage
+  # MARQUEZ: a CONSUMER of the OpenLineage events Airflow emits, and nothing
+  # more. It is not an authority on this platform and must not become one --
+  # `feeds_behind_report()` derives lineage from the dbt project and RETENTION
+  # REFUSES TO SWEEP on its answer, so a second graph that drifts is the exact
+  # failure this repo keeps rejecting. Marquez observes; the dbt project
+  # decides. See docs/DECISIONS.md#openlineage-is-an-export-not-a-record
+  #
+  # BEHIND A PROFILE, so it is opt-in: `docker compose --profile lineage up -d`.
+  # This stack already runs twelve services and the host it was built on had
+  # ~6 GB free; two more that are useful only when somebody is looking at them
+  # should not be in the default set.
+  marquez-api:
+    image: marquezproject/marquez:${MARQUEZ_VERSION:-0.51.1}
+    profiles: ["lineage"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      # Host and port only. The image's marquez.dev.yml HARDCODES the database
+      # name, user and password to `marquez`, so the role exists in
+      # scripts/init-postgres.sql rather than reusing `platform`.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      MARQUEZ_PORT: 5000
+      MARQUEZ_ADMIN_PORT: 5001
+      # OFF, AND THIS IS THE WHOLE REASON THIS FITS. marquez.dev.yml defaults
+      # `search.enabled` to true against an OpenSearch on :9200 -- which is the
+      # 2 GB component that makes a full catalogue deployment too heavy for
+      # this host. Search is a nice-to-have; lineage is the point.
+      SEARCH_ENABLED: "false"
+      JAVA_OPTS: -Xmx512m
+    ports:
+      - "${MARQUEZ_API_HOST_PORT:-15000}:5000"
+      - "${MARQUEZ_ADMIN_HOST_PORT:-15001}:5001"
+    # 5000/5001/3000 are all taken on a developer box running anything else --
+    # grafana owns 3000 on the machine this was built on. Container-internal
+    # ports are unchanged, so Airflow still reaches marquez-api:5000.
+    mem_limit: 900m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5001/healthcheck || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  marquez-web:
+    image: marquezproject/marquez-web:${MARQUEZ_VERSION:-0.51.1}
+    profiles: ["lineage"]
+    depends_on:
+      marquez-api: {condition: service_healthy}
+    environment:
+      # All three are MANDATORY -- setupProxy.js calls process.exit(1) on any
+      # one of them being unset, which presents as a container that starts and
+      # immediately dies with nothing obviously wrong.
+      MARQUEZ_HOST: marquez-api
+      MARQUEZ_PORT: "5000"
+      WEB_PORT: "3000"
+    ports: ["${MARQUEZ_WEB_HOST_PORT:-13000}:3000"]
+    mem_limit: 256m
 
 volumes:
   minio-data:

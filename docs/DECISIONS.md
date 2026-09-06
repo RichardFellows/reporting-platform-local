@@ -3390,3 +3390,97 @@ on, so it is what the real run would do rather than a second opinion about it.
 The rule, stated once so the next dry-run flag has somewhere to look: **a dry
 run may write to the index; it may not write anything a later step reads to
 decide what to delete.**
+
+
+## openlineage-is-an-export-not-a-record
+
+Airflow emits an OpenLineage event per task run; Marquez consumes them and draws
+the graph. Both are behind one switch and are OFF by default — `OPENLINEAGE_DISABLED`
+in `.env` and the `lineage` compose profile.
+
+**Marquez is a CONSUMER and must never become an authority.** This platform
+already derives lineage from the dbt project, and that derivation is
+load-bearing: `feeds_behind_report()` walks an exposure's `ref()` closure and
+**retention refuses to sweep** on its answer. A second graph that drifts from
+the project is the exact failure this repo keeps rejecting elsewhere — "a second
+list of reports", "a second registry of feeds". Marquez observes; the dbt
+project decides.
+
+**It is also not the record of what a run published.** `registry.run_input` is,
+and the two answer different questions on purpose. A run's inputs are the
+deliveries whose rows are PRESENT in what was published, so an SCD2 dimension
+contributes 10 of its 40 ingested deliveries; OpenLineage reports what the job
+READ, which is all 40. Both numbers are right for their own question and neither
+should be reconciled to the other. Anyone who "fixes" one to match the other has
+broken REQ-602.
+
+### The provider was already installed, and installing it would have broken dbt
+
+`apache-airflow-providers-openlineage` 2.0.0 (with `openlineage-python` 1.27.0)
+is already in the image as a transitive dependency. Nothing needed installing —
+which is fortunate, because doing it the obvious way is the cosmos trap exactly.
+Under Airflow's own constraint file:
+
+```
+$ pip install --dry-run --constraint .../constraints-2.10.5/constraints-3.11.txt \
+      apache-airflow-providers-openlineage
+Would install typing_extensions-4.12.2
+```
+
+The image currently has 4.16.0. The constraint pins 4.12.2, dbt's `mashumaro`
+needs `evaluate_forward_ref` from 4.13+, and every dbt invocation would then die
+at import — in dbt, not in openlineage, and not until something ran dbt. Caught
+by the dry run this repo already mandates before moving `COSMOS_VERSION`; the
+rule generalises to any provider added later.
+
+### A SKIPPED task never closes, and Airflow 2.10 cannot fix it
+
+Observed on the first run, which skipped every task because nothing was pending:
+Marquez showed `ingest_fo_trade.resolve_arrival` as `RUNNING` on a DAG run that
+had already succeeded. A subsequent `platform_housekeeping` run, whose tasks all
+do real work, closed 12 of 12 — so the success path is fine and the skip path is
+the whole of the problem.
+
+It is not a provider defect and no version bump fixes it. Airflow 2.10's
+listener spec offers exactly three task hooks:
+
+```
+airflow.listeners.spec.taskinstance ->
+  ['on_task_instance_failed', 'on_task_instance_running', 'on_task_instance_success']
+```
+
+There is no `on_task_instance_skipped`. A task that emits START and then skips
+has no hook through which a terminal event could ever be sent. **This matters
+here more than it would elsewhere**, because skipping is the ingest DAGs' normal
+idle behaviour — `resolve_arrival` raises `AirflowSkipException` whenever there
+is nothing pending, which is most runs — so each feed accumulates one
+permanently-`RUNNING` run in Marquez per idle poll.
+
+Read the graph accordingly: **`RUNNING` in Marquez means "started and did not
+succeed or fail", which on this platform usually means skipped.** It is not
+evidence that anything is stuck. The authority on whether a run is still going
+is Airflow, and the authority on whether it published anything is
+`registry.run`.
+
+### Why OpenSearch is not here
+
+`marquez.dev.yml` defaults `search.enabled` to true against an OpenSearch on
+:9200. That is the component that makes a full catalogue deployment too heavy
+for a developer box — OpenMetadata's own quickstart asks for 6 GiB and 4 vCPUs,
+against roughly 6 GB free on the machine this was built on. `SEARCH_ENABLED=false`
+drops it entirely. Measured cost of what remains: **220 MB for the API and 25 MB
+for the web front end.** Search is a nice-to-have; lineage is the point.
+
+### Verified
+
+- Marquez 0.51.1 on the existing Postgres 16, its own `marquez` role and
+  database because the image hardcodes all three credentials and reads only
+  host and port from the environment. 91 flyway migrations applied on startup;
+  admin healthcheck reports `postgresql: healthy`.
+- Host ports remapped to 15000/15001/13000: the defaults 5000, 5001 and 3000
+  were all in use on the build machine (grafana owns 3000). Container-internal
+  ports are unchanged, so `marquez-api:5000` still resolves for Airflow.
+- `ingest_fo_trade` and `platform_housekeeping` both emitted into namespace
+  `reporting-platform-local`: 13 jobs, 12 `COMPLETED`, 1 stuck `RUNNING` — the
+  skipped task above, and nothing else.
+

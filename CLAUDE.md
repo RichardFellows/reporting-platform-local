@@ -365,6 +365,24 @@ Two corollaries worth holding on to:
   the models rebuilt after it. See `docs/DECISIONS.md#supersession-is-declared-not-assumed`,
   `#as-of-is-a-var-not-a-second-model` and `#delivery-ref-is-the-fallback-with-the-prefix-stripped`.
 
+- **OpenLineage is an EXPORT, and Marquez is a CONSUMER.** Airflow emits an
+  event per task run; `docker compose --profile lineage up -d` starts Marquez
+  to draw it. Both halves are off by default behind `OPENLINEAGE_DISABLED`.
+  **It is not an authority**: lineage here is derived from the dbt project and
+  `feeds_behind_report()` decides retention windows with it, so a second graph
+  that drifts is the failure this file keeps warning about. **It is not the
+  record of what a run published** either — `registry.run_input` is, and the
+  two differ legitimately (an SCD2 dimension contributes 10 of 40 deliveries to
+  a published table; OpenLineage reports all 40 as read). Do not reconcile them.
+  The provider is ALREADY in the image — installing it explicitly under
+  Airflow's constraint file pins `typing_extensions==4.12.2` and kills every dbt
+  invocation, the cosmos trap exactly. **A SKIPPED task shows as `RUNNING` in
+  Marquez forever**: Airflow 2.10's listener spec has only
+  running/success/failed, no skipped hook, and skipping is the ingest DAGs'
+  normal idle state. `RUNNING` there means "started, did not succeed or fail" —
+  Airflow is the authority on what is actually running.
+  See `docs/DECISIONS.md#openlineage-is-an-export-not-a-record`.
+
 ## Quick reference
 
 ```powershell
@@ -460,6 +478,14 @@ docker compose exec -T airflow python -m scripts.duckdb_console --tables
 
 # refs (add ?fetch=ALL for commit metadata)
 curl -s http://localhost:19120/api/v2/trees
+
+# lineage -- opt-in. Needs OPENLINEAGE_DISABLED=false in .env AND the airflow
+# containers RECREATED (env is read at process start), or nothing is emitted.
+docker compose --profile lineage up -d marquez-api marquez-web
+docker compose up -d --force-recreate airflow airflow-webserver airflow-triggerer
+# http://localhost:13000 -- 5000/5001/3000 are remapped, they collide with
+# grafana and friends on an ordinary developer box
+curl -s 'http://localhost:15000/api/v1/namespaces/reporting-platform-local/jobs?limit=50'
 ```
 
 A clean seed that passes its tests — needed for anything that publishes —
