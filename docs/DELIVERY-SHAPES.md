@@ -263,9 +263,9 @@ silent failure this whole design is trying to remove.
 A new `ready:` block in `retention.yml`, in days. It has none of the coupling
 the `landing:` block carries — that one must be `>=` the raw window because
 `find_pending` computes its keep-set from landing, and the config comment says
-so. `ready/` is rebuildable, so the only floor is operational: it must comfortably
-exceed `arrival_timeout_hours` (26h, deliberately longer than a day), or a
-delivery can be swept between normalization and a late ingest. Seven days.
+so. `ready/` is rebuildable, so it has no correctness floor either — what stops
+a delivery being swept between normalization and a late ingest is the rule
+below, at any age, not this number. Seven days.
 
 One rule, and it uses the derived ledger rather than a status flag: **never
 sweep a manifest whose parts are not in `already_ingested`.** A manifest swept
@@ -334,9 +334,11 @@ here yet" into a hard failure in well under a minute. The safety-net poll
 path already built for every other feed — `find_pending`, reached from
 `resolve_arrival`'s no-conf fallback, or `scripts.bulk_ingest` — is what
 picks the delivery up once the control file actually lands, however long
-that takes. `arrival_timeout_hours` is **not** what does this: it is a
-config field nothing reads, and a first pass at this section claimed
-otherwise before that was checked against the code.
+that takes. There is no timeout: `arrival_timeout_hours` was a config field
+nothing read — a first pass at this section claimed otherwise before that was
+checked against the code — and it has since been deleted rather than left to
+be mistaken for a mechanism. See
+[DECISIONS.md#no-arrival-timeout](DECISIONS.md#no-arrival-timeout).
 
 `inbox.route()` needed a second check for this to work locally at all: a
 control file matches no feed's `filename_pattern` and would otherwise be
@@ -421,7 +423,8 @@ in the filename rejected. **Not verified: an actual in-browser
 click-through** -- no browser was available in the session that built this
 (see [DECISIONS.md#the-sniffer](DECISIONS.md#the-sniffer)); the JS was
 syntax-checked and traced by hand instead, which is how a real bug
-(`completeness` silently defaulting to unchecked for any sniffed draft) was
+(`delivery_expected`, then named `completeness`, silently defaulting to
+unchecked for any sniffed draft) was
 caught before it shipped.
 
 Creating and editing an archive/control-gated feed through `delivery:` was

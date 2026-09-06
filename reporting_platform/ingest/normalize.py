@@ -156,25 +156,41 @@ def _find_control_key(feed: Feed, object_key: str) -> str | None:
     return None
 
 
-def _declared_row_count(feed: Feed, control_key: str) -> int | None:
-    """The exact row count a control file declares, or None if it declares none.
+def _declared(feed: Feed, control_key: str) -> dict[str, Any]:
+    """What the landed control file declares about the delivery's INTEGRITY.
 
-    `row_count` is optional on `delivery.control` -- some control files are
-    pure readiness gates with nothing to parse out of them.
+    `row_count` and `md5`, both optional -- some control files are pure
+    readiness gates with nothing to parse out of them. Read HERE, on the
+    landing side, so they are checked once for every delivery: one an approved
+    sender wrote straight into the bucket, and one the inbox renamed and
+    promoted. The inbox reads the same file for the delivery's IDENTITY
+    (business date, version) and deliberately checks none of this.
+    See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
     """
-    row_count = feed.delivery["control"].get("row_count")
-    if row_count is None:
-        return None
+    control = feed.delivery["control"]
+    if not any(k in control for k in ("row_count", "md5")):
+        return {}
     body = _client().get_object(Bucket=_bucket(), Key=control_key)["Body"].read()
     text = body.decode(feed.file_encoding, errors="replace")
-    m = re.search(row_count, text)
-    if not m:
-        raise ValueError(
-            f"{feed.name}: control file {control_key} does not match "
-            f"`delivery.control.row_count` {row_count!r}. The control file "
-            f"arrived but does not say what it was validated to say -- a "
-            f"format change upstream, not a timing problem.")
-    return int(m.group("rows"))
+
+    out: dict[str, Any] = {}
+    for key, group in (("row_count", "rows"), ("md5", "md5")):
+        pattern = control.get(key)
+        if pattern is None:
+            continue
+        m = re.search(pattern, text)
+        if not m:
+            raise ValueError(
+                f"{feed.name}: control file {control_key} does not match "
+                f"`delivery.control.{key}` {pattern!r}. The control file "
+                f"arrived but does not say what it was validated to say -- a "
+                f"format change upstream, not a timing problem.")
+        out[key] = m.group(group)
+    if "row_count" in out:
+        out["row_count"] = int(out["row_count"])
+    if "md5" in out:
+        out["md5"] = out["md5"].lower()
+    return out
 
 
 def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
@@ -194,7 +210,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
     business_date, _version = parsed
 
     control_key = None
-    declared_row_count = None
+    declared: dict[str, Any] = {}
     if "control" in feed.delivery:
         control_key = _find_control_key(feed, object_key)
         if control_key is None:
@@ -203,7 +219,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
                 f"matching {feed.delivery['control']['pattern']!r} (stem "
                 f"{_stem(filename)!r}) in the same landing folder. Not a "
                 f"failure -- a late feed, not a failed one.")
-        declared_row_count = _declared_row_count(feed, control_key)
+        declared = _declared(feed, control_key)
 
     head = _head(_bucket(), object_key)
     return {
@@ -233,7 +249,8 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
         # never holds derived state, only what arrived. None for a feed with
         # no `delivery.control`, or one whose control file sets no row_count.
         "control_object": control_key,
-        "declared_row_count": declared_row_count,
+        "declared_row_count": declared.get("row_count"),
+        "declared_md5": declared.get("md5"),
         "normalizer": NORMALIZERS["file"],
     }
 
@@ -343,6 +360,7 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
         # (context.resolve_delivery_config), so both are always None here.
         "control_object": None,
         "declared_row_count": None,
+        "declared_md5": None,
         "normalizer": NORMALIZERS["archive"],
     }
 
@@ -395,6 +413,15 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
     `write=False` builds the manifest without storing it, which is what the
     single-file CLI path uses so that `--object landing/...` keeps working
     without leaving a queue entry behind.
+
+    A STORED MANIFEST IS ALSO REGISTERED. Producing one is the moment the
+    platform accepts a landed object as a readable delivery -- it has a
+    business date, parts and a format -- so it is the moment the delivery
+    registry (REQ-101) can describe it. Best-effort and never fatal: see
+    `registry.deliveries.register_quietly`. `write=False` registers nothing,
+    because nothing was accepted into the queue either -- with one caller that
+    has to do both itself: `reconcile()` below passes `write=False` and then
+    writes the manifest, so it registers the delivery too.
     """
     kind = _kind(feed)
     if kind not in NORMALIZERS:
@@ -411,7 +438,8 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
         # the `ready/` sweep -- which iterates manifests -- could never
         # collect. Cheaper to enqueue and let it be marked ingested.
         manifest = _normalize_archive(feed, object_key)
-        write_manifest(feed, manifest)
+        key = write_manifest(feed, manifest)
+        _register(feed, manifest, key)
         return manifest
 
     manifest = _normalize_file(feed, object_key)
@@ -419,7 +447,25 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
         key = manifest_key(feed, object_key)
         if force or not _exists(key):
             write_manifest(feed, manifest)
+        # Outside the `_exists` guard on purpose. The manifest is written once
+        # and the registry row may still be missing -- a registry that was
+        # down when this delivery first normalized is exactly the case
+        # `register_quietly` tolerates, and re-registering an already-known
+        # delivery is an upsert that changes nothing.
+        _register(feed, manifest, key)
     return manifest
+
+
+def _register(feed: Feed, manifest: dict[str, Any], key: str) -> None:
+    """Record the delivery, without letting the registry break normalization.
+
+    Imported here rather than at module scope: this module is imported by
+    `retention/landing.py` and by the config-level tests, neither of which has
+    a database, and an import-time psycopg2 dependency would reach both.
+    """
+    from reporting_platform.registry.deliveries import register_quietly
+
+    register_quietly(feed, manifest, key)
 
 
 def _exists(key: str) -> bool:
@@ -458,7 +504,26 @@ def reconcile(feed: Feed) -> dict[str, Any]:
         if manifest_key(feed, key) in have:
             continue
         try:
-            created.append(write_manifest(feed, normalize(feed, key, write=False)))
+            # `write=False` and then writing it here, rather than
+            # `normalize(feed, key)`: the manifest key for an archive comes
+            # from the manifest itself, not from the landing object, so
+            # write_manifest is the one thing that knows where it went.
+            #
+            # THE REGISTRATION HAS TO BE REPEATED HERE, and its absence was a
+            # real gap. `normalize()` registers what it writes, but this path
+            # tells it not to write and then writes the manifest itself -- so
+            # every delivery normalized by the POLL path got a manifest and no
+            # registry row. Observed on a cold load: 198 landed objects, 157
+            # ingested, 0 rows. Not a correctness failure -- `deliveries.
+            # reconcile()` is the authority and the nightly
+            # `registry_reconcile` task closes it -- but it left the inline
+            # path covering only deliveries that arrived through a triggered
+            # DAG run, which is the smaller half, and `coverage()` reporting a
+            # lag that nothing had actually failed to do.
+            manifest = normalize(feed, key, write=False)
+            mkey = write_manifest(feed, manifest)
+            _register(feed, manifest, mkey)
+            created.append(mkey)
         except NotReady as exc:
             awaiting.append({"object": key, "waiting_for": str(exc)})
         except Exception as exc:                               # noqa: BLE001

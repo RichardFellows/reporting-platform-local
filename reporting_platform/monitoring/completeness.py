@@ -36,10 +36,10 @@ blind spot is undocumented is worse than no monitor:
     non-delivery day a gap -- the seed's `rating` feed arrives weekly and the
     first run of this check duly reported five false gaps for it. Hence
     `cadence: weekly`, which asks only that each week containing business
-    dates saw at least one delivery, and `completeness: false` to opt out
-    entirely. Note what opting out costs: a `completeness: false` feed that
-    stops delivering for a month is invisible here, and only freshness will
-    notice.
+    dates saw at least one delivery, and `delivery_expected: false` to opt
+    out entirely. Note what opting out costs: a `delivery_expected: false`
+    feed that stops delivering for a month is invisible here, and only
+    freshness will notice.
   * Anything outside a feed's own observed range: dates before its first
     delivery are not gaps, they are history it does not have.
 """
@@ -141,7 +141,7 @@ def run(lookback: int | None = None) -> dict:
             # A feed that does not deliver daily would show every non-delivery
             # day as a gap, so opting out must be possible -- and must be
             # explicit, or a feed silently drops out of the check.
-            if getattr(fd, "completeness", True) is False:
+            if getattr(fd, "delivery_expected", True) is False:
                 skipped.append(name)
                 continue
             cadence[name] = getattr(fd, "cadence", "daily")

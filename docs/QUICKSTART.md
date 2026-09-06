@@ -264,13 +264,25 @@ You should see **`main` and no `build/*` branches**. A surviving `build/*`
 branch is a build whose tests failed — deliberately kept for inspection, with
 `main` untouched.
 
-**You will not see any `published/*` tags yet, and that is expected on this
-path.** Those tags are cut by `record_publication`, a task in the *ingest
-DAGs* — and step 4 deliberately used the `bulk_ingest` CLI instead, because it
-is far quicker for a first load. Everything is published to `main`; nothing has
-been *tagged* for time travel. To get tags, run an ingest through Airflow —
+**You will not see any `snapshot/*` tags yet, and that is expected on this
+path.** Those tags are cut by `record_snapshot`, a task in the *ingest DAGs* —
+and step 4 deliberately used the `bulk_ingest` CLI instead, because it is far
+quicker for a first load. Everything is published to `main`; nothing has been
+*tagged*. To get one, run an ingest through Airflow —
 [`README.md`](../README.md) section 14 covers it — and see section 13 there for
 time travel once a tag exists.
+
+**`published/*` tags are a different thing and come from the reporting
+build.** One per report — `published/<report>/<business_date>/<run_id>` — cut
+when `reporting_build` merges, alongside a row in `registry.report_version`
+saying which version of that report it is. An ingest pins raw state; only a
+report publication is a publication. See
+[`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication).
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.registry runs
+docker compose exec -T airflow python -m reporting_platform.registry versions
+```
 
 ---
 

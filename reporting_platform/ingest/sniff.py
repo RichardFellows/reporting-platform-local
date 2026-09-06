@@ -390,7 +390,23 @@ def propose_feed(filename: str, data: bytes) -> dict:
 
     con = duckdb.connect()
     proposal = sniff_bytes(con, data, filename)
-    proposal["filename_pattern"] = derive_pattern(filename)
+    dated = derive_pattern(filename)
+    proposal["filename_pattern"] = dated
+    proposal["filename_has_date"] = dated is not None
+
+    # A PLAIN FILE WITH NO DATE IN ITS NAME IS ONBOARDABLE, and the proposal
+    # has to say how or the console dead-ends: `derive_pattern` returns None,
+    # the form requires a business_date group, and there is no obvious way to
+    # say "this one arrives through the inbox and gets renamed". So propose
+    # the arrival shape -- the source pattern is the name as sent, escaped,
+    # and the landing pattern is left for the operator, who is the only one
+    # who knows what this feed should be called.
+    #
+    # Only for a plain file. An archive with no date on the container is a
+    # different gap (`business_date_from: member`, still NOT BUILT), and the
+    # inbox gate does not unpack archives.
+    if dated is None and not filename.lower().endswith(".zip"):
+        proposal["arrival_source_pattern"] = re.escape(filename)
     if filename.lower().endswith(".zip"):
         proposal["container_has_date"] = _container_has_a_date(filename)
     return proposal

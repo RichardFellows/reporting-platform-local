@@ -213,6 +213,12 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
     unique_key = ", ".join(f"'{c}'" for c in ["business_date", *spec.business_key])
     tag = "reference" if len(spec.business_key) == 1 else "transactional"
 
+    # `source_provenance()` goes in beside `audit_columns()` below rather than
+    # being rendered column by column here. Both are macros for the same
+    # reason: a scaffolded model that omitted the delivery provenance would
+    # reopen REQ-304 once per feed, quietly, in the file nobody re-reads after
+    # the console writes it.
+    #
     # Align every `as <alias>` in one column, the way the hand-written models
     # do -- computed from the widest expression rather than fixed, so a long
     # safe_cast does not push its own alias out of line with the rest.
@@ -262,6 +268,7 @@ with raw_rows as (
         {{{{ dedupe_rank([{key_list}]) }}}} as _rn
     from {{{{ source('raw', '{spec.name}') }}}}
     where {{{{ incremental_window('_business_date', 'business_date') }}}}
+      and {{{{ known_as_of() }}}}
 
 ),
 
@@ -273,6 +280,7 @@ cleaned as (
 
     select
 {body}
+        {{{{ source_provenance() }}}}
         {{{{ audit_columns() }}}}
 
     from deduped
@@ -334,6 +342,17 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
     bd["name"] = "business_date"
     bd["tests"] = _flow(["not_null"])
     cols.append(bd)
+
+    # THE MIGRATION GUARD, generated so a new feed cannot be the one model
+    # without it. `source_provenance()` projects `delivery_ref()`, which is
+    # never NULL for a table built after that macro -- so a NULL means the
+    # table has not been rebuilt since, and its rows cannot name the delivery
+    # they came from. See the comment this writes into _prepared.yml for the
+    # rest of the reasoning.
+    did = CommentedMap()
+    did["name"] = "delivery_id"
+    did["tests"] = _flow(["not_null"])
+    cols.append(did)
 
     for col in spec.columns:
         tests: list = []

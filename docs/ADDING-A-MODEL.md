@@ -80,6 +80,15 @@ Five things that are not optional:
   Centralising them is the point — a bare `CAST(x AS VARCHAR)` copy-pasted into
   three models is the defect that file exists to prevent. Note also that Spark
   3.x rejects bare `VARCHAR` without a length: use `string`.
+- **A prepared model reading `raw` must have `{{ known_as_of() }}` in its
+  `where`, and `{{ source_provenance() }}` in its select.** Both are checked by
+  `tests/test_supersession.py`, which greps the model files rather than
+  trusting that a macro reached them. The first is the as-of filter: with no
+  `knowledge_time` var it compiles to `1 = 1`, and a model that omits it
+  silently returns everything whatever an as-of query asked for. The second
+  carries `delivery_id` through, which is what a published run enumerates its
+  inputs from — and `_prepared.yml` needs `- name: delivery_id` /
+  `tests: [not_null]` to prove the table was built after that macro existed.
 - **Aggregates must `ref()` the detail model, not re-derive from `prepared`.**
   `exposure_by_country` reads `counterparty_exposure` so the rollup reconciles
   to the detail *by construction*. Two independent derivations eventually

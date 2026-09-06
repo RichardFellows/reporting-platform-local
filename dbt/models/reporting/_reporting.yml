@@ -115,8 +115,25 @@ exposures:
       - ref('counterparty_exposure')
       - ref('exposure_change')
     owner:
+      # REQ-501's NAMED OWNER, and it is this one rather than a new field.
+      # An exposure already names an owner; `context.report_owner()` reads it,
+      # and `registry/lifecycle.py` checks a reopening approver against it. Two
+      # requirements, one declaration, and no second place for it to be wrong.
       name: Reporting
       email: reporting@example.invalid
+    meta:
+      # REQ-502. What happens to a published as-at date whose inputs later
+      # change. THERE IS NO PLATFORM DEFAULT -- `context.restatement_policy()`
+      # refuses a report that has not declared one (open decision 2, settled as
+      # `fail`), because the two answers differ only after something has gone
+      # wrong and a default would be a policy nobody chose, in force for years.
+      #
+      # `restate` here: this replaces a set of legacy regulatory-facing
+      # reports, so a figure whose inputs have moved must be republished
+      # deliberately rather than left standing. A publish onto a locked or
+      # submitted date whose deliveries have changed is REFUSED until somebody
+      # reopens it. See docs/DECISIONS.md#the-as-at-date-has-a-lifecycle
+      restatement: restate
 
   - name: country_exposure_dashboard
     label: Country Exposure (Qlik)
@@ -131,3 +148,15 @@ exposures:
     owner:
       name: Reporting
       email: reporting@example.invalid
+    meta:
+      # `carry_forward`, and the CONTRAST with the report above is the point.
+      # This is an internal dashboard: a corrected delivery for a date already
+      # published shows up at the current date, and last month's dashboard is
+      # not reissued. Two reports over the same lineage with different answers
+      # is exactly why the policy is per report and not per platform.
+      #
+      # REQ-503 lives here too: this is a daily internal report and it
+      # traverses the SAME machinery -- same lifecycle table, same gate, same
+      # version sequence -- with no separate code path. tests/test_lifecycle.py
+      # asserts that rather than trusting this comment.
+      restatement: carry_forward

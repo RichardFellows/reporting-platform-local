@@ -1,9 +1,20 @@
-"""`ready/` retention: a cache, swept in days -- but never before ingest.
+"""`ready/` retention: a cache, swept in days -- but never before ingest, and
+never a manifest whose landing object is still there.
 
-The rule that matters is negative: a manifest whose parts are not yet in the
-raw table is left alone regardless of age. Sweeping one is not data loss --
-landing still holds the object -- but nothing re-normalizes it on its own, so
-it is a SILENT drop. See reporting_platform/retention/ready.py.
+Two negative rules, and both are about deleting something that comes straight
+back or should never have gone.
+
+  * A manifest whose landing object is still in `landing/` is KEPT at any age.
+    `normalize.reconcile` recreates one for every landing object that lacks
+    one, so sweeping it is a nightly no-op that both subsystems log as success
+    -- and the manifest is what `deliveries.reconcile` rebuilds the registry
+    from, so it is not merely a queue entry.
+  * A manifest whose parts are not yet in the raw table has its derived parts
+    left alone regardless of age. Deleting them is not data loss -- landing
+    still holds the object -- but nothing re-normalizes it on its own, so it
+    is a SILENT drop.
+
+See reporting_platform/retention/ready.py.
 """
 from __future__ import annotations
 
@@ -39,26 +50,54 @@ def _all_ingested():
     return [f"landing/fo_trade/TRADE_{d:%Y%m%d}.csv" for d in (OLD, RECENT)]
 
 
-def test_old_and_ingested_is_swept():
+def test_old_and_ingested_manifest_is_kept():
+    """The churn this module was fixed for.
+
+    Old, ingested, every part pointing back into `landing/` -- so there is
+    nothing derived to reclaim, and deleting the manifest would only give
+    `normalize.reconcile` something to recreate tonight.
+    """
     s3, monkey, fd, ready = _setup(ingested=_all_ingested())
     try:
         report = ready.sweep_feed(fd, date.today() - timedelta(days=7),
                                   dry_run=False)
-        assert report["expired"] == 1, report
-        assert report["retained"] == 1, report
-        assert "ready/fo_trade/TRADE_20190603.csv.json" not in s3.objects
+        assert report["parts_deleted"] == 0, report
+        assert report["manifests_deleted"] == 0, report
+        assert report["retained"] == 2, report
+        assert "ready/fo_trade/TRADE_20190603.csv.json" in s3.objects
     finally:
         uninstall(monkey)
 
 
-def test_old_but_not_ingested_is_held():
-    """The rule this module exists for."""
-    s3, monkey, fd, ready = _setup(ingested=[])
+def test_the_sweep_survives_its_own_reconcile():
+    """The end of it, stated as the property rather than as a count.
+
+    Sweep, then reconcile, and nothing may have been recreated -- otherwise
+    the two subsystems are undoing each other and both are reporting success.
+    """
+    s3, monkey, fd, ready = _setup(ingested=_all_ingested())
     try:
+        from reporting_platform.ingest import normalize as norm
+
+        ready.sweep_feed(fd, date.today() - timedelta(days=7), dry_run=False)
+        after_sweep = set(s3.objects)
+        created = norm.reconcile(fd)["created"]
+        assert created == [], created
+        assert set(s3.objects) == after_sweep
+    finally:
+        uninstall(monkey)
+
+
+def test_an_orphaned_manifest_is_swept_at_any_age():
+    """Landing has let it go, so nothing recreates it. The one lasting
+    reclaim a manifest offers."""
+    s3, monkey, fd, ready = _setup(ingested=_all_ingested())
+    try:
+        del s3.objects[f"landing/fo_trade/TRADE_{RECENT:%Y%m%d}.csv"]
         report = ready.sweep_feed(fd, date.today() - timedelta(days=7),
                                   dry_run=False)
-        assert report["expired"] == 0, report
-        assert report["held_uningested"] == 1, report
+        assert report["manifests_deleted"] == 1, report
+        assert f"ready/fo_trade/TRADE_{RECENT:%Y%m%d}.csv.json" not in s3.objects
         assert "ready/fo_trade/TRADE_20190603.csv.json" in s3.objects
     finally:
         uninstall(monkey)
@@ -77,10 +116,11 @@ def test_the_landing_object_is_never_deleted():
 def test_dry_run_deletes_nothing():
     s3, monkey, fd, ready = _setup(ingested=_all_ingested())
     try:
+        del s3.objects[f"landing/fo_trade/TRADE_{RECENT:%Y%m%d}.csv"]
         before = set(s3.objects)
         report = ready.sweep_feed(fd, date.today() - timedelta(days=7),
                                   dry_run=True)
-        assert report["expired"] == 1, report
+        assert report["manifests_deleted"] == 1, report
         assert set(s3.objects) == before
     finally:
         uninstall(monkey)

@@ -8,6 +8,10 @@ in the on-prem OpenShift target (see `OPENSHIFT-MAPPING.md`), and so that the
 *code you write locally is the code that runs in the cluster* — only
 configuration changes.
 
+> For the *sequence* rather than the shape — one delivered file from the
+> inbox through to a reporting table, with the failure mode at each stage —
+> see [PIPELINE.md](PIPELINE.md).
+
 It replaces the legacy pattern:
 
 ```

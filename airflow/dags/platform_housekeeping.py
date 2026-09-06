@@ -103,7 +103,7 @@ def _spark_subprocess(*args: str) -> dict:
     default_args=DEFAULT_ARGS,
     tags=["reporting-platform", "platform", "housekeeping"],
     params={"dry_run": False, "force_compaction": False,
-            "fail_on_gap": False},
+            "fail_on_gap": False, "fail_on_late": False},
 )
 def platform_housekeeping():
 
@@ -128,6 +128,210 @@ def platform_housekeeping():
         specs = [f"{t}:{layer}" for t, layer in managed_tables()]
         mode = "dry" if context["params"].get("dry_run") else "real"
         return _spark_subprocess("retention", mode, *specs)
+
+    @task
+    def reproducibility_check(**context) -> dict:
+        """Can a published run still be read at its own pin? REQ-702.
+
+        AFTER THE MAINTENANCE CHAIN, and that ordering is the whole test.
+        `maintain` rewrites data files; `enforce_retention` then expires
+        published tags, expires business dates out of the tables, runs Nessie
+        GC and executes the deferred deletes an earlier sweep queued. Every one
+        of those can break a pin while leaving a catalog that looks healthy,
+        and none of them announces it. Running the check first would exercise
+        yesterday's state and pass on the night the damage was done.
+
+        FAILS THE RUN, unlike `completeness_check` beside it, and the
+        difference is what the red means. A completeness gap is an upstream
+        missing a Tuesday — real, but not the platform's own doing, and a red
+        run there would be indistinguishable to the watchdog from housekeeping
+        being down. A pin that no longer resolves IS the platform destroying
+        its own evidence, in the step that just ran, and it is unrecoverable:
+        every further night makes it worse and less diagnosable.
+
+        `not_yet_meaningful` DOES NOT FAIL, and it is no longer an age. The
+        check selects the oldest pin holding a data file `main` no longer
+        references, because a pin whose every file `main` still keeps alive
+        would read successfully whether pinning worked or not; when no scanned
+        pin holds one, there is nothing here worth reading and a green would be
+        a check whose window does not contain the thing it describes. This used
+        to be approximated by the pin being older than `recent_partition_days`,
+        which is backwards — compaction is scoped to the RECENT partitions, so
+        a pin ages out of that window rather than into it, and the gate would
+        have opened on a fixed date and reported green on files identical to
+        `main`'s. See monitoring/reproducibility.py.
+        """
+        import logging
+
+        from airflow.exceptions import AirflowException
+
+        log = logging.getLogger("airflow.task")
+        report = _spark_subprocess("reproducibility")
+        status = report.get("status")
+        if status == "not_yet_meaningful":
+            log.info("reproducibility: %s", report.get("detail"))
+            return report
+        if status == "no_published_tags":
+            log.info("reproducibility: nothing has been published yet")
+            return report
+        if not report.get("ok", False):
+            raise AirflowException(
+                f"REPRODUCIBILITY BROKEN at {report.get('tag')}: "
+                f"{len(report.get('unreadable', []))} table(s) can no longer "
+                f"be read at a published pin. The maintenance chain that just "
+                f"ran destroyed evidence a published run depends on. Do not "
+                f"ignore this — every further night makes it less diagnosable."
+            )
+        # The divergence count is the half that says the green MEANS something:
+        # it is how many data files this pin keeps alive that main does not.
+        # A green with zero there would be the old age gate's meaningless one.
+        div = report.get("divergence") or {}
+        log.info("reproducibility: %s reproduced, %d table(s) read, %d absent "
+                 "at that pin; selected after scanning %s pin(s), holding %s "
+                 "data file(s) main no longer references", report.get("tag"),
+                 len(report.get("tables", [])), len(report.get("absent", [])),
+                 div.get("pins_scanned"), div.get("exclusive_files"))
+        return report
+
+    @task(pool="lakehouse_write")
+    def migrate_raw_schema(**context) -> dict:
+        """Give every raw table the current provenance columns. Idempotent.
+
+        FIRST IN THE CHAIN, and it is not maintenance -- it is the guard
+        against a lazy migration. `ingest` adds a missing provenance column on
+        the branch it is already writing, for the one feed it is ingesting, so
+        a feed that has not delivered since the column was added keeps the old
+        schema. Every prepared model selects those columns, so the next build
+        fails for every feed that has not happened to deliver -- observed, on
+        three of four models, which is why this task exists.
+
+        Costs one schema read per feed and commits nothing when they are all
+        current, which is every night after the first.
+        """
+        import logging
+
+        log = logging.getLogger("airflow.task")
+        mode = "dry" if context["params"].get("dry_run") else "real"
+        report = _spark_subprocess("migrate-raw", mode)
+        if report.get("migrated"):
+            log.warning("migrated %d raw table(s) to the current provenance "
+                        "schema: %s", report["migrated"],
+                        [f["feed"] for f in report["feeds"]
+                         if f["status"] == "migrated"])
+        return report
+
+    @task
+    def registry_reconcile(**context) -> dict:
+        """Register every delivery object storage holds that has no row yet.
+
+        NO SPARK, so it runs in the task process rather than through
+        `scripts/_spark_task.py` -- boto3, json and psycopg2 only, the same
+        reason `normalize` is an ordinary task in the ingest DAGs.
+
+        BEFORE the evidence check below and after retention, and both halves
+        of that matter. After, because the landing sweep may have removed
+        deliveries and this must describe what is left; before, because a
+        delivery with no registry row looks to the evidence check exactly like
+        a pinned date whose evidence is gone.
+
+        Ingest already registers each delivery inline as it normalizes it, so
+        on an ordinary night this finds nothing. It exists for the nights it
+        does: a registry write that failed while Postgres was restarting, or a
+        file an upstream agent pushed straight into the bucket while nothing
+        of ours was running.
+
+        `dry_run` NARROWS THIS TASK, IT DOES NOT SKIP IT, and the distinction
+        is which side effect matters. Registry rows are an index: the write is
+        an upsert, nothing that deletes reads it, and skipping the poll is
+        precisely what the rule above forbids. Manifest objects are different
+        -- they are the input to the `ready/` sweep two tasks back, so a "dry"
+        run that creates one changes what the real run does. Observed: a run
+        triggered with `{"dry_run": true}` wrote 116 manifests and forecast a
+        sweep of 42 that then removed 157. So a dry run reconciles from the
+        manifests that exist and reports how many it would have made.
+        """
+        import logging
+
+        from reporting_platform.registry.deliveries import reconcile_all
+
+        log = logging.getLogger("airflow.task")
+        dry = bool(context["params"].get("dry_run"))
+        report = reconcile_all(normalize_first=not dry)
+        log.info("registry: %d newly registered, %d failed",
+                 report["registered"], report["failed"])
+        if dry:
+            log.info("dry_run: no manifests written; %d landed object(s) have "
+                     "none and would be normalized by a real run",
+                     report.get("would_normalize", 0))
+        return report
+
+    @task
+    def evidence_check(**context) -> dict:
+        """Does every published pin still have its deliveries? REQ-602.
+
+        The per-delivery half of the interlock.
+        `retention.check_reproducibility_window` compares two windows and
+        refuses the sweep if they disagree; that runs first, inside retention,
+        and cannot see a single delivery missing inside a coherent window.
+        This can, because the registry says what was received and object
+        storage says what is left.
+
+        FAILS THE RUN when a pinned delivery's landing object is gone, for the
+        same reason `reproducibility_check` fails: it is the platform having
+        destroyed its own evidence, and it does not get better by itself.
+
+        Resolves each pin's input set from its RUN RECORD where there is one
+        (exact -- the deliveries that run actually read) and from the tag's
+        business date where there is not (approximate, and generous only in
+        the direction of missing something). The counts are logged separately.
+
+        WARNS, and does not fail, when a pinned tag has no registered
+        deliveries at all. That is what an unreconciled registry
+        looks like -- indistinguishable from the real thing on the evidence
+        available here -- and failing the chain on it would make the first
+        red the one everybody learns to ignore.
+        """
+        import logging
+
+        from airflow.exceptions import AirflowException
+
+        from reporting_platform.monitoring import evidence
+
+        log = logging.getLogger("airflow.task")
+        report = evidence.run()
+        if report.get("status") == "no_published_tags":
+            log.info("evidence: nothing has been published yet")
+            return report
+        if not report.get("ok", False):
+            raise AirflowException(
+                f"EVIDENCE MISSING behind a published pin: "
+                f"{len(report.get('missing_evidence', []))} delivery(ies) "
+                f"registered as received are no longer in landing/. The pin "
+                f"still resolves, so the tables read -- what the upstream "
+                f"actually sent does not. REQ-602.")
+        if report.get("unregistered_inputs"):
+            log.warning("evidence: %d input delivery(ies) named by a run are "
+                        "not in the registry: %s. reconcile is the rebuild "
+                        "path.", len(report["unregistered_inputs"]),
+                        report["unregistered_inputs"][:5])
+            return report
+        if report.get("unbacked_tags"):
+            log.warning("evidence: %d pinned tag(s) have no input "
+                        "deliveries: %s", len(report["unbacked_tags"]),
+                        report["unbacked_tags"][:5])
+            return report
+        # EXACT vs APPROXIMATE is worth saying out loud every night: a green
+        # from a tag resolved through its run record means the deliveries that
+        # run actually read; a green from a tag resolved by business date
+        # means the deliveries that happened to arrive that day. The second is
+        # weaker, and a log line that did not distinguish them would let the
+        # weaker one pass for the stronger.
+        log.info("evidence: %d delivery(ies) behind %d pinned tag(s), all "
+                 "still landed (%d exact from run records, %d approximated "
+                 "from the tag's business date)",
+                 report.get("deliveries_checked"), report.get("tags_checked"),
+                 report.get("exact"), report.get("approximate"))
+        return report
 
     @task
     def completeness_check(**context) -> dict:
@@ -167,6 +371,44 @@ def platform_housekeeping():
             raise AirflowException(
                 f"{report['total_missing']} business date(s) are missing; "
                 "see the per-feed detail above")
+        return report
+
+    @task
+    def lateness_check(**context) -> dict:
+        """Deliveries that arrived after the time the feed promised. REQ-201.
+
+        BESIDE `completeness_check`, NOT INSIDE IT, and the split is the
+        point: that one asks which business dates are MISSING, this asks which
+        of the deliveries that arrived were late. A date with nothing
+        registered is a gap and is not judged here, so an outage is reported
+        once rather than by both checks in different words.
+
+        WARNS RATHER THAN FAILING, for `completeness_check`'s reason exactly:
+        a red here would be indistinguishable, to the watchdog, from
+        housekeeping being down, and an upstream missing a deadline is not
+        reclamation failing. `fail_on_late` is there for a platform where it
+        should stop the night.
+
+        No Spark: the arrival time is `registry.delivery.received_at`, so this
+        runs in the task process rather than through `_spark_task`.
+        """
+        import logging
+
+        from airflow.exceptions import AirflowException
+
+        from reporting_platform.monitoring import lateness
+
+        log = logging.getLogger("airflow.task")
+        report = lateness.run()
+        for f in report.get("feeds", []):
+            for entry in f.get("late", []):
+                log.warning("feed %s: %s arrived %.1fh after its %s deadline",
+                            f["feed"], entry["business_date"],
+                            entry["hours_late"], f["expected_by"])
+        if report.get("total_late") and context["params"].get("fail_on_late"):
+            raise AirflowException(
+                f"{report['total_late']} delivery(ies) arrived late; see the "
+                "per-feed detail above")
         return report
 
     @task
@@ -305,14 +547,31 @@ def platform_housekeeping():
             "published tag or an open branch. Do not ignore this."
         )
 
+    # BEFORE the maintenance chain, and before anything reads a raw table:
+    # a raw table missing a provenance column breaks every prepared build,
+    # not just its own feed's model.
+    migrated = migrate_raw_schema()
     metrics = collect_metrics()
     maintained = maintain()
     retained = enforce_retention()
-    metrics >> maintained >> retained
+    migrated >> metrics >> maintained >> retained
     storage_report(metrics, retained)
+    # AFTER retention, and depending on it: this asks whether the chain that
+    # just ran destroyed a published pin, so it has to observe the state that
+    # chain left behind.
+    retained >> reproducibility_check()
+    # Same reasoning, different question: reproducibility asks whether the
+    # TABLES can still be read at the pin, this asks whether the DELIVERIES
+    # behind it are still in landing. Both have to observe the state the
+    # retention chain left, and the registry has to be current before the
+    # second one can tell "evidence gone" from "never recorded".
+    retained >> registry_reconcile() >> evidence_check()
     # No dependency on the chain above, on purpose: a data gap must not block
-    # reclamation, and reclamation failing must not hide a data gap.
+    # reclamation, and reclamation failing must not hide a data gap. The
+    # lateness check is beside it and independent of it for the same reason,
+    # and of it: a feed can be complete and late, or on time and full of holes.
     completeness_check()
+    lateness_check()
 
 
 platform_housekeeping()

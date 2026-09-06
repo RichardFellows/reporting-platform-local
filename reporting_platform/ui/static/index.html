@@ -140,13 +140,15 @@ const jpost = (path, body) => api(path, {
   method: "POST", headers: {"Content-Type": "application/json"},
   body: JSON.stringify(body ?? {})});
 
-let STATE = { feeds: [], conventions: [], selected: null, tab: "details", types: [] };
+let STATE = { feeds: [], conventions: [], retentionClasses: [], selected: null,
+              tab: "details", types: [] };
 
 // --------------------------------------------------------------- feed list
 async function loadFeeds(keep) {
   const data = await api("/api/feeds");
   STATE.feeds = data.feeds;
   STATE.conventions = data.conventions || [];
+  STATE.retentionClasses = data.retention_classes || [];
   const list = $("#feed-list");
   list.textContent = "";
   for (const f of data.feeds) {
@@ -334,8 +336,8 @@ function feedForm(f, creating) {
     el("option", {value: v, selected: (f?.cadence ?? "daily") === v ? "selected" : null}, v)));
   const drift = el("select", {}, ["warn", "fail"].map(v =>
     el("option", {value: v, selected: (f?.schema_drift ?? "warn") === v ? "selected" : null}, v)));
-  const completeness = el("input", {type: "checkbox"});
-  completeness.checked = f ? f.completeness : true;
+  const deliveryExpected = el("input", {type: "checkbox"});
+  deliveryExpected.checked = f ? f.delivery_expected : true;
   // Closed list, never free text: a typo'd convention name is not an error the
   // user would see, it is a silent revert to `defaults:` -- the feed loads and
   // reads its files with the wrong delimiter. "(none)" is the empty string.
@@ -345,6 +347,24 @@ function feedForm(f, creating) {
     ...(STATE.conventions || []).map(v =>
       el("option", {value: v, selected: (f?.convention ?? "") === v ? "selected" : null}, v)),
   ]);
+
+  // REQ-201. Text, not <input type="time">: the value written to feeds.yml is
+  // a QUOTED "HH:MM" string, and the browser's time widget localises its
+  // display, which would show an Asian desk a different number from the one
+  // the file holds. The platform's own `parse_expected_by` is what validates
+  // it on save, so the pattern here only saves a round trip.
+  const expectedBy = el("input", {class: "mono", placeholder: "07:00",
+                                  pattern: "([01][0-9]|2[0-3]):[0-5][0-9]"});
+  expectedBy.value = f?.expected_by ?? "";
+  // Closed list for the same reason `convention` is one, but failing harder:
+  // a class retention.yml does not declare is refused when feeds.yml LOADS,
+  // so a typo here does not degrade the feed, it stops Airflow parsing.
+  const RCLASSES = (STATE.retentionClasses || []).length
+    ? STATE.retentionClasses : ["standard"];
+  const retentionClass = el("select", {}, RCLASSES.map(v =>
+    el("option", {value: v,
+                  selected: (f?.retention_class ?? "standard") === v ? "selected" : null},
+       v)));
 
   // ---------------------------------------------------------- file format
   // These four reach Spark's reader unchanged. A wrong delimiter does not
@@ -408,10 +428,89 @@ function feedForm(f, creating) {
       ]),
       patternResult,
     ]),
-    field("filename_pattern", "Filename pattern", pattern,
+    field("filename_pattern", "Filename pattern (in landing)", pattern,
       "Matched with re.fullmatch, so it must cover the whole filename, and must contain " +
-      "a (?P<business_date>\\d{8}) group. A pattern that matches nothing is silent: the feed " +
-      "simply never has anything pending."),
+      "a (?P<business_date>\\d{8}) group. This is the name the file has IN LANDING. If the " +
+      "upstream sends something else — no date, a wrong prefix — leave this as the name you " +
+      "want and describe the real one under Arrival below; the inbox renames it on the way in. " +
+      "A pattern that matches nothing is silent: the feed simply never has anything pending."),
+  );
+
+  // ------------------------------------------------------------- arrival
+  // landing/ HAS A CONTRACT: everything in it is correctly named and
+  // classified. A legacy upstream that sends `positions.csv` with the date
+  // inside `positions.ctl` does not satisfy it, and the fix is to make the
+  // delivery conformant AT THE DOOR rather than teach the whole platform a
+  // second shape. This section is what the door needs.
+  // See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
+  const hasArrival = el("input", {type: "checkbox"});
+  hasArrival.checked = !!(f?.arrival && f.arrival.source_pattern);
+  const sourcePattern = el("input", {class: "mono",
+    value: f?.arrival?.source_pattern ?? "", placeholder: "positions\\.csv"});
+  const arrCtlPattern = el("input", {class: "mono",
+    value: f?.arrival?.control?.pattern ?? "", placeholder: "{stem}\\.ctl"});
+  const arrCtlDate = el("input", {class: "mono",
+    value: f?.arrival?.control?.business_date ?? "",
+    placeholder: "ReportingDate\\|(?P<business_date>\\d{8})"});
+
+  const arrivalFields = el("div", {}, [
+    el("div", {class: "field", style: "margin-top:10px"}, [
+      el("label", {}, "Filename as the upstream sends it"),
+      sourcePattern,
+      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+        "A regex, fullmatched against the name in the inbox — a different " +
+        "string from the landing pattern above. It may capture " +
+        "(?P<business_date>\\d{8}) if the sender's name has a date but is " +
+        "otherwise wrong; if it does not, the control file below must supply " +
+        "the date. Exactly one of the two, never both."),
+    ]),
+    el("div", {class: "field", style: "margin-top:10px"}, [
+      el("label", {}, "Control file pattern"),
+      arrCtlPattern,
+      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+        "{stem} stands for the delivery's own filename minus its extension. " +
+        "The control file is consumed at the door and never reaches landing; " +
+        "its contents are copied verbatim into the metadata file instead. " +
+        "Until it arrives the delivery is HELD in the inbox — not rejected, " +
+        "and not landed."),
+    ]),
+    el("div", {class: "field", style: "margin-top:10px"}, [
+      el("label", {}, "Business date pattern"),
+      arrCtlDate,
+      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+        "Read from the control file's contents. For a line like " +
+        "ReportingDate|20260801 that is " +
+        "'ReportingDate\\|(?P<business_date>\\d{8})'. Required unless the " +
+        "upstream filename above already captures the date."),
+    ]),
+    el("div", {class: "sub", style: "font-size:12px;margin-top:10px"},
+      "Row count and checksum are NOT set here \u2014 they belong to the " +
+      "control file's landing-side block below, so they are checked once for " +
+      "every delivery whether it came through the inbox or an approved sender " +
+      "wrote it straight into landing. The inbox establishes identity; " +
+      "ingestion verifies content."),
+  ]);
+
+  function syncArrivalVisibility() {
+    arrivalFields.style.display = hasArrival.checked ? "" : "none";
+    if (hasArrival.checked && !arrCtlPattern.value.trim())
+      arrCtlPattern.value = "{stem}\\.ctl";
+  }
+  hasArrival.addEventListener("change", syncArrivalVisibility);
+  syncArrivalVisibility();
+
+  node.append(
+    el("div", {class: "field"}, [
+      el("label", {}, "Arrival"),
+      el("div", {class: "row"}, [hasArrival,
+        el("span", {class: "sub", style: "font-size:12px"},
+           "This feed arrives via the inbox and needs renaming or checking " +
+           "before it can land. Leave unchecked when the upstream already " +
+           "writes a correctly named file straight into landing/ — which is " +
+           "every feed here today.")]),
+      (errBoxes["arrival"] = el("div", {class: "err"})),
+    ]),
+    arrivalFields,
   );
 
   // ------------------------------------------------------- delivery shape
@@ -437,6 +536,9 @@ function feedForm(f, creating) {
   const controlRowCount = el("input", {class: "mono",
     value: f?.delivery?.control?.row_count ?? "",
     placeholder: "ROWS=(?P<rows>\\d+)  (optional)"});
+  const controlMd5 = el("input", {class: "mono",
+    value: f?.delivery?.control?.md5 ?? "",
+    placeholder: "MD5=(?P<md5>[0-9a-fA-F]{32})  (optional)"});
 
   const memberPatternField = el("div", {class: "field", style: "margin-top:10px"}, [
     el("label", {}, "Member pattern"),
@@ -459,6 +561,16 @@ function feedForm(f, creating) {
       "file. While set, a delivery is not normalized until a sibling matching " +
       "this pattern has also landed -- not a failure, a late feed."),
   ]);
+  const controlMd5Field = el("div", {class: "field", style: "margin-top:10px"}, [
+    el("label", {}, "Checksum pattern (optional)"),
+    controlMd5,
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+      "A regex with a named group (?P<md5>...) read from the control file, " +
+      "checked at ingest against the md5 of the delivery as landed. Catches " +
+      "what the row count cannot: a file truncated or re-encoded in transit " +
+      "that still holds the right NUMBER of rows. A mismatch abandons the " +
+      "build branch and leaves main untouched."),
+  ]);
   const controlRowCountField = el("div", {class: "field", style: "margin-top:10px"}, [
     el("label", {}, "Declared row count pattern (optional)"),
     controlRowCount,
@@ -478,6 +590,7 @@ function feedForm(f, creating) {
     // fill it in and hit that error at save.
     controlPatternField.style.display = isArchive ? "none" : "";
     controlRowCountField.style.display = isArchive ? "none" : "";
+    controlMd5Field.style.display = isArchive ? "none" : "";
   }
   deliveryKind.addEventListener("change", syncDeliveryVisibility);
   syncDeliveryVisibility();
@@ -488,6 +601,7 @@ function feedForm(f, creating) {
       "dated container holding one or more members, exploded into ready/ at " +
       "normalize time."),
     memberPatternField, controlPatternField, controlRowCountField,
+    controlMd5Field,
   );
 
   // ------------------------------------------------------------- columns
@@ -572,6 +686,19 @@ function feedForm(f, creating) {
     if (!pattern.value.trim() && r.filename_pattern) pattern.value = r.filename_pattern;
 
     const bits = [];
+    if (r.arrival_source_pattern) {
+      // Switch the form into the shape that fits rather than leaving the
+      // pattern box empty with no hint about why nothing was derived.
+      hasArrival.checked = true;
+      if (!sourcePattern.value.trim())
+        sourcePattern.value = r.arrival_source_pattern;
+      syncArrivalVisibility();
+      bits.push("this filename carries no 8-digit date, so it cannot land " +
+        "under it. Turned on Arrival and pre-filled the upstream pattern — " +
+        "now set the landing filename pattern above to the name you want " +
+        "(e.g. myfeed_(?P<business_date>\\d{8})\\.csv) and give the business " +
+        "date pattern in the control file");
+    }
     if (r.business_key_candidates && r.business_key_candidates.length)
       bits.push("business key candidate(s): " + r.business_key_candidates.join(", "));
     if (r.encoding_confidence === "low")
@@ -694,18 +821,29 @@ function feedForm(f, creating) {
         "Aborts the ingest below this count, leaving main untouched. Set it to something " +
         "an empty or truncated delivery would fail, not to the expected row count."),
       field("cadence", "Cadence", cadence,
-        "weekly stops the completeness check reporting every non-delivery day as a gap."),
+        "weekly stops the gap check reporting every non-delivery day as a gap."),
     ]),
     el("div", {class: "grid2"}, [
       field("schema_drift", "Schema drift", drift,
         "warn lands the file and records the drift; fail aborts the load. warn is usually " +
         "right — a rejected file is a file nobody looks at."),
       el("div", {class: "field"}, [
-        el("label", {}, "Completeness check"),
-        el("div", {class: "row"}, [completeness,
+        el("label", {}, "Delivery expected"),
+        el("div", {class: "row"}, [deliveryExpected,
           el("span", {class: "sub", style: "font-size:12px"},
-             "Unchecked opts the feed out of gap detection entirely (monthly or ad-hoc feeds).")]),
+             "Whether a delivery is expected on every business date. Unchecked opts the " +
+             "feed out of gap detection entirely (monthly or ad-hoc feeds).")]),
       ]),
+    ]),
+    el("div", {class: "grid2"}, [
+      field("expected_by", "Expected by", expectedBy,
+        "Wall-clock time (HH:MM, UTC) the upstream commits to, judged on the day AFTER the " +
+        "business date. Leave blank to assert no deadline \u2014 the lateness check then skips " +
+        "the feed rather than inventing an expectation for it."),
+      field("retention_class", "Retention class", retentionClass,
+        "How long this feed's landing and quarantine evidence is kept. The windows live in " +
+        "retention.yml; a class shorter than a report's tag window is refused for any feed " +
+        "that report is built from."),
     ]),
     el("div", {class: "grid2"}, [
       field("delimiter", "Delimiter", el("div", {class: "row"}, [delim, delimOther]),
@@ -747,6 +885,24 @@ function feedForm(f, creating) {
   // Mirrors ui.registry._delivery_from_payload: blanks are dropped here too,
   // so submitting the form twice without touching these fields produces the
   // same {} (or the same archive/control shape) both times.
+  // Mirrors ui.registry._arrival_from_payload: blanks dropped, and an
+  // unchecked box sends {} rather than a half-filled block, so toggling it
+  // off genuinely removes the feed's arrival: block on the next save.
+  const readArrival = () => {
+    if (!hasArrival.checked) return {};
+    const out = {};
+    const sp = sourcePattern.value.trim();
+    if (sp) out.source_pattern = sp;
+    const control = {};
+    for (const [k, input] of [["pattern", arrCtlPattern],
+                              ["business_date", arrCtlDate]]) {
+      const v = input.value.trim();
+      if (v) control[k] = v;
+    }
+    if (Object.keys(control).length) out.control = control;
+    return out;
+  };
+
   const readDelivery = () => {
     if (deliveryKind.value === "archive") {
       const d = {kind: "archive"};
@@ -758,6 +914,8 @@ function feedForm(f, creating) {
     const control = {pattern: pat};
     const rc = controlRowCount.value.trim();
     if (rc) control.row_count = rc;
+    const md5 = controlMd5.value.trim();
+    if (md5) control.md5 = md5;
     return {control};
   };
 
@@ -779,12 +937,15 @@ function feedForm(f, creating) {
       cadence: cadence.value,
       schema_drift: drift.value,
       convention: convention.value,
-      completeness: completeness.checked,
+      delivery_expected: deliveryExpected.checked,
+      expected_by: expectedBy.value.trim(),
+      retention_class: retentionClass.value,
       delimiter: readDelim(),
       quote_char: quote.value,
       file_encoding: encoding.value.trim(),
       header: hasHeader.checked,
       delivery: readDelivery(),
+      arrival: readArrival(),
     }),
     clearErrors: () => Object.values(errBoxes).forEach(e => e.textContent = ""),
     showErrors: (err) => {
@@ -814,17 +975,27 @@ function newFeed(draft) {
               "Writes feeds.yml, the dbt source, a prepared model and its tests — the " +
               "five files in docs/ADDING-A-FEED.md."));
   if (draft) {
-    // feedForm reads `f ? f.completeness : true` (a truthy-f check, not
-    // `f?.completeness ?? true`), so a draft that never sets `completeness`
-    // -- sniffing has no opinion on delivery cadence -- would silently
-    // uncheck it rather than default it, opting the new feed OUT of the
-    // completeness check with nothing on screen explaining why.
-    if (draft.completeness === undefined) draft.completeness = true;
+    // feedForm reads `f ? f.delivery_expected : true` (a truthy-f check, not
+    // `f?.delivery_expected ?? true`), so a draft that never sets
+    // `delivery_expected` -- sniffing has no opinion on delivery cadence --
+    // would silently uncheck it rather than default it, opting the new feed
+    // OUT of the gap check with nothing on screen explaining why.
+    if (draft.delivery_expected === undefined) draft.delivery_expected = true;
     const bits = [`Pre-filled by sniffing "${draft._sniffedFrom}".`];
     if (draft.business_key_candidates && draft.business_key_candidates.length)
       bits.push("business key candidate(s): " + draft.business_key_candidates.join(", "));
     if (draft.encoding_confidence === "low")
       bits.push(`encoding guessed as ${draft.file_encoding} -- low confidence, double-check it`);
+    if (draft.arrival_source_pattern) {
+      // Same shape readArrival() builds, so feedForm's f?.arrival?.* reads
+      // pick it up unchanged -- see the archive branch below.
+      draft.arrival = {source_pattern: draft.arrival_source_pattern,
+                       control: {pattern: "{stem}\\.ctl"}};
+      bits.push(`"${draft._sniffedFrom}" carries no 8-digit date, so it ` +
+        "cannot land under that name. Turned on Arrival and pre-filled the " +
+        "upstream pattern — set the landing filename pattern to the name you " +
+        "want, and give the business date pattern found in the control file");
+    }
     if (draft.archive_members) {
       // feedForm reads f?.delivery?.kind / f?.delivery?.member_pattern --
       // build that shape from the sniff proposal's own fields before handing

@@ -7,6 +7,53 @@
 # observed in the table, not calendar days. A skipped upstream day does not
 # silently shorten the retained window.
 
+# RETENTION CLASSES (REQ-600/601). A named EVIDENCE OBLIGATION a feed is in.
+#
+# Before this, `landing:` and `quarantine:` had one window each and every feed
+# was in it. That is the right default and the wrong only option: the reason
+# landing is kept for ten years is that a PUBLISHED figure must be reproducible
+# from what the upstream actually sent, and a feed behind no published report
+# does not carry that obligation. Keeping its evidence for a decade anyway is
+# not caution, it is a policy nobody chose.
+#
+# A FEED NAMES ITS CLASS IN feeds.yml; THE WINDOWS ARE HERE. The name is a
+# property of the feed and belongs beside it, inheritable through
+# `conventions:` because the obligation nearly always comes from the source
+# system. The years are a per-environment policy value and belong here with
+# every other one. Listing feed NAMES under each class here would create a
+# second registry of feeds that drifts from feeds.yml -- the failure deriving
+# reports from the dbt exposures exists to avoid.
+#
+# DECLARED ONCE, NOT PER ENVIRONMENT. A class declared in `local` and forgotten
+# in `dev` would make feeds.yml fail to load in dev alone, for a key that reads
+# perfectly well in the environment you are looking at. Each environment below
+# then gives windows only for the classes it wants to MOVE; anything it does
+# not mention falls back to that prefix's own `keep_years`.
+#
+# CLASSES GOVERN THE EVIDENCE PREFIXES ONLY -- `landing:` and `quarantine:`.
+# The raw/prepared/reporting keep-sets stay per LAYER: a table window says how
+# much history is queryable, which is a decision about a layer, and a per-feed
+# raw window would fight `find_pending`, which derives one keep-set per feed
+# from that feed's landing prefix.
+# See docs/DECISIONS.md#retention-classes-name-the-obligation
+retention_classes:
+  # `standard` is always available even if this block is deleted -- it is
+  # Feed.retention_class's default and the window every feed had before classes
+  # existed, so a retention.yml that declares nothing behaves as it always did.
+  standard:
+    description: >
+      Evidence behind a published report. Kept for the full reproducibility
+      window, and bound by check_reproducibility_window() to outlive the
+      published tags of every report this feed reaches.
+
+  operational:
+    description: >
+      Evidence for a feed that reaches no published report, so no published
+      figure is reproduced from it. Still kept long enough to stay coherent
+      with the raw layer's own window (80 month-ends is about 6.7 years), and
+      find_pending derives its keep-set from landing -- so this is shorter
+      than `standard`, not short.
+
 environments:
   local:   &full
     # THE EVIDENCE COPY. Flat age, not a keep-set: everything every feed ever
@@ -20,22 +67,84 @@ environments:
     # longer hold. Sampling it by keep-set would destroy exactly the evidence
     # it exists to preserve, for a saving on the cheapest bytes in the estate.
     #
-    # MUST BE >= the raw layer's window (keep_month_ends/12 years), or
-    # find_pending starts computing its keep-set from a landing prefix that no
-    # longer holds every date and treats live business dates as expired.
-    # landing.py warns if that is violated.
+    # TWO LOWER BOUNDS, and the second is the binding one now.
+    #
+    # >= the raw layer's window (keep_month_ends/12 years), or find_pending
+    # starts computing its keep-set from a landing prefix that no longer holds
+    # every date and treats live business dates as expired. landing.py WARNS
+    # if that is violated -- gradual, and recoverable by raising this.
+    #
+    # >= the longest `references.published_tags` window below, because a
+    # published tag pins the TABLES and landing is the only copy of what the
+    # upstream actually sent. A pin that outlives its landing evidence is a
+    # pin that cannot be fully honoured. retention.py REFUSES to sweep if that
+    # is violated -- unrecoverable, and the sweep runs nightly and unattended.
+    # Raised from 8 to 10 when the tag window was corrected; see
+    # docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
     landing:
-      keep_years: 8
+      # The class every feed is in unless it says otherwise.
+      keep_years: 10
+      classes:
+        # 7, not 10: nothing published is reproduced from an `operational`
+        # feed, so the published-tag interlock does not bind it. It is still
+        # above the raw layer's own window (keep_month_ends 80 = 6.7 years),
+        # because `find_pending` computes its keep-set per feed from that
+        # feed's landing prefix and a shorter window would start reporting
+        # live business dates as expired. That band -- under the pin window,
+        # over the raw window -- is the whole space a class has to move in.
+        operational: {keep_years: 7}
+
+    # REFUSED DELIVERIES (REQ-106). What an upstream sent that the conformance
+    # gate would not accept: an unroutable name, a name two feeds claim, a
+    # delivery that cannot be given a landing name at all. The bytes go to
+    # `quarantine/` and `registry.rejection` says what was wrong with them.
+    #
+    # THE SAME CLASS OF EVIDENCE AS `landing:`, and kept the same way -- flat
+    # age, everything, no keep-set -- because it answers the same question
+    # from the other side: "what did they actually send us?", asked about a
+    # delivery that never arrived. A rejected file is frequently the whole
+    # explanation for a missing business date, and the explanation is needed
+    # for as long as the date it is missing from.
+    #
+    # A SEPARATE KEY, not a reference to landing's, even though the value is
+    # the same today. The two windows answer to different things: landing's
+    # has a hard floor from the published-tag interlock and the raw keep-set,
+    # and this one has neither -- nothing is reproduced from a delivery that
+    # never landed. Shortening this is a policy call somebody can make on its
+    # own; shortening landing is not.
+    #
+    # Dated from the object's own key -- `quarantine/<feed>/<yyyy>/<mm>/...`
+    # -- because a quarantined file frequently has no parsable business date,
+    # not being nameable being a common reason it is here at all.
+    quarantine:
+      keep_years: 10
+      # NO `classes:` HERE, and the absence is the point. A class that shortens
+      # `landing:` and says nothing about quarantine gets quarantine's own
+      # window, because the two answer to different things -- this block's
+      # comment above already says quarantine has neither of landing's hard
+      # floors. A rejected delivery explains a missing business date whether or
+      # not the feed is behind a published report, so there is no reason yet
+      # for `operational` to shorten it. Add an entry here if that changes.
 
     # THE WORK QUEUE, and a cache: manifests and any parts a normalizer
     # derived, all rebuildable by re-normalizing from landing/. Days, not
     # years, and unlike `landing:` it constrains nothing -- nothing computes
-    # a keep-set from it. The only floor is operational: comfortably longer
-    # than `arrival_timeout_hours` (26h), or a delivery could be swept
-    # between being normalized and being ingested by a late run.
+    # a keep-set from it, and it has no correctness floor either.
     #
-    # A manifest whose parts are not yet in the raw table is never swept
-    # regardless of age. See reporting_platform/retention/ready.py.
+    # IT GOVERNS THE DERIVED PARTS, NOT THE MANIFESTS. A manifest whose
+    # landing object is still there is kept at any age, because
+    # normalize.reconcile recreates one for every landing object that lacks
+    # one -- sweeping it was a nightly no-op that both subsystems logged as
+    # success (157 deleted, 157 re-created, 0 newly registered, in one run) --
+    # and because deliveries.reconcile rebuilds the registry FROM manifests.
+    # A manifest goes when landing has let its object go. So what this number
+    # actually bounds is an extracted archive member: the second copy of data
+    # landing already holds. On a queue of plain CSVs it bounds nothing,
+    # because their parts point back into landing/ and nothing was copied.
+    #
+    # What protects a delivery waiting to be ingested is not this number
+    # either: a manifest whose parts are not yet in the raw table keeps its
+    # parts at any age. See reporting_platform/retention/ready.py.
     ready:
       keep_days: 7
 
@@ -66,8 +175,15 @@ environments:
   # the ability to reproduce a production month-end issue in a lower
   # environment without an explicit restore procedure.
   dev:
-    landing:   {keep_years: 1}
-    ready:     {keep_days: 2}
+    landing:
+      keep_years: 1
+      # dev shortens everything to a year, so `operational` has nowhere below
+      # that to go -- but it is written down rather than left to fall back, so
+      # `class_keep_years` reads the same shape in every environment.
+      classes:
+        operational: {keep_years: 1}
+    quarantine: {keep_years: 1}
+    ready:      {keep_days: 2}
     raw:       {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
     prepared:  {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 2, snapshot_retain_last: 3}
     reporting: {keep_business_days: 5, keep_month_ends: 3, snapshot_retention_days: 5, snapshot_retain_last: 3}
@@ -76,10 +192,98 @@ environments:
 # commit pins every data file that commit referenced, and expire_snapshots
 # cannot reclaim it.
 references:
-  # published/<business_date>/<run_id> — cut on main after each publication
+  # published/<report>/<business_date>/<run_id> — cut on main by
+  # dbt_builds.publish, once per report, when a REPORTING build merges.
+  # The two-segment `published/<business_date>/<run_id>` shape is still
+  # matched by the sweep, because tags cut under it before publication knew
+  # its report are real pins; nothing writes it any more.
+  #
+  # FLAT AGE IN YEARS, NOT A KEEP-SET, and that is the whole point of this
+  # block. It was `keep_business_days: 10 / keep_month_ends: 80` — the numbers
+  # the TABLES use — which is a category error: a table window says how much
+  # history is queryable today, a tag says how far back a published result can
+  # be REPRODUCED. Under the old values an ordinary daily publication lost its
+  # pin after ten more published business dates, roughly a fortnight, and
+  # month-end pins lasted 80/12 ≈ 6.7 years against a period assumed to be
+  # longer than that. The evidence was expiring on the wrong schedule and had
+  # been since publication started.
+  #
+  # `landing:` above is the same kind of object and already says why: it is
+  # the evidence copy, kept by flat age, because "sampling it by keep-set
+  # would destroy exactly the evidence it exists to preserve".
+  #
+  # A tag pins every data file its commit referenced. Verified against the
+  # running Nessie: a tag's own state stays live at ANY `nessie_gc`
+  # `default_cutoff` — even P0D — because the identify phase walks each
+  # reference from its HEAD and the cutoff only bounds how much history
+  # BEHIND it stays live. So the tag's lifetime, set here, is the only thing
+  # that decides whether a published run can still be reproduced.
+  # See docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
   published_tags:
-    keep_business_days: 10
-    keep_month_ends: 80
+    # Applies to every tag with no `per_report` entry, which today is all of
+    # them — nothing cutting a tag yet knows which report it is for.
+    #
+    # TEN YEARS IS PROVISIONAL. The regulatory period is not confirmed, and
+    # over-retaining tags costs storage while under-retaining costs the
+    # evidence permanently, so this is deliberately the longest plausible
+    # value rather than the assumed seven. Confirm it and revisit.
+    #
+    # A bare number or a map keyed by REPORTING_ENV, like
+    # `nessie_gc.deferred_delete_after_hours` below. It is a map because
+    # `landing.keep_years` is per environment and `dev` deliberately shortens
+    # it: a globally fixed window would leave dev pinning published runs for a
+    # decade whose source evidence it discarded after a year, and the
+    # interlock would then refuse every dev sweep.
+    default_keep_years:
+      local: 10
+      dev: 1          # matches dev's landing keep_years, which is also 1
+      uat: 10
+      prod: 10
+
+    # Per-report windows, for reports whose period genuinely differs. The key
+    # is the report name as it appears in the tag — which is a dbt EXPOSURE
+    # name, since that is what the platform derives its reports from
+    # (`context.reports()`). Anything not listed gets `default_keep_years`.
+    #
+    # THIS NOW MATCHES SOMETHING. A reporting build cuts one tag per report,
+    # so naming `counterparty_exposure_report` here gives that report its own
+    # window. Left empty because no report has yet declared a period that
+    # differs from the default, and inventing one would be a policy nobody
+    # made.
+    #
+    # A value below `default_keep_years` is allowed — a shorter period can be
+    # a real answer — but it is logged loudly, because it is the direction
+    # that loses evidence.
+    per_report: {}
+
+  # snapshot/<feed>/<business_date>/<run_id> — cut on main by the ingest DAG
+  # after each feed's delivery is merged.
+  #
+  # A DIFFERENT OBJECT FROM A PUBLISHED TAG, and the split is the point. This
+  # used to be cut as `published/<bd>/<run_id>`, so an ingest was indexed,
+  # retained and monitored as though it were a report publication: it was kept
+  # for the full ten-year reproducibility window, it was what every
+  # `published/` check actually examined, and because the name carried no feed
+  # the sweep could not tell one feed's ingest from another's.
+  #
+  # NOTHING IS REPRODUCED FROM ONE. No published figure rests on a snapshot
+  # tag, so this window is a storage decision rather than an evidence one: it
+  # buys the ability to read a raw business date back after retention has
+  # removed it from the live table, and it costs every data file that ingest
+  # referenced staying unreclaimable for the duration. Set to comfortably
+  # outlive the raw keep-set (80 month-ends ≈ 6.7 years is the long tail there)
+  # without approaching the published window.
+  #
+  # It is NOT bound by the landing interlock. That interlock exists because a
+  # PUBLISHED run must be able to show the files it was built from, and
+  # landing is the only copy of those. Nothing claims that of a snapshot.
+  snapshot_tags:
+    keep_years:
+      local: 7
+      dev: 1          # matches dev's landing and published windows
+      uat: 7
+      prod: 7
+
   # ingest/* and build/* working branches
   working_branches:
     # NOT READ BY ANY CODE. ingest_feed.py deletes the branch immediately

@@ -21,7 +21,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from reporting_platform.common.context import CATALOG, conventions, feeds
+from reporting_platform.common.context import (CATALOG, conventions, feeds,
+                                               retention_classes)
 from . import (dbt_check, feeddata, feedtest, jobs, orchestration,
                registry, sampledata, scaffold)
 from .registry import FeedSpec, FeedValidationError
@@ -103,12 +104,42 @@ def _summary(fd) -> dict[str, Any]:
         # back. The choice survived exactly one scaffold call. See
         # Feed.column_types in common/context.py for what that cost.
         "column_types": scaffold.resolve_types(fd),
+        # THE SAME BUG column_types had, in five more fields. The form reads
+        # `f?.delimiter ?? ","`, `f?.file_encoding ?? "utf-8"` and so on, so a
+        # key missing here is not invisible -- the form shows the DEFAULT, and
+        # posts it back. One edit of a pipe-delimited latin-1 feed through the
+        # console silently rewrote it to comma/utf-8 and dropped its
+        # `source_columns`; the ingest then lands one column holding the whole
+        # row, and the renamed columns land NULL. Demonstrated before fixing.
+        #
+        # `_block` only writes a key that differs from what is inherited,
+        # which is what made it silent: the feed's own `delimiter: "|"` was
+        # REMOVED rather than changed, leaving a diff that reads as tidying up.
+        "delimiter": fd.delimiter,
+        "quote_char": fd.quote_char,
+        "header": fd.header,
+        "file_encoding": fd.file_encoding,
+        "source_columns": dict(fd.source_columns or {}),
         "expected_min_rows": fd.expected_min_rows,
         "cadence": fd.cadence,
-        "completeness": fd.completeness,
+        "delivery_expected": fd.delivery_expected,
+        # REQ-201 and REQ-600. Both are plain scalars on the feed rather than
+        # blocks, but they are subject to the same rule as everything above:
+        # the form posts back what this endpoint gave it, so an omission here
+        # is a silent revert to the inherited value on the next save.
+        "expected_by": fd.expected_by,
+        "retention_class": fd.retention_class,
         "schema_drift": fd.schema_drift,
         "convention": fd.convention,
         "delivery": dict(fd.delivery or {}),
+        # EVERY BLOCK THE FORM CAN EDIT HAS TO COME BACK OUT OF HERE. The edit
+        # form populates itself from this endpoint and posts what it read, so
+        # a block omitted here is not merely invisible -- `readArrival()` sees
+        # an unchecked box, sends {}, and the next save DELETES the feed's
+        # arrival block from feeds.yml in a diff that looks deliberate. That
+        # is the same failure `column_types` had above, and it is caught by
+        # tests/test_conform.py's serialiser round-trip.
+        "arrival": dict(fd.arrival or {}),
         "raw_table": fd.raw_table,
         "asset_uri": fd.asset_uri,
         "landing_prefix": f"{fd.landing_prefix}/{fd.name}/",
@@ -129,8 +160,13 @@ def api_feeds():
     # a closed list. A free-text field here would make a typo an invisible
     # revert to `defaults:` -- the feed would load, and read its files with the
     # wrong delimiter.
+    # `retention_classes` rides along for the same reason `conventions` does,
+    # and with a sharper edge: a class name feeds.yml carries but retention.yml
+    # does not declare is refused at LOAD, so a free-text field here would let
+    # the console write a feeds.yml the next Airflow parse will not read.
     return {"catalog": CATALOG,
             "conventions": sorted(conventions()),
+            "retention_classes": sorted(retention_classes()),
             "feeds": [_summary(fd) for fd in feeds().values()]}
 
 

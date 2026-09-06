@@ -8,6 +8,21 @@ models:
       divergence between apps shows up in the lineage graph instead of
       hiding in 23 separate stored procedures.
     columns:
+      # THE MIGRATION GUARD FOR delivery_id. `source_provenance()` projects
+      # `delivery_ref()`, which coalesces `_delivery_id` with the basename of
+      # `_source_file` -- and every raw row has a `_source_file` -- so after
+      # that macro landed there is no legitimate NULL here. A NULL means one
+      # thing only: this table has not been rebuilt since, so its history
+      # cannot say which delivery each row came from, and a run record built
+      # from it would enumerate an incomplete input set without saying so.
+      #
+      # A macro change reaches only the models rebuilt after it. That is the
+      # failure `ingest/migrate_raw.py` exists for one layer down; this is the
+      # prepared layer's version, and the fix is a `dbt build --full-refresh
+      # --select path:models/prepared` on a branch. Failing the build is the
+      # point -- an unmigrated prepared table must not publish.
+      - name: delivery_id
+        tests: [not_null]
       # SCD2: there is no business_date on this table any more. One row per
       # VERSION, addressed point-in-time with the as_of() macro.
       - name: counterparty_id
@@ -52,6 +67,10 @@ models:
   - name: fo_trade
     description: Conformed, typed trade positions. No joins, no report opinions.
     columns:
+      # See ref_counterparty: a NULL here means this table predates
+      # `delivery_ref()` and has not been rebuilt since.
+      - name: delivery_id
+        tests: [not_null]
       - name: business_date
         tests: [not_null]
       - name: trade_id
@@ -78,6 +97,10 @@ models:
   - name: ref_rating
     description: Agency ratings with numeric rank and grade band.
     columns:
+      # See ref_counterparty: a NULL here means this table predates
+      # `delivery_ref()` and has not been rebuilt since.
+      - name: delivery_id
+        tests: [not_null]
       - name: counterparty_id
         tests: [not_null]
       - name: agency
@@ -121,6 +144,10 @@ models:
     # right. Add accepted_values / accepted_range for this feed's
     # domain, or it will publish whatever it is given.
     columns:
+      # See ref_counterparty: a NULL here means this table predates
+      # `delivery_ref()` and has not been rebuilt since.
+      - name: delivery_id
+        tests: [not_null]
       - name: business_date
         tests: [not_null]
       - name: collateral_id

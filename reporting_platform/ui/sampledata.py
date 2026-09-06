@@ -43,6 +43,7 @@ from typing import Any
 from reporting_platform.common.volatility import (
     epoch, epoch_start, hold_for_type, stable_rng)
 from reporting_platform.common.context import Feed, feeds
+from reporting_platform.common.filenames import FilenameError, render_filename
 
 from .feeddata import SEED_DIR, seed_dir
 from .scaffold import infer_types
@@ -58,93 +59,25 @@ class GenerationError(ValueError):
 
 
 # ------------------------------------------------------------------ filenames
+# MOVED to common/filenames.py, because the inbox gate needs it too: a legacy
+# upstream sends `positions.csv`, `landing/` accepts only correctly named
+# deliveries, and the rename between them must produce a name
+# `parse_filename` accepts. That is a platform concern now, not a console one,
+# and `ui/` is the wrong place for the inbox to import from.
+#
+# Re-exported under its old name so this module's callers -- and the round-trip
+# check in `generate()` -- read as they did.
 def filename_for(feed: Feed, business_date: date, version: int | None = None) -> str:
-    """Render a filename the feed's own pattern will match.
-
-    Building a string from a regex is not possible in general, and this does
-    not pretend otherwise: it walks the pattern handling only the constructs
-    the platform's patterns actually use -- the two named groups, escaped
-    literals, and an optional non-capturing group -- and gives up on anything
-    else.
-
-    THE RESULT IS THEN CHECKED with `feed.parse_filename`. That check is the
-    point: a generated name that does not round-trip would produce files that
-    land and are never ingested, which is the silent failure this console
-    exists to prevent. Better to refuse and say so.
-    """
-    out: list[str] = []
-    i, pattern = 0, feed.filename_pattern
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "\\":                       # escaped literal: \. \_ \-
-            if i + 1 >= len(pattern):
-                raise GenerationError("filename_pattern ends in a backslash")
-            out.append(pattern[i + 1]); i += 2; continue
-        if pattern.startswith("(?P<business_date>", i):
-            j = _closing_paren(pattern, i)
-            out.append(f"{business_date:%Y%m%d}"); i = j + 1; continue
-        if pattern.startswith("(?P<version>", i):
-            j = _closing_paren(pattern, i)
-            out.append(str(version or 1)); i = j + 1; continue
-        if pattern.startswith("(?:", i):
-            j = _closing_paren(pattern, i)
-            optional = j + 1 < len(pattern) and pattern[j + 1] == "?"
-            inner = pattern[i + 3:j]
-            if "(?P<version>" in inner and version is not None:
-                # The re-delivery marker: render it only when a version was
-                # asked for, so a v1 file is `FEED_20260819.csv` and not
-                # `FEED_20260819_v1.csv`.
-                out.append(_render_inner(inner, business_date, version))
-            elif not optional:
-                out.append(_render_inner(inner, business_date, version))
-            i = j + (2 if optional else 1); continue
-        if ch in "[]*+?{}()|^$.":
-            raise GenerationError(
-                f"cannot build a filename from this pattern: it uses {ch!r}, "
-                f"which has no single literal form. Upload a CSV instead, or "
-                f"simplify the pattern.")
-        out.append(ch); i += 1
-
-    candidate = "".join(out)
-    parsed = feed.parse_filename(candidate)
-    if parsed is None or parsed[0] != business_date:
-        raise GenerationError(
-            f"generated name {candidate!r} does not match the feed's own "
-            f"pattern ({feed.filename_pattern}). Refusing to write a file that "
-            f"would land and never be ingested.")
-    return candidate
-
-
-def _render_inner(inner: str, business_date: date, version: int | None) -> str:
-    out: list[str] = []
-    i = 0
-    while i < len(inner):
-        if inner[i] == "\\":
-            out.append(inner[i + 1]); i += 2; continue
-        if inner.startswith("(?P<version>", i):
-            j = _closing_paren(inner, i)
-            out.append(str(version or 1)); i = j + 1; continue
-        if inner.startswith("(?P<business_date>", i):
-            j = _closing_paren(inner, i)
-            out.append(f"{business_date:%Y%m%d}"); i = j + 1; continue
-        if inner[i] in "[]*+?{}()|^$.":
-            raise GenerationError("unsupported construct inside an optional group")
-        out.append(inner[i]); i += 1
-    return "".join(out)
-
-
-def _closing_paren(s: str, start: int) -> int:
-    depth = 0
-    for i in range(start, len(s)):
-        if s[i] == "\\":
-            continue
-        if s[i] == "(":
-            depth += 1
-        elif s[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-    raise GenerationError("unbalanced parentheses in filename_pattern")
+    """Render a filename the feed's own pattern will match. See
+    common/filenames.render_filename for how, and why the round-trip check
+    that backs it is the whole point."""
+    try:
+        return render_filename(feed, business_date, version)
+    except FilenameError as exc:
+        # One exception type per layer: callers here already handle
+        # GenerationError, and a FilenameError escaping would reach the API as
+        # a 500 rather than the message the form shows.
+        raise GenerationError(str(exc)) from exc
 
 
 # ----------------------------------------------------------------- the dates

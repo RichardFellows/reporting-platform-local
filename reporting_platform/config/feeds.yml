@@ -14,8 +14,6 @@ defaults:
   # it. See docs/DELIVERY-SHAPES.md.
   ready_prefix: ready
   raw_namespace: raw
-  arrival_poke_seconds: 60
-  arrival_timeout_hours: 26      # deliberately > 24h: a feed is late, not lost
   file_encoding: utf-8
   delimiter: ","
   quote_char: '"'
@@ -34,6 +32,13 @@ defaults:
   # until then nothing read this setting at all and 'fail' was silently
   # identical to 'warn').
   schema_drift: warn
+  # REQ-600/601. Which EVIDENCE OBLIGATION a feed's landing and quarantine
+  # objects are under. Declared in retention.yml, which is also where the
+  # windows live -- the name is a property of the feed and the years are a
+  # per-environment policy, so they are deliberately in different files.
+  # `standard` is the reproducibility window: what a published report is
+  # reproduced from. See docs/DECISIONS.md#retention-classes-name-the-obligation
+  retention_class: standard
 
 # A middle tier between `defaults:` above and a feed block below:
 # defaults -> convention -> feed, each layer overriding the last.
@@ -54,6 +59,17 @@ conventions:
     # The three reference feeds are one delivery arrangement, not three.
     source_system: REF_SRC
     expected_min_rows: 10
+    # REQ-201. The wall-clock time by which the upstream has agreed a delivery
+    # will have ARRIVED. One arrangement, one time -- which is the case for
+    # putting it on the convention rather than repeating it on three feeds
+    # that would then drift apart.
+    #
+    # QUOTED, and it has to be. Unquoted, YAML 1.1 reads a time as SEXAGESIMAL
+    # -- `7:30` is the integer 450. A LEADING ZERO happens to block pyyaml's
+    # resolver, so `07:30` would survive unquoted and `9:30` would not, which
+    # is worse than if it never worked: it would hold until the first hour
+    # somebody did not pad. `parse_expected_by` refuses a non-string saying so.
+    expected_by: "07:30"
 
 feeds:
 
@@ -63,6 +79,8 @@ feeds:
     filename_pattern: 'TRADE_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [trade_id]
     expected_min_rows: 100
+    # The front office closes and extracts before the reference systems do.
+    expected_by: "06:30"
     columns:
       - trade_id
       - counterparty_id
@@ -92,7 +110,7 @@ feeds:
     description: External agency credit ratings.
     filename_pattern: 'RATING_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [counterparty_id, agency]
-    # Agency ratings arrive weekly, not daily. Without this the completeness
+    # Agency ratings arrive weekly, not daily. Without this the gap
     # check infers the business calendar from the daily feeds and
     # reports every non-delivery day as a gap -- it did exactly that on its
     # first run, five false gaps in a ten-day window. `weekly` asks only that
@@ -110,6 +128,17 @@ feeds:
       system.
     filename_pattern: 'COLLATERAL_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [collateral_id]
+    # BEHIND NO PUBLISHED REPORT. `feeds_behind_report` walks the exposures'
+    # ref() closure and this feed is in neither report's lineage, so no
+    # published figure is reproduced from its evidence and the published-tag
+    # interlock does not bind it. `operational` is 7 years rather than 10 --
+    # still above the raw layer's own window, which find_pending needs.
+    #
+    # THIS IS A POLICY STATEMENT, not a tuning knob: if a report ever ref()s
+    # prepared.ref_collateral, check_reproducibility_window() will refuse the
+    # nightly sweep until this is moved back to `standard`. That refusal is
+    # the mechanism -- the class cannot silently outlive its correctness.
+    retention_class: operational
     columns:
       - collateral_id
       - counterparty_id

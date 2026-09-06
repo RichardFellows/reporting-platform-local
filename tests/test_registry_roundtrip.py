@@ -90,3 +90,26 @@ def test_clearing_a_convention_pins_what_it_supplied():
     assert "convention:" not in blk, blk
     assert "source_system: REF_SRC" in blk, blk
     assert "expected_min_rows: 10" in blk, blk
+
+
+def test_a_hand_written_supersession_block_survives_a_console_save():
+    """The console has no supersession field, and that is exactly why this
+    matters. `update()` rewrites only the keys in BLOCK_ORDER, so a key the
+    UI does not manage must come through untouched -- otherwise declaring a
+    feed's supersession in feeds.yml and then editing that feed in the console
+    would silently delete the declaration and return the feed to the default,
+    which is the mode whose whole purpose is to be stated rather than assumed.
+    """
+    d, registry, feeds = _setup()
+    path = d / "feeds.yml"
+    text = path.read_text()
+    # Hand-add the block the way somebody would, under the first feed.
+    marker = "  - name: fo_trade\n"
+    assert marker in text
+    path.write_text(text.replace(
+        marker, marker + "    supersession:\n      mode: full_snapshot\n", 1))
+
+    registry.update(registry.spec_from_feed(feeds()["fo_trade"]))
+    after = path.read_text()
+    assert "supersession:" in after, "the console dropped a key it does not manage"
+    assert feeds()["fo_trade"].supersession_mode == "full_snapshot"

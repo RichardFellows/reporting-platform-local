@@ -23,6 +23,8 @@ Usage:
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
     python -m scripts._spark_task completeness [lookback_business_days]
+    python -m scripts._spark_task reproducibility [published_tag]
+    python -m scripts._spark_task run-inputs <branch>
 
 `pending` returns MANIFEST keys under ready/; `ingest` takes one of those or a
 landing object key. See reporting_platform/ingest/normalize.py.
@@ -32,6 +34,44 @@ from __future__ import annotations
 import json
 import sys
 from datetime import date
+
+
+def run(*args: str) -> dict:
+    """Launch one of the operations below in a child process; parse its JSON.
+
+    THE CALLER SIDE LIVES BESIDE THE CALLEE SIDE, so the argument list and the
+    dispatch table below cannot drift. It was a private helper in
+    `feed_ingest.py`, and the build DAG needed the same thing -- a second copy
+    is how two launchers end up parsing output two different ways.
+
+    Importing this module costs nothing: it pulls in json, sys and datetime,
+    and every Spark import is inside the branch that needs it. Nothing here
+    starts a JVM in the calling process, which is the whole point of the
+    module (docs/DECISIONS.md#spark-in-a-subprocess).
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts._spark_task", *args],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        # Head of the last traceback as well as the tail: a Py4JJavaError's
+        # Java stack pushes the exception MESSAGE off the front of a tail-only
+        # budget. See docs/DECISIONS.md#log-tail-plus-head
+        err = proc.stderr or ""
+        cut = err.rfind("Traceback (most recent call last)")
+        head = err[cut:cut + 2500] if cut >= 0 else ""
+        tail = ((proc.stdout or "")[-1500:] + "\n" + head
+                + "\n...\n" + err[-2000:])
+        raise RuntimeError(
+            f"spark task {args!r} failed (exit {proc.returncode})\n{tail}")
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    raise RuntimeError(
+        f"spark task {args!r} produced no JSON:\n{(proc.stdout or '')[-1500:]}")
 
 
 def main() -> int:
@@ -60,6 +100,13 @@ def main() -> int:
         print(json.dumps(result, default=str))
         return 0
 
+    if op == "migrate-raw":
+        from reporting_platform.ingest.migrate_raw import migrate
+
+        dry = len(sys.argv) > 2 and sys.argv[2] == "dry"
+        print(json.dumps(migrate(dry_run=dry), default=str))
+        return 0
+
     if op == "maintain":
         from reporting_platform.maintenance.maintain import run
 
@@ -80,6 +127,22 @@ def main() -> int:
 
         lookback = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
         print(json.dumps(run(lookback), default=str))
+        return 0
+
+    if op == "reproducibility":
+        from reporting_platform.monitoring.reproducibility import run
+
+        tag = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+        print(json.dumps(run(tag), default=str))
+        return 0
+
+    if op == "run-inputs":
+        # REQ-400. Which deliveries the build on this branch actually read,
+        # read from the branch itself before it is merged. See
+        # reporting_platform/registry/inputs.py.
+        from reporting_platform.registry.inputs import collect
+
+        print(json.dumps(collect(sys.argv[2]), default=str))
         return 0
 
     if op == "retention":

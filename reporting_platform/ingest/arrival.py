@@ -54,6 +54,75 @@ def list_landing(feed: Feed) -> list[str]:
     return [o["Key"] for o in sorted(objs, key=lambda o: o["LastModified"])]
 
 
+def landed_md5_lookup(feed: Feed, keys: Iterable[str]):
+    """`landing_filename -> md5 of the delivery landed under it, or None`.
+
+    What lets the conformance gate tell an unchanged RESEND from a genuine
+    correction. `taken` says the name is used; only the bytes say by what.
+    See `conform._free_name` and `conform.DuplicateDelivery`.
+
+    TWO SOURCES, IN THIS ORDER, and the second is not redundant. The metadata
+    sibling already records `md5` measured at the door, so the ordinary case
+    costs one small GET. But `inbox._promote` writes the data file BEFORE the
+    metadata and treats a failed metadata write as the survivable failure --
+    "the delivery is complete and will ingest with its provenance missing" --
+    and an object an approved sender wrote straight into `landing/` has no
+    sibling at all. Falling back to hashing the landed object covers both,
+    and covers everything landed before this function existed.
+
+    **None means UNKNOWN, and unknown must not be read as "different".** The
+    caller versions on None, which is the fail-open direction: an unnecessary
+    `_v2` costs one object, and a suppressed restatement loses evidence.
+
+    `keys` is the feed's landing listing, which the caller already has -- so a
+    name with nothing landed under it costs no request at all. Results are
+    cached: a resend walks the same candidate more than once.
+    """
+    from reporting_platform.ingest import conform
+
+    prefix = f"{feed.landing_prefix}/{feed.name}/"
+    present = set(keys)
+    cache: dict[str, str | None] = {}
+
+    def lookup(filename: str) -> str | None:
+        if filename in cache:
+            return cache[filename]
+        cache[filename] = md5 = _md5_of_landed(prefix, filename, present,
+                                               conform.METADATA_SUFFIX)
+        return md5
+
+    return lookup
+
+
+def _md5_of_landed(prefix: str, filename: str, present: set[str],
+                   metadata_suffix: str) -> str | None:
+    import hashlib
+    import json
+
+    client = _client()
+    sidecar = f"{prefix}{filename}{metadata_suffix}"
+    if sidecar in present:
+        try:
+            body = client.get_object(Bucket=_bucket(), Key=sidecar)["Body"].read()
+            recorded = json.loads(body).get("md5")
+            if recorded:
+                return str(recorded)
+        except Exception as exc:                            # noqa: BLE001
+            # Unreadable or malformed metadata is not a reason to refuse the
+            # delivery -- fall through to the object itself.
+            log.warning("cannot read %s: %s", sidecar, str(exc)[:200])
+
+    key = f"{prefix}{filename}"
+    if key not in present:
+        return None
+    try:
+        body = client.get_object(Bucket=_bucket(), Key=key)["Body"].read()
+    except Exception as exc:                                # noqa: BLE001
+        log.warning("cannot read %s: %s", key, str(exc)[:200])
+        return None
+    return hashlib.md5(body).hexdigest()
+
+
 def matching(feed: Feed, keys: Iterable[str]) -> list[str]:
     """Keys whose filename matches the feed's declared pattern."""
     out = []
@@ -195,4 +264,20 @@ def put_landing(feed: Feed, local_path: str, filename: str | None = None) -> str
     name = filename or os.path.basename(local_path)
     key = f"{feed.landing_prefix}/{feed.name}/{name}"
     _client().upload_file(local_path, _bucket(), key)
+    return key
+
+
+def put_landing_bytes(feed: Feed, filename: str, body: bytes,
+                      content_type: str = "") -> str:
+    """Write bytes into the feed's landing prefix under a chosen name.
+
+    The conformance gate needs this rather than `put_landing`: it uploads
+    content it already holds, under a name it DERIVED, and it also writes a
+    metadata sibling that exists only in memory. `put_landing` takes a local
+    path and defaults the key to that file's own basename, which is exactly
+    the coupling the gate has to break.
+    """
+    key = f"{feed.landing_prefix}/{feed.name}/{filename}"
+    kwargs = {"ContentType": content_type} if content_type else {}
+    _client().put_object(Bucket=_bucket(), Key=key, Body=body, **kwargs)
     return key

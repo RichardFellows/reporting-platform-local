@@ -42,6 +42,13 @@ def config_dir(feeds_yml: str | None = None) -> pathlib.Path:
         else (CONFIG / "feeds.yml").read_text(encoding="utf-8"), encoding="utf-8")
     shutil.copy(CONFIG / "retention.yml", d / "retention.yml")
     os.environ["REPORTING_CONFIG_DIR"] = str(d)
+    # The REAL dbt project, not a copy. `reports()`, `managed_tables()` and
+    # `feeds_behind_report()` are derivations from the project directory, and
+    # since phase 7 the retention interlock walks that lineage -- so a config
+    # test that does not set this reads /opt/platform/dbt, which exists in the
+    # image and not on a laptop. It is deliberately not copied: the project is
+    # what these tests are pinning, and a copy would let it drift.
+    os.environ.setdefault("DBT_PROJECT_DIR", str(REPO / "dbt"))
     _purge()
     return d
 

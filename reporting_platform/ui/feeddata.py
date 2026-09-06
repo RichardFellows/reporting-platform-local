@@ -70,15 +70,27 @@ def list_seed(feed: Feed) -> list[dict[str, Any]]:
 
 
 def list_landed(feed: Feed) -> list[dict[str, Any]]:
-    """Objects under the feed's landing prefix. S3 only, no Spark."""
+    """Objects under the feed's landing prefix. S3 only, no Spark.
+
+    A metadata sibling written by the conformance gate is shown as what it is
+    rather than as an unmatched object. `matches: false` is this console's
+    warning that a file will land and never be ingested; showing it for the
+    `.meta.json` beside every conformed delivery would make that warning
+    meaningless exactly where a legacy feed needs it most.
+    """
+    from reporting_platform.ingest import conform
+
     out = []
     for key in list_landing(feed):
         name = key.rsplit("/", 1)[-1]
-        parsed = feed.parse_filename(name)
+        is_meta = conform.is_metadata_key(name)
+        parsed = feed.parse_filename(
+            conform.delivery_of_metadata(name) if is_meta else name)
         out.append({
             "key": key,
             "filename": name,
             "matches": parsed is not None,
+            "metadata_file": is_meta,
             "business_date": parsed[0].isoformat() if parsed else None,
             "version": parsed[1] if parsed else None,
         })

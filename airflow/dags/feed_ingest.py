@@ -6,7 +6,7 @@ received* — there is no single batch run that processes all feeds together.
 Adding a feed means adding a block to feeds.yml. No DAG file is edited.
 
 Each DAG:
-  resolve_arrival -> normalize -> ingest (Spark) -> publish (Nessie merge + tag)
+  resolve_arrival -> normalize -> ingest (Spark) -> snapshot (Nessie merge + tag)
 and emits an Asset on completion, which is what triggers the dbt builds.
 
 `normalize` is the stage that turns whatever the upstream actually delivered
@@ -55,33 +55,15 @@ def _spark_subprocess(*args: str) -> dict:
     In OpenShift this becomes a
     KubernetesPodOperator issuing spark-submit -- same module, same arguments,
     a different execution wrapper, and the same process-isolation property.
-    """
-    import json
-    import subprocess
-    import sys
 
-    proc = subprocess.run(
-        [sys.executable, "-m", "scripts._spark_task", *args],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        # Head of the last traceback as well as the tail: a Py4JJavaError's Java
-        # stack pushes the exception MESSAGE off the front of a tail-only
-        # budget. See docs/DECISIONS.md#log-tail-plus-head
-        err = proc.stderr or ""
-        cut = err.rfind("Traceback (most recent call last)")
-        head = err[cut:cut + 2500] if cut >= 0 else ""
-        tail = ((proc.stdout or "")[-1500:] + "\n" + head
-                + "\n...\n" + err[-2000:])
-        raise RuntimeError(
-            f"spark task {args!r} failed (exit {proc.returncode})\n{tail}"
-        )
-    for line in reversed((proc.stdout or "").strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            return json.loads(line)
-    raise RuntimeError(
-        f"spark task {args!r} produced no JSON:\n{proc.stdout[-1500:]}")
+    The implementation moved to `scripts/_spark_task.run` when the build DAG
+    needed the same launcher: the argument list and the dispatch table it
+    feeds belong in one file, or two copies of this eventually parse the same
+    output differently.
+    """
+    from scripts._spark_task import run
+
+    return run(*args)
 
 
 def build_feed_dag(feed):
@@ -146,8 +128,11 @@ def build_feed_dag(feed):
             of docs/DELIVERY-SHAPES.md) SKIPS rather than fails. `DEFAULT_ARGS`
             retries twice at `RETRY_DELAY` -- seconds, tuned for a transient
             infra hiccup -- which would turn "the control file has not landed
-            yet" into a hard failure long before `arrival_timeout_hours` (26h)
-            says this delivery is actually late. Skipping leaves this run
+            yet" into a hard failure in well under a minute, for the
+            ordinary case this whole mechanism exists to handle gracefully.
+            Nothing declares when a delivery is actually late -- there is no
+            timeout here, by decision, see
+            docs/DECISIONS.md#no-arrival-timeout. Skipping leaves this run
             asking nothing further; the safety-net poll path
             (`resolve_arrival`'s `find_pending` fallback above, or
             `scripts.bulk_ingest`) is what picks the delivery up once the
@@ -191,20 +176,33 @@ def build_feed_dag(feed):
                 arrival.get("business_date") or "",
             )
 
-        @task(task_id="record_publication")
-        def record_publication(result: dict) -> dict:
-            """Tag main so this publication is addressable for time travel.
+        @task(task_id="record_snapshot")
+        def record_snapshot(result: dict) -> dict:
+            """Pin the state this ingest left, so it stays addressable.
 
-            Tag retention is governed by retention.yml -> references.
-            published_tags, because a tag pins every data file its commit
-            referenced. See docs/RETENTION.md.
+            THIS TASK USED TO BE CALLED `record_publication` AND CUT
+            `published/<bd>/<run_id>`, AND AN INGEST IS NOT A PUBLICATION.
+            The consequences were not cosmetic: every check that read
+            `published/` -- reproducibility, evidence, the per-report
+            retention window -- was reading ingests, N feeds landing one
+            business date cut N tags that carried no feed name to tell them
+            apart, and `references.published_tags.per_report` could never match
+            anything because no ingest knows which report it serves.
+
+            It is still worth pinning. Raw is where retention deletes business
+            dates, so the state each ingest left is exactly what someone may
+            need to read back. It is simply a different object with a
+            different lifetime: `snapshot/<feed>/<bd>/<run_id>`, kept by
+            `references.snapshot_tags` in retention.yml. A REPORT publication
+            is cut by the reporting build, which knows what it published.
             """
             from datetime import date as _date
 
-            from reporting_platform.common.context import Nessie, published_tag
+            from reporting_platform.common.context import Nessie, snapshot_tag
 
-            tag = published_tag(_date.fromisoformat(result["business_date"]),
-                                result["run_id"])
+            tag = snapshot_tag(feed.name,
+                               _date.fromisoformat(result["business_date"]),
+                               result["run_id"])
             try:
                 Nessie().create_tag(tag, from_ref="main")
             except Exception as exc:      # tag already exists on a rerun
@@ -230,7 +228,7 @@ def build_feed_dag(feed):
         arrival = resolve_arrival()
         ready = normalize_task(arrival)
         ingested = ingest_task(ready)
-        report_drift(ingested) >> record_publication(ingested)
+        report_drift(ingested) >> record_snapshot(ingested)
 
     return _dag()
 

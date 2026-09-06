@@ -232,6 +232,7 @@ rather than loud:
 |---|---|
 | **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands. Start here.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, Nessie write-audit-publish, per-feed DAG topology, why Spark is the only build engine |
+| **[docs/PIPELINE.md](docs/PIPELINE.md)** | one delivered file end to end — inbox → landing → ready → raw → prepared → reporting, with the failure mode at every stage |
 | **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the five files a new feed touches, in order, with a worked example |
 | **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same five files through a form, plus land/ingest/build buttons |
@@ -853,7 +854,8 @@ what it does and does not prove:
   read it before trusting any claim in this file. `CLAUDE.md` is the
   orientation for picking the work up fresh.
 - **No serving-layer export.** The Postgres `serving` database is created but
-  nothing writes to it. The PoC's DuckDB→pyodbc→the legacy RDBMS export would slot in
+  nothing writes to it. (The `platform` database is no longer idle — the
+  delivery registry writes there; see `docs/DECISIONS.md#the-registry-records-observations-not-verdicts`.) The PoC's DuckDB→pyodbc→the legacy RDBMS export would slot in
   after `reporting_build`, gated on the same asset.
 - **No semantic layer.** The design constraint that the BI tool must be
   replaceable means a semantic layer belongs between `reporting` and the tool.

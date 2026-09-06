@@ -20,6 +20,16 @@ x-s3-env: &s3-env
   NESSIE_ICEBERG_URI: http://nessie:19120/iceberg
   REPORTING_CATALOG: lakehouse
   REPORTING_ENV: ${REPORTING_ENV:-local}
+  # The delivery registry (REQ-101). The `platform` database has existed since
+  # the first compose file with nothing connected to it; this is its first
+  # user. Here rather than on each service's own `environment:` block because
+  # four of them redefine that key and so inherit nothing from the anchor
+  # above -- the registry is written by the inbox and by every normalize, and
+  # read by the console, so one definition merged everywhere is the only shape
+  # that cannot drift. `registry/db.py` refuses to run without it rather than
+  # defaulting, so a container started before this line was added fails
+  # loudly; recreate it, restarting is not enough.
+  REGISTRY_DSN: postgresql://platform:platform@postgres:5432/platform
 
 # One place per jar version, from .env. See docs/DECISIONS.md#jar-versions
 x-versions: &versions
@@ -32,6 +42,27 @@ x-airflow-common: &airflow-common
     dockerfile: Dockerfile.airflow
     args:
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.99.0}
+  # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own
+  # `id -u`; `.env.example` says how and why.
+  #
+  # Half the bind mounts here are READ-WRITE by design -- the feed console
+  # writes feeds.yml, the dbt sources and a scaffolded model; the inbox
+  # watcher creates `.processed/` and moves files into it -- and a bind mount
+  # keeps the HOST's ownership, which no `chown` in the image can reach. As
+  # uid 50000 the container could not write any of them, and the symptom was
+  # never "permissions": it was a 500 from the console with the traceback only
+  # in `docker compose logs`, and an inbox watcher that uploaded a delivery
+  # correctly and then died moving the file.
+  #
+  # The group stays 0 and that is the load-bearing half. Everything the image
+  # needs to write -- /home/airflow, /opt/airflow/logs, /opt/platform/run and
+  # the named volumes under it -- is owned `airflow:0` with `g+rwX`
+  # (Dockerfile.airflow's last layer says so explicitly), which is precisely
+  # the arrangement that lets an ARBITRARY uid run this image. So the uid may
+  # change freely; the gid may not.
+  #
+  # Default 50000 keeps the previous behaviour for anyone with no .env entry.
+  user: "${AIRFLOW_UID:-50000}:0"
   environment:
     # A sequence: YAML allows only one merge key per mapping and this block
     # needs both anchors. Neither defines a key the other does.
@@ -58,6 +89,32 @@ x-airflow-common: &airflow-common
     # a non-Spark value. See docs/DECISIONS.md#duckdb-is-not-an-engine
     DBT_TARGET: ${DBT_TARGET:-spark_local}
     PYTHONPATH: /opt/platform
+    # OPENLINEAGE -> MARQUEZ. On the anchor, so the scheduler, webserver and
+    # triggerer all get it and none of them can disagree; the four services
+    # that REPLACE this block wholesale (feed-ui, notebook, inbox, watchdog)
+    # deliberately do not, because none of them runs a DAG task and the
+    # provider only emits from the process that does.
+    #
+    # DISABLED BY DEFAULT, and that is the interlock. Marquez is behind the
+    # `lineage` compose profile, so on an ordinary `docker compose up` there
+    # is nothing listening on marquez-api:5000. The provider's HTTP transport
+    # retries and logs on a refused connection rather than failing the task,
+    # but a nightly chain that emits several hundred failed POSTs is noise
+    # that trains people to ignore task logs. One variable turns both on
+    # together -- see .env.example.
+    #
+    # apache-airflow-providers-openlineage is ALREADY in the image (2.0.0,
+    # openlineage-python 1.27.0) as a transitive dependency. Do NOT install it
+    # explicitly under Airflow's constraint file: that pins
+    # typing_extensions==4.12.2, and dbt's mashumaro needs evaluate_forward_ref
+    # from 4.13+. Verified by dry run -- it is the cosmos trap exactly.
+    # See docs/DECISIONS.md#openlineage-is-an-export-not-a-record
+    AIRFLOW__OPENLINEAGE__DISABLED: ${OPENLINEAGE_DISABLED:-true}
+    AIRFLOW__OPENLINEAGE__NAMESPACE: ${OPENLINEAGE_NAMESPACE:-reporting-platform-local}
+    # One line deliberately: a folded scalar whose continuation is indented
+    # further keeps the newline (YAML's more-indented-line rule). JSON tolerates
+    # it, so this was working and looked wrong, which is the worst combination.
+    AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type": "http", "url": "http://marquez-api:5000", "endpoint": "api/v1/lineage", "timeout": 5}'
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./reporting_platform:/opt/platform/reporting_platform
@@ -109,10 +166,29 @@ services:
       /bin/sh -c "
       mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin123};
       mc mb --ignore-existing local/lakehouse;
-      mc mb --ignore-existing local/lakehouse/landing;
-      mc mb --ignore-existing local/lakehouse/warehouse;
-      echo 'buckets ready';
+      echo 'bucket ready';
       "
+    # THE BUCKET ONLY. `landing/` and `warehouse/` are PREFIXES, not
+    # directories -- S3 has no directories, and a prefix exists exactly when
+    # an object whose key starts with it exists. `mc mb local/lakehouse/landing`
+    # therefore could not create one; what it actually did was PUT a zero-byte
+    # object whose key is literally `landing/`, a "folder marker" that makes
+    # the MinIO console draw a folder icon.
+    #
+    # Those markers are a small lie with a real cost: they are objects that no
+    # feed owns, no `filename_pattern` matches and nothing reads, so any sweep
+    # over the bare `landing/` prefix counts them as unrecognised objects it
+    # must never delete. `retention/landing.py` and `retention/orphan_storage.py`
+    # both happen to miss them today -- the first is scoped to
+    # `landing/<feed>/`, the second skips keys with fewer than four segments --
+    # which is luck, not design, and exactly the kind of thing a later
+    # bucket-wide sweep would trip over.
+    #
+    # Nothing needs them. Iceberg writes through `S3FileIO`, which PUTs keys
+    # directly and has no notion of a parent directory, and the only S3A use is
+    # READING landing CSVs that already exist. Verified by creating a bucket
+    # with no prefixes at all and building a table into it.
+    # See docs/DECISIONS.md#no-folder-markers
 
   # ------------------------------------------------------- catalog + stores
   postgres:
@@ -207,14 +283,21 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    # Runs once; everything else waits on it COMPLETING. Four steps, each of
+    # Runs once; everything else waits on it COMPLETING. Five steps, each of
     # which once broke the platform silently when skipped.
+    #
+    # The registry schema is here so a cold stack has its tables before any
+    # DAG parses. `registry/db.py` also ensures it on first connect, and that
+    # is not redundant: `inbox`, `feed-ui` and `watchdog` share this image but
+    # not this container's `depends_on`, so they can be up and recording
+    # deliveries while this has never run.
     # See docs/DECISIONS.md#airflow-init-four-things
     command: >
       bash -euc "
       airflow db migrate &&
       { airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true; } &&
       { airflow pools set lakehouse_write 1 'serialise all Iceberg writers, incl. maintenance' || true; } &&
+      python -m reporting_platform.registry schema &&
       dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
       "
     restart: "no"
@@ -369,6 +452,66 @@ services:
       # this runs as `airflow`. Also readable without entering a container.
       - ./var/watchdog:/var/lib/reporting-watchdog
     restart: unless-stopped
+
+  # ------------------------------------------------------------------ lineage
+  # MARQUEZ: a CONSUMER of the OpenLineage events Airflow emits, and nothing
+  # more. It is not an authority on this platform and must not become one --
+  # `feeds_behind_report()` derives lineage from the dbt project and RETENTION
+  # REFUSES TO SWEEP on its answer, so a second graph that drifts is the exact
+  # failure this repo keeps rejecting. Marquez observes; the dbt project
+  # decides. See docs/DECISIONS.md#openlineage-is-an-export-not-a-record
+  #
+  # BEHIND A PROFILE, so it is opt-in: `docker compose --profile lineage up -d`.
+  # This stack already runs twelve services and the host it was built on had
+  # ~6 GB free; two more that are useful only when somebody is looking at them
+  # should not be in the default set.
+  marquez-api:
+    image: marquezproject/marquez:${MARQUEZ_VERSION:-0.51.1}
+    profiles: ["lineage"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      # Host and port only. The image's marquez.dev.yml HARDCODES the database
+      # name, user and password to `marquez`, so the role exists in
+      # scripts/init-postgres.sql rather than reusing `platform`.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      MARQUEZ_PORT: 5000
+      MARQUEZ_ADMIN_PORT: 5001
+      # OFF, AND THIS IS THE WHOLE REASON THIS FITS. marquez.dev.yml defaults
+      # `search.enabled` to true against an OpenSearch on :9200 -- which is the
+      # 2 GB component that makes a full catalogue deployment too heavy for
+      # this host. Search is a nice-to-have; lineage is the point.
+      SEARCH_ENABLED: "false"
+      JAVA_OPTS: -Xmx512m
+    ports:
+      - "${MARQUEZ_API_HOST_PORT:-15000}:5000"
+      - "${MARQUEZ_ADMIN_HOST_PORT:-15001}:5001"
+    # 5000/5001/3000 are all taken on a developer box running anything else --
+    # grafana owns 3000 on the machine this was built on. Container-internal
+    # ports are unchanged, so Airflow still reaches marquez-api:5000.
+    mem_limit: 900m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5001/healthcheck || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  marquez-web:
+    image: marquezproject/marquez-web:${MARQUEZ_VERSION:-0.51.1}
+    profiles: ["lineage"]
+    depends_on:
+      marquez-api: {condition: service_healthy}
+    environment:
+      # All three are MANDATORY -- setupProxy.js calls process.exit(1) on any
+      # one of them being unset, which presents as a container that starts and
+      # immediately dies with nothing obviously wrong.
+      MARQUEZ_HOST: marquez-api
+      MARQUEZ_PORT: "5000"
+      WEB_PORT: "3000"
+    ports: ["${MARQUEZ_WEB_HOST_PORT:-13000}:3000"]
+    mem_limit: 256m
 
 volumes:
   minio-data:
