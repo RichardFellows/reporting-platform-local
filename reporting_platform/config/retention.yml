@@ -111,9 +111,11 @@ environments:
 # commit pins every data file that commit referenced, and expire_snapshots
 # cannot reclaim it.
 references:
-  # published/<business_date>/<run_id>, or published/<report>/<business_date>/
-  # <run_id> once a publication knows which report it is for — cut on main
-  # after each publication by feed_ingest.record_publication.
+  # published/<report>/<business_date>/<run_id> — cut on main by
+  # dbt_builds.publish, once per report, when a REPORTING build merges.
+  # The two-segment `published/<business_date>/<run_id>` shape is still
+  # matched by the sweep, because tags cut under it before publication knew
+  # its report are real pins; nothing writes it any more.
   #
   # FLAT AGE IN YEARS, NOT A KEEP-SET, and that is the whole point of this
   # block. It was `keep_business_days: 10 / keep_month_ends: 80` — the numbers
@@ -158,20 +160,49 @@ references:
       prod: 10
 
     # Per-report windows, for reports whose period genuinely differs. The key
-    # is the report name as it appears in the tag; anything not listed gets
-    # `default_keep_years`.
+    # is the report name as it appears in the tag — which is a dbt EXPOSURE
+    # name, since that is what the platform derives its reports from
+    # (`context.reports()`). Anything not listed gets `default_keep_years`.
     #
-    # NOTHING MATCHES THIS TODAY, and it is written down as a forward hook
-    # rather than presented as a working mechanism: no publication yet carries
-    # a report identity, so every tag resolves to the default. The resolver
-    # and the three-segment tag shape are built and tested so that the day a
-    # publication does name its report, retention already honours it instead
-    # of silently applying the default to a report that declared otherwise.
+    # THIS NOW MATCHES SOMETHING. A reporting build cuts one tag per report,
+    # so naming `counterparty_exposure_report` here gives that report its own
+    # window. Left empty because no report has yet declared a period that
+    # differs from the default, and inventing one would be a policy nobody
+    # made.
     #
     # A value below `default_keep_years` is allowed — a shorter period can be
     # a real answer — but it is logged loudly, because it is the direction
     # that loses evidence.
     per_report: {}
+
+  # snapshot/<feed>/<business_date>/<run_id> — cut on main by the ingest DAG
+  # after each feed's delivery is merged.
+  #
+  # A DIFFERENT OBJECT FROM A PUBLISHED TAG, and the split is the point. This
+  # used to be cut as `published/<bd>/<run_id>`, so an ingest was indexed,
+  # retained and monitored as though it were a report publication: it was kept
+  # for the full ten-year reproducibility window, it was what every
+  # `published/` check actually examined, and because the name carried no feed
+  # the sweep could not tell one feed's ingest from another's.
+  #
+  # NOTHING IS REPRODUCED FROM ONE. No published figure rests on a snapshot
+  # tag, so this window is a storage decision rather than an evidence one: it
+  # buys the ability to read a raw business date back after retention has
+  # removed it from the live table, and it costs every data file that ingest
+  # referenced staying unreclaimable for the duration. Set to comfortably
+  # outlive the raw keep-set (80 month-ends ≈ 6.7 years is the long tail there)
+  # without approaching the published window.
+  #
+  # It is NOT bound by the landing interlock. That interlock exists because a
+  # PUBLISHED run must be able to show the files it was built from, and
+  # landing is the only copy of those. Nothing claims that of a snapshot.
+  snapshot_tags:
+    keep_years:
+      local: 7
+      dev: 1          # matches dev's landing and published windows
+      uat: 7
+      prod: 7
+
   # ingest/* and build/* working branches
   working_branches:
     # NOT READ BY ANY CODE. ingest_feed.py deletes the branch immediately

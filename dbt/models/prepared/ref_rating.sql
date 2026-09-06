@@ -41,7 +41,11 @@ raw_rows as (
       on t.counterparty_id = r.counterparty_id and t.agency = r.agency
     left join replay_from p
       on p.counterparty_id = r.counterparty_id and p.agency = r.agency
-    where r._business_date >= coalesce(p.from_date, date '1900-01-01')
+    {% endif %}
+    {# Unconditional, for the reason ref_counterparty's copy of this states. #}
+    where {{ known_as_of() }}
+    {% if is_incremental() %}
+      and r._business_date >= coalesce(p.from_date, date '1900-01-01')
     {% endif %}
 
 ),

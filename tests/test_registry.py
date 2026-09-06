@@ -209,3 +209,59 @@ def test_an_unknown_rejection_class_is_refused():
         assert "oops" in str(exc)
     else:
         raise AssertionError("an unknown reason_class was accepted")
+
+
+# ------------------------------------------- the boundary, at schema level
+def _table_ddl(name: str) -> str:
+    """The CREATE TABLE body for one registry table, out of db.SCHEMA."""
+    import sys
+
+    from tests.support import REPO
+    sys.path.insert(0, str(REPO))
+    from reporting_platform.registry import db
+
+    start = db.SCHEMA.index(f"CREATE TABLE IF NOT EXISTS registry.{name} (")
+    return db.SCHEMA[start:db.SCHEMA.index(");", start)]
+
+
+def test_the_delivery_table_still_carries_no_verdict():
+    """The projection test above covers what `observations()` builds; this
+    covers the TABLE, which is where somebody would add a column without
+    going anywhere near that function."""
+    ddl = _table_ddl("delivery").lower()
+    for forbidden in ("ingested", "superseded", " status", "processed"):
+        assert forbidden not in ddl, forbidden
+
+
+def test_a_run_does_carry_a_status_and_that_is_not_the_same_relaxation():
+    """A delivery's status would be a VERDICT about something already true and
+    derivable elsewhere -- which is how it drifts. A run's status is the
+    record of how the run ended: nothing else knows it and nothing can derive
+    it, so refusing to store it would simply lose it."""
+    assert "status" in _table_ddl("run").lower()
+
+
+def test_run_inputs_are_not_foreign_keyed_to_deliveries():
+    """A foreign key would let a registry rebuild -- drop and reconcile from
+    object storage -- CASCADE run history away: destroying the only copy of
+    something to protect a table that has a second copy in storage."""
+    ddl = _table_ddl("run_input")
+    assert "REFERENCES registry.run (run_id)" in ddl
+    # The CONSTRAINT, not the word: the table's comment names
+    # `registry.delivery` precisely to say why it does not reference it.
+    assert "REFERENCES registry.delivery" not in ddl
+
+
+def test_a_report_version_is_keyed_per_report_and_as_at_date():
+    """Decision 5. Numbering per run would move a report's version when an
+    unrelated report was rebuilt; numbering per family would move it when a
+    sibling was restated."""
+    ddl = _table_ddl("report_version")
+    assert "PRIMARY KEY (report, as_at_date, version_no)" in ddl
+
+
+def test_the_family_lives_on_the_submission_not_on_the_version():
+    """Decision 5's other half: reports submitted together are a SUBMISSION
+    concern, so grouping them must not touch how either one is numbered."""
+    assert "family" in _table_ddl("submission")
+    assert "family" not in _table_ddl("report_version")

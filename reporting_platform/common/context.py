@@ -160,11 +160,31 @@ class Feed:
     # Validated at load by `resolve_arrival_config`.
     # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
     arrival: dict[str, Any] = field(default_factory=dict)
+    # How a LATER delivery relates to an earlier one for the same business
+    # date. Absent means `mode: full_snapshot` -- each delivery restates the
+    # whole population, newest version wins -- which is what every feed here
+    # does and what `dedupe_rank` has always implemented.
+    #
+    # Written down rather than assumed because the assumption is invisible
+    # when it is wrong: a delta feed deduped as a snapshot loses every key the
+    # newest file does not mention, with nothing raising anywhere.
+    # Validated at load by `resolve_supersession_config`.
+    supersession: dict[str, Any] = field(default_factory=dict)
 
     @property
     def needs_conforming(self) -> bool:
         """Whether this feed's deliveries reach landing via the inbox gate."""
         return bool(self.arrival)
+
+    @property
+    def supersession_mode(self) -> str:
+        """How a later delivery relates to an earlier one. See `supersession`.
+
+        Resolved at load, so this never has to re-apply the default; an empty
+        block would mean the feed was constructed by hand rather than through
+        `feeds()`, and `full_snapshot` is the right answer there too.
+        """
+        return (self.supersession or {}).get("mode", "full_snapshot")
 
     def claims_source(self, filename: str) -> bool:
         """Whether `filename` is this feed's delivery AS THE UPSTREAM SENDS IT.
@@ -457,6 +477,83 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, str]:
                 f"only thing normalize reads out of a match.")
         out[key] = value
     return out
+
+
+# -------------------------------------------------------------- supersession
+# What `supersession:` may say: HOW A LATER DELIVERY RELATES TO AN EARLIER ONE
+# for the same business date. Every feed here today restates its whole
+# population on every delivery, and `dedupe_rank` has always assumed exactly
+# that -- newest `_file_version` wins, last row in file order wins within it.
+#
+# THE ASSUMPTION WAS TRUE AND UNDECLARED, which is the problem. A feed whose
+# second delivery is a DELTA rather than a restatement would be ingested
+# without complaint and then silently reduced to that delta alone: every key
+# not present in the newest file simply stops existing in `prepared`, for the
+# dates it covers, with no error anywhere. Declaring the mode does not make
+# the other shapes work -- it makes the platform REFUSE a feed whose
+# supersession it cannot implement, which is the whole of the value here.
+#
+# Same rule as `delivery:` and `arrival:`: one key, and it is dispatched on.
+SUPERSESSION_KEYS = {"mode"}
+SUPERSESSION_MODES = ("full_snapshot",)
+
+# Modes named in the requirements (REQ-202) that are NOT built. Listed so the
+# error says "not built" rather than "unknown" -- a typo and a missing feature
+# are different problems with different fixes.
+SUPERSESSION_NOT_BUILT = {
+    "delta_append": (
+        "each delivery carries only what changed, so a business date's "
+        "population is the UNION of its deliveries rather than the newest one "
+        "-- `dedupe_rank` would have to rank across versions instead of "
+        "selecting the newest, and a deletion would need a tombstone "
+        "convention the feed does not have"),
+    "correction": (
+        "a delivery restates individual keys of an EARLIER business date, so "
+        "supersession crosses the partition `dedupe_rank` ranks within and "
+        "the corrected date has to be rebuilt rather than the delivered one"),
+}
+
+
+def resolve_supersession_config(feed_name: str, supersession: Any) -> dict[str, Any]:
+    """Validate a `supersession:` block and fill its default.
+
+    Checked at LOAD for the same reason `delivery:` is: the failure is
+    otherwise silent, and here it is silent in the direction that loses rows
+    rather than the one that loses a file.
+
+    An absent block means `full_snapshot`, which is what every feed has always
+    been and what `dedupe_rank` implements. That default is not a guess: it is
+    the behaviour already in force, written down.
+    """
+    if not supersession:
+        return {"mode": "full_snapshot"}
+    if not isinstance(supersession, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `supersession:` must be a mapping, "
+            f"got {type(supersession).__name__}")
+
+    unknown = set(supersession) - SUPERSESSION_KEYS
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `supersession:` has unknown key(s) "
+            f"{', '.join(sorted(unknown))}. Valid: "
+            f"{', '.join(sorted(SUPERSESSION_KEYS))}")
+
+    mode = supersession.get("mode", "full_snapshot")
+    if mode in SUPERSESSION_NOT_BUILT:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `supersession.mode: {mode}` is "
+            f"described in the requirements (REQ-202) but NOT BUILT -- "
+            f"{SUPERSESSION_NOT_BUILT[mode]}. Every prepared model resolves "
+            f"supersession with `dedupe_rank`, which implements "
+            f"`full_snapshot` only.")
+    if mode not in SUPERSESSION_MODES:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `supersession.mode: {mode!r}` is "
+            f"not recognised. Valid: {', '.join(SUPERSESSION_MODES)} "
+            f"(not built: {', '.join(sorted(SUPERSESSION_NOT_BUILT))})")
+    return {"mode": mode}
+
 
 
 # --------------------------------------------------------------- the gate
@@ -856,6 +953,8 @@ def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
             block["name"], merged.get("delivery"))
         merged["arrival"] = resolve_arrival_config(
             block["name"], merged.get("arrival"), merged.get("filename_pattern"))
+        merged["supersession"] = resolve_supersession_config(
+            block["name"], merged.get("supersession"))
         check_gates_are_coherent(block["name"], merged["arrival"],
                                    merged["delivery"])
         names, sources = split_columns(merged.get("columns") or [])
@@ -950,6 +1049,77 @@ def managed_tables() -> list[tuple[str, str]]:
     for layer in ("prepared", "reporting"):
         tables += [(f"{CATALOG}.{layer}.{t}", layer) for t in models_in(layer)]
     return tables
+
+
+# ---------------------------------------------------------------- reports
+# A REPORT IS A dbt EXPOSURE, and it is derived from the project exactly as
+# the managed tables are. The alternative was a `reports:` block in a new
+# config file, which would be a second place to declare something the dbt
+# project already declares -- and the two would disagree the first time a
+# model was renamed.
+#
+# An exposure is the right object for this and not a convenient one: it is
+# what already answers "what breaks if I change this model", it already names
+# an owner, and `dbt ls --select +exposure:<name>` already resolves it to the
+# models behind it. A published run is a run of those models, and the tag it
+# cuts is what makes that run addressable per report -- which is what
+# `references.published_tags.per_report` has been waiting for.
+_EXPOSURE_LAYERS = ("reporting",)
+
+
+@lru_cache(maxsize=None)
+def _reports_at(mtime_ns: int) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for layer in _EXPOSURE_LAYERS:
+        directory = DBT_MODELS_DIR / layer
+        if not directory.is_dir():
+            raise RuntimeError(
+                f"no dbt models directory at {directory}. Reports are derived "
+                f"from the project's exposures, so it needs the project "
+                f"mounted -- set DBT_PROJECT_DIR, or mount ./dbt into this "
+                f"service.")
+        for path in sorted(directory.glob("*.yml")):
+            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            for exposure in doc.get("exposures") or []:
+                name = exposure.get("name")
+                if not name:
+                    raise ValueError(f"{path}: an exposure has no `name`")
+                if "/" in name:
+                    # The tag shape is published/<report>/<bd>/<run>, so a
+                    # slash in a report name would produce a tag that TAG_RE
+                    # parses into the wrong fields -- silently, and only
+                    # visibly when retention resolved the wrong window for it.
+                    raise ValueError(
+                        f"{path}: exposure {name!r} contains '/'. A report "
+                        f"name becomes a segment of the published tag, which "
+                        f"is split on '/'.")
+                out[name] = {
+                    "name": name,
+                    "label": exposure.get("label") or name,
+                    "type": exposure.get("type") or "analysis",
+                    "owner": (exposure.get("owner") or {}).get("name") or "",
+                    # `ref('x')` -> x. The models this report is built from,
+                    # which is what makes a run attributable to it.
+                    "models": sorted({
+                        m.split("'")[1] if "'" in m else m.strip()
+                        for m in (exposure.get("depends_on") or [])
+                        if isinstance(m, str)}),
+                }
+    return out
+
+
+def reports() -> dict[str, dict[str, Any]]:
+    """Every report the platform publishes, derived from the dbt exposures.
+
+    Keyed on the directory mtime like `models_in`, and for the same reason: a
+    long-lived process must not hold a stale answer after an exposure is
+    added.
+    """
+    directory = DBT_MODELS_DIR / _EXPOSURE_LAYERS[0]
+    if not directory.is_dir():
+        raise RuntimeError(
+            f"no dbt models directory at {directory}; cannot derive reports.")
+    return _reports_at(directory.stat().st_mtime_ns)
 
 
 def retention_policy(layer: str) -> dict[str, Any]:
@@ -1118,8 +1288,122 @@ def branch_name(purpose: str, scope: str, business_date: date, run_id: str) -> s
     return f"{purpose}/{scope}/{business_date:%Y-%m-%d}/{run_id}"
 
 
-def published_tag(business_date: date, run_id: str) -> str:
-    return f"published/{business_date:%Y-%m-%d}/{run_id}"
+def published_tag(report: str, business_date: date, run_id: str) -> str:
+    """The pin a PUBLICATION cuts: published/<report>/<bd>/<run_id>.
+
+    THREE SEGMENTS, and the report is not optional. `retention.TAG_RE` accepts
+    the two-segment shape as well, because tags cut before this existed are
+    still real pins and a retention sweep must never fail to recognise
+    something it might delete -- but nothing writes two segments any more.
+    A publication that cannot say which report it is for is not a publication;
+    it is an ingest, and that cuts `snapshot_tag` instead.
+    """
+    if not report or "/" in report:
+        raise ValueError(
+            f"published_tag needs a report name with no '/' in it, got "
+            f"{report!r}. The tag is split on '/' by retention and by "
+            f"monitoring, so a missing or slashed name silently reparses into "
+            f"the wrong fields.")
+    return f"published/{report}/{business_date:%Y-%m-%d}/{run_id}"
+
+
+def snapshot_tag(feed: str, business_date: date, run_id: str) -> str:
+    """The pin an INGEST cuts: snapshot/<feed>/<bd>/<run_id>.
+
+    THIS USED TO BE CALLED A PUBLICATION and it never was one. The tag was
+    `published/<bd>/<run_id>`, cut by `record_publication` at the end of every
+    per-feed ingest DAG -- so "published" meant "some feed landed some rows",
+    N feeds publishing one business date cut N tags that carried no feed name
+    between them, and the reproducibility and evidence checks that read
+    `published/` were reading ingests.
+
+    It is still a pin worth cutting: raw is where retention deletes business
+    dates, so pinning the state each ingest left is what makes that state
+    addressable afterwards. It is simply a different thing from a report
+    publication, kept for a different reason and for a different length of
+    time -- `references.snapshot_tags` in retention.yml, not
+    `references.published_tags`.
+    """
+    if not feed or "/" in feed:
+        raise ValueError(f"snapshot_tag needs a feed name with no '/', got {feed!r}")
+    return f"snapshot/{feed}/{business_date:%Y-%m-%d}/{run_id}"
+
+
+# ------------------------------------------------------------- code identity
+# REQ-404. What a published run has to be able to say about the code that
+# produced it, and the honest answer depends on how the platform is deployed.
+#
+# A GIT SHA WOULD BE A LIE HERE. In this stack `./reporting_platform`, `./dbt`
+# and `./scripts` are BIND-MOUNTED from the developer's working tree, so the
+# code that ran is whatever was on disk at the time -- which a commit hash
+# does not describe, and describes most wrongly exactly when the tree is dirty
+# and somebody most needs to know. `.git` is not mounted into any container
+# either, so there is nothing to read even if it were the right answer.
+#
+# So: the deployed identity if the deployment supplies one, and otherwise a
+# CONTENT DIGEST of the code that actually ran, labelled as such. The kind is
+# recorded beside the value (`code_ref_kind`) so nobody can mistake a laptop
+# digest for a release tag. Same shape as `Feed.schema_version`: derived, not
+# declared, because a version somebody has to remember to bump is wrong the
+# first time somebody forgets.
+CODE_ROOTS = ("reporting_platform", "scripts", "airflow")
+PLATFORM_ROOT = Path(os.environ.get("PLATFORM_ROOT", "/opt/platform"))
+
+
+def _tree_digest(roots: list[Path], suffixes: tuple[str, ...]) -> str:
+    """A stable digest over the CONTENT of every matching file under `roots`.
+
+    Sorted by path, and the path is hashed alongside the bytes, so moving a
+    file changes the digest as much as editing it does. `__pycache__` is
+    excluded: a .pyc is a function of the .py that is already hashed, and its
+    presence depends on which processes happened to import what.
+    """
+    h = hashlib.sha256()
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            if "__pycache__" in path.parts:
+                continue
+            h.update(str(path.relative_to(root)).encode())
+            h.update(b"\0")
+            h.update(hashlib.sha256(path.read_bytes()).digest())
+    return h.hexdigest()[:16]
+
+
+def code_ref() -> tuple[str, str]:
+    """(value, kind) identifying the platform code a run executed. REQ-404.
+
+    `PLATFORM_CODE_REF` first -- an image tag or a release SHA, which is what
+    a deployment knows and this process cannot work out. Otherwise a content
+    digest of the mounted Python. Never None and never a guess: a run record
+    that cannot name its code is a run record that cannot be reproduced from,
+    and "unknown" written into the column would be indistinguishable from a
+    real one six months later.
+    """
+    supplied = os.environ.get("PLATFORM_CODE_REF", "").strip()
+    if supplied:
+        return supplied, "deployed"
+    roots = [PLATFORM_ROOT / r for r in CODE_ROOTS]
+    return _tree_digest(roots, (".py",)), "tree-digest"
+
+
+def dbt_manifest_ref() -> str:
+    """A digest of the dbt project as built. REQ-404, the model half.
+
+    NOT dbt's own `target/manifest.json`. Cosmos runs ONE dbt subprocess PER
+    MODEL, each overwriting that file and each carrying its own
+    `invocation_id`, so there is no single manifest for a run and the field
+    would record whichever task finished last. The project's source is the
+    thing that actually determines what was built, and hashing it answers the
+    question the manifest was being asked for: was this run's SQL the same SQL
+    as that run's.
+    """
+    project = Path(os.environ.get("DBT_PROJECT_DIR", "/opt/platform/dbt"))
+    return _tree_digest([project / "models", project / "macros",
+                         project / "tests"], (".sql", ".yml"))
 
 
 # ---------------------------------------------------------------------- spark
@@ -1314,7 +1598,9 @@ class Nessie:
             json={"type": src["type"], "name": src["name"], "hash": src["hash"]},
         )
 
-    def merge(self, from_branch: str, into: str = "main") -> dict[str, Any]:
+    def merge(self, from_branch: str, into: str = "main",
+              message: str | None = None,
+              properties: dict[str, str] | None = None) -> dict[str, Any]:
         """POST /v2/trees/{branch}@{expectedHash}/history/merge
 
         v2 has no separate `expectedHash` body field -- the target's expected
@@ -1327,13 +1613,39 @@ class Nessie:
         one-time bootstrap commit against `into` before the first merge (see
         `_bootstrap_main_if_empty` in ingest_feed.py) so this path is only
         ever hit once `into` is off the sentinel.
+
+        `message` and `properties` become the merge commit's CommitMeta. Sent
+        only when there is something to say, so the no-message call is
+        byte-identical to what this posted before.
+
+        READING THEM BACK, the properties are under **`allProperties`**, not
+        `properties` -- v2 returns them multi-valued, `{"change_ref":
+        ["RPT-1421"]}`. Looking for `properties` finds nothing and reads
+        exactly like the server having dropped them, which is what it looked
+        like here the first time. `GET /trees/main/history?fetch=ALL`.
         """
         src = self.get_reference(from_branch)["reference"]
         tgt = self.get_reference(into)["reference"]
+        body: dict[str, Any] = {"fromRefName": from_branch,
+                                "fromHash": src["hash"]}
+        if message or properties:
+            # REQ-405. The merge commit is the only place a publication can
+            # say WHY it happened in the catalog itself, and it carried
+            # nothing at all: Nessie synthesises "Merge <hash> into main",
+            # which names two hashes and no change. `properties` is a free-
+            # form string map on Nessie's CommitMeta, so the change reference
+            # is queryable rather than only greppable out of the message.
+            meta: dict[str, Any] = {}
+            if message:
+                meta["message"] = message
+            if properties:
+                meta["properties"] = {k: str(v) for k, v in properties.items()
+                                      if v is not None}
+            body["commitMeta"] = meta
         return self._req(
             "POST",
             f"/trees/{_urlquote(into, safe='')}@{tgt['hash']}/history/merge",
-            json={"fromRefName": from_branch, "fromHash": src["hash"]},
+            json=body,
         )
 
     def list_entries(self, ref: str = "main") -> list[dict[str, Any]]:

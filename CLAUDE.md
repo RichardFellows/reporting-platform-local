@@ -280,6 +280,37 @@ Two corollaries worth holding on to:
   that cannot be honoured. Verified: a tag's own state stays live at any
   `nessie_gc` cutoff, so the tag's lifetime is the only thing that decides
   reproducibility. See `docs/DECISIONS.md#published-tags-are-the-reproducibility-window`.
+- **AN INGEST IS NOT A PUBLICATION, and they cut different tags.** An ingest
+  pins `snapshot/<feed>/<bd>/<run_id>` (`references.snapshot_tags`); the
+  **reporting build** cuts `published/<report>/<bd>/<run_id>`, one per report,
+  when it merges. While the ingest cut `published/`, every check that read that
+  prefix was reading ingests, `per_report` could never match anything, and an
+  ingest was retained for the full ten-year window. A **report is a dbt
+  EXPOSURE**, derived by `context.reports()` from the project — not a new
+  config block. See `docs/DECISIONS.md#an-ingest-is-not-a-publication`.
+- **A run record is the first thing in the registry that CANNOT be rebuilt.**
+  `registry.run` / `run_input` / `report_version` / `submission`: a delivery is
+  an observation about an object in storage, a run is an event that happened
+  once. So `run_input` carries **no foreign key** to `delivery` (a registry
+  rebuild would cascade run history away), and a run **does** have a mutable
+  status where a delivery may not. The input set is DERIVED — `publish` reads
+  the distinct `delivery_id` out of the **prepared** models on the branch,
+  before the merge, because only prepared knows which feed a delivery belongs
+  to. Version numbering is per `(report, as-at date)`; a family is grouped on
+  the SUBMISSION. See `docs/DECISIONS.md#a-run-is-the-first-thing-the-registry-cannot-rebuild`.
+- **`supersession:` in feeds.yml declares what `dedupe_rank` always assumed.**
+  `full_snapshot` is the only built mode and the default; `delta_append` and
+  `correction` raise NOT_BUILT at load. The value is the REFUSAL — a delta feed
+  deduped as a snapshot silently loses every key its newest file omits.
+  As-of queries are the same models with `--vars '{knowledge_time: ...}'`,
+  filtered by `known_as_of()` on `coalesce(_received_at, _ingest_ts)`; it
+  compiles to `1 = 1` when unset and **refuses an incremental run**, because
+  merging as-of rows into the published table restates it backwards.
+  `delivery_ref()` is the `_source_file` fallback and it strips the prefix —
+  `_delivery_id` is a basename, `_source_file` is a key. A `not_null` test on
+  `prepared.delivery_id` is the migration guard: a macro change reaches only
+  the models rebuilt after it. See `docs/DECISIONS.md#supersession-is-declared-not-assumed`,
+  `#as-of-is-a-var-not-a-second-model` and `#delivery-ref-is-the-fallback-with-the-prefix-stripped`.
 
 ## Quick reference
 
@@ -308,6 +339,16 @@ docker compose exec -T airflow python -m reporting_platform.monitoring.reproduci
 docker compose exec -T airflow python -m reporting_platform.registry reconcile
 docker compose exec -T airflow python -m reporting_platform.registry coverage
 docker compose exec -T airflow python -m reporting_platform.registry rejections
+
+# what was published, and out of which deliveries (REQ-400/401)
+docker compose exec -T airflow python -m reporting_platform.registry runs
+docker compose exec -T airflow python -m reporting_platform.registry versions
+docker compose exec -T airflow python -m reporting_platform.registry inputs --run-id <id>
+
+# as of a knowledge time -- the same models, on a throwaway branch, NEVER merged.
+# --full-refresh is not optional: known_as_of() refuses an incremental run.
+$branch = (docker compose exec -T airflow python -m scripts._open_build_branch).Trim()
+docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --full-refresh --select path:models/prepared --vars "{nessie_ref: $branch, knowledge_time: '2026-08-10'}"
 
 # is every published pin's landing evidence still there? (REQ-602, per delivery)
 docker compose exec -T airflow python -m reporting_platform.monitoring.evidence

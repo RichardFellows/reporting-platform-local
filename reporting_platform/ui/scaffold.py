@@ -268,6 +268,7 @@ with raw_rows as (
         {{{{ dedupe_rank([{key_list}]) }}}} as _rn
     from {{{{ source('raw', '{spec.name}') }}}}
     where {{{{ incremental_window('_business_date', 'business_date') }}}}
+      and {{{{ known_as_of() }}}}
 
 ),
 
@@ -341,6 +342,17 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
     bd["name"] = "business_date"
     bd["tests"] = _flow(["not_null"])
     cols.append(bd)
+
+    # THE MIGRATION GUARD, generated so a new feed cannot be the one model
+    # without it. `source_provenance()` projects `delivery_ref()`, which is
+    # never NULL for a table built after that macro -- so a NULL means the
+    # table has not been rebuilt since, and its rows cannot name the delivery
+    # they came from. See the comment this writes into _prepared.yml for the
+    # rest of the reasoning.
+    did = CommentedMap()
+    did["name"] = "delivery_id"
+    did["tests"] = _flow(["not_null"])
+    cols.append(did)
 
     for col in spec.columns:
         tests: list = []

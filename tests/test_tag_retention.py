@@ -396,3 +396,98 @@ def _retention_shipped():
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
     from reporting_platform.retention import retention
     return retention
+
+
+# ----------------------------------------------------- snapshot tags (phase 5)
+# `snapshot/<feed>/<bd>/<run>` is what an INGEST pins now. It used to be cut as
+# `published/<bd>/<run>`, which meant an ingest was retained for the full
+# reproducibility window and counted by every check that asks whether a
+# PUBLICATION can still be read. These hold the split apart.
+SNAP_YML = """
+references:
+  published_tags:
+    default_keep_years: 10
+    per_report: {}
+  snapshot_tags:
+    keep_years: 7
+"""
+
+
+def test_a_snapshot_tag_is_judged_by_its_own_window():
+    R = _retention(SNAP_YML)
+    n = FakeNessie([_tag("snapshot/fo_trade/2018-01-04/old", days_ago=8 * YEAR),
+                    _tag("snapshot/fo_trade/2026-08-01/new", days_ago=1)])
+    assert R.expire_snapshot_tags(n, dry_run=False) == \
+        ["snapshot/fo_trade/2018-01-04/old"]
+    assert n.deleted == ["snapshot/fo_trade/2018-01-04/old"]
+
+
+def test_the_two_sweeps_do_not_touch_each_others_tags():
+    """The whole point of the rename: a snapshot must not be kept for the
+    published window, and a publication must not be expired on the snapshot
+    one."""
+    R = _retention(SNAP_YML)
+    refs = [_tag("published/rep/2018-01-04/p", days_ago=8 * YEAR),
+            _tag("snapshot/fo_trade/2018-01-04/s", days_ago=8 * YEAR)]
+    # 8 years old: inside the 10-year published window, past the 7-year
+    # snapshot one.
+    assert R.expire_tags(FakeNessie(refs), dry_run=True) == []
+    assert R.expire_snapshot_tags(FakeNessie(refs), dry_run=True) == \
+        ["snapshot/fo_trade/2018-01-04/s"]
+
+
+def test_every_snapshot_for_a_date_is_kept_on_its_own_merits():
+    """N feeds landing one business date cut N snapshot tags. The defect this
+    inherits from the published sweep kept only the newest per date."""
+    R = _retention(SNAP_YML)
+    n = FakeNessie([_tag(f"snapshot/{f}/2026-08-01/r{i}", days_ago=1)
+                    for i, f in enumerate(("fo_trade", "ref_rating",
+                                           "ref_counterparty"))])
+    assert R.expire_snapshot_tags(n, dry_run=True) == []
+
+
+def test_a_name_under_snapshot_that_is_not_one_is_left_alone():
+    R = _retention(SNAP_YML)
+    n = FakeNessie([_tag("snapshot/hand-made", days_ago=40 * YEAR)])
+    assert R.expire_snapshot_tags(n, dry_run=True) == []
+    assert n.deleted == []
+
+
+def test_an_unreadable_snapshot_window_refuses_rather_than_guessing():
+    for bad in ("keep_years: 0", "keep_years: '7'", ""):
+        R = _retention("references:\n  published_tags:\n"
+                       "    default_keep_years: 10\n"
+                       "  snapshot_tags:\n"
+                       + (f"    {bad}\n" if bad else "    other: 1\n"))
+        n = FakeNessie([_tag("snapshot/fo_trade/2010-01-04/x",
+                             days_ago=20 * YEAR)])
+        try:
+            R.expire_snapshot_tags(n, dry_run=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted snapshot_tags {bad!r}")
+        assert n.deleted == []
+
+
+def test_the_shipped_snapshot_window_resolves_in_every_environment():
+    import os
+
+    from tests.support import CONFIG
+    for env in ("local", "dev", "uat", "prod"):
+        os.environ["REPORTING_ENV"] = env
+        R = _retention((CONFIG / "retention.yml").read_text(encoding="utf-8"))
+        n = FakeNessie([_tag("snapshot/fo_trade/2026-08-01/r", days_ago=1)])
+        assert R.expire_snapshot_tags(n, dry_run=True) == []
+    os.environ["REPORTING_ENV"] = "local"
+
+
+def test_a_snapshot_window_longer_than_landing_is_allowed():
+    """Unlike a published pin. Nothing is REPRODUCED from a snapshot, so it
+    makes no claim on landing evidence and the interlock does not bind it --
+    which is exactly why it may be set independently."""
+    from tests.support import CONFIG
+    R = _retention((CONFIG / "retention.yml").read_text(encoding="utf-8"))
+    # The shipped config is coherent; the point is that the interlock reads
+    # published_tags only.
+    assert R.check_reproducibility_window() >= R.longest_tag_retention_years()

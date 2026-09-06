@@ -33,6 +33,29 @@ rows are inserted in `received_at` order, so the ORDER is reproduced and the
 values are not. Nothing may key on the value -- `_delivery_id` on the raw
 table references `(feed, delivery_id)`, which is the landing filename and is
 stable.
+
+RUNS, VERSIONS AND SUBMISSIONS ARE THE EXCEPTION, and it is the only one.
+Everything above is an observation about an object that exists in storage, so
+it can be recomputed from storage. A RUN is not: it is an event that happened
+once, at a time, from a particular commit of the code, and no object anywhere
+records that it happened. Neither is the version number a report was published
+under, nor the fact that somebody submitted it.
+
+So these tables are the first rows in this database that a rebuild cannot
+reconstruct, and two things follow that are easy to get wrong:
+
+  * `run_input` carries NO FOREIGN KEY to `delivery`. It looks like it should
+    -- it names (feed, delivery_id) -- but a foreign key would let a registry
+    rebuild (drop, reconcile) CASCADE run history away, destroying the only
+    copy of something to protect the integrity of a table that has a second
+    copy in object storage. Exactly the wrong way round. The join still works;
+    it is simply not enforced, and `monitoring/evidence.py` treats a delivery
+    it cannot find as a finding rather than as an impossibility.
+  * A run legitimately HAS A STATUS, where a delivery does not. That is not
+    the boundary being relaxed: a delivery's status would be a verdict about
+    something already true (was it ingested, was it superseded), derivable and
+    therefore driftable. A run's status is the record of how the run ended,
+    which nothing else knows and nothing can derive.
 """
 from __future__ import annotations
 
@@ -185,7 +208,133 @@ CREATE TABLE IF NOT EXISTS registry.rejection (
 
 CREATE INDEX IF NOT EXISTS rejection_feed_time
     ON registry.rejection (feed, rejected_at);
+-- ------------------------------------------------------------------- runs
+-- REQ-400/REQ-401. One row per BUILD RUN that reached the point of writing
+-- something: which branch it built on, what it merged, which code and which
+-- dbt project produced it, and how it ended.
+--
+-- `purpose` is 'prepared' or 'reporting', matching the two build DAGs. Only a
+-- reporting run publishes reports; a prepared run is recorded anyway, because
+-- "which prepared build produced the tables this report read" is exactly the
+-- kind of question that is unanswerable after the fact if nothing wrote it
+-- down at the time.
+CREATE TABLE IF NOT EXISTS registry.run (
+    run_id            TEXT        PRIMARY KEY,
+    purpose           TEXT        NOT NULL,
+    -- 'running', 'published' or 'failed'. Mutable, unlike anything in the
+    -- delivery tables -- see the module header on why that is not the same
+    -- boundary being relaxed.
+    status            TEXT        NOT NULL,
+    environment       TEXT        NOT NULL,
+    -- The Airflow dag/run this came from, so a row here leads back to logs.
+    dag_id            TEXT,
+    airflow_run_id    TEXT,
+    branch            TEXT        NOT NULL,
+    merged_hash       TEXT,
+    -- The business date the run PUBLISHED: the maximum business date present
+    -- in what it built. Null until it publishes, because until then nothing
+    -- has been read to establish it.
+    business_date     DATE,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at       TIMESTAMPTZ,
+    -- REQ-404. What code produced this. `code_ref_kind` says whether the
+    -- value is a deployed identity or a content digest of the mounted tree --
+    -- see context.code_ref(), and never conflate the two.
+    code_ref          TEXT        NOT NULL,
+    code_ref_kind     TEXT        NOT NULL,
+    dbt_manifest_ref  TEXT        NOT NULL,
+    -- REQ-405. The change this publication was made under, as supplied by
+    -- whoever triggered it. Also written onto the Nessie merge commit.
+    change_ref        TEXT,
+    error             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS run_purpose_started
+    ON registry.run (purpose, started_at DESC);
+
+-- REQ-400, and the half that closes REQ-602. The deliveries whose rows are
+-- PRESENT in what the run published -- DERIVED from what it built rather than
+-- declared: the publish step selects the distinct delivery ids out of the
+-- models on the branch, which is the same `delivery_ref()` the rows carry. A
+-- declared input set would be a second statement of something the data
+-- already says, and the two would disagree the first time a model changed
+-- which sources it reads.
+--
+-- NOT "every delivery the run scanned". An SCD2 model keeps one row per
+-- version, so a delivery that restated an unchanged entity is not in here.
+-- That is the right set for reproducing the published tables and the wrong
+-- one for auditing what was read; see registry/inputs.py.
+CREATE TABLE IF NOT EXISTS registry.run_input (
+    run_id      TEXT NOT NULL REFERENCES registry.run (run_id) ON DELETE CASCADE,
+    feed        TEXT NOT NULL,
+    -- NO FOREIGN KEY to registry.delivery, deliberately. See the module
+    -- header: a registry rebuild must not be able to cascade run history away.
+    delivery_id TEXT NOT NULL,
+    PRIMARY KEY (run_id, feed, delivery_id)
+);
+
+CREATE INDEX IF NOT EXISTS run_input_delivery
+    ON registry.run_input (feed, delivery_id);
+
+-- REQ-401/REQ-403. The version a report was published at, and the pin that
+-- makes it addressable.
+--
+-- VERSION IS PER (REPORT, AS-AT DATE) -- settled decision 5. A version number
+-- says "this is the Nth answer we have given for this report and this date",
+-- which is a question about one report: numbering per run would move a
+-- report's version when an unrelated report was rebuilt, and numbering per
+-- family would move it when a sibling was restated. Reports submitted
+-- together are grouped on the SUBMISSION instead, which is where that
+-- relationship actually lives.
+--
+-- Allocated by Postgres, in a transaction, against the unique constraint --
+-- the same serialising authority `sequence_no` needed, and for the same
+-- reason: MAX(...)+1 from several writers is a read-then-write.
+CREATE TABLE IF NOT EXISTS registry.report_version (
+    report        TEXT        NOT NULL,
+    as_at_date    DATE        NOT NULL,
+    version_no    INT         NOT NULL,
+    run_id        TEXT        NOT NULL REFERENCES registry.run (run_id),
+    tag           TEXT        NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (report, as_at_date, version_no)
+);
+
+CREATE INDEX IF NOT EXISTS report_version_run ON registry.report_version (run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS report_version_tag
+    ON registry.report_version (tag);
+
+-- REQ-402. That a version was SENT somewhere, which is a different event from
+-- publishing it and frequently happens later, to several reports at once.
+--
+-- This platform submits nothing: there is no transport here and this table
+-- does not pretend otherwise. It is the record that a submission was made,
+-- written by whoever made it, and it exists now because the alternative is
+-- reconstructing it later from email.
+CREATE TABLE IF NOT EXISTS registry.submission (
+    submission_id TEXT        PRIMARY KEY,
+    -- The FAMILY grouping, decision 5's other half: reports submitted
+    -- together as one return. Free text and nullable -- a single-report
+    -- submission has no family and inventing one would be noise.
+    family        TEXT,
+    destination   TEXT        NOT NULL,
+    submitted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    submitted_by  TEXT        NOT NULL,
+    note          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS registry.submission_item (
+    submission_id TEXT NOT NULL
+        REFERENCES registry.submission (submission_id) ON DELETE CASCADE,
+    report        TEXT NOT NULL,
+    as_at_date    DATE NOT NULL,
+    version_no    INT  NOT NULL,
+    PRIMARY KEY (submission_id, report, as_at_date),
+    FOREIGN KEY (report, as_at_date, version_no)
+        REFERENCES registry.report_version (report, as_at_date, version_no)
+);
 """
+
 
 
 def ensure_schema(conn=None) -> None:

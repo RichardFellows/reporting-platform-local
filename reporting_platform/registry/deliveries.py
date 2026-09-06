@@ -355,6 +355,41 @@ def deliveries_on(business_date: date, feed: str | None = None
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    """The registered deliveries named by (feed, delivery_id). REQ-602/REQ-400.
+
+    What `deliveries_on` is for a business date, this is for a RUN's recorded
+    input set -- the exact deliveries a published run read, rather than every
+    delivery that happened to arrive for the date its tag names.
+
+    A pair with no row is NOT dropped silently: it comes back with
+    `registered: False`, because `run_input` carries no foreign key to
+    `delivery` (see registry/db.py) and a run naming a delivery the registry
+    cannot describe is exactly the finding this is asked for.
+    """
+    if not pairs:
+        return []
+    wanted = sorted(set(pairs))
+    sql = ("SELECT feed, delivery_id, source_object, business_date, "
+           "       received_at, md5, bytes "
+           "FROM registry.delivery WHERE (feed, delivery_id) IN %s")
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, (tuple(wanted),))
+        cols = [d[0] for d in cur.description]
+        found = {(r[0], r[1]): dict(zip(cols, r)) for r in cur.fetchall()}
+    out = []
+    for feed, delivery_id in wanted:
+        row = found.get((feed, delivery_id))
+        if row:
+            out.append({**row, "registered": True})
+        else:
+            out.append({"feed": feed, "delivery_id": delivery_id,
+                        "source_object": None, "business_date": None,
+                        "received_at": None, "md5": None, "bytes": None,
+                        "registered": False})
+    return out
+
+
 def reconcile_all() -> dict[str, Any]:
     out = {"feeds": [], "registered": 0, "failed": 0}
     for fd in feeds().values():

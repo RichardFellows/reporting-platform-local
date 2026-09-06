@@ -419,7 +419,9 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
     business date, parts and a format -- so it is the moment the delivery
     registry (REQ-101) can describe it. Best-effort and never fatal: see
     `registry.deliveries.register_quietly`. `write=False` registers nothing,
-    because nothing was accepted into the queue either.
+    because nothing was accepted into the queue either -- with one caller that
+    has to do both itself: `reconcile()` below passes `write=False` and then
+    writes the manifest, so it registers the delivery too.
     """
     kind = _kind(feed)
     if kind not in NORMALIZERS:
@@ -502,7 +504,26 @@ def reconcile(feed: Feed) -> dict[str, Any]:
         if manifest_key(feed, key) in have:
             continue
         try:
-            created.append(write_manifest(feed, normalize(feed, key, write=False)))
+            # `write=False` and then writing it here, rather than
+            # `normalize(feed, key)`: the manifest key for an archive comes
+            # from the manifest itself, not from the landing object, so
+            # write_manifest is the one thing that knows where it went.
+            #
+            # THE REGISTRATION HAS TO BE REPEATED HERE, and its absence was a
+            # real gap. `normalize()` registers what it writes, but this path
+            # tells it not to write and then writes the manifest itself -- so
+            # every delivery normalized by the POLL path got a manifest and no
+            # registry row. Observed on a cold load: 198 landed objects, 157
+            # ingested, 0 rows. Not a correctness failure -- `deliveries.
+            # reconcile()` is the authority and the nightly
+            # `registry_reconcile` task closes it -- but it left the inline
+            # path covering only deliveries that arrived through a triggered
+            # DAG run, which is the smaller half, and `coverage()` reporting a
+            # lag that nothing had actually failed to do.
+            manifest = normalize(feed, key, write=False)
+            mkey = write_manifest(feed, manifest)
+            _register(feed, manifest, mkey)
+            created.append(mkey)
         except NotReady as exc:
             awaiting.append({"object": key, "waiting_for": str(exc)})
         except Exception as exc:                               # noqa: BLE001

@@ -2765,3 +2765,265 @@ depended on; it cannot raise a false alarm, because everything it does check
 genuinely was received for that date. The exact input set needs the run record
 enumerating its deliveries — REQ-400 — and until that exists REQ-602 is closer,
 not done.
+
+## supersession-is-declared-not-assumed
+
+REQ-202. `supersession:` in feeds.yml, resolved by
+`context.resolve_supersession_config` and validated at load like `delivery:`
+and `arrival:` before it. One key, `mode`, and one built value,
+`full_snapshot`.
+
+**The behaviour is old; the declaration is new, and that is the point.**
+`dedupe_rank` has always implemented exactly one supersession rule — newest
+`_file_version` wins within a business date, last row in file order wins within
+a version — and no feed anywhere said that was its shape. The assumption was
+true for all four feeds and invisible, which is the combination that eventually
+costs something: a feed whose second delivery is a DELTA rather than a
+restatement would be ingested without complaint and then silently reduced to
+that delta alone. Every key the newest file does not mention stops existing in
+`prepared`, for the dates it covers, with nothing raising anywhere and the row
+counts looking plausible.
+
+So declaring the mode does not make the other shapes work. It makes the
+platform REFUSE a feed whose supersession it cannot implement, which is the
+whole of the value:
+
+    feeds.yml: feed 'x' `supersession.mode: delta_append` is described in the
+    requirements (REQ-202) but NOT BUILT -- each delivery carries only what
+    changed, so a business date's population is the UNION of its deliveries
+    rather than the newest one [...]
+
+Two levels, deliberately. `SUPERSESSION_NOT_BUILT` refuses at config load,
+where a feed is onboarded; `dedupe_rank(partition_keys, mode=...)` raises a dbt
+compiler error, for a model written by hand with a mode nothing checked. The
+scaffold emits the mode only when it is not the default, so no existing model
+changed on the day this landed.
+
+It is inheritable through `conventions:`, because supersession is a property of
+the SOURCE SYSTEM far more often than of one feed — the same reasoning that put
+`delimiter` and `expected_min_rows` there.
+
+## as-of-is-a-var-not-a-second-model
+
+REQ-300, REQ-301. "What did we believe on date X" is answered by the models
+that already exist, filtered by `known_as_of()`, driven by a dbt var:
+
+    dbt build --full-refresh --select path:models/prepared \
+      --vars '{nessie_ref: <branch>, knowledge_time: "2026-08-10"}'
+
+**A var rather than a per-call-site argument** because the filter has to reach
+every model and a model that quietly omits it returns everything, whatever the
+caller asked for. With no `knowledge_time` set the macro compiles to `1 = 1`,
+so the nightly build is byte-identical to what it was before this existed.
+
+**A WHERE clause rather than a macro every model already calls.** There is no
+such macro: two of the four prepared models do not call `incremental_window` on
+their incremental path at all, they use `scd2_incremental_scope` and their own
+predicate. So `known_as_of()` is at each call site, and
+`tests/test_supersession.py` greps every file in `models/prepared/` for it —
+CLAUDE.md's rule that fixing a macro proves nothing about models that do not
+call it, written as a test rather than trusted.
+
+**The clock is `coalesce(_received_at, _ingest_ts)`, and the fallback is not
+decoration.** `_received_at` is the delivery's arrival time and the right
+answer; it is also NULL for every row ingested before provenance existed
+(#provenance-is-added-not-backfilled), so a filter on it alone would exclude
+the whole of history rather than include it. `_ingest_ts` has been on every raw
+table since the beginning and is never null. The two differ by however long a
+delivery waited to be ingested — a Friday arrival loaded on Monday — so the
+fallback is the later and more conservative of the two: it can include a row in
+an as-of query slightly earlier than the truth, never exclude one it should
+have shown.
+
+**It refuses to run incrementally.** On the incremental path dbt MERGEs into
+the target, so an as-of build would restate the published table backwards —
+silently, with a green run. `known_as_of()` raises a compiler error when
+`knowledge_time` is set and `is_incremental()` is true; full-refresh on a
+throwaway branch is the only way to materialise one.
+
+Reporting models carry no arrival clock of their own — they read `ref()`s — so
+an as-of reporting build is a build of the whole chain on one branch with the
+var set. That is also why the var reaches every model rather than being passed
+model by model.
+
+## delivery-ref-is-the-fallback-with-the-prefix-stripped
+
+The half of phase 3's stated limit that had to be built. `_delivery_id` was
+added and never backfilled, so a run record, an as-of query and the evidence
+check could see nothing about the deliveries behind older rows.
+`delivery_ref()` in `engine.sql` is the fallback:
+
+    coalesce(_delivery_id, element_at(split(_source_file, '/'), -1))
+
+**The basename, not the key, and that is the whole subtlety.**
+`_delivery_id` holds a bare filename; `_source_file` holds a full object key.
+Coalescing them without stripping the prefix would put two namespaces in one
+column — every join and group-by over it silently wrong for exactly the rows
+that predate provenance, and looking perfectly ordinary in both. It is exact
+for `kind: file`, which is every delivery in this catalog, because the part IS
+the landing object. The one shape it is not exact for is an archive ingested
+before the provenance columns existed, where the part is an extracted member
+and its basename is a member name; no feed here is `kind: archive`, so no such
+row exists, and the limit is written down rather than left to be found.
+
+`source_provenance()` projects it as `delivery_id`, so a rebuilt prepared table
+can name the delivery behind every row it holds — which is what makes a run's
+input set enumerable across the whole history rather than from phase 3 onwards.
+
+**A macro change reaches only the models rebuilt after it**, and this one is
+the prepared layer's version of the migration `migrate_raw.py` performs for
+raw. The guard is a `not_null` test on `delivery_id` in `_prepared.yml`: after
+the coalesce there is no legitimate NULL, so a NULL means the table has not
+been rebuilt and its rows cannot say where they came from. It fails the build,
+which is correct — an unmigrated prepared table must not publish a run whose
+inputs cannot be enumerated. `ui/scaffold.py` writes the same test, so a new
+feed cannot be the one model without it.
+
+## an-ingest-is-not-a-publication
+
+`feed_ingest` cut `published/<business_date>/<run_id>` at the end of every
+per-feed ingest DAG. It now cuts `snapshot/<feed>/<business_date>/<run_id>`,
+and a REPORT publication — `published/<report>/<business_date>/<run_id>` — is
+cut by the reporting build, which is the only thing that knows what it
+published.
+
+The old name was not a cosmetic problem. Three consequences, all live:
+
+  * **Every check that read `published/` was reading ingests.**
+    `monitoring/reproducibility.py` exercised an ingest pin,
+    `monitoring/evidence.py` asked what a business date received rather than
+    what a run read, and both correctly reported on a thing nobody publishes.
+  * **`references.published_tags.per_report` could never match anything**, so
+    the per-report retention window was a resolver with no input.
+  * **An ingest was retained for the reproducibility window** — ten years of
+    pinned raw data files per feed per business date, because nothing is
+    reclaimable while a tag references it.
+
+An ingest pin is still worth cutting: raw is where retention deletes business
+dates, so the state an ingest left is exactly what somebody may need to read
+back. It is simply a different object with a different lifetime, and
+`references.snapshot_tags` says so — seven years locally against the published
+ten, and explicitly NOT bound by the landing interlock, because nothing is
+reproduced from a snapshot. Nothing claims a snapshot's evidence is still in
+`landing/`; a publication does.
+
+`TAG_RE` still matches the old two-segment shape. Tags cut under it are real
+pins, and a sweep that fails to recognise something skips it forever rather
+than judging it — the same rule `clean_working_branches` follows for `hold/`.
+
+## a-run-is-the-first-thing-the-registry-cannot-rebuild
+
+REQ-400, REQ-401, REQ-404. `registry.run`, `registry.run_input`,
+`registry.report_version`, `registry.submission` and
+`registry.submission_item`, in the same Postgres schema as the deliveries and
+under a different rule.
+
+Everything phase 2 put there is an OBSERVATION about an object that exists in
+storage, so `reconcile()` can reconstruct it — that property is what makes the
+registry an index rather than a second source of truth
+(#the-registry-records-observations-not-verdicts). A run is not: it is an event
+that happened once, at a time, from a particular commit of the code, and no
+object anywhere records that it happened. Two things follow that are easy to
+get wrong:
+
+  * **`run_input` carries no foreign key to `delivery`.** It names
+    `(feed, delivery_id)` and looks like it should. A foreign key would let a
+    registry rebuild — drop, reconcile from object storage — CASCADE run
+    history away: destroying the only copy of something to protect the
+    integrity of a table that has a second copy in storage. Exactly the wrong
+    way round. `evidence.py` treats a delivery it cannot find as a finding.
+  * **A run has a mutable `status` and a delivery still may not.** That is not
+    the phase 2 boundary being relaxed. A delivery's status would be a verdict
+    about something already true and derivable elsewhere — was it ingested,
+    was it superseded — which is how it drifts. A run's status is the record of
+    how the run ended: nothing else knows it, and refusing to store it would
+    simply lose it.
+
+**The input set is derived, not declared.** `publish` reads the distinct
+`delivery_id` out of the prepared models ON THE BRANCH, before the merge, while
+the state is exactly what was audited — reading main afterwards would answer a
+different question and depend on what else merged in between. A declared input
+set would be a second statement of something the rows already carry, and the
+two would disagree the first time a model changed which sources it reads.
+
+**It is "the deliveries whose rows are in what was published", not "the
+deliveries the run scanned",** and for an SCD2 model those differ a lot. A
+model that keeps one row per VERSION drops every delivery that restated an
+unchanged entity: measured here, `ref_counterparty` contributes 10 of its 40
+ingested deliveries, against 40 of 40 for `fo_trade` and 36 of 36 for
+`ref_rating`, whose ratings change on nearly every delivery. That is the right
+set for the question REQ-602 asks — re-deriving the published tables needs
+exactly the deliveries whose data is in them, and an SCD2 table re-derives
+identically from the versions that survived — and the wrong set for "what did
+this run read". The number looks like a bug the first time you see it, which
+is why it is written down here.
+
+It asks the PREPARED layer, not the reporting one, because only prepared knows
+which FEED a delivery belongs to: a prepared model is one feed by the naming
+rule (#table-naming-no-layer-prefix), where a reporting model joins several and
+keeps no column saying which delivery came from where. A reporting run's input
+set is its prepared tables' input set.
+
+**The run is opened before the build, not after it.** A run that fails is the
+one most worth having a record of, and a row written only on success describes
+a platform that has never had a bad night. `keep_failed_branch` closes it as
+`failed`.
+
+## code-identity-is-a-digest-when-it-cannot-be-a-tag
+
+REQ-404. `context.code_ref()` returns a value AND a kind:
+`PLATFORM_CODE_REF` if the deployment supplies one — an image tag, a release
+SHA — and otherwise a sixteen-character content digest of the mounted
+`reporting_platform/`, `scripts/` and `airflow/` trees, labelled
+`tree-digest`.
+
+**A git SHA would be a lie here.** In this stack those directories are
+BIND-MOUNTED from a working tree, so the code that ran is whatever was on disk
+at the time — which a commit hash does not describe, and describes most wrongly
+exactly when the tree is dirty and somebody most needs to know. `.git` is not
+mounted into any container either, so there is nothing to read even if it were
+the right answer. The kind travels with the value so a laptop digest can never
+be read as a release.
+
+`dbt_manifest_ref()` is the same shape over `dbt/models`, `dbt/macros` and
+`dbt/tests`, and deliberately NOT dbt's own `target/manifest.json`: Cosmos runs
+one dbt subprocess per model, each overwriting that file with its own
+invocation id, so there is no single manifest for a run and the field would
+record whichever task finished last. The project's source is what determines
+what was built.
+
+Both follow `Feed.schema_version`: derived, not declared, because a version
+somebody has to remember to bump is wrong the first time somebody forgets.
+
+## version-is-per-report-and-as-at-date
+
+Open decision 5, settled. `registry.report_version` is keyed
+`(report, as_at_date, version_no)`, and reports submitted together are grouped
+on the SUBMISSION record instead.
+
+A version number answers "this is the Nth answer we have given for this report
+and this date", which is a question about one report. Numbering per RUN would
+move a report's version when an unrelated report was rebuilt in the same run;
+numbering per FAMILY would move it when a sibling was restated. Both make a
+report's own version history depend on things that are not about it.
+
+REQ-402 already separates the version from the submission, so the family has a
+place to live that costs nothing: `registry.submission` carries `family`,
+`destination` and who sent it, and `submission_item` names the exact versions
+that went. The platform submits nothing and this does not pretend otherwise —
+it is the record that a submission was made, written at the time rather than
+reconstructed from email afterwards.
+
+The number is allocated by Postgres inside the transaction that inserts it,
+with the primary key as the backstop. A plain sequence will not do, because it
+restarts per (report, as-at date) rather than running globally — and
+`MAX(...)+1` read by two publishers is the read-then-write `sequence_no` was
+made a BIGSERIAL to avoid. It is idempotent on the TAG: a retried publish task
+finds the version it already minted rather than minting a second.
+
+**A report is a dbt EXPOSURE** (`context.reports()`), derived from the project
+exactly as the managed tables are. The alternative was a `reports:` block in a
+new config file, which would be a second declaration of something the dbt
+project already makes — and the two disagree the first time a model is renamed.
+An exposure is also already the thing that answers "what breaks if I change
+this model", and already names an owner.

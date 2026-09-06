@@ -25,6 +25,7 @@ with raw_rows as (
         {{ dedupe_rank(['collateral_id']) }} as _rn
     from {{ source('raw', 'ref_collateral') }}
     where {{ incremental_window('_business_date', 'business_date') }}
+      and {{ known_as_of() }}
 
 ),
 

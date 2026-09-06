@@ -127,13 +127,23 @@ table always keeps a rollback point. `superseded_grace_days` delays removal of
 a superseded `_file_version` so a bad re-delivery can still be investigated.
 
 Nessie reference retention lives in the same file under a separate top-level
-`references:` key — `published_tags` and `working_branches`. That separation is
-deliberate: tag retention is data retention (see above), but it is not a
-per-layer property.
+`references:` key — `published_tags`, `snapshot_tags` and `working_branches`.
+That separation is deliberate: tag retention is data retention (see above), but
+it is not a per-layer property.
 
 **Published tags are sized in years, not by keep-set**, and that is the one
 place where the shape of the policy differs from everything else in this file.
 See *The reproducibility window* below.
+
+**`snapshot_tags` is a different window for a different object.**
+`published/<report>/<bd>/<run_id>` is cut by the reporting build for a report
+it published; `snapshot/<feed>/<bd>/<run_id>` is cut by an ingest, and pins the
+raw state that ingest left so a business date stays readable after retention
+removes it from the live table. Nothing is REPRODUCED from a snapshot, so its
+window is a storage decision rather than an evidence one — it is not bound by
+the landing interlock, and it is set shorter than the published window on
+purpose. See
+[`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication).
 
 ### `keep_business_days`
 
@@ -314,11 +324,20 @@ over-retaining costs storage while under-retaining costs the evidence
 permanently, so it is set to the longest plausible value rather than the
 assumed seven.
 
-`per_report` matches nothing today — no publication yet knows which report it
-is for, so every tag resolves to the default. It is written down as a forward
-hook, and `TAG_RE` accepts `published/<report>/<business_date>/<run_id>`
-alongside today's shape, so the day a publication does name its report,
-retention honours it rather than silently applying the default.
+`per_report` **now matches something.** A reporting build cuts one tag per
+report — `published/<report>/<business_date>/<run_id>` — so naming a report
+here gives it its own window. It is left empty because no report has yet
+declared a period different from the default, and inventing one would be a
+policy nobody made. `TAG_RE` still accepts the two-segment shape as well: tags
+cut before publication knew its report are real pins, and a sweep that fails
+to recognise something skips it forever rather than judging it.
+
+The `published/<business_date>/<run_id>` shape was cut by the INGEST DAGs, and
+that is what the third defect above describes. Ingests now cut
+`snapshot/<feed>/<business_date>/<run_id>`, judged against
+`references.snapshot_tags` — a shorter window, because nothing is reproduced
+from a snapshot. See
+[`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication).
 
 **Age is measured from the commit time**, not the business date: a retention
 period runs from when the record was made, and a restatement published today

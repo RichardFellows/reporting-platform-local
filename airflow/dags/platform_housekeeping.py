@@ -253,8 +253,13 @@ def platform_housekeeping():
         same reason `reproducibility_check` fails: it is the platform having
         destroyed its own evidence, and it does not get better by itself.
 
-        WARNS, and does not fail, when a pinned business date has no
-        registered deliveries at all. That is what an unreconciled registry
+        Resolves each pin's input set from its RUN RECORD where there is one
+        (exact -- the deliveries that run actually read) and from the tag's
+        business date where there is not (approximate, and generous only in
+        the direction of missing something). The counts are logged separately.
+
+        WARNS, and does not fail, when a pinned tag has no registered
+        deliveries at all. That is what an unreconciled registry
         looks like -- indistinguishable from the real thing on the evidence
         available here -- and failing the chain on it would make the first
         red the one everybody learns to ignore.
@@ -277,14 +282,28 @@ def platform_housekeeping():
                 f"registered as received are no longer in landing/. The pin "
                 f"still resolves, so the tables read -- what the upstream "
                 f"actually sent does not. REQ-602.")
-        if report.get("unbacked_dates"):
-            log.warning("evidence: %d pinned date(s) have no registered "
-                        "deliveries: %s", len(report["unbacked_dates"]),
-                        report["unbacked_dates"][:5])
+        if report.get("unregistered_inputs"):
+            log.warning("evidence: %d input delivery(ies) named by a run are "
+                        "not in the registry: %s. reconcile is the rebuild "
+                        "path.", len(report["unregistered_inputs"]),
+                        report["unregistered_inputs"][:5])
             return report
-        log.info("evidence: %d delivery(ies) behind %d pinned date(s), all "
-                 "still landed", report.get("deliveries_checked"),
-                 report.get("dates_checked"))
+        if report.get("unbacked_tags"):
+            log.warning("evidence: %d pinned tag(s) have no input "
+                        "deliveries: %s", len(report["unbacked_tags"]),
+                        report["unbacked_tags"][:5])
+            return report
+        # EXACT vs APPROXIMATE is worth saying out loud every night: a green
+        # from a tag resolved through its run record means the deliveries that
+        # run actually read; a green from a tag resolved by business date
+        # means the deliveries that happened to arrive that day. The second is
+        # weaker, and a log line that did not distinguish them would let the
+        # weaker one pass for the stronger.
+        log.info("evidence: %d delivery(ies) behind %d pinned tag(s), all "
+                 "still landed (%d exact from run records, %d approximated "
+                 "from the tag's business date)",
+                 report.get("deliveries_checked"), report.get("tags_checked"),
+                 report.get("exact"), report.get("approximate"))
         return report
 
     @task

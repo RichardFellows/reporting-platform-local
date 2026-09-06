@@ -24,17 +24,22 @@ gap. That also makes this a check on the registry itself -- a delivery
 registered and then deleted from landing is what it is looking for, and the
 two cannot both be wrong in the same direction without somebody having tried.
 
-WHAT IT STILL CANNOT TELL YOU, and this is the honest limit until phase 5.
-A tag names one business date, because `record_publication` cuts it from the
-date of the ingest that triggered the build. A published run reads more than
-that date -- reference data from earlier dates, a month-end window, whatever
-the model selects -- so "the deliveries for the tag's business date" is an
-approximation of the run's real input set, and a generous one in one direction
-only: it can miss a delivery from another date that the run depended on. It
-cannot produce a false alarm, because everything it does check genuinely was
-received for that date. The exact set needs the run record enumerating its
-deliveries, which is REQ-400 and phase 5. Stated here rather than left to be
-discovered from the code.
+TWO WAYS THE INPUT SET IS RESOLVED, and the difference is REQ-400 arriving.
+
+  * EXACT, where the tag has a run record. A published run now enumerates the
+    deliveries it read -- taken off the tables it built, not declared -- so
+    the check asks the registry about exactly those and nothing else.
+  * APPROXIMATE, where it does not. A tag cut before run records existed
+    carries only a business date, and the best available answer is "every
+    delivery received for that date". That is generous in one direction only:
+    a published run reads more than one business date (reference data from
+    earlier dates, a month-end window), so it can MISS a delivery the run
+    depended on. It cannot raise a false alarm, because everything it checks
+    genuinely was received for that date.
+
+Each tag's result says which of the two it got, because a green from the
+second kind means less than a green from the first and a report that did not
+distinguish them would overstate itself.
 """
 from __future__ import annotations
 
@@ -71,50 +76,109 @@ def _existing(keys: set[str]) -> set[str]:
     return present
 
 
-def check(business_dates: dict[date, list[str]]) -> dict:
-    """For each business date, are all its registered deliveries still landed?
+def check(tag_inputs: dict[str, dict]) -> dict:
+    """For each pinned tag, are all its input deliveries still landed?
 
-    `business_dates` maps a date to the tags that name it, so one date pinned
-    by five tags -- which is what five feeds publishing one day produces -- is
-    checked once and reported against all five.
+    `tag_inputs` maps a tag to `{"rows": [...], "resolution": "run"|
+    "business_date"}` -- see `resolve_inputs`. The landing check itself is one
+    LIST per prefix over the union of every tag's rows, so a hundred tags
+    sharing one feed's deliveries cost one listing, not a hundred.
     """
-    from reporting_platform.registry import deliveries as reg
-
-    rows: list[dict] = []
-    for bd in sorted(business_dates):
-        for row in reg.deliveries_on(bd):
-            rows.append(row)
-
-    keys = {r["source_object"] for r in rows}
+    rows = [r for v in tag_inputs.values() for r in v["rows"]]
+    keys = {r["source_object"] for r in rows if r.get("source_object")}
     present = _existing(keys) if keys else set()
-    missing = [r for r in rows if r["source_object"] not in present]
 
-    dated: dict[str, dict] = {}
-    for bd, tags in sorted(business_dates.items()):
-        for_date = [r for r in rows if r["business_date"] == bd]
-        gone = [r for r in for_date if r["source_object"] not in present]
-        dated[bd.isoformat()] = {
-            "tags": sorted(tags),
-            "deliveries": len(for_date),
+    per_tag: dict[str, dict] = {}
+    for tag, value in sorted(tag_inputs.items()):
+        mine = value["rows"]
+        gone = [r for r in mine
+                if r.get("source_object") and r["source_object"] not in present]
+        # A delivery a RUN named that the registry cannot describe. Only
+        # possible on the run path -- `run_input` carries no foreign key, on
+        # purpose -- and it is a finding rather than an impossibility: the run
+        # read it, so it existed, and the registry not knowing it means the
+        # registry has lost something or was never reconciled.
+        unregistered = [f"{r['feed']}/{r['delivery_id']}" for r in mine
+                        if r.get("registered") is False]
+        per_tag[tag] = {
+            "resolution": value["resolution"],
+            "business_date": value.get("business_date"),
+            "deliveries": len(mine),
             "missing": sorted(r["source_object"] for r in gone),
-            # NO REGISTERED DELIVERY AT ALL for a pinned date. Reported apart
-            # from a missing object because the two have different causes: an
-            # empty result usually means the registry has not been reconciled
-            # since this date was ingested, and a missing object means the
-            # evidence really is gone. Both are worth seeing; only one is an
-            # emergency, and guessing which would make the check useless.
-            "unbacked": not for_date,
+            "unregistered": sorted(unregistered),
+            # NO INPUT AT ALL for a pinned tag. Reported apart from a missing
+            # object because the two have different causes: an empty result
+            # usually means the registry has not been reconciled since the
+            # date was ingested, and a missing object means the evidence
+            # really is gone. Both are worth seeing; only one is an emergency,
+            # and guessing which would make the check useless.
+            "unbacked": not mine,
         }
 
-    unbacked = sorted(d for d, v in dated.items() if v["unbacked"])
+    missing = sorted({r["source_object"] for v in tag_inputs.values()
+                      for r in v["rows"]
+                      if r.get("source_object")
+                      and r["source_object"] not in present})
     return {
-        "business_dates": dated,
-        "dates_checked": len(dated),
+        "tags": per_tag,
+        "tags_checked": len(per_tag),
+        "exact": sum(1 for v in per_tag.values() if v["resolution"] == "run"),
+        "approximate": sum(1 for v in per_tag.values()
+                           if v["resolution"] != "run"),
         "deliveries_checked": len(rows),
-        "missing_evidence": sorted(r["source_object"] for r in missing),
-        "unbacked_dates": unbacked,
+        "missing_evidence": missing,
+        "unbacked_tags": sorted(t for t, v in per_tag.items() if v["unbacked"]),
+        "unregistered_inputs": sorted(
+            {u for v in per_tag.values() for u in v["unregistered"]}),
         "ok": not missing,
     }
+
+
+def resolve_inputs(tags: list[dict]) -> dict[str, dict]:
+    """Tag -> the deliveries behind it, by run record where there is one.
+
+    THE RUN RECORD IS PREFERRED AND THE DATE IS THE FALLBACK, never the other
+    way round: the run says what it actually read, the date says what happened
+    to arrive. Where a run exists but recorded no inputs the date fallback is
+    NOT used -- an empty input set on a real run is a finding about that run,
+    and quietly substituting a broader answer would hide it.
+    """
+    from reporting_platform.registry import deliveries as reg
+    from reporting_platform.registry import runs as reg_runs
+
+    # One query per business date, shared by every tag naming it -- which is
+    # what N feeds publishing one day produces.
+    by_date: dict[date, list[dict]] = {}
+    out: dict[str, dict] = {}
+    for tag in tags:
+        name = tag["tag"]
+        run = None
+        try:
+            run = reg_runs.run_for_tag(name)
+        except Exception as exc:                                # noqa: BLE001
+            log.warning("cannot read the run record for %s: %s", name,
+                        f"{type(exc).__name__}: {exc}")
+        if run:
+            pairs = [(i["feed"], i["delivery_id"])
+                     for i in reg_runs.inputs_for_run(run["run_id"])]
+            out[name] = {"rows": reg.deliveries_by_id(pairs),
+                         "resolution": "run",
+                         "run_id": run["run_id"],
+                         "report": run.get("report"),
+                         "version": run.get("version_no"),
+                         "business_date": str(run.get("business_date") or
+                                              tag["business_date"])}
+            continue
+        try:
+            bd = date.fromisoformat(tag["business_date"])
+        except (TypeError, ValueError):
+            continue
+        if bd not in by_date:
+            by_date[bd] = [{**r, "registered": True}
+                           for r in reg.deliveries_on(bd)]
+        out[name] = {"rows": by_date[bd], "resolution": "business_date",
+                     "business_date": bd.isoformat()}
+    return out
 
 
 def run() -> dict:
@@ -126,15 +190,7 @@ def run() -> dict:
         report.update({"ok": True, "status": "no_published_tags"})
         return report
 
-    dates: dict[date, list[str]] = {}
-    for tag in tags:
-        try:
-            bd = date.fromisoformat(tag["business_date"])
-        except (TypeError, ValueError):
-            continue
-        dates.setdefault(bd, []).append(tag["tag"])
-
-    report.update(check(dates))
+    report.update(check(resolve_inputs(tags)))
     if not report["ok"]:
         log.error(
             "EVIDENCE MISSING for %d delivery(ies) behind a published pin: "
@@ -142,17 +198,28 @@ def run() -> dict:
             "actually sent cannot. See REQ-602.",
             len(report["missing_evidence"]), report["missing_evidence"][:5])
         report["status"] = "BROKEN"
-    elif report["unbacked_dates"]:
+    elif report["unregistered_inputs"]:
+        # A run named a delivery the registry has no row for. Not evidence
+        # loss by itself -- the landing object may well be there -- but the
+        # registry is what turns "is it there" into "is everything there", so
+        # a gap in it degrades every future run of this check.
+        log.warning(
+            "%d input delivery(ies) named by a run are not in the registry: "
+            "%s. `python -m reporting_platform.registry reconcile` is the "
+            "rebuild path.",
+            len(report["unregistered_inputs"]), report["unregistered_inputs"][:5])
+        report["status"] = "unregistered_inputs"
+    elif report["unbacked_tags"]:
         # Not a failure by itself: an unreconciled registry looks exactly like
         # this, and failing the nightly chain the first time a tag is cut
         # before reconcile has run would train people to ignore it.
         log.warning(
-            "%d pinned business date(s) have no registered deliveries: %s. "
-            "Either the registry has not been reconciled since they were "
-            "ingested, or their landing evidence predates the registry. "
+            "%d pinned tag(s) have no input deliveries: %s. Either the "
+            "registry has not been reconciled since they were ingested, or "
+            "their landing evidence predates the registry. "
             "`python -m reporting_platform.registry reconcile` answers which.",
-            len(report["unbacked_dates"]), report["unbacked_dates"][:5])
-        report["status"] = "unbacked_dates"
+            len(report["unbacked_tags"]), report["unbacked_tags"][:5])
+        report["status"] = "unbacked_tags"
     else:
         report["status"] = "backed"
     return report

@@ -57,7 +57,17 @@ raw_rows as (
     {% if is_incremental() %}
     join touched t on t.counterparty_id = r.counterparty_id
     left join replay_from p on p.counterparty_id = r.counterparty_id
-    where r._business_date >= coalesce(p.from_date, date '1900-01-01')
+    {% endif %}
+    {#
+      known_as_of() is unconditional, unlike the join predicates above: the
+      as-of filter has to apply on the FULL-REFRESH path, which is the only
+      path an as-of build is allowed to take (the macro refuses an incremental
+      one). It compiles to `1 = 1` when no knowledge_time is set, so the
+      ordinary incremental build is unchanged.
+    #}
+    where {{ known_as_of() }}
+    {% if is_incremental() %}
+      and r._business_date >= coalesce(p.from_date, date '1900-01-01')
     {% endif %}
 
 ),

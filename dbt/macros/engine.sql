@@ -120,6 +120,64 @@
 {% endmacro %}
 
 
+{#
+  --------------------------------------------------- knowledge time (as-of)
+  REQ-300/REQ-301. "What did we believe on date X", answered by the same
+  models rather than by a second code path.
+
+  A ROW'S KNOWLEDGE TIME IS ITS DELIVERY'S ARRIVAL TIME, and the platform has
+  two clocks for that. `_received_at` is when the delivery landed and is the
+  right one -- but it was ADDED, NEVER BACKFILLED, so it is NULL for every row
+  ingested before that change. `_ingest_ts` is when the platform loaded the
+  rows, has been on every raw table since the beginning, and is never null.
+  The two differ by however long a delivery waited to be ingested (a Friday
+  arrival loaded on Monday), so the fallback is not a synonym -- it is the
+  later, more conservative of the two, and using it can only ever include a
+  row in an as-of query slightly earlier than the truth, never exclude one it
+  should have shown.
+
+  DEFAULTS TO NOW, expressed as `1 = 1`. With no `knowledge_time` var the
+  predicate compiles away entirely, so no model changes behaviour on the day
+  this lands and the ordinary nightly build is byte-identical to before.
+
+  PREPARED ONLY. Reporting models read `ref()`s, not raw, and carry no
+  arrival clock of their own; an as-of reporting build is a build of the whole
+  chain on one branch with the var set, which is why the var reaches every
+  model rather than being a per-call-site argument.
+#}
+{% macro known_as_of() %}
+  {%- set kt = var('knowledge_time', none) -%}
+  {%- if kt is none or kt | string | trim == '' -%}
+    1 = 1
+  {%- else -%}
+    {%- set kt = kt | string | trim -%}
+    {%- if not modules.re.match('^\\d{4}-\\d{2}-\\d{2}([ T]\\d{2}:\\d{2}(:\\d{2})?)?$', kt) -%}
+      {{ exceptions.raise_compiler_error(
+           "knowledge_time must be 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]', got "
+           ~ kt ~ ". It is interpolated into SQL, and a value that is not a "
+           ~ "timestamp would either fail deep in the build or silently "
+           ~ "compare against NULL and return nothing.") }}
+    {%- endif -%}
+    {%- if is_incremental() -%}
+      {#
+        AN AS-OF BUILD MUST NOT WRITE INTO THE PUBLISHED TABLE. On the
+        incremental path dbt MERGEs into `this`, so a build restricted to what
+        was known last month would delete or overwrite rows built from
+        everything known today -- a silent restatement backwards, in the
+        published table, with a green run. Full-refresh on a throwaway branch
+        is the only correct way to materialise one.
+      #}
+      {{ exceptions.raise_compiler_error(
+           "knowledge_time=" ~ kt ~ " on an INCREMENTAL run of " ~ this ~
+           ". An as-of build must be --full-refresh on a throwaway Nessie "
+           ~ "branch: merging as-of rows into the published table would "
+           ~ "restate it backwards. Add --full-refresh, or drop the var.") }}
+    {%- endif -%}
+    coalesce(_received_at, _ingest_ts) <= TIMESTAMP '{{ kt }}'
+  {%- endif -%}
+{% endmacro %}
+
+
 {# Standard audit columns on every prepared/reporting model.
    Lineage back to the exact ingest batch is what makes a published figure
    explainable six months later. #}
@@ -145,18 +203,55 @@
   provenance column added to the list below reaches both.
 #}
 {% macro provenance_pairs() %}
-  {{ return([('delivery_id',    '_delivery_id'),
+  {#-
+    (alias, expression). All but the first are a bare raw column; the first is
+    `delivery_ref()`, which is where the phase-3 fallback lives -- see that
+    macro. Anything added here reaches `source_provenance()` and
+    `source_provenance_columns()` together.
+  -#}
+  {{ return([('delivery_id',    delivery_ref()),
              ('received_at',    '_received_at'),
              ('schema_version', '_schema_version'),
              ('source_system',  '_source_system')]) }}
 {% endmacro %}
 
 
+{% macro delivery_ref() %}
+  {#-
+    WHICH DELIVERY A RAW ROW CAME FROM, reaching back past the change that
+    started recording it.
+
+    `_delivery_id` was ADDED, NEVER BACKFILLED (docs/DECISIONS.md#provenance-
+    is-added-not-backfilled): adding a column in Iceberg touches no data
+    files, so every row ingested before it reads NULL and no as-of query, run
+    record or evidence check could see those rows' deliveries at all.
+
+    `_source_file` is the fallback, and it is not a synonym. It is the PART --
+    the object the rows were actually read from -- and `already_ingested`
+    depends on it staying the part, which is exactly why `_delivery_id` needed
+    a column of its own. For `kind: file`, which is every delivery in this
+    catalog, the part IS the landing object and the delivery id is its
+    BASENAME, so the fallback is exact once the prefix is stripped. It is not
+    a full key with the prefix left on: `_delivery_id` holds a bare filename,
+    and coalescing the two without stripping would mix two namespaces in one
+    column and silently break every join and group-by over it.
+
+    THE ONE SHAPE IT IS NOT EXACT FOR is an archive ingested before the
+    provenance columns existed, where the part is an extracted member under
+    `ready/` and its basename is a member name rather than the delivery. No
+    feed in this catalog is `kind: archive`, so no such row exists -- but the
+    limit is written here rather than left to be discovered, because the row
+    it would produce looks perfectly ordinary.
+  -#}
+  coalesce(_delivery_id, element_at(split(_source_file, '/'), -1))
+{% endmacro %}
+
+
 {# Emits a TRAILING COMMA: it is always placed before `audit_columns()`,
    which is always last in the select. #}
 {% macro source_provenance() %}
-  {%- for alias, column in provenance_pairs() %}
-  {{ column }}                                AS {{ alias }},
+  {%- for alias, expression in provenance_pairs() %}
+  {{ expression }}                            AS {{ alias }},
   {%- endfor %}
 {% endmacro %}
 
@@ -164,7 +259,7 @@
 {# The same columns by their prepared-layer names, for a model that lists its
    output columns rather than selecting *. Also trailing-comma'd. #}
 {% macro source_provenance_columns() %}
-  {%- for alias, _column in provenance_pairs() %}
+  {%- for alias, _expression in provenance_pairs() %}
   {{ alias }},
   {%- endfor %}
 {% endmacro %}
@@ -192,7 +287,28 @@
    Centralised here so the rule cannot drift between models — this is exactly
    the kind of logic that was copy-pasted across legacy stored procedures and
    then diverged. #}
-{% macro dedupe_rank(partition_keys) %}
+{% macro dedupe_rank(partition_keys, mode='full_snapshot') %}
+  {#-
+    `mode` IS THE FEED'S DECLARED SUPERSESSION, not a switch with a
+    convenient default. `full_snapshot` -- each delivery restates the whole
+    population for its business date -- is what this macro has always
+    implemented and what every feed does, and it was implemented without ever
+    being stated. Stating it is what lets `supersession:` in feeds.yml refuse
+    a feed this cannot serve, instead of ranking a delta feed as though it
+    were a snapshot and silently dropping every key its newest file omits.
+
+    The other two modes are validated at load in
+    `context.resolve_supersession_config` and rejected there with a reason;
+    this is the second line of defence, for a model written by hand with a
+    mode nothing checked.
+  -#}
+  {%- if mode != 'full_snapshot' -%}
+    {{ exceptions.raise_compiler_error(
+         "dedupe_rank implements supersession mode 'full_snapshot' only, got '"
+         ~ mode ~ "'. See `supersession:` in feeds.yml and "
+         ~ "context.SUPERSESSION_NOT_BUILT for what each other mode would "
+         ~ "require.") }}
+  {%- endif -%}
   ROW_NUMBER() OVER (
     PARTITION BY _business_date,
       {%- for k in partition_keys %} {{ ident(k) }}{{ ',' if not loop.last }}{% endfor %}

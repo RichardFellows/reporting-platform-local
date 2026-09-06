@@ -49,16 +49,28 @@ log = logging.getLogger("retention")
 HELPTEXT = ("every table the platform manages, from managed_tables() -- the "
             "same list platform_housekeeping uses")
 
-# TWO SHAPES, and the second one nothing cuts yet. `published/<bd>/<run>` is
-# what `feed_ingest.record_publication` writes today; `published/<report>/<bd>/
-# <run>` is what a publication that knows its report will write, and matching
-# it here is what lets `references.published_tags.per_report` mean anything
-# when that lands. A report name may not contain "/", so the two alternatives
-# cannot both match one name.
+# TWO SHAPES, and only one of them is still written. `published/<report>/<bd>/
+# <run>` is what `dbt_builds.publish` cuts for each report a reporting build
+# publishes, which is what makes `references.published_tags.per_report` mean
+# something. `published/<bd>/<run>` is what the INGEST DAG used to cut before
+# a publication knew which report it was for; nothing writes it any more, and
+# it is still matched here because tags cut under it are real pins that this
+# sweep must recognise rather than skip. A report name may not contain "/", so
+# the two alternatives cannot both match one name.
 TAG_RE = re.compile(
     r"^published/"
     r"(?:(?P<report>[^/]+)/)?"
     r"(?P<bd>\d{4}-\d{2}-\d{2})/(?P<run>.+)$")
+
+# `snapshot/<feed>/<bd>/<run>` -- what an INGEST pins now. A different object
+# from a publication and kept for a different reason: it pins the state one
+# feed's ingest left, so a raw business date stays readable after retention
+# has deleted it from the live table. Its window is
+# `references.snapshot_tags`, which is allowed to be much shorter than a
+# published tag's, because nothing is reproduced FROM it -- it is a
+# convenience for reading back, not evidence a published figure rests on.
+SNAPSHOT_RE = re.compile(
+    r"^snapshot/(?P<feed>[^/]+)/(?P<bd>\d{4}-\d{2}-\d{2})/(?P<run>.+)$")
 
 # Matches landing.py, and for the same reason: a whole number of years turned
 # into a timedelta avoids the 29 February case that calendar arithmetic hits.
@@ -218,6 +230,36 @@ def clean_working_branches(nessie: Nessie, dry_run: bool = False) -> list[str]:
     return removed
 
 
+def _tag_age(ref: dict, business_date: date) -> tuple[str, date, date | None]:
+    """(what it was judged on, the date to judge it by, the commit date).
+
+    THE AGE IS THE COMMIT TIME where there is one -- when the record was made
+    -- with the BUSINESS DATE as a conservative fallback: a tag cannot be cut
+    before the date it is about, so the business date is never later than the
+    commit time and can only ever keep a tag the commit time would have kept
+    too. Deleting a tag is unrecoverable, so everything ambiguous keeps.
+
+    Shared by the published and snapshot sweeps: they answer to different
+    windows, but "how old is this tag" is one question and had better have one
+    answer.
+    """
+    meta = ref.get("metadata") or {}
+    committed = (meta.get("commitMetaOfHEAD") or {}).get("commitTime")
+    commit_date = None
+    if committed:
+        try:
+            commit_date = datetime.fromisoformat(
+                committed.replace("Z", "+00:00")).date()
+        except ValueError:
+            commit_date = None
+    if committed and commit_date is None:
+        log.warning("tag %s has an unreadable commit time %r; judging it on "
+                    "its business date alone", ref.get("name"), committed)
+    if commit_date is not None:
+        return "commit time", commit_date, commit_date
+    return "business date", business_date, None
+
+
 # --------------------------------------------------------------- 2. tag expiry
 def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
     """Published-tag retention. TAG RETENTION IS DATA RETENTION.
@@ -289,21 +331,7 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
         cutoff = (now - timedelta(days=years * DAYS_PER_YEAR)).date()
 
         bd = datetime.strptime(m.group("bd"), "%Y-%m-%d").date()
-        meta = ref.get("metadata") or {}
-        committed = (meta.get("commitMetaOfHEAD") or {}).get("commitTime")
-        commit_date = None
-        if committed:
-            try:
-                commit_date = datetime.fromisoformat(
-                    committed.replace("Z", "+00:00")).date()
-            except ValueError:
-                commit_date = None
-        if committed and commit_date is None:
-            log.warning("tag %s has an unreadable commit time %r; judging it "
-                        "on its business date alone", name, committed)
-
-        judged_on, age_date = ("commit time", commit_date) \
-            if commit_date is not None else ("business date", bd)
+        judged_on, age_date, commit_date = _tag_age(ref, bd)
         keep = age_date >= cutoff
         log.info("published tag %s: business date %s, published %s, window "
                  "%dy (cutoff %s), judged on %s%s -> %s",
@@ -318,6 +346,69 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
         removed.append(name)
 
     log.info("published tags: %d kept, %d removed", kept, len(removed))
+    return removed
+
+
+
+def expire_snapshot_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
+    """`snapshot/<feed>/<bd>/<run>` retention. NOT the same thing as a pin.
+
+    An ingest pins the state it left so a raw business date stays readable
+    after retention has removed it from the live table. That is a convenience
+    with a cost -- a pinned file cannot be reclaimed by `expire_snapshots` --
+    and NOTHING IS REPRODUCED FROM IT: no published figure rests on a snapshot
+    tag, so its window is a storage decision rather than an evidence one, and
+    it is allowed to be far shorter than a published tag's.
+
+    This is why the ingest DAG's tag was renamed out of `published/`. While it
+    lived there it was judged by the published window -- ten years of pinned
+    raw files per feed per business date -- and it was counted by every check
+    that asks whether a PUBLICATION can still be read.
+
+    Judged the same way a published tag is (`_tag_age`), and it keeps
+    everything it does not positively recognise, for the same reason.
+    """
+    policy = reference_policy("snapshot_tags")
+    years = policy.get("keep_years")
+    if isinstance(years, dict):
+        if ENV not in years:
+            raise ValueError(
+                f"retention.yml: references.snapshot_tags.keep_years has no "
+                f"entry for env {ENV!r} (has {sorted(years)}). Add one, or use "
+                f"a bare number of years.")
+        years = years[ENV]
+    if isinstance(years, bool) or not isinstance(years, int) or years <= 0:
+        raise ValueError(
+            f"retention.yml: references.snapshot_tags.keep_years is {years!r}, "
+            f"which is not a positive whole number of years. Refusing to sweep "
+            f"rather than guessing a window that authorises deletion.")
+
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=years * DAYS_PER_YEAR)).date()
+    removed: list[str] = []
+    kept = 0
+    for ref in nessie.list_references("snapshot/", fetch_all=True):
+        if ref.get("type") != "TAG":
+            continue
+        name = ref["name"]
+        m = SNAPSHOT_RE.match(name)
+        if not m:
+            log.info("tag %s does not match the snapshot shape; leaving it",
+                     name)
+            continue
+        bd = datetime.strptime(m.group("bd"), "%Y-%m-%d").date()
+        judged_on, age_date, _commit = _tag_age(ref, bd)
+        keep = age_date >= cutoff
+        log.info("snapshot tag %s: feed %s, business date %s, window %dy "
+                 "(cutoff %s), judged on %s -> %s", name, m.group("feed"), bd,
+                 years, cutoff, judged_on, "keep" if keep else "expire")
+        if keep:
+            kept += 1
+            continue
+        if not dry_run:
+            nessie.delete_reference(name)
+        removed.append(name)
+    log.info("snapshot tags: %d kept, %d removed", kept, len(removed))
     return removed
 
 
@@ -984,6 +1075,10 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
 
     report["working_branches_removed"] = clean_working_branches(nessie, dry_run)
     report["tags_removed"] = expire_tags(nessie, dry_run)
+    # Beside the published sweep and before the GC, for the same reason: both
+    # kinds of tag pin data files, and the GC must run after everything that
+    # can release one.
+    report["snapshot_tags_removed"] = expire_snapshot_tags(nessie, dry_run)
     # Step 3 of the documented chain, and it MUST land here: after tag expiry
     # (a tag pins every file its commit referenced) and before expire_snapshots.
     report["nessie_gc"] = nessie_gc(dry_run)
