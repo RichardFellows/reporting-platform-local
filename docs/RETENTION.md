@@ -478,8 +478,12 @@ with a tagged snapshot surviving it. No sweep or delete phase was run.
 a published pin and fails the night if one that exists can no longer be read.
 It runs as the last task of `platform_housekeeping`, *after* the maintenance
 chain, so it observes the state that chain left behind; and it only counts a
-pin older than `recent_partition_days`, because a younger one still shares its
-files with `main` and would resolve whether pinning worked or not. See
+pin that holds a data file `main` no longer references, because a pin whose
+files `main` still keeps alive would resolve whether pinning worked or not.
+"Can be read" includes the data: `SELECT COUNT(*)` at a tag is answered out of
+Iceberg's manifests and returns the published number from a table whose parquet
+files have been deleted, so the check also asks object storage for the files
+the pin's snapshot names. See
 [DECISIONS.md#reproducibility-is-exercised-not-asserted](DECISIONS.md#reproducibility-is-exercised-not-asserted).
 
 ```bash

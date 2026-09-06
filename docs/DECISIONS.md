@@ -2369,8 +2369,10 @@ The three retention comments are re-anchored to the guard that actually holds.
 manifest whose parts are not yet in the raw table, **at any age**, which is a
 stronger statement than "seven days comfortably exceeds twenty-six hours" and
 was already written two paragraphs below each of them. Seven days is now
-described as what it is — a convenience for reading a recent manifest, with
-re-normalization rebuilding an older one.
+described as what it is — a convenience for reading a recently extracted
+archive member, with re-normalization rebuilding an older one. (It does not
+bound the manifests at all any more; see
+[#the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests).)
 
 `arrival_poke_seconds` had exactly two references, the dataclass default and
 `feeds.yml`, and is the same defect one size smaller.
@@ -2503,26 +2505,79 @@ that collected a file the tag still referenced, a compaction that rewrote data
 before a snapshot expiry removed what the tag pointed at — each leaves a
 catalog that looks healthy and a pin that no longer resolves, and the first
 person to find out is whoever was asked to reproduce a figure from years ago.
-So the pin is READ, on a schedule, against the real catalog: resolving the
-reference, opening the commit's metadata and reading the data files it names is
-the whole check, and a collected link raises rather than returning wrong
-numbers.
+So the pin is EXERCISED, on a schedule, against the real catalog: the
+reference is resolved, the commit's metadata is opened, and every data file it
+names is confirmed to still be an object.
 
 **It runs after the maintenance chain, and that ordering is the test.**
 `maintain` compacts, `enforce_retention` expires tags, runs GC and expires
 snapshots. Running the check first would exercise yesterday's state and pass on
 the night the damage was done.
 
-**Older than `recent_partition_days`, or it reports `not_yet_meaningful` and
-does not pass.** A tag cut this morning proves almost nothing: its files are
-the ones main is still using, so it resolves whether pinning works or not.
-`maintain.py` compacts partitions older than that cutoff, rewriting their data
-files while the tag keeps referencing the old ones — which is exactly the state
-a too-eager GC destroys. A run past the cutoff has been through at least one
-such cycle, so it is the youngest whose survival means anything. This is
-CLAUDE.md's own rule about a check whose window does not contain the thing it
-describes, and the honest answer is a third outcome rather than a green one.
-The oldest eligible pin is chosen, because it has survived the most cycles.
+**It holds a data file `main` no longer references, or it reports
+`not_yet_meaningful` and does not pass.** A tag whose every file `main` still
+uses proves almost nothing: those files are kept alive by `main`, so the read
+succeeds whether pinning works or not. What makes it mean something is the pin
+holding a file nothing else keeps alive — the file a too-eager collector takes.
+This is CLAUDE.md's own rule about a check whose window does not contain the
+thing it describes, and the honest answer is a third outcome rather than a
+green one. Among the pins that diverge the oldest is chosen, because its
+exclusive files have been unreferenced by anything else for longest: the most
+GC identify passes have had a chance at them.
+
+**This was an AGE, and the age was wrong in both directions.** The rule was
+"older than `recent_partition_days`", on the stated grounds that `maintain.py`
+compacts partitions older than that cutoff and so rewrites their data files.
+`compact()` scopes its rewrite to `date_column >= today − recent_partition_days`
+— only the RECENT partitions — so a pin ages OUT of the compaction window
+rather than into it. And compaction is not the mechanism that produces
+divergence on this platform anyway: expiring a business date is a
+metadata-level partition delete, so `main` stops referencing that date's files
+while every pin goes on referencing them, which is how REQ-700's reclamation
+run produced a genuinely divergent pin. On a catalog whose newest business date
+is older than the compaction window — which is every catalog between deliveries
+— the age gate opens on a fixed date and reports GREEN on a pin still
+byte-identical to `main`. Worse than an unverified check: a check that turns
+green on a calendar.
+
+**The cost was the reason it was an age, and the cost turned out not to be
+there.** A file-set comparison reads Iceberg metadata, which needs Spark, and
+the check already opens a session per pin it reads — so a session per pin
+scanned looked like the price. It is not: Nessie's Iceberg catalog resolves
+``catalog.namespace.`table@ref`.files``, so ONE session addresses every
+reference. Measured on the live stack across 11 managed tables: 6.9s for
+`main`'s baseline, then ~1.0s per pin. The scan stops at the first pin that
+diverges, dedupes tags that share a commit, and is capped at
+`MAX_PINS_SCANNED` distinct commits so the cost is bounded by the cap rather
+than by how many reports have ever been published. A capped
+`not_yet_meaningful` says how many pins it looked at, because it means "none
+of these", not "none".
+
+### `SELECT COUNT(*)` does not read the data
+
+The check used to be one count per table, on the stated grounds that the read
+"reads the data files that metadata names". It does not. Iceberg answers
+`COUNT(*)` — and `COUNT(<column>)` — from the record counts in its own
+manifests, without opening a parquet file. Measured, by deleting one data file
+the pin referenced and `main` did not:
+
+```
+COUNT(*)                                     -> 16400
+COUNT(trade_id)                              -> 16400
+COUNT(*) WHERE trade_id IS NOT NULL          -> raised
+COUNT(*) WHERE _business_date = '2026-08-06' -> raised
+```
+
+The whole check reported `reproduced` on a pin whose data was gone. The count
+proves the METADATA chain resolves, which is worth asserting and is all it ever
+asserted. What proves the DATA survives is that the files the pin's snapshot
+names are still objects: `<table>.files` at the tag is the list, and object
+storage is asked whether they are there — one paginated LIST per table data
+prefix, no Spark, and it names the file that went rather than handing over a
+Py4J stack. Forcing a real scan with a predicate would also have worked and is
+not what this does: a full scan of every published table every night costs a
+great deal for no extra signal, because a file that is present is not corrupt
+in any failure mode this platform has. GC deletes; it does not rewrite.
 
 **It fails the run, where `completeness_check` beside it only warns.** A
 completeness gap is an upstream missing a Tuesday: real, not the platform's
@@ -2545,29 +2600,34 @@ pin, which is the failure mode that actually occurs and the one that is silent.
 
 ### Verified
 
-Against the live catalog. The scheduled path returned, correctly:
+Against the live catalog, on the automatic path — no `--tag`. The scan looked
+at one pin, found it holding 37 data files `main` no longer references across
+eight tables, selected it, and read all eleven managed tables at it:
 
 ```
-"status": "not_yet_meaningful",
-"detail": "no published tag is older than recent_partition_days (7d).
-           Every pin still shares its files with main, so a successful read
-           would not prove the pin holds."
+"divergence": {"pins_scanned": 1, "capped": false, "cap": 25, "tables": 11,
+               "exclusive_files": 37, ...},
+"selected": "oldest_diverging", "status": "reproduced", "ok": true
 ```
 
-Forced onto a real pin with `--tag published/2026-08-01/e__20260904T154139084306`,
-it read four raw tables at that commit — `fo_trade` 15255 rows,
-`ref_counterparty` 2340, `ref_rating` 5425, `ref_collateral` 975 — with zero
-unreadable and the seven prepared/reporting tables correctly classified as
-absent at that pin rather than as failures. `airflow dags list-import-errors`
-is clean and `airflow tasks list platform_housekeeping` renders
-`reproducibility_check`.
+**And the BROKEN branch has now executed**, which it never had before. One of
+those 37 files — a `raw.fo_trade` parquet under
+`_business_date_day=2026-08-06`, referenced by the pins and by nothing on
+`main` — was copied out of MinIO and deleted, so the blast radius was the pin
+under test. The check went red and named it:
 
-**Not verified**: a genuinely broken pin. Producing one means deleting a tag
-and then GC-sweeping and executing deferred deletes against real warehouse
-files, which is destructive on a catalog holding the seed data. The failure
-branch is exercised by construction (any read exception that is not
-`TABLE_OR_VIEW_NOT_FOUND` lands in `unreadable`, which clears `ok`) but has not
-been observed firing.
+```
+EXIT=1  status BROKEN  ok false
+unreadable: 1 of 41 data file(s) the pin references are no longer in object
+            storage, e.g. warehouse/raw/fo_trade_…/data/
+            _business_date_day=2026-08-06/00000-6-…-00001.parquet
+```
+
+The identical bytes were then put back (md5 `5405b5ef…1c6f`, 17310 bytes, equal
+before and after), the check returned `reproduced` with `missing_files: []`,
+and the pin again reads 400 rows at 2026-08-06 — a date `main` no longer holds.
+That same run is what established that `COUNT(*)` alone had reported
+`reproduced` with the file missing; see above.
 
 ## the-registry-records-observations-not-verdicts
 
@@ -3239,3 +3299,94 @@ stack today is two versions of one date with identical 126-delivery input sets
 and different code refs (`1da75dbe51fed0eb` → `cf50684d0cf3d257`, change_ref
 `RPT-1421` → `RPT-1490`). A diff that only differenced deliveries would say "no
 change" about a rebuild that moved every figure.
+
+
+## the-ready-window-bounds-the-parts-not-the-manifests
+
+Found by running `platform_housekeeping` end to end and reading its own log,
+three tasks apart, inside a single run:
+
+```
+enforce_retention   ready/ sweep      157 manifests deleted
+registry_reconcile  normalize first   157 manifests re-created   newly registered: 0
+```
+
+`ready.sweep_feed` deleted every manifest past `keep_days` whose parts were in
+raw; `normalize.reconcile` then created a manifest for every landing object
+that lacked one, which after the sweep was all of them. The `ready:` window
+reclaimed nothing lasting and both subsystems logged success — a standing
+no-op, which is the shape of thing that survives for years because nothing is
+ever red.
+
+**The sweep was the one in the wrong, and which one is not obvious.** The
+tempting fix is the other way round: have `normalize.reconcile` skip landing
+objects that are already ingested, since a manifest for an ingested delivery is
+not a queue entry anybody needs. That breaks the property that makes the
+registry an index rather than a second source of truth. `deliveries.reconcile`
+walks MANIFESTS — the registry follows the platform having accepted a delivery
+as readable, not a raw landing object whose business date nothing has yet
+established — so with the manifests swept and reconcile taught not to rebuild
+them, dropping the registry and rebuilding it would re-register only the last
+`keep_days` of deliveries. "Rebuildable from object storage by the same code
+that writes it" would quietly become "rebuildable for a week".
+
+So the manifest is not merely a queue entry. It is the delivery's description
+of record in object storage, it is about 1KB against a landing object kept for
+ten years, and it is kept for as long as that object is. What `ready:`
+actually bounds is narrower and was always the part worth reclaiming:
+
+* **Derived parts** — a zip member `_normalize_archive` extracted — of a
+  manifest past `keep_days` whose parts are all ingested. That is the real
+  duplication, a second copy of data `landing/` already holds. The manifest
+  stays, so `normalize.reconcile` skips the landing object and nothing
+  re-extracts them; `normalize --force` rebuilds them if anything ever needs
+  to. On a queue of plain CSVs this reclaims nothing, because their parts point
+  back into `landing/` and nothing was ever copied — which on the shipped seed
+  is every one of the 199 objects in `ready/`.
+* **Orphaned manifests**, whose `source_object` is no longer in `landing/`, at
+  any age. Nothing recreates one, because `reconcile` walks landing. These are
+  what the landing sweep leaves behind, which is why it runs immediately before
+  this one in `retention.run()`.
+
+`already_ingested` opens a Spark session per feed, and is now taken lazily —
+only when some manifest actually has derived parts old enough to consider, or
+an orphan to classify. On the shipped seed that is never, so the sweep costs
+four fewer JVM starts a night than it did while deleting nothing.
+
+The report counts what was REMOVED rather than what was considered:
+`parts_deleted` and `manifests_deleted` (orphans only). A counter that tracked
+"past the window" would be describing work the next `normalize.reconcile`
+undoes, which is exactly what it used to do.
+
+## a-dry-run-may-write-to-the-index-not-to-object-storage
+
+Same run, same reading. `registry_reconcile` took no notice of the `dry_run`
+param, and `deliveries.reconcile()` calls `normalize.reconcile()` first so that
+a delivery pushed straight into the bucket has a manifest to follow. A
+housekeeping run explicitly triggered with `{"dry_run": true}` therefore wrote
+**116 manifests into `ready/`** and registered zero deliveries — and
+invalidated its own forecast, because the dry run predicted a sweep of 42
+manifests and the real run then removed 157. The dry run had created the
+difference.
+
+**Gating the whole task on `dry_run` would have been the wrong fix.** The
+task's docstring argues at length that it should always run: it is the registry
+rebuild path, and `arrival.py`'s rule — *events are an optimisation, the poll
+is the correctness guarantee* — is precisely what a skipped poll throws away. A
+dry run of the nightly chain that leaves the registry stale for the night is a
+worse outcome than the defect.
+
+The distinction that resolves it is not "does this write" but **what the write
+changes**. A registry row is an index entry: the write is an upsert, it is
+idempotent, and nothing that deletes reads it, so making one on a dry run
+changes nothing about what the real run would do. A manifest object is an input
+to the `ready/` sweep two tasks back, so making one *does*. So `dry_run`
+narrows the task to `normalize_first=False`: every delivery that has a manifest
+is still reconciled and still gets its row, and the count of landing objects
+that have none is reported as `would_normalize` instead of being manufactured.
+The prediction is computed with the SAME predicate `normalize.reconcile` skips
+on, so it is what the real run would do rather than a second opinion about it.
+
+The rule, stated once so the next dry-run flag has somewhere to look: **a dry
+run may write to the index; it may not write anything a later step reads to
+decide what to delete.**

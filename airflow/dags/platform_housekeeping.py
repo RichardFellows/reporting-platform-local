@@ -134,12 +134,12 @@ def platform_housekeeping():
         """Can a published run still be read at its own pin? REQ-702.
 
         AFTER THE MAINTENANCE CHAIN, and that ordering is the whole test.
-        `maintain` compacts partitions older than `recent_partition_days`,
-        which rewrites their data files; `enforce_retention` then expires tags,
-        runs Nessie GC and expires snapshots. Every one of those can break a
-        pin while leaving a catalog that looks healthy, and none of them
-        announces it. Running the check first would exercise yesterday's
-        state and pass on the night the damage was done.
+        `maintain` rewrites data files; `enforce_retention` then expires
+        published tags, expires business dates out of the tables, runs Nessie
+        GC and executes the deferred deletes an earlier sweep queued. Every one
+        of those can break a pin while leaving a catalog that looks healthy,
+        and none of them announces it. Running the check first would exercise
+        yesterday's state and pass on the night the damage was done.
 
         FAILS THE RUN, unlike `completeness_check` beside it, and the
         difference is what the red means. A completeness gap is an upstream
@@ -149,11 +149,17 @@ def platform_housekeeping():
         its own evidence, in the step that just ran, and it is unrecoverable:
         every further night makes it worse and less diagnosable.
 
-        A pin younger than `recent_partition_days` reports
-        `not_yet_meaningful` and does not fail. It has not been through a
-        compaction cycle, so it still shares its files with main and would read
-        successfully whether pinning worked or not — a green result there would
-        be a check whose window does not contain the thing it describes.
+        `not_yet_meaningful` DOES NOT FAIL, and it is no longer an age. The
+        check selects the oldest pin holding a data file `main` no longer
+        references, because a pin whose every file `main` still keeps alive
+        would read successfully whether pinning worked or not; when no scanned
+        pin holds one, there is nothing here worth reading and a green would be
+        a check whose window does not contain the thing it describes. This used
+        to be approximated by the pin being older than `recent_partition_days`,
+        which is backwards — compaction is scoped to the RECENT partitions, so
+        a pin ages out of that window rather than into it, and the gate would
+        have opened on a fixed date and reported green on files identical to
+        `main`'s. See monitoring/reproducibility.py.
         """
         import logging
 
@@ -176,9 +182,15 @@ def platform_housekeeping():
                 f"ran destroyed evidence a published run depends on. Do not "
                 f"ignore this — every further night makes it less diagnosable."
             )
-        log.info("reproducibility: %s reproduced, %d table(s) read, "
-                 "%d absent at that pin", report.get("tag"),
-                 len(report.get("tables", [])), len(report.get("absent", [])))
+        # The divergence count is the half that says the green MEANS something:
+        # it is how many data files this pin keeps alive that main does not.
+        # A green with zero there would be the old age gate's meaningless one.
+        div = report.get("divergence") or {}
+        log.info("reproducibility: %s reproduced, %d table(s) read, %d absent "
+                 "at that pin; selected after scanning %s pin(s), holding %s "
+                 "data file(s) main no longer references", report.get("tag"),
+                 len(report.get("tables", [])), len(report.get("absent", [])),
+                 div.get("pins_scanned"), div.get("exclusive_files"))
         return report
 
     @task(pool="lakehouse_write")
@@ -227,15 +239,30 @@ def platform_housekeeping():
         does: a registry write that failed while Postgres was restarting, or a
         file an upstream agent pushed straight into the bucket while nothing
         of ours was running.
+
+        `dry_run` NARROWS THIS TASK, IT DOES NOT SKIP IT, and the distinction
+        is which side effect matters. Registry rows are an index: the write is
+        an upsert, nothing that deletes reads it, and skipping the poll is
+        precisely what the rule above forbids. Manifest objects are different
+        -- they are the input to the `ready/` sweep two tasks back, so a "dry"
+        run that creates one changes what the real run does. Observed: a run
+        triggered with `{"dry_run": true}` wrote 116 manifests and forecast a
+        sweep of 42 that then removed 157. So a dry run reconciles from the
+        manifests that exist and reports how many it would have made.
         """
         import logging
 
         from reporting_platform.registry.deliveries import reconcile_all
 
         log = logging.getLogger("airflow.task")
-        report = reconcile_all()
+        dry = bool(context["params"].get("dry_run"))
+        report = reconcile_all(normalize_first=not dry)
         log.info("registry: %d newly registered, %d failed",
                  report["registered"], report["failed"])
+        if dry:
+            log.info("dry_run: no manifests written; %d landed object(s) have "
+                     "none and would be normalized by a real run",
+                     report.get("would_normalize", 0))
         return report
 
     @task

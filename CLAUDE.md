@@ -191,8 +191,16 @@ Two corollaries worth holding on to:
   and landing is the only prefix still holding every date. The manifest never
   records whether something was ingested; that stays derived from the raw
   table. `ready/` is reconciled from `landing/` on demand, so a file pushed
-  straight into the bucket is never stranded.
-  See `docs/DECISIONS.md#ready-is-a-derived-index` and `docs/DELIVERY-SHAPES.md`.
+  straight into the bucket is never stranded — and because the registry
+  follows MANIFESTS, that reconcile is also what makes the registry
+  rebuildable. So the `ready:` window bounds the **derived parts**, not the
+  manifests: a manifest whose landing object is still there is kept at any age,
+  because sweeping it only gives the next reconcile something to recreate. The
+  two were undoing each other nightly, 157 deleted and 157 remade, both logging
+  success.
+  See `docs/DECISIONS.md#ready-is-a-derived-index`,
+  `#the-ready-window-bounds-the-parts-not-the-manifests` and
+  `docs/DELIVERY-SHAPES.md`.
 - **A feed is named `<source_system>_<feed>`** — `fo_trade`,
   `ref_counterparty`, `treasury_margin_call` — and it is TYPED into feeds.yml,
   not derived. That one string is the raw table, the DAG id, the landing
@@ -269,6 +277,15 @@ Two corollaries worth holding on to:
   See `docs/DECISIONS.md#provenance-is-added-not-backfilled`.
 - Retention and GC delete data. `dry_run` first, always. GC defers its deletes
   by design; the deferred-delete pass is the deliberate second step.
+- **A dry run may write to the index; it may not write anything a later step
+  reads to decide what to delete.** `registry_reconcile` used to ignore
+  `dry_run` entirely, and `deliveries.reconcile()` normalizes first, so
+  `{"dry_run": true}` wrote 116 manifests into `ready/` and then mispredicted
+  its own sweep. Skipping the task is not the fix — it is the rebuild path, and
+  *events are an optimisation, the poll is the correctness guarantee*. It is
+  narrowed instead: rows still written, manifests not, and the count reported
+  as `would_normalize`.
+  See `docs/DECISIONS.md#a-dry-run-may-write-to-the-index-not-to-object-storage`.
 - **A published tag is DATA retention, sized in years, not by the table
   keep-set.** `references.published_tags` in `retention.yml` is the
   reproducibility window: a tag pins every data file its commit referenced, so
@@ -368,7 +385,8 @@ $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select path:models/prepared path:models/reporting --vars "{nessie_ref: $branch}"
 
 # can a published run still be read at its own pin? (REQ-702)
-# reports `not_yet_meaningful` until a pin is older than recent_partition_days
+# picks the oldest pin holding a data file main no longer references; reports
+# `not_yet_meaningful` when no scanned pin does. `--tag <t>` forces one.
 docker compose exec -T airflow python -m reporting_platform.monitoring.reproducibility
 
 # the delivery registry -- reconcile is the rebuild path and is idempotent

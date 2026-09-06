@@ -316,3 +316,76 @@ def test_the_family_lives_on_the_submission_not_on_the_version():
     concern, so grouping them must not touch how either one is numbered."""
     assert "family" in _table_ddl("submission")
     assert "family" not in _table_ddl("report_version")
+
+
+# ------------------------------------------------- the dry-run write it made
+class _NoDatabase(Exception):
+    """Sentinel: the reconcile reached Postgres, which these tests do not have."""
+
+
+def _reconcile_to_the_db_boundary(normalize_first: bool):
+    """Run `deliveries.reconcile` over a fake bucket, stopping at `db.connect`.
+
+    Everything before that boundary is object storage, which is exactly the
+    half under test. The Postgres half is verified by running it -- see this
+    module's header.
+    """
+    from tests.fakes3 import FakeS3, install, uninstall
+
+    config_dir()
+    s3 = FakeS3()
+    monkey: list = []
+    install(monkey, s3)
+    from reporting_platform.common.context import feeds
+    from reporting_platform.registry import db, deliveries
+
+    fd = feeds()["fo_trade"]
+    s3.put("landing/fo_trade/TRADE_20260811.csv", "trade_id\nT1\n")
+    monkey.append((db, "connect", db.connect))
+
+    def _refuse():
+        raise _NoDatabase()
+
+    db.connect = _refuse
+    try:
+        try:
+            deliveries.reconcile(fd, normalize_first=normalize_first)
+        except _NoDatabase:
+            pass
+        return {k for k in s3.objects if k.startswith("ready/")}
+    finally:
+        uninstall(monkey)
+
+
+def test_a_reconcile_that_may_not_write_creates_no_manifest():
+    """The defect: `platform_housekeeping` triggered with `{"dry_run": true}`
+    wrote 116 manifests into `ready/` and registered 0 -- and invalidated its
+    own forecast, since the sweep it predicted at 42 then removed 157. A dry
+    run whose side effects change what the real run does is not a dry run.
+
+    The registry ROWS are deliberately still written; only the object-storage
+    write is withheld. See `deliveries.reconcile`.
+    """
+    assert _reconcile_to_the_db_boundary(normalize_first=False) == set()
+
+
+def test_and_the_real_one_still_does():
+    """The control. Without this the test above passes on a reconcile that
+    stopped working."""
+    assert _reconcile_to_the_db_boundary(normalize_first=True) == {
+        "ready/fo_trade/TRADE_20260811.csv.json"}
+
+
+def test_the_nightly_task_is_narrowed_by_dry_run_not_skipped():
+    """`registry_reconcile` is the REBUILD path -- *events are an
+    optimisation, the poll is the correctness guarantee* -- so gating the
+    whole task on `dry_run` throws away the thing it is for. It must pass the
+    flag down to the one write that leaks instead. Checked as text because the
+    failure is a one-line `if p.get("dry_run"): return` somebody adds later.
+    """
+    from tests.support import REPO
+    src = (REPO / "airflow" / "dags" / "platform_housekeeping.py").read_text(
+        encoding="utf-8")
+    body = src[src.index("def registry_reconcile"):src.index("def evidence_check")]
+    assert "reconcile_all(normalize_first=not dry)" in body
+    assert "return report" in body

@@ -223,7 +223,38 @@ def test_member_keys_are_stable_so_reingest_does_not_happen():
         uninstall(monkey)
 
 
-def test_ready_sweep_removes_extracted_members_too():
+def test_ready_sweep_removes_extracted_members_but_keeps_the_manifest():
+    """The extracted members ARE the duplication `ready:` exists to reclaim.
+
+    The manifest is not, and keeping it is what stops the sweep and
+    `normalize.reconcile` undoing each other every night -- with the manifest
+    gone, reconcile would re-extract the whole archive tomorrow. See
+    reporting_platform/retention/ready.py.
+    """
+    from datetime import date, timedelta
+
+    s3, monkey, fd, norm = _setup(TWO_PARTS)
+    try:
+        from reporting_platform.retention import ready
+        m = norm.normalize(fd, ZIP_KEY)
+        monkey.append((ready, "already_ingested", ready.already_ingested))
+        ready.already_ingested = lambda feed: {p["object_key"] for p in m["parts"]}
+        report = ready.sweep_feed(fd, date.today() + timedelta(days=1),
+                                  dry_run=False)
+        assert report["parts_deleted"] == len(m["parts"]), report
+        assert report["manifests_deleted"] == 0, report
+        members = [p["object_key"] for p in m["parts"]]
+        assert not any(k in s3.objects for k in members), list(s3.objects)
+        assert any(k.startswith("ready/") and k.endswith(".json")
+                   for k in s3.objects), list(s3.objects)
+        # ...and never the container.
+        assert ZIP_KEY in s3.objects
+    finally:
+        uninstall(monkey)
+
+
+def test_a_swept_archive_is_not_re_extracted():
+    """The property, not the count: reconcile must find nothing to do."""
     from datetime import date, timedelta
 
     s3, monkey, fd, norm = _setup(TWO_PARTS)
@@ -233,8 +264,8 @@ def test_ready_sweep_removes_extracted_members_too():
         monkey.append((ready, "already_ingested", ready.already_ingested))
         ready.already_ingested = lambda feed: {p["object_key"] for p in m["parts"]}
         ready.sweep_feed(fd, date.today() + timedelta(days=1), dry_run=False)
-        assert not any(k.startswith("ready/") for k in s3.objects), list(s3.objects)
-        # ...and never the container.
-        assert ZIP_KEY in s3.objects
+        after = set(s3.objects)
+        assert norm.reconcile(fd)["created"] == []
+        assert set(s3.objects) == after
     finally:
         uninstall(monkey)

@@ -255,6 +255,22 @@ def reconcile(feed: Feed, *, normalize_first: bool = True) -> dict[str, Any]:
     control file has landed but is not yet a delivery anything can describe,
     and giving it a row would mean inventing a business date the platform has
     not yet been told.
+
+    AND IT IS THE ONE WRITE A DRY RUN MUST NOT MAKE. `normalize_first` writes
+    manifest OBJECTS; everything else here writes registry ROWS, and the two
+    are not the same kind of side effect. A row changes nothing downstream --
+    the registry is an index, the write is an upsert, and nothing that deletes
+    reads it. A manifest is an input to the `ready/` sweep, so creating one on
+    a "dry" run changes what the real run then does: observed, a housekeeping
+    run triggered with `{"dry_run": true}` wrote 116 manifests and predicted a
+    sweep of 42, after which the real run swept 157. So a dry run passes
+    `normalize_first=False` and reports `would_normalize` instead.
+
+    NOT gated on `dry_run` as a whole, deliberately. This is the rebuild path
+    and the module header's rule -- *events are an optimisation, the poll is
+    the correctness guarantee* -- is exactly what a skipped poll throws away.
+    A dry run of the nightly chain still reconciles every delivery that has a
+    manifest; it just does not manufacture the manifests it would then count.
     """
     from reporting_platform.ingest import arrival
     from reporting_platform.ingest import normalize as norm
@@ -262,6 +278,13 @@ def reconcile(feed: Feed, *, normalize_first: bool = True) -> dict[str, Any]:
     out: dict[str, Any] = {"feed": feed.name, "registered": [], "failed": []}
     if normalize_first:
         out["normalized"] = norm.reconcile(feed)["created"]
+    else:
+        # The SAME predicate `normalize.reconcile` skips on, so the prediction
+        # is what the real run would do rather than a second opinion about it.
+        have = set(norm.list_manifests(feed))
+        out["would_normalize"] = [
+            k for k in arrival.matching(feed, arrival.list_landing(feed))
+            if norm.manifest_key(feed, k) not in have]
 
     listing = _landing_listing(feed)
     present, etags = set(listing), listing
@@ -390,11 +413,16 @@ def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
     return out
 
 
-def reconcile_all() -> dict[str, Any]:
-    out = {"feeds": [], "registered": 0, "failed": 0}
+def reconcile_all(*, normalize_first: bool = True) -> dict[str, Any]:
+    """Every feed. `normalize_first=False` is the dry-run shape -- see
+    `reconcile`: registry rows still get written, manifest objects do not."""
+    out: dict[str, Any] = {"feeds": [], "registered": 0, "failed": 0,
+                           "normalize_first": normalize_first}
     for fd in feeds().values():
-        one = reconcile(fd)
+        one = reconcile(fd, normalize_first=normalize_first)
         out["feeds"].append(one)
         out["registered"] += len(one["registered"])
         out["failed"] += len(one["failed"])
+        out["would_normalize"] = (out.get("would_normalize", 0)
+                                  + len(one.get("would_normalize", ())))
     return out

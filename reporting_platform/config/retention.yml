@@ -131,9 +131,20 @@ environments:
     # years, and unlike `landing:` it constrains nothing -- nothing computes
     # a keep-set from it, and it has no correctness floor either.
     #
-    # What protects a delivery waiting to be ingested is not this number: a
-    # manifest whose parts are not yet in the raw table is never swept, at
-    # any age. See reporting_platform/retention/ready.py.
+    # IT GOVERNS THE DERIVED PARTS, NOT THE MANIFESTS. A manifest whose
+    # landing object is still there is kept at any age, because
+    # normalize.reconcile recreates one for every landing object that lacks
+    # one -- sweeping it was a nightly no-op that both subsystems logged as
+    # success (157 deleted, 157 re-created, 0 newly registered, in one run) --
+    # and because deliveries.reconcile rebuilds the registry FROM manifests.
+    # A manifest goes when landing has let its object go. So what this number
+    # actually bounds is an extracted archive member: the second copy of data
+    # landing already holds. On a queue of plain CSVs it bounds nothing,
+    # because their parts point back into landing/ and nothing was copied.
+    #
+    # What protects a delivery waiting to be ingested is not this number
+    # either: a manifest whose parts are not yet in the raw table keeps its
+    # parts at any age. See reporting_platform/retention/ready.py.
     ready:
       keep_days: 7
 
