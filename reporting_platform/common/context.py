@@ -1779,6 +1779,95 @@ def code_ref() -> tuple[str, str]:
     return _tree_digest(roots, (".py",)), "tree-digest"
 
 
+# Environments where the transformation project is deployed rather than edited,
+# so a declared version is expected and a divergence from it is a fault. The
+# feed console is not deployed here; `local` and `dev` are where it writes
+# models and source definitions into the project, which is exactly the
+# divergence `check_project_drift()` must NOT refuse on.
+CONTROLLED_ENVIRONMENTS = ("uat", "prod")
+
+
+def dbt_project_ref() -> str:
+    """The DECLARED version of the transformation project, or "".
+
+    The commit the deployment pipeline built from -- what an auditor resolves
+    in git, and thereafter to the change record and its approval. Empty where
+    nothing declared one, which is every developer machine and, deliberately,
+    `dev`: the console edits the project there, so a declared version would be
+    false within a day.
+
+    NOT a substitute for `dbt_manifest_ref()`. That one is computed from the
+    project on disk and answers "was this run's SQL the same SQL as that
+    run's"; this one answers "which commit is that SQL supposed to be". Two
+    questions, two fields, and `check_project_drift()` is what reconciles
+    them.
+    """
+    return os.environ.get("DBT_PROJECT_REF", "").strip()
+
+
+def deployment_provenance() -> dict[str, str]:
+    """The identifiers the DEPLOYMENT knows and a run cannot work out.
+
+    A CHANGE IS A DEPLOYMENT EVENT, NOT A RUN EVENT. One ticket authorises a
+    version and every run executes that version until the next deployment, so
+    these come from the environment the chart set, not from whoever triggered
+    the build. `registry.run.change_ref` is the other thing -- a per-run
+    reference for an exceptional publication, a restatement or an out-of-cycle
+    rerun -- and the two must not be merged into one column: "published under
+    the standing deployed version" and "published under a specific
+    authorisation" are different facts.
+
+    Empty strings rather than None, and never a guess. A value absent here is
+    a deployment that did not supply one, which is a true and useful thing for
+    the run record to say.
+    """
+    return {
+        "dbt_project_ref": dbt_project_ref(),
+        "deployment_change_ref": os.environ.get("DEPLOYMENT_CHANGE_REF", "").strip(),
+        "deployment_pipeline_ref": os.environ.get("DEPLOYMENT_PIPELINE_REF", "").strip(),
+    }
+
+
+def check_project_drift() -> str:
+    """Does the project on disk match the one the pipeline deployed?
+
+    THE DECLARED VERSION SAYS WHAT SHOULD BE RUNNING; THE DIGEST SAYS WHAT IS.
+    A commit id alone cannot detect that the project was modified after
+    deployment -- and this platform can modify it, because the feed console
+    writes `_sources.yml` and scaffolds a prepared model straight into
+    DBT_PROJECT_DIR. The console is a dev tool and is not deployed above dev,
+    which is precisely why a divergence in `uat` or `prod` is a fault worth
+    refusing on rather than a normal Tuesday.
+
+    The comparison is digest to digest, because a commit id and a content
+    digest are different value spaces and cannot be compared. The pipeline
+    computes `DBT_PROJECT_DIGEST` with THIS function's counterpart --
+    `python -m reporting_platform.registry provenance` prints it -- so the two
+    sides are one implementation rather than two that agree until one is
+    changed.
+
+    Returns "" when there is nothing to check (no declared digest) or when it
+    matches; otherwise a description of the divergence. RAISES only in a
+    controlled environment: `dev` diverges by design and must stay usable.
+    """
+    declared = os.environ.get("DBT_PROJECT_DIGEST", "").strip()
+    if not declared:
+        return ""
+    actual = dbt_manifest_ref()
+    if declared == actual:
+        return ""
+    message = (f"the transformation project on disk (digest {actual}) is not "
+               f"the one this deployment declared (digest {declared}, version "
+               f"{dbt_project_ref() or 'undeclared'}). Something changed the "
+               f"project after it was deployed.")
+    if ENV in CONTROLLED_ENVIRONMENTS:
+        raise RuntimeError(
+            f"{message} Publishing from it would attribute the result to a "
+            f"commit that did not produce it. Deploy the change through the "
+            f"pipeline rather than editing the project in place.")
+    return message
+
+
 def dbt_manifest_ref() -> str:
     """A digest of the dbt project as built. REQ-404, the model half.
 

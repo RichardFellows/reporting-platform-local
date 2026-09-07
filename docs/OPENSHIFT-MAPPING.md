@@ -15,7 +15,36 @@ This table is the contract that keeps that true.
 | Serving DB | Postgres container | an enterprise RDBMS | dbt/export target profile |
 | Secrets | `.env` | OpenShift Secrets / Vault | injection mechanism |
 | DAG deployment | bind mount | Forge CI → image → Helm | packaging only |
+| Change provenance | nothing declared; content digests | `DBT_PROJECT_REF`, `DBT_PROJECT_DIGEST`, `DEPLOYMENT_CHANGE_REF`, `DEPLOYMENT_PIPELINE_REF` from the chart | env vars only |
 | Feed arrival | poll of the MinIO landing prefix | S3 event / SFTP landing prefix poll | sensor implementation |
+
+## What the chart must supply
+
+Four environment variables, set at deployment and constant for the life of it.
+Every run records them, which is what makes a published figure resolvable back
+through the pipeline to the change record and its approval.
+
+| Variable | Value | Resolves in |
+|---|---|---|
+| `DBT_PROJECT_REF` | the commit the pipeline built the project from | Git |
+| `DBT_PROJECT_DIGEST` | `python -m reporting_platform.registry provenance` run over the project being deployed, `dbt_project_digest` field | — (compared at run time) |
+| `DEPLOYMENT_CHANGE_REF` | the change ticket the CAB approved | Ticketing |
+| `DEPLOYMENT_PIPELINE_REF` | the pipeline or job id that deployed it | CI |
+
+`PLATFORM_CODE_REF` already exists for the platform image and should be the
+image **digest**, not a tag: a tag can be re-pushed, and then the evidence
+changes underneath a run that has already been published.
+
+**`DBT_PROJECT_DIGEST` is computed with the platform's own command**, not
+reimplemented in the pipeline. A run recomputes it and compares; a mismatch
+means the project was modified after deployment, and in `uat`/`prod` the build
+refuses rather than attributing a publication to a commit that did not produce
+it. See `docs/DECISIONS.md#a-change-is-a-deployment-event-not-a-run-event`.
+
+**The feed console is not deployed above `dev`.** It writes `_sources.yml` and
+a scaffolded model into the project, which is exactly the drift the check
+exists to catch — so its changes reach `uat` and `prod` the same way any other
+change does, through git and the pipeline.
 
 ## The three things that genuinely differ
 

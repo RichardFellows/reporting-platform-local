@@ -47,7 +47,8 @@ def open_run(run_id: str, purpose: str, branch: str, *,
              environment: str, code_ref: str, code_ref_kind: str,
              dbt_manifest_ref: str, dag_id: str | None = None,
              airflow_run_id: str | None = None,
-             change_ref: str | None = None) -> dict[str, Any]:
+             change_ref: str | None = None,
+             provenance: dict[str, str] | None = None) -> dict[str, Any]:
     """Record that a build has started. Idempotent on `run_id`.
 
     OPENED BEFORE THE BUILD, not after it, because a run that fails is the one
@@ -56,17 +57,25 @@ def open_run(run_id: str, purpose: str, branch: str, *,
     Airflow task reuses the row rather than raising: `keep_failed_branch`
     deliberately leaves the branch behind for a retry to reuse, and the run is
     the same logical run.
+
+    `provenance` is `context.deployment_provenance()` -- the standing change,
+    the pipeline and the declared project version, all of which are properties
+    of the DEPLOYMENT and identical across every run of it. `change_ref` is the
+    per-run exception and stays separate; see the column comments in db.py.
     """
     if purpose not in PURPOSES:
         raise ValueError(f"run purpose must be one of {PURPOSES}, got {purpose!r}")
+    prov = provenance or {}
     with db.connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO registry.run (run_id, purpose, status, environment,
                                       dag_id, airflow_run_id, branch,
                                       code_ref, code_ref_kind,
-                                      dbt_manifest_ref, change_ref)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                      dbt_manifest_ref, change_ref,
+                                      dbt_project_ref, deployment_change_ref,
+                                      deployment_pipeline_ref)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (run_id) DO UPDATE SET
                 -- A retry re-reads the code and the project, and they can
                 -- legitimately have changed between attempts -- that is worth
@@ -81,10 +90,21 @@ def open_run(run_id: str, purpose: str, branch: str, *,
                 code_ref_kind = EXCLUDED.code_ref_kind,
                 dbt_manifest_ref = EXCLUDED.dbt_manifest_ref,
                 change_ref = COALESCE(EXCLUDED.change_ref, registry.run.change_ref),
+                -- Overwritten, not coalesced, unlike change_ref: a retry runs
+                -- under whatever is deployed NOW, and if that changed between
+                -- attempts then the new deployment is what produced the
+                -- publication. Keeping the first attempt's would attribute the
+                -- result to a version that did not produce it.
+                dbt_project_ref = EXCLUDED.dbt_project_ref,
+                deployment_change_ref = EXCLUDED.deployment_change_ref,
+                deployment_pipeline_ref = EXCLUDED.deployment_pipeline_ref,
                 error = NULL
             """,
             (run_id, purpose, RUNNING, environment, dag_id, airflow_run_id,
-             branch, code_ref, code_ref_kind, dbt_manifest_ref, change_ref))
+             branch, code_ref, code_ref_kind, dbt_manifest_ref, change_ref,
+             prov.get("dbt_project_ref") or None,
+             prov.get("deployment_change_ref") or None,
+             prov.get("deployment_pipeline_ref") or None))
     log.info("run %s opened (%s) on %s, code %s/%s", run_id, purpose, branch,
              code_ref_kind, code_ref)
     return {"run_id": run_id, "purpose": purpose, "status": RUNNING}
@@ -369,7 +389,9 @@ def inputs_for_run(run_id: str) -> list[dict[str, str]]:
 def recent(limit: int = 20, purpose: str | None = None) -> list[dict[str, Any]]:
     sql = ("SELECT run_id, purpose, status, environment, branch, business_date, "
            "       started_at, finished_at, code_ref, code_ref_kind, "
-           "       dbt_manifest_ref, change_ref, merged_hash, error "
+           "       dbt_manifest_ref, change_ref, dbt_project_ref, "
+           "       deployment_change_ref, deployment_pipeline_ref, "
+           "       merged_hash, error "
            "FROM registry.run")
     args: list[Any] = []
     if purpose:

@@ -246,9 +246,24 @@ CREATE TABLE IF NOT EXISTS registry.run (
     code_ref          TEXT        NOT NULL,
     code_ref_kind     TEXT        NOT NULL,
     dbt_manifest_ref  TEXT        NOT NULL,
-    -- REQ-405. The change this publication was made under, as supplied by
-    -- whoever triggered it. Also written onto the Nessie merge commit.
+    -- REQ-405. The change this ONE PUBLICATION was made under, as supplied by
+    -- whoever triggered it -- a restatement, a backfill, an out-of-cycle
+    -- rerun. Also written onto the Nessie merge commit.
+    --
+    -- NOT the standing authorisation for the code that ran: that is
+    -- `deployment_change_ref` below and it arrives from the environment, not
+    -- from the trigger. Merging the two would make a scheduled run either
+    -- record no change at all or carry a re-typed one, and a re-typed
+    -- identifier is an unverified one.
     change_ref        TEXT,
+    -- REQ-406. DEPLOYMENT provenance: what the pipeline knew and a run cannot
+    -- work out. Constant across every run of a deployed version, which is the
+    -- whole point -- one change authorises a version, and hundreds of runs
+    -- inherit it. Null where the deployment supplied nothing, which is every
+    -- developer machine.
+    dbt_project_ref         TEXT,
+    deployment_change_ref   TEXT,
+    deployment_pipeline_ref TEXT,
     error             TEXT
 );
 
@@ -383,6 +398,25 @@ CREATE TABLE IF NOT EXISTS registry.submission_item (
 
 
 
+# COLUMNS ADDED TO A TABLE THAT ALREADY EXISTS, which `SCHEMA` above cannot do.
+# `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table -- it does
+# not reconcile its columns -- so every column added after a database was first
+# created has to arrive here or it silently never appears. The failure mode is
+# the bad one: `ensure_schema` succeeds, and the INSERT naming the new column
+# fails later, in a task, at publish time.
+#
+# `ADD COLUMN IF NOT EXISTS` makes each statement idempotent, so this runs on
+# every connection like the schema does. Additive only -- a column that needs
+# dropping or retyping is a real migration and does not belong in a startup
+# path. This is the same lazy, idempotent shape `ensure_raw_columns()` uses one
+# layer down, for the same reason.
+MIGRATIONS = """
+ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_project_ref         TEXT;
+ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_change_ref   TEXT;
+ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_pipeline_ref TEXT;
+"""
+
+
 def ensure_schema(conn=None) -> None:
     """Create the registry schema if it is not there. Idempotent.
 
@@ -416,5 +450,7 @@ def ensure_schema(conn=None) -> None:
         log.info("registry schema was created concurrently; re-checking")
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
+    with conn.cursor() as cur:
+        cur.execute(MIGRATIONS)
     conn.commit()
     _ensured = True

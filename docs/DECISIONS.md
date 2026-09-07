@@ -3692,3 +3692,84 @@ added columns come from no file column and are correctly absent.
   that would have logged was itself the stale copy. This is CLAUDE.md's
   long-running-process rule, and the lineage export is subject to it like
   everything else.
+
+## a-change-is-a-deployment-event-not-a-run-event
+
+`registry.run.change_ref` was the only change reference the platform had, and
+it arrives as a DAG parameter — supplied by whoever triggered the build. That
+models the wrong thing for a controlled estate.
+
+The real flow is: raise a ticket, commit, build a pipeline, obtain change
+approval, deploy a new version of the transformation project. **Every run then
+executes that version until the next deployment.** A run does not have its own
+change ticket; it inherits the one that put the code there, and hundreds of
+runs share it. Modelled per run, a scheduled overnight build records no change
+at all, and the only way to populate the field is for an operator to re-type
+the ticket — and a re-typed identifier is an unverified one.
+
+So there are two concepts, and they are separate columns because they are
+separate facts:
+
+| | Scope | Source |
+|---|---|---|
+| `deployment_change_ref` | every run of a deployed version | the environment, set by the chart |
+| `change_ref` | one run | the trigger, for a restatement or an out-of-cycle rerun |
+
+"Published under the standing deployed version" and "published under a
+specific authorisation" cannot both be expressed by one nullable column.
+
+### The declared version and the computed digest are both required
+
+`dbt_manifest_ref` is a content digest of the project on disk. It answers *was
+this run's SQL the same SQL as that run's*, and it cannot answer *which commit
+is that SQL supposed to be* — so `dbt_project_ref` carries the commit the
+pipeline built from, and it is what resolves onward to the change record.
+
+Keeping both is not redundancy, because they disagree in a way that matters.
+The declared version says what SHOULD be running; the digest says what IS.
+They diverge whenever the project is writable at run time — and this platform
+writes to it: the feed console scaffolds a prepared model and edits
+`_sources.yml` straight into `DBT_PROJECT_DIR`.
+
+`check_project_drift()` reconciles them, and **the comparison is digest to
+digest** because a commit id and a content digest are different value spaces.
+The pipeline computes `DBT_PROJECT_DIGEST` by running
+`python -m reporting_platform.registry provenance` over the project it is
+deploying, so both sides are one implementation rather than two that agree
+until somebody changes one.
+
+**It refuses only in `uat` and `prod`.** The console is a dev tool and is not
+deployed above dev, so divergence there is the normal working state and
+refusing on it would make the tool that edits the project unusable with the
+platform that reads it. Getting this the wrong way round breaks dev or makes
+prod's attribution a guess, which is why `CONTROLLED_ENVIRONMENTS` is pinned by
+a test rather than left as a literal somebody can extend in passing.
+
+The check runs BEFORE the run row is opened and is deliberately **outside** the
+try/except that makes the registry write best-effort: a drifted project is a
+refusal, not a lost audit row.
+
+### Adding a column to a table that already exists
+
+`SCHEMA` is `CREATE TABLE IF NOT EXISTS`, which is a no-op against an existing
+table and does **not** reconcile its columns. Every column added after a
+database was first created therefore has to appear in `MIGRATIONS` as well, or
+it silently never appears — and the failure lands far from the cause:
+`ensure_schema()` succeeds, and the INSERT naming the column fails later, in a
+task, at publish time. `ADD COLUMN IF NOT EXISTS` keeps it idempotent on every
+connection, additive only; a drop or a retype is a real migration and does not
+belong in a startup path. `tests/test_provenance.py` asserts that every
+migrated column is also declared in `SCHEMA`, so a fresh database and a
+migrated one converge.
+
+### Verified
+
+- The migration adds three columns to a `registry.run` that already existed and
+  held rows, on the running Postgres.
+- `provenance` reports `code_ref_kind: tree-digest` and empty deployment fields
+  on a developer machine, and the full set when the variables are supplied.
+- A digest mismatch raises in `prod` naming both sides, and warns and continues
+  in `dev`.
+- A retry under a newer deployment **overwrites** the deployment fields — the
+  version that produced the publication is the one recorded — while the
+  per-run `change_ref` is preserved.
