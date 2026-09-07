@@ -36,6 +36,20 @@ RUN pip install --no-cache-dir \
       "pyspark==3.5.3" \
       "pyyaml" "boto3" "pandas" "pyarrow"
 
+# sqlglot parses the COMPILED dbt SQL into column-level lineage for the
+# OpenLineage export. It is here rather than in the constrained block above
+# because it is not an Airflow provider, and it is a dependency at all because
+# the parser already in the image cannot do the job: openlineage-sql resolves a
+# column's origin to the CTE it came through, and the prepared models open with
+# `select *`, which nothing can expand without a schema. sqlglot takes one --
+# the platform reads it from the catalog already (lineage/schemas.py) -- and
+# traces 116 of 136 columns where openlineage-sql managed 26, none of them in
+# prepared. Pinned, and verified against Airflow's constraint file first:
+# `Would install sqlglot-30.18.0` and nothing else, so this is not the
+# typing_extensions trap that --no-deps exists for below.
+# See docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project
+RUN pip install --no-cache-dir "sqlglot==30.18.0"
+
 # The feed console. ruamel.yaml rather than the pyyaml above because feeds.yml
 # is mostly comments and a pyyaml round trip deletes every one of them; pyyaml
 # stays for the read-only config loading in common/context.py.

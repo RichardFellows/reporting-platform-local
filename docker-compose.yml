@@ -115,6 +115,23 @@ x-airflow-common: &airflow-common
     # further keeps the newline (YAML's more-indented-line rule). JSON tolerates
     # it, so this was working and looked wrong, which is the worst combination.
     AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type": "http", "url": "http://marquez-api:5000", "endpoint": "api/v1/lineage", "timeout": 5}'
+    # WITHOUT THIS, EVERY JOB REACHES MARQUEZ WITH NO INPUTS AND NO OUTPUTS --
+    # 41 disconnected boxes rather than a graph. Airflow converts a task's
+    # outlets to datasets only for a URI scheme with a registered converter,
+    # and this image has three (`file`, `gs`, `s3`); the ingest DAGs' outlet is
+    # `iceberg://`. Cosmos has its own extractor, and it returns nothing here:
+    # openlineage-integration-common raises NotImplementedError for dbt's
+    # `method: session`, which profiles.yml uses deliberately.
+    # ExtractorManager checks task_type against the custom extractors BEFORE it
+    # looks for the operator's own facet methods, so this wins over Cosmos's.
+    #
+    # `__EXTRACTORS`, NOT `__CUSTOM_EXTRACTORS`: the option is `[openlineage]
+    # extractors` and the provider reads it by that name, so the more obvious
+    # spelling is simply ignored -- silently, since an option nobody sets is
+    # an empty set and an empty set of extractors is the default. Separator is
+    # `;` if a second one is ever added.
+    # See docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project
+    AIRFLOW__OPENLINEAGE__EXTRACTORS: reporting_platform.lineage.extractor.PlatformLineageExtractor
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./reporting_platform:/opt/platform/reporting_platform
