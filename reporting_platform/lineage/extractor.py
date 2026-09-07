@@ -13,7 +13,7 @@ HOW IT IS SELECTED. `ExtractorManager.get_extractor_class` checks
 Cosmos's own -- which matters, because Cosmos HAS one and it returns nothing
 here: `openlineage-integration-common` raises `NotImplementedError` for dbt's
 `method: session`, and `method: session` is load-bearing on this platform.
-Registered through AIRFLOW__OPENLINEAGE__CUSTOM_EXTRACTORS in
+Registered through AIRFLOW__OPENLINEAGE__EXTRACTORS in
 docker-compose.yml, which is read at process start -- the airflow containers
 must be RECREATED, not restarted.
 
@@ -40,8 +40,11 @@ docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project.
 """
 from __future__ import annotations
 
+import attr
 from openlineage.client.event_v2 import Dataset
-from openlineage.client.facet_v2 import column_lineage_dataset, schema_dataset
+from openlineage.client.facet_v2 import (
+    DatasetFacet, column_lineage_dataset, schema_dataset,
+)
 
 from airflow.providers.openlineage.extractors.base import (
     BaseExtractor, OperatorLineage,
@@ -51,6 +54,33 @@ from reporting_platform.lineage import columns, graph, schemas
 
 INGEST_DAG_PREFIX = "ingest_"
 INGEST_TASK_ID = "ingest"
+
+# A CUSTOM facet, and it is documented in this repo rather than in the spec,
+# which is what `_schemaURL` is for. Marquez stores any facet it is given and
+# returns it verbatim on the dataset -- verified here before this was built on
+# -- so a producer-defined facet is a supported shape rather than a smuggled
+# one.
+CLASSIFICATION_SCHEMA_URL = (
+    "https://github.com/RichardFellows/reporting-platform-local/blob/main/"
+    "docs/DECISIONS.md#a-column-with-no-source-says-so")
+
+
+@attr.define
+class ColumnClassificationDatasetFacet(DatasetFacet):
+    """Per-column classification, and the defect list hoisted out of it.
+
+    `columns` is {column: {"classification": ..., "detail": ...}} for every
+    column of the dataset; `unresolved` names the ones the export could not
+    read, so a consumer does not have to scan the map to find out whether
+    there were any.
+    """
+
+    columns: dict = attr.field(factory=dict)
+    unresolved: list = attr.field(factory=list)
+
+    @staticmethod
+    def _get_schema() -> str:
+        return CLASSIFICATION_SCHEMA_URL
 
 
 class PlatformLineageExtractor(BaseExtractor):
@@ -152,19 +182,55 @@ def _dataset(dataset: tuple[str, str], column_lineage=None) -> Dataset:
                     for column, data_type in schema])
     if column_lineage:
         facets["columnLineage"] = _column_lineage(column_lineage)
+        facets["columnClassification"] = _column_classification(column_lineage)
     return Dataset(namespace=namespace, name=name, facets=facets or None)
 
 
 def _column_lineage(traced) -> column_lineage_dataset.ColumnLineageDatasetFacet:
+    """EVERY column, including the ones with no input field (R-LIN-8).
+
+    A sourceless column is emitted with an EMPTY `inputFields` rather than
+    omitted, and rather than given a fabricated input to make the entry look
+    well-formed. Checked against the running Marquez before being relied on,
+    because the spec does not settle it: an entry with `inputFields: []` is
+    accepted (201) and read back verbatim out of the dataset's facets. What it
+    does NOT do is appear in Marquez's `/api/v1/column-lineage` graph, which is
+    built from edges and has none to build from -- so the classification rides
+    in `columnClassification` alongside, where it is queryable. See
+    docs/DECISIONS.md#a-column-with-no-source-says-so.
+    """
     fields = {}
-    for column, (sources, transformation) in traced.items():
+    for column, lineage in traced.items():
         fields[column] = column_lineage_dataset.Fields(
             inputFields=[column_lineage_dataset.InputField(
                 namespace=namespace, name=name, field=field)
-                for (namespace, name), field in sources],
+                for (namespace, name), field in lineage.sources],
             # Absent for a pure rename, where the input field's own name is
             # already the whole story.
-            transformationDescription=transformation or None,
-            transformationType="TRANSFORMATION" if transformation else "IDENTITY",
+            transformationDescription=lineage.transformation or None,
+            transformationType=("TRANSFORMATION" if lineage.transformation
+                                else "IDENTITY"),
         )
     return column_lineage_dataset.ColumnLineageDatasetFacet(fields=fields)
+
+
+def _column_classification(traced) -> ColumnClassificationDatasetFacet:
+    """WHY A SECOND FACET EXISTS AT ALL.
+
+    `ColumnLineageDatasetFacet` can carry a sourceless column but it cannot
+    SAY anything about one: its per-field vocabulary is `inputFields` and a
+    transformation description, so `count(*)`, `current_timestamp()`, an
+    injected literal and a column the parser could not read are all reduced to
+    the same empty list. Those are the four different facts this requirement
+    exists to distinguish, and the distinction is the answer to the auditor's
+    question. So the class goes in a facet of its own rather than being
+    encoded as a fake input field -- a fabricated edge is worse than an absent
+    one -- and `unresolved` is hoisted to the top of it, because a defect
+    nobody has to go looking for is a defect somebody will find.
+    """
+    return ColumnClassificationDatasetFacet(
+        columns={column: {"classification": lineage.classification,
+                          **({"detail": lineage.detail} if lineage.detail else {})}
+                 for column, lineage in traced.items()},
+        unresolved=columns.unresolved_columns(traced),
+    )

@@ -441,13 +441,39 @@ Two corollaries worth holding on to:
   to the CTE it came through and produced ZERO for prepared, because those
   models open with `select *` and no parser expands a star without a schema.
   sqlglot takes one, and the platform already reads it — so 116 of 136 columns
-  trace, the other 20 being `dbt_invocation_id`/`nessie_ref`/`dbt_updated_at`
-  and a `count(*)`, which have no source column. Checked under Airflow's
-  constraint file first (`Would install sqlglot-30.18.0` and nothing else, so
-  not the cosmos trap) and installed in the UNCONSTRAINED block. Landing → raw
-  is NOT parsed: ingest performs a declared rename, so that mapping is
-  `Feed.source_column()`.
-  See `docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project`.
+  trace. Checked under Airflow's constraint file first (`Would install
+  sqlglot-30.18.0` and nothing else, so not the cosmos trap) and installed in
+  the UNCONSTRAINED block. Landing → raw is NOT parsed: ingest performs a
+  declared rename, so that mapping is `Feed.source_column()`.
+- **EVERY column is CLASSIFIED, and a sourceless one says which kind it is.**
+  Reporting only the columns that trace made absence ambiguous — a literal, a
+  `count(*)` and a parser failure nobody noticed all looked identical, like
+  nothing — so `columns.py` returns a `ColumnLineage` for every column of the
+  table: `sourced`, `row_aggregate`, `build_metadata`, `literal`,
+  `ingest_added` or `unresolved`. The class is read off the SAME deepest
+  expression the transformation description comes from, so the two can never
+  describe different nodes. Ingest's own raw columns are `ingest_added`,
+  and which those are is DERIVED — a column `feeds.yml` does not declare is
+  the platform's, with the `_` prefix only as a tiebreak; neither declared nor
+  prefixed is drift, reported as `unresolved`.
+  **`unresolved` is a DEFECT that does not fail a build**: nothing in this
+  package may raise, an export must never gain the power to stop the pipeline,
+  and the condition is legitimately transient (compiled SQL is from the last
+  build, the schema is read from `main`). The seam is CI —
+  `python -m reporting_platform.lineage --columns` exits 1 on any.
+  **Marquez carries an empty `inputFields`** (201, returned verbatim) but its
+  `/api/v1/column-lineage` graph DROPS such a column, having no edge to build
+  from — verified against the running instance, not assumed — so the class
+  rides in a second producer-defined facet, `columnClassification`, rather than
+  in a fabricated input field. A fabricated edge is worse than an absent one.
+  **A facet VALUE is redacted through Airflow's SecretsMasker on the way out**,
+  and this estate's Postgres user AND password are both the word `platform` —
+  so the class first called `platform_column` reached Marquez as `***_column`,
+  a well-formed facet with corrupted content. `_producer`/`_schemaURL` are
+  exempt, so checking the wrong field would have passed. No value this package
+  emits may contain a credential word; a test pins it.
+  See `docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project` and
+  `#a-column-with-no-source-says-so`.
 
 ## Quick reference
 
@@ -557,8 +583,10 @@ docker compose up -d --force-recreate airflow airflow-webserver airflow-triggere
 curl -s 'http://localhost:15000/api/v1/namespaces/reporting-platform-local/jobs?limit=50'
 # what Marquez will be told each task reads and writes -- no Airflow, no Spark.
 # A missing edge here is a missing edge there; both come from one derivation.
-# (columns are read from the published table instead, and are not shown here)
 docker compose exec -T airflow python -m reporting_platform.lineage
+# every column of every managed table, classified. EXITS 1 on any `unresolved`
+# -- this is the CI seam, because the lineage package itself may never refuse.
+docker compose exec -T airflow python -m reporting_platform.lineage --columns
 # the datasets live in their OWN namespaces, not the job's -- a jobs query
 # showing no inputs/outputs is not evidence that nothing was emitted
 curl -s http://localhost:15000/api/v1/namespaces

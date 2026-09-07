@@ -158,26 +158,36 @@ def test_an_unreadable_catalog_costs_the_schema_and_not_the_edge():
     """THE TOTALITY PROPERTY. Schemas are read from the published tables
     through DuckDB, so they depend on a catalog being reachable -- and this
     runs inside an OpenLineage extractor, where an exception costs the
-    DATASETS of whatever was being extracted. No catalog here (these tests
-    take no stack), so this is the failing case in its natural state: it must
-    return no columns and raise nothing, leaving the edge intact.
+    DATASETS of whatever was being extracted. So a catalog that cannot be
+    reached must cost the columns and never the edge.
+
+    ASSERTED AS TOTALITY, NOT AS EMPTINESS. This used to assert `== []`, which
+    was true only because the host has no catalog -- and it therefore FAILED
+    the moment the same suite was run in the airflow container, where the
+    catalog answers. That is CLAUDE.md's rule about a check whose window does
+    not contain the thing it describes: the property is that these return a
+    list and raise, whichever environment they are run in, and the edge is
+    intact either way.
     """
     context, graph = _setup()
     from reporting_platform.lineage import schemas
 
-    assert schemas.table_columns("prepared", "fo_trade") == []
-    assert schemas.columns_for((graph.CATALOG_NAMESPACE, "raw.fo_trade")) == []
+    assert isinstance(schemas.table_columns("prepared", "fo_trade"), list)
+    assert isinstance(
+        schemas.columns_for((graph.CATALOG_NAMESPACE, "raw.fo_trade")), list)
+    # A table the platform does not manage has no columns anywhere.
+    assert schemas.table_columns("prepared", "no_such_model") == []
     inputs, outputs = graph.model_io("fo_trade")
     assert outputs == [graph.table("prepared", "fo_trade")]
+    assert inputs, "the edge survives whatever the catalog did"
 
 
 def test_ingest_column_lineage_is_the_declared_rename():
     """Landing -> raw is a RENAME, not a query, so it is not parsed.
 
     Ingest performs the mapping `feeds.yml` declares, so the column lineage
-    for it IS `Feed.source_column()` -- and the platform's own added columns
-    (`_business_date`, the provenance four) come from no file column and must
-    be absent rather than invented.
+    for it IS `Feed.source_column()`. The feed's own columns are `sourced`,
+    and they carry no transformation: a rename has no expression to show.
     """
     from tests.support import feeds_from, synthetic
 
@@ -185,10 +195,70 @@ def test_ingest_column_lineage_is_the_declared_rename():
     from reporting_platform.lineage import columns, graph
 
     traced = columns.ingest_columns("t_one")
-    assert set(traced) == {"k", "v"}, "only the feed's own columns"
-    sources, transformation = traced["v"]
-    assert sources == [(graph.landing("t_one"), "V Column")]
-    assert transformation == "", "a rename has no expression to show"
+    assert set(traced) == {"k", "v"}, "the feed's columns, with no raw table"
+    assert traced["v"].classification == columns.SOURCED
+    assert traced["v"].sources == [(graph.landing("t_one"), "V Column")]
+    assert traced["v"].transformation == "", "a rename has no expression"
+
+
+def test_ingest_classifies_the_platforms_own_columns_rather_than_omitting_them():
+    """R-LIN-8, the ingest half.
+
+    `_business_date`, `_ingest_ts` and the provenance four come from no file
+    column. They used to be dropped, which made them indistinguishable from a
+    declared column whose mapping had gone missing -- one is by construction,
+    the other is a defect, and silence reported them identically. They are
+    `ingest_added` now, and they are PRESENT.
+
+    The raw table is injected rather than read: these tests take no catalog,
+    and the property being pinned is what the classifier does with a raw
+    column list, not whether DuckDB can fetch one.
+    """
+    from tests.support import feeds_from, synthetic
+
+    feeds_from(synthetic(feed_extra='    source_columns: {v: "V Column"}\n'))
+    from reporting_platform.lineage import columns, schemas
+
+    schemas._TABLES = {"raw.t_one": [("k", "string"), ("v", "string"),
+                                     ("_business_date", "date"),
+                                     ("_delivery_id", "string")]}
+    try:
+        traced = columns.ingest_columns("t_one")
+        assert set(traced) == {"k", "v", "_business_date", "_delivery_id"}
+        assert traced["_business_date"].classification == columns.INGEST_ADDED
+        assert traced["_delivery_id"].classification == columns.INGEST_ADDED
+        assert traced["_business_date"].sources == [], "sourceless by construction"
+        assert traced["k"].classification == columns.SOURCED
+        assert not columns.unresolved_columns(traced), (
+            "a platform column is not a defect")
+    finally:
+        # Per-process and deliberately not invalidated, so a test that sets it
+        # owns restoring it -- see schemas._TABLES.
+        schemas._TABLES = None
+
+
+def test_a_raw_column_neither_declared_nor_platform_added_is_a_defect():
+    """The drift case, and the reason the `_` prefix is only a TIEBREAK.
+
+    A raw column the feed does not declare is the platform's own -- unless it
+    does not look like one, in which case the table and `feeds.yml` disagree
+    and that is exactly what `unresolved` exists to surface. Classifying it as
+    a platform column would bury a real divergence under a reassuring name.
+    """
+    from tests.support import feeds_from, synthetic
+
+    feeds_from(synthetic())
+    from reporting_platform.lineage import columns, schemas
+
+    schemas._TABLES = {"raw.t_one": [("k", "string"), ("v", "string"),
+                                     ("dropped_from_feeds_yml", "string")]}
+    try:
+        traced = columns.ingest_columns("t_one")
+        assert traced["dropped_from_feeds_yml"].classification == columns.UNRESOLVED
+        assert columns.unresolved_columns(traced) == ["dropped_from_feeds_yml"]
+        assert traced["dropped_from_feeds_yml"].detail, "a defect says why"
+    finally:
+        schemas._TABLES = None
 
 
 def test_column_lineage_is_absent_rather_than_wrong_without_compiled_sql():
@@ -215,3 +285,203 @@ def test_column_lineage_is_absent_rather_than_wrong_without_compiled_sql():
             del os.environ["DBT_TARGET_PATH"]
         else:
             os.environ["DBT_TARGET_PATH"] = previous
+
+
+# ------------------------------------------------------------------ R-LIN-8
+# THE CLASSIFIER NEEDS sqlglot, AND sqlglot IS IN THE IMAGE, NOT ON THE HOST.
+# It went into the UNCONSTRAINED pip block with dbt and duckdb; the host runs
+# `python -m tests.run` against a checkout with only pyyaml and ruamel, which
+# is the property tests/run.py exists to keep. So these tests assert the FULL
+# battery wherever the parser is -- `docker compose exec -T airflow python -m
+# tests.run test_lineage`, which is the run that has teeth -- and assert the
+# TOTALITY property where it is not: a missing parser must cost the column
+# lineage and raise nothing, because this package runs inside an OpenLineage
+# extractor. Neither branch passes vacuously.
+def _sqlglot() -> bool:
+    try:
+        import sqlglot                                       # noqa: F401
+    except Exception:                                        # noqa: BLE001
+        return False
+    return True
+
+
+# One query with every sourceless shape the shipped project produces, plus a
+# real column. Hand-written rather than read from `target/compiled/`, so the
+# classes are pinned by a fixture that cannot silently change under a rebuild.
+_SQL = """
+select
+    t.trade_id                          as trade_id,
+    try_cast(trim(t.notional) as decimal(28,4)) as notional,
+    count(*)                            as trade_count,
+    current_timestamp()                 as dbt_updated_at,
+    cast('abc-123' as string)           as dbt_invocation_id
+from raw.fo_trade as t
+group by t.trade_id, t.notional
+"""
+_SCHEMA = {"raw": {"fo_trade": {"trade_id": "string", "notional": "string"}}}
+_CLASSIFIED = ["trade_id", "notional", "trade_count", "dbt_updated_at",
+               "dbt_invocation_id"]
+
+
+def test_every_column_asked_for_comes_back_classified():
+    """R-LIN-8's whole point: no column is silently dropped.
+
+    The old shape returned only the columns that traced, so a column's absence
+    meant a literal, an aggregate, or a parser failure nobody noticed -- three
+    different facts rendered identically as nothing. Every requested column
+    must now appear, whatever it turned out to be.
+    """
+    _setup()
+    from reporting_platform.lineage import columns
+
+    if not _sqlglot():
+        assert columns.model_columns("prepared", "fo_trade") == {}, (
+            "no parser must cost the lineage and raise nothing")
+        return
+    traced = columns.classify_sql(_SQL, _CLASSIFIED, _SCHEMA)
+    assert set(traced) == set(_CLASSIFIED)
+    assert all(l.classification for l in traced.values()), (
+        "a column with no classification is the thing this replaced")
+
+
+def test_each_kind_of_sourceless_column_is_told_apart():
+    """The classes are distinct, and each is read off the expression node.
+
+    `count(*)` reads no column, `current_timestamp()` is a property of the
+    build, and `cast('...' as string)` is a constant dbt injected. All three
+    have an empty `sources`; the class is what says which emptiness it is.
+    """
+    _setup()
+    from reporting_platform.lineage import columns
+
+    if not _sqlglot():
+        assert columns.ingest_columns("nonexistent_feed") == {}
+        return
+    traced = columns.classify_sql(_SQL, _CLASSIFIED, _SCHEMA)
+
+    assert traced["trade_id"].classification == columns.SOURCED
+    assert traced["notional"].classification == columns.SOURCED
+    assert traced["notional"].sources, "a sourced column names its input"
+
+    assert traced["trade_count"].classification == columns.ROW_AGGREGATE
+    assert traced["dbt_updated_at"].classification == columns.BUILD_METADATA
+    assert traced["dbt_invocation_id"].classification == columns.LITERAL
+
+    for column in ("trade_count", "dbt_updated_at", "dbt_invocation_id"):
+        assert traced[column].sources == [], (
+            f"{column} has no input column, and inventing one to make the "
+            f"facet entry look well-formed is a fabricated edge")
+        assert not traced[column].is_defect
+
+    assert traced["trade_count"].transformation == "COUNT(*)", (
+        "the classification and the SQL shown come from the SAME node")
+
+
+def test_the_unresolved_class_is_reachable_and_says_why():
+    """PROVEN REACHABLE, NOT ASSUMED EMPTY.
+
+    `unresolved` is empty against the shipped project, and a class that is
+    only ever asserted to be empty is a class nobody has shown can be entered
+    -- so the assertion below it would be worthless. This drives it
+    deliberately: sqlglot raises "Cannot find column 'x' in query" whenever
+    the TABLE has a column the current SQL does not produce, which is the real
+    condition (a column dropped from a model, or added by a later version) and
+    is what silence used to hide.
+    """
+    _setup()
+    from reporting_platform.lineage import columns
+
+    if not _sqlglot():
+        import os
+
+        previous = os.environ.get("DBT_TARGET_PATH")
+        os.environ["DBT_TARGET_PATH"] = "/nonexistent/target"
+        try:
+            assert columns.model_columns("prepared", "fo_trade") == {}
+        finally:
+            if previous is None:
+                del os.environ["DBT_TARGET_PATH"]
+            else:
+                os.environ["DBT_TARGET_PATH"] = previous
+        return
+
+    traced = columns.classify_sql(_SQL, _CLASSIFIED + ["dropped_column"], _SCHEMA)
+    assert traced["dropped_column"].classification == columns.UNRESOLVED
+    assert traced["dropped_column"].is_defect
+    assert "dropped_column" in traced["dropped_column"].detail, (
+        "a defect that does not say what it was is not actionable")
+    assert columns.unresolved_columns(traced) == ["dropped_column"]
+    assert not columns.unresolved_columns(
+        columns.classify_sql(_SQL, _CLASSIFIED, _SCHEMA)), (
+        "and it does not fire on a query that resolves")
+
+
+def test_the_shipped_project_has_no_unresolved_columns():
+    """Zero defects against what this repo actually ships.
+
+    STRONG ONLY WHERE THE ARTEFACTS ARE. This needs the compiled SQL under
+    `DBT_TARGET_PATH` and the catalog behind `schemas.py`, which a config-level
+    run on the host has neither of -- there it asserts the derivation is
+    correctly UNAVAILABLE (empty, not "everything is unresolved"), which is a
+    different and equally real property. Run it where the artefacts are:
+
+        docker compose exec -T airflow python -m tests.run test_lineage
+
+    The enforcing seam is the CLI, not this test: `python -m
+    reporting_platform.lineage --columns` exits 1 on any unresolved column, so
+    CI can gate on it without giving an EXPORT the power to fail a build. See
+    `columns.py` on why nothing in that package refuses.
+    """
+    context, graph = _setup()
+    from reporting_platform.lineage import columns
+
+    defects, derivable = {}, 0
+    for feed_name in context.feeds():
+        traced = columns.ingest_columns(feed_name)
+        derivable += bool(traced)
+        defects.update({f"raw.{feed_name}.{c}": traced[c].detail
+                        for c in columns.unresolved_columns(traced)})
+    for layer in ("prepared", "reporting"):
+        for model in context.models_in(layer):
+            traced = columns.model_columns(layer, model)
+            derivable += bool(traced)
+            defects.update({f"{layer}.{model}.{c}": traced[c].detail
+                            for c in columns.unresolved_columns(traced)})
+
+    assert not defects, f"unresolved columns in the shipped project: {defects}"
+    if not _sqlglot():
+        # The host case, asserted rather than skipped: `ingest_columns` still
+        # answers from `feeds.yml` alone, so what must be absent here is the
+        # PARSED half.
+        assert all(not columns.model_columns(layer, model)
+                   for layer in ("prepared", "reporting")
+                   for model in context.models_in(layer)), (
+            "without the parser the parsed half must be empty, not guessed")
+
+
+def test_no_classification_name_is_eaten_by_the_secrets_masker():
+    """THE VALUES THIS PACKAGE EMITS PASS THROUGH AIRFLOW'S SecretsMasker.
+
+    The OpenLineage provider redacts facet values on the way out, and this
+    deployment's Postgres password is the word `platform` -- so the class
+    originally called `platform_column` arrived in Marquez as `***_column`.
+    The facet was well-formed and the value was corrupted, which no amount of
+    reading the emitting code would have shown; it was found by reading the
+    facet back off the running Marquez.
+
+    Pinned as a NAMING RULE rather than as a stack test, because the masker is
+    not importable here: no class name may contain any word that a credential
+    in this estate is likely to be. `platform` is the one that bit, and it is
+    in `REPORTING_DSN`/`REGISTRY_DSN` as both user and password, so it is the
+    one asserted.
+    """
+    _setup()
+    from reporting_platform.lineage import columns
+
+    classes = [columns.SOURCED, columns.ROW_AGGREGATE, columns.BUILD_METADATA,
+               columns.LITERAL, columns.INGEST_ADDED, columns.UNRESOLVED]
+    for name in classes:
+        assert "platform" not in name, (
+            f"{name!r} contains a value the secrets masker redacts; it would "
+            f"reach Marquez mangled. See columns.INGEST_ADDED.")
+    assert len(set(classes)) == len(classes), "the classes are distinct"
