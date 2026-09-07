@@ -382,6 +382,47 @@ Two corollaries worth holding on to:
   normal idle state. `RUNNING` there means "started, did not succeed or fail" —
   Airflow is the authority on what is actually running.
   See `docs/DECISIONS.md#openlineage-is-an-export-not-a-record`.
+- **The DATASETS in that export come from `reporting_platform/lineage`, and
+  they are derived by the walker retention already trusts.** Airflow emits the
+  jobs; without this it emits no inputs or outputs at all and Marquez draws
+  disconnected boxes. Neither built-in path can work here and both reasons are
+  permanent: an `iceberg://` outlet has no registered converter (`file`, `gs`,
+  `s3` are the three), and Cosmos's dbt extractor raises `NotImplementedError`
+  for dbt's `method: session`, which `profiles.yml` uses deliberately — logged
+  at DEBUG, so it looked like nothing was happening. So a custom extractor
+  supplies them, registered by `AIRFLOW__OPENLINEAGE__EXTRACTORS` — **not**
+  `__CUSTOM_EXTRACTORS`, which is read by nothing and warns about nothing —
+  and read at process start, so the airflow containers need **recreating**.
+  The edges come from `context.model_refs()`, the SAME walker
+  `feeds_behind_report()` uses to size a retention window, because the picture
+  people reason from and the rule that decides whether evidence still exists
+  must not be two derivations. `tests/test_lineage.py` asserts they agree.
+  Cosmos is asked only WHICH model a task builds, never what it depends on.
+  A `dbt_test` writes no table and so draws no node.
+  **The COLUMNS are the exception: they come from the TABLE, via `DESCRIBE`
+  through DuckDB** (`schemas.py`, ~0.9s per process, cached). The dbt schema
+  YAML documents only the columns somebody tested — two of `raw.fo_trade`'s
+  twenty — and a partial field list in Marquez reads as a complete one, so
+  empty is honest and partial is not. It is the PUBLISHED schema (DuckDB sees
+  only the default branch), the facet is omitted rather than empty when a
+  table is not published yet, and a landing prefix carries `Feed.file_header`
+  — the FILE's names, so the graph shows the rename ingest performs.
+  `information_schema.columns` is not usable here; the Iceberg attach answers
+  it with one placeholder column per table.
+  **COLUMN-level lineage is parsed from the COMPILED SQL** (`columns.py`) —
+  the models are Jinja, so the template cannot say which columns a macro
+  reads, but `target/compiled/**` can. It uses **sqlglot**, not the
+  `openlineage-sql` already in the image: that one resolves a column's origin
+  to the CTE it came through and produced ZERO for prepared, because those
+  models open with `select *` and no parser expands a star without a schema.
+  sqlglot takes one, and the platform already reads it — so 116 of 136 columns
+  trace, the other 20 being `dbt_invocation_id`/`nessie_ref`/`dbt_updated_at`
+  and a `count(*)`, which have no source column. Checked under Airflow's
+  constraint file first (`Would install sqlglot-30.18.0` and nothing else, so
+  not the cosmos trap) and installed in the UNCONSTRAINED block. Landing → raw
+  is NOT parsed: ingest performs a declared rename, so that mapping is
+  `Feed.source_column()`.
+  See `docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project`.
 
 ## Quick reference
 
@@ -486,6 +527,19 @@ docker compose up -d --force-recreate airflow airflow-webserver airflow-triggere
 # http://localhost:13000 -- 5000/5001/3000 are remapped, they collide with
 # grafana and friends on an ordinary developer box
 curl -s 'http://localhost:15000/api/v1/namespaces/reporting-platform-local/jobs?limit=50'
+# what Marquez will be told each task reads and writes -- no Airflow, no Spark.
+# A missing edge here is a missing edge there; both come from one derivation.
+# (columns are read from the published table instead, and are not shown here)
+docker compose exec -T airflow python -m reporting_platform.lineage
+# the datasets live in their OWN namespaces, not the job's -- a jobs query
+# showing no inputs/outputs is not evidence that nothing was emitted
+curl -s http://localhost:15000/api/v1/namespaces
+curl -s -G http://localhost:15000/api/v1/lineage \
+  --data-urlencode 'nodeId=dataset:s3://lakehouse:landing/fo_trade' --data-urlencode depth=20
+# column-level: one column back to the CSV it came from, with the SQL that
+# transformed it at each hop
+curl -s -G http://localhost:15000/api/v1/column-lineage --data-urlencode depth=20 \
+  --data-urlencode 'nodeId=datasetField:iceberg://lakehouse:reporting.exposure_by_country:total_mtm'
 ```
 
 A clean seed that passes its tests — needed for anything that publishes —

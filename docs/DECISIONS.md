@@ -3484,3 +3484,211 @@ for the web front end.** Search is a nice-to-have; lineage is the point.
   `reporting-platform-local`: 13 jobs, 12 `COMPLETED`, 1 stuck `RUNNING` — the
   skipped task above, and nothing else.
 
+
+## lineage-is-derived-from-the-dbt-project
+
+The export above emitted a job per task and **no datasets at all** — 41
+disconnected boxes in Marquez, which is a run history drawn as a graph rather
+than a lineage graph. `reporting_platform/lineage` supplies the missing half:
+what each task reads and writes, derived from the dbt project and `feeds.yml`.
+
+### Neither half arrived on its own, and both reasons are structural
+
+**The ingest DAGs' outlet is not convertible.** Airflow turns a task's outlets
+into OpenLineage datasets only for a URI scheme with a registered converter,
+and this image has three:
+
+```
+>>> ProvidersManager().asset_to_openlineage_converters.keys()
+['file', 'gs', 's3']
+```
+
+`Feed.asset_uri` is `iceberg://lakehouse/raw/fo_trade`, so
+`translate_airflow_asset` returns `None` and the ingest task reports nothing it
+wrote. Registering an `iceberg` converter means shipping a provider package,
+which is a lot of machinery to describe four tables.
+
+**Cosmos's own dbt extractor cannot work against this profile.** It parses the
+artifacts with `openlineage-integration-common`, which raises for anything but
+thrift/http/odbc:
+
+```
+NotImplementedError: Connection method `session` is not supported for spark adapter.
+```
+
+`method: session` is deliberate here — it is how dbt reaches the Nessie catalog
+on the Spark cluster — so this is a permanent disagreement, not a version to
+bump. Two details made it invisible for a while: Cosmos catches that exception
+and logs it at **debug**, and there is a *second*, earlier failure hiding
+behind it. `DBT_TARGET_PATH` is absolute (`/opt/platform/run/dbt/target`,
+because the `./dbt` bind mount is not writable by uid 50000), while the
+processor reads `<the temp project Cosmos cloned>/target/manifest.json`. Fixing
+only the path gets you a `FileNotFoundError` replaced by the
+`NotImplementedError` and still no datasets, which is a good way to lose an
+afternoon.
+
+### So the datasets are derived, and from the source that already decides
+
+A custom extractor, registered through `AIRFLOW__OPENLINEAGE__EXTRACTORS`
+(**not** `__CUSTOM_EXTRACTORS`; the option is `[openlineage] extractors` and
+the more obvious spelling is read by nothing and reported by nothing).
+`ExtractorManager.get_extractor_class` checks `task_type` against the custom
+extractors *before* it looks for `get_openlineage_facets_on_*` on the operator,
+so it wins over Cosmos's — which is the only reason this approach works at all.
+
+**It attaches datasets to the runs Airflow is already reporting.** The
+alternative — a task that posts its own events — would put a second job node
+next to every model and draw each transformation twice. There is exactly one
+node per task, and the operational record and the data flow are the same
+object.
+
+**The edges come from `context.model_refs()`, which is what
+`feeds_behind_report()` walks to size a retention window.** That sharing is the
+entire point and not an optimisation. This repo already refuses second lists of
+reports and second registries of feeds; a second lineage walker is worse than
+either, because the two answers are read by different audiences. People reason
+from the picture, while the rule that quietly decides whether a feed's evidence
+still exists is the other one. `tests/test_lineage.py` asserts that walking the
+exported edges backwards from a report reaches exactly the feeds
+`feeds_behind_report()` names, and that assertion was confirmed to fail when
+the walk is broken.
+
+Cosmos is asked only **which model a task builds** (`dbt_node_config`'s
+`unique_id`, which it resolved by running `dbt ls`). Identity, not
+dependencies: slicing `dbt.<model>_run` apart would be a second guess at a
+Cosmos naming convention, and taking the dependencies from there instead would
+reintroduce the second walker.
+
+### What is deliberately not in the graph
+
+- **`dbt_test` produces no dataset.** A test reads models and writes nothing;
+  drawing it as a transformation would put a node in the graph that never
+  produced a table. The audit half of write-audit-publish is visible in Airflow
+  and in `registry.run`, which is where a verdict belongs.
+- **A landing node is the PREFIX, not the object.** `s3://lakehouse` +
+  `landing/fo_trade`. The graph describes the shape of the flow; a node per
+  delivery would redraw it 157 times on a cold load.
+- **Datasets carry their layer** — `raw.fo_trade` and `prepared.fo_trade` are
+  different nodes. Every layer holds a table per feed with the same name, so
+  naming a dataset by the table alone would collapse the three layers into one
+  node and draw a table that feeds itself.
+
+### The extractor claims every `@task` in the estate
+
+There is no narrower hook: the ingest task is a plain decorated function, so
+the only class name to register is `_PythonDecoratedOperator`, which every
+`@task` shares. Two obligations follow, and `extractor.py` honours both. It
+must be **cheap** — it does no I/O until it has recognised the task — and it
+must be **total**: an extractor that raises is caught and logged by the
+manager rather than failing the task, but it takes the datasets of whatever it
+was extracting with it, so every path returns an empty lineage instead. An
+unrecognised task returns `OperatorLineage()` and the manager then falls back
+to that task's own inlets and outlets exactly as before, so nothing that used
+to emit stopped emitting.
+
+### The columns come from the TABLE, not from the dbt project
+
+The edges are derived; the schema deliberately is not. The dbt schema YAML
+documents the columns somebody wrote a test or a description for --
+`_sources.yml` names two columns of `raw.fo_trade`, and the table has twenty.
+Emitting that would not be an incomplete answer but a WRONG one: nothing in
+Marquez marks a field list as partial, so a reader would conclude the other
+eighteen do not exist. Empty is honest, partial is not.
+
+So `schemas.py` runs `DESCRIBE` through DuckDB -- the platform's established
+no-Spark read path (`scripts/duckdb_console.py`), measured at 0.59s for all
+eleven tables plus 0.31s to attach, and cached per process. Spark here would
+put a JVM in the task process, which
+docs/DECISIONS.md#spark-in-a-subprocess forbids. Note
+`information_schema.columns` is NOT usable: the Iceberg attach answers it with
+one placeholder column per table, so it must be `DESCRIBE`.
+
+**It reports the PUBLISHED schema**, because DuckDB can only address the
+catalog's default branch. That is the right one: Marquez should show the shape
+a reader can actually query on `main`, not what the branch this run is
+building might merge in a minute. A table that has never been published gets
+no facet and appears after the first run that merges it -- which is also when
+it becomes true. The facet is **omitted** rather than sent empty in that case,
+since an empty `fields` list is a claim that the table has no columns.
+
+**A landing prefix is not a table**, so its columns are `Feed.file_header` --
+the names the FILE carries, before ingest renames them. The graph therefore
+shows the rename this platform performs, and the ingest's own contribution
+becomes visible as columns: `landing/fo_trade` has the upstream's 9,
+`raw.fo_trade` has 20, and the 11 added are `_extra_columns` (drift),
+`_business_date`, `_ingest_ts`, `_source_file`, `_file_version`, `_row_number`,
+`_batch_id` and the four provenance columns.
+
+### Column lineage is parsed, from the COMPILED SQL
+
+The models are Jinja -- `clean_string()`, `safe_cast()`, `dedupe_rank()` -- so
+the template says nothing about which columns a macro reads. The parseable
+artefact is `target/compiled/**/<model>.sql`, which dbt writes on every build
+and which persists because `DBT_TARGET_PATH` is absolute.
+
+**`openlineage-sql` is already in the image and cannot do this job.** Measured
+on this project: of 59 fields it produced, 26 resolved to a real table and the
+rest named the CTE the column arrived through (`trades`, `deduped`). The
+prepared layer produced **zero** -- and prepared is the layer that does the
+renaming and the casting, so it is the entire point. The cause is not a bug:
+those models open with `select *`, and no parser can expand a star without
+knowing the table's columns.
+
+**sqlglot can, because it takes a schema, and the platform already reads one.**
+`schemas.py` describes every managed table off the catalog; handing that to
+sqlglot resolves the CTEs and expands the stars. 116 of 136 columns then trace
+to a source column. The 20 that do not are `dbt_invocation_id`, `nessie_ref`,
+`dbt_updated_at` and a `count(*)` -- columns genuinely computed from no input
+column. So this is complete rather than partial, which is the distinction
+`schemas.py` refuses to blur: every column that HAS a source gets one.
+
+Adding a dependency to this image is the move this repo warns about twice, so
+it was checked the way the warnings say to: `pip install --dry-run` under
+Airflow's constraint file reports `Would install sqlglot-30.18.0` and nothing
+else. No `typing_extensions` downgrade, so it is not the cosmos trap. It goes
+in the UNCONSTRAINED block with dbt and duckdb, because it is not a provider.
+
+**The transformation is reported, not just the dependency.** A rename carries
+no description -- the input field's own name is the whole story -- while a
+computation carries the SQL that performs it. That is the DEEPEST non-trivial
+expression on the path from output column to source: the outermost is always a
+passthrough from the final CTE (`typed.notional AS notional`), and the useful
+one is `TRY_CAST(NULLIF(NULLIF(NULLIF(TRIM(deduped.notional), ''), 'NULL'),
+'N/A') AS DECIMAL(28,4))`.
+
+**Landing -> raw is not parsed**, because ingest performs a declared rename
+rather than a query: that mapping IS `Feed.source_column()`. The platform's own
+added columns come from no file column and are correctly absent.
+
+### Verified
+
+- 15 datasets registered across two namespaces — 11 Iceberg tables under
+  `iceberg://lakehouse`, 4 landing prefixes under `s3://lakehouse` — and 11 of
+  41 jobs carrying edges. The other 30 are `resolve_arrival`, `normalize`,
+  `publish`, `open_branch`, `dbt_test` and friends, none of which writes a
+  table.
+- Marquez traverses it end to end: 21 nodes reachable from
+  `dataset:s3://lakehouse:landing/fo_trade`, through raw and prepared to
+  `reporting.exposure_by_country`. `ref_collateral` is correctly absent from
+  that traversal — it feeds no report, which is the same reason
+  `feeds_behind_report()` does not name it.
+- Driven by a real delivery rather than a replay: one new business date
+  (2026-08-20) landed for all four feeds, ingested by the `ingest_*` DAGs,
+  which cascaded through `prepared_build` to `reporting_build` on their assets
+  and carried 2026-08-20 into `reporting.counterparty_exposure`.
+- All 15 datasets carry their columns: 16-24 per Iceberg table, 5-9 per
+  landing prefix.
+- 144 column-lineage entries across the 11 tables, and Marquez traverses them:
+  `reporting.exposure_by_country.total_mtm` resolves in five hops back to
+  `landing/fo_trade.mtm_value`, through `SUM(counterparty_exposure.total_mtm)`,
+  `SUM(t.mtm_value)` and the `TRY_CAST` that turned a VARCHAR into a
+  DECIMAL(28,4).
+- `AIRFLOW__OPENLINEAGE__EXTRACTORS` is read at process start: the airflow
+  containers must be **recreated**, not restarted. Separately, the LocalExecutor
+  FORKS TASKS FROM THE SCHEDULER, so a module the scheduler has already
+  imported is the one the task runs -- adding `schemas.py` under an
+  `extractor.py` that was already imported changed nothing at all until
+  `docker compose restart airflow`, and it failed silently because the code
+  that would have logged was itself the stale copy. This is CLAUDE.md's
+  long-running-process rule, and the lineage export is subject to it like
+  everything else.

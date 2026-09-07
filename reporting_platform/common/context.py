@@ -1353,15 +1353,60 @@ def feeds_behind_report(name: str) -> list[str]:
                 f"prepared nor a reporting model in {DBT_MODELS_DIR}. The "
                 f"lineage behind this report cannot be resolved, so the "
                 f"feeds behind it cannot be named.")
-        path = DBT_MODELS_DIR / "reporting" / f"{model}.sql"
-        queue.extend(_REF_RE.findall(path.read_text(encoding="utf-8")))
+        queue.extend(model_refs("reporting", model))
     return sorted(found)
 
 
-# `ref('x')` / `ref("x")`. Read off the model SQL rather than the compiled
-# manifest -- see feeds_behind_report on why the manifest is not trustworthy
-# here.
+def layer_of(model: str) -> str:
+    """Which layer a dbt model lives in, or "" if the project has no such model.
+
+    The model -> layer answer, in ONE place. `managed_tables()` needs it to
+    qualify a table, the OpenLineage export needs it to name a dataset, and a
+    second copy would be a second opinion about where `fo_trade` is written.
+    Returns "" rather than raising because both callers have a more useful
+    thing to say about an unknown name than this function does.
+    """
+    for layer in ("prepared", "reporting"):
+        if model in models_in(layer):
+            return layer
+    return ""
+
+
+def model_refs(layer: str, model: str) -> list[str]:
+    """The `ref()`s a model declares, read off its SQL.
+
+    THE ONE REF WALKER. `feeds_behind_report()` uses it to decide retention
+    windows and `reporting_platform/lineage` uses it to draw the graph Marquez
+    shows, so the picture and the obligation are derived from the same read of
+    the same files. Two walkers would eventually disagree, and the one anybody
+    would notice is the picture -- while the one that loses evidence is the
+    other. See docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project.
+    """
+    return _REF_RE.findall(_model_sql(layer, model))
+
+
+def model_sources(layer: str, model: str) -> list[tuple[str, str]]:
+    """The `source()`s a model declares, as (source name, table) pairs.
+
+    The other half of a model's inputs. `feeds_behind_report()` never needed
+    this -- it stops at a prepared model, because by the platform's rule that
+    model name == feed name it already knows the feed -- but a lineage graph
+    has to name the raw table that prepared model actually reads.
+    """
+    return _SOURCE_RE.findall(_model_sql(layer, model))
+
+
+def _model_sql(layer: str, model: str) -> str:
+    return (DBT_MODELS_DIR / layer / f"{model}.sql").read_text(encoding="utf-8")
+
+
+# `ref('x')` / `ref("x")`, and `source('raw', 'x')`. Read off the model SQL
+# rather than the compiled manifest -- see feeds_behind_report on why the
+# manifest is not trustworthy here.
 _REF_RE = re.compile(r"""\bref\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
+_SOURCE_RE = re.compile(
+    r"""\bsource\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*,"""
+    r"""\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
 
 
 def retention_policy(layer: str) -> dict[str, Any]:
