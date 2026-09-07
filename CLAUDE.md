@@ -305,6 +305,31 @@ Two corollaries worth holding on to:
   ingest was retained for the full ten-year window. A **report is a dbt
   EXPOSURE**, derived by `context.reports()` from the project — not a new
   config block. See `docs/DECISIONS.md#an-ingest-is-not-a-publication`.
+- **A CHANGE IS A DEPLOYMENT EVENT, NOT A RUN EVENT.** One ticket authorises a
+  version, the pipeline deploys it, and every run until the next deployment
+  inherits it — so `deployment_change_ref`, `dbt_project_ref` and
+  `deployment_pipeline_ref` come from the ENVIRONMENT the chart set, not from
+  the trigger. `change_ref` is the other thing and stays separate: a per-run
+  reference for a restatement or an out-of-cycle rerun. One nullable column
+  cannot say both "published under the standing deployed version" and
+  "published under a specific authorisation", and modelling only the second
+  means a scheduled run records no change at all.
+  **`dbt_project_ref` is the declared commit; `dbt_manifest_ref` is the digest
+  of what is actually on disk** — keep both, because they diverge whenever the
+  project is writable at run time, which is exactly what the feed console does.
+  `check_project_drift()` compares DIGEST TO DIGEST (a commit id and a content
+  digest are different value spaces), against `DBT_PROJECT_DIGEST` that the
+  pipeline computed with `python -m reporting_platform.registry provenance` —
+  one implementation, not two. It **refuses only in `uat`/`prod`**: the console
+  is a dev tool, so drift in `dev` is the normal working state, and
+  `CONTROLLED_ENVIRONMENTS` is pinned by a test so nobody extends it in
+  passing. The check runs BEFORE the run row and OUTSIDE the best-effort
+  try/except — a drifted project is a refusal, not a lost audit row.
+  **Adding a registry column needs `MIGRATIONS` as well as `SCHEMA`**:
+  `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table and does not
+  reconcile columns, so the column silently never appears and the INSERT fails
+  later, in a task, at publish.
+  See `docs/DECISIONS.md#a-change-is-a-deployment-event-not-a-run-event`.
 - **A run record is the first thing in the registry that CANNOT be rebuilt.**
   `registry.run` / `run_input` / `report_version` / `submission`: a delivery is
   an observation about an object in storage, a run is an event that happened
@@ -455,6 +480,9 @@ docker compose exec -T airflow python -m reporting_platform.registry rejections
 
 # what was published, and out of which deliveries (REQ-400/401)
 docker compose exec -T airflow python -m reporting_platform.registry runs
+# what a run would record as its code and deployment identity. The DEPLOYMENT
+# PIPELINE uses this too, to compute the DBT_PROJECT_DIGEST it bakes in.
+docker compose exec -T airflow python -m reporting_platform.registry provenance
 docker compose exec -T airflow python -m reporting_platform.registry versions
 docker compose exec -T airflow python -m reporting_platform.registry inputs --run-id <id>
 

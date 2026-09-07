@@ -3,6 +3,7 @@
     python -m reporting_platform.registry reconcile [--feed fo_trade]
     python -m reporting_platform.registry coverage
     python -m reporting_platform.registry schema
+    python -m reporting_platform.registry provenance
     python -m reporting_platform.registry deliveries --business-date 2026-08-01
     python -m reporting_platform.registry rejections
     python -m reporting_platform.registry runs [--purpose reporting]
@@ -31,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import date
 
@@ -56,6 +58,14 @@ def main(argv=None) -> int:
     cov.add_argument("--feed")
 
     sub.add_parser("schema", help="create the registry schema if absent")
+
+    # FOR THE DEPLOYMENT PIPELINE as much as for an operator. The pipeline
+    # bakes `dbt_project_digest` into the deployment as DBT_PROJECT_DIGEST, and
+    # every run recomputes it and compares -- so the two sides have to be ONE
+    # implementation. Printing it here rather than documenting the algorithm is
+    # what keeps them from being two that agree until one is changed.
+    sub.add_parser("provenance",
+                   help="the code and deployment identity a run would record")
 
     dl = sub.add_parser("deliveries", help="registered deliveries for a date")
     dl.add_argument("--business-date", required=True,
@@ -203,6 +213,19 @@ def main(argv=None) -> int:
     elif a.command == "schema":
         db.ensure_schema()
         out = {"schema": "ensured"}
+    elif a.command == "provenance":
+        from reporting_platform.common import context as ctx
+
+        ref, kind = ctx.code_ref()
+        out = {"environment": ctx.ENV,
+               "code_ref": ref,
+               "code_ref_kind": kind,
+               "dbt_project_digest": ctx.dbt_manifest_ref(),
+               **ctx.deployment_provenance(),
+               # "" when nothing is declared to check against, which is not
+               # the same as "checked and matching" -- so say which.
+               "declared_digest": os.environ.get("DBT_PROJECT_DIGEST", "").strip(),
+               "drift": ctx.check_project_drift() or ""}
     elif a.command == "deliveries":
         out = deliveries.deliveries_on(a.business_date, a.feed)
     else:

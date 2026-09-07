@@ -266,9 +266,24 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             import logging
 
             from reporting_platform.common.context import (
-                ENV, code_ref, dbt_manifest_ref,
+                ENV, check_project_drift, code_ref, dbt_manifest_ref,
+                deployment_provenance,
             )
             from reporting_platform.registry import runs
+
+            # BEFORE the run row and before any model builds. In a controlled
+            # environment this RAISES, and failing here is the point: the
+            # project on disk is not the one the pipeline deployed, so
+            # anything published from it would be attributed to a commit that
+            # did not produce it. Outside those environments it returns a
+            # description and the build proceeds -- `dev` diverges by design,
+            # because the feed console writes models into the project there.
+            # NOT inside the try below: this refusal must not be swallowed as
+            # a best-effort registry failure.
+            drift = check_project_drift()
+            if drift:
+                logging.getLogger("airflow.task").warning(
+                    "transformation project drift: %s", drift)
 
             try:
                 ref, kind = code_ref()
@@ -277,7 +292,8 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                     environment=ENV, code_ref=ref, code_ref_kind=kind,
                     dbt_manifest_ref=dbt_manifest_ref(),
                     dag_id=dag_id, airflow_run_id=context["run_id"],
-                    change_ref=(context["params"].get("change_ref") or None))
+                    change_ref=(context["params"].get("change_ref") or None),
+                    provenance=deployment_provenance())
             except Exception as exc:                            # noqa: BLE001
                 logging.getLogger("airflow.task").warning(
                     "could not open the run record for %s: %s", run_id,
