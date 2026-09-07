@@ -3658,7 +3658,118 @@ one is `TRY_CAST(NULLIF(NULLIF(NULLIF(TRIM(deduped.notional), ''), 'NULL'),
 
 **Landing -> raw is not parsed**, because ingest performs a declared rename
 rather than a query: that mapping IS `Feed.source_column()`. The platform's own
-added columns come from no file column and are correctly absent.
+added columns come from no file column -- they are `ingest_added`, and they
+are PRESENT rather than absent; see the next section for why that changed.
+
+## a-column-with-no-source-says-so
+
+Column lineage reported only the columns it could trace. 116 of 136. The other
+20 were simply not in the facet, and that absence was ambiguous in a way nobody
+could resolve from the outside: a column missing from the map might be a
+literal, an aggregate over rows rather than columns, or a parser failure nobody
+noticed. **Those are three different facts and they were rendered identically,
+as nothing.** An auditor asks which, and the export could not say. Worse, a
+regression that dropped a column's lineage entirely would have failed nothing
+at all — the shape had no way to distinguish "no source" from "not looked at".
+
+So every column of every managed table now carries a **classification**:
+
+| class | what it means |
+|---|---|
+| `sourced` | computed from >=1 upstream table column, which is named |
+| `row_aggregate` | an aggregate over ROWS, not columns: `count(*)` |
+| `build_metadata` | a property of the build: `current_timestamp()` |
+| `literal` | a constant the build injected: `dbt_invocation_id`, `nessie_ref` |
+| `ingest_added` | ingest's own column, sourceless by construction |
+| `unresolved` | **the defect class** — the export could not read it |
+
+**The class is read off the same node the transformation description is.**
+`_deepest()` walks to the deepest non-passthrough expression — the cast, the
+trim, the `count(*)` — because that is where the work happens and the
+outermost layer is always a passthrough from the final CTE. Its node TYPE is
+what tells `COUNT(*)` over a `Star` from `CurrentTimestamp` from a cast
+`Literal`. Sharing that walk is deliberate: the classification and the SQL
+shown for it can never describe two different nodes.
+
+**Which raw columns are the platform's is DERIVED, not listed.** A raw table is
+the feed's declared columns plus ingest's own, so a column `feeds.yml` does not
+declare is ingest's — and re-listing the `CREATE TABLE` from `ingest_feed.py`
+here would be the second list this document keeps refusing. The `_` prefix is
+only a TIEBREAK, consulted for a column the feed did not declare: one that is
+neither declared nor underscore-prefixed is drift between the table and
+`feeds.yml`, and it is reported as `unresolved` rather than filed under a
+reassuring name.
+
+### `unresolved` is a defect, and it does not fail a build
+
+It is reachable and detectable: sqlglot raises `Cannot find column 'x' in
+query` whenever the TABLE has a column the current SQL does not produce — a
+column dropped from a model, or added by a later version. It is empty against
+the shipped project, which is the point; a class that is only ever asserted to
+be empty is one nobody has shown can be entered, so `tests/test_lineage.py`
+drives it deliberately.
+
+It is **reported, not enforced**, for three reasons that all point the same
+way. Nothing in `reporting_platform/lineage/` may raise — it runs inside an
+OpenLineage extractor, where an exception costs the DATASETS of whatever was
+being extracted. An export is not an authority (see
+*openlineage-is-an-export-not-a-record*), so a DESCRIPTION of the pipeline must
+never acquire the power to stop the pipeline. And the condition is legitimately
+transient: the compiled SQL on disk is from the LAST build while the table
+schema is read from `main`, so mid-change the two disagree by construction and
+a build-time refusal would fire on a correct deployment.
+
+The seam is therefore CI, not runtime. `python -m reporting_platform.lineage
+--columns` classifies every column and **exits 1** on any unresolved one, which
+is gate-able without inverting the dependency.
+
+### Marquez carries an empty `inputFields`, and the graph endpoint drops it
+
+The spec does not settle whether a `ColumnLineageDatasetFacet` `Fields` entry
+may have an empty `inputFields`, which is what a sourceless column needs. It
+was **checked against the running Marquez before being relied on**, rather than
+assumed:
+
+- Posting an entry with `inputFields: []` returns **201**, and the entry comes
+  back verbatim from `/api/v1/namespaces/{ns}/datasets/{name}` under
+  `facets.columnLineage`. So it is carried.
+- But `/api/v1/column-lineage` returns an **empty graph** for that column —
+  `datasetField:...:sourceless_col` is not a node. That endpoint is built from
+  edges, and a sourceless column has none.
+
+So the shape is: **every** column goes in `columnLineage`, sourceless ones with
+an empty `inputFields` — never with a fabricated input to make the entry look
+well-formed, because a fabricated edge is worse than an absent one. And because
+that facet's per-field vocabulary cannot SAY which kind of sourceless a column
+is, the classification rides in a second, producer-defined dataset facet,
+`columnClassification`, which Marquez also stores and returns verbatim
+(verified the same way). It hoists `unresolved` to the top level, because a
+defect nobody has to go looking for is a defect somebody will find.
+
+### A facet VALUE passes through Airflow's SecretsMasker
+
+The class was called `platform_column`. It arrived in Marquez as
+`***_column`.
+
+The OpenLineage provider redacts facet values through
+`airflow.utils.log.secrets_masker` on the way out, and this deployment's
+Postgres DSN is `postgresql+psycopg2://platform:platform@postgres:5432/airflow`
+-- so the literal string `platform` is a REGISTERED SECRET, and every emitted
+value containing it is rewritten. The facet was perfectly well-formed; only its
+content was wrong. Nothing in the emitting code could have shown this, and it
+was found the way this file keeps insisting on: by reading the facet back off
+the running Marquez rather than reasoning about what was sent.
+
+`_producer` and `_schemaURL` are exempt, so the repo URL in the custom facet's
+schema link survives intact -- which is why the corruption was visible in one
+field and not the other, and why a spot check of the wrong field would have
+passed.
+
+The class is `ingest_added` now. The general rule, pinned by
+`tests/test_lineage.py`, is that **no value this package emits may contain a
+word that is also a credential in this estate** -- `platform` being both the
+user and the password in `REPORTING_DSN` and `REGISTRY_DSN`, it is the one that
+bites.
 
 ### Verified
 
@@ -3683,6 +3794,26 @@ added columns come from no file column and are correctly absent.
   `landing/fo_trade.mtm_value`, through `SUM(counterparty_exposure.total_mtm)`,
   `SUM(t.mtm_value)` and the `TRY_CAST` that turned a VARCHAR into a
   DECIMAL(28,4).
+- R-LIN-8, driven by two real deliveries rather than a replay: 2026-08-25 and
+  2026-08-26 landed for all four feeds, ingested by the `ingest_*` DAGs, which
+  cascaded through `prepared_build` to `reporting_build` (both `success`).
+  Read back off Marquez: **all 11 datasets carry `columnClassification` with
+  zero `unresolved`**; `raw.*` shows 5-9 `sourced` and 11 `ingest_added`;
+  `prepared.*` 16-18 `sourced`, 2 `literal`, 1 `build_metadata`;
+  `reporting.counterparty_exposure` additionally 1 `row_aggregate`, which is
+  `trade_count`. `columnLineage` widened from 20 to 24 fields on that table --
+  the sourceless four are carried, with empty `inputFields`.
+- The existing traversal is unaffected by that widening:
+  `reporting.exposure_by_country.total_mtm` still resolves in five hops back to
+  `landing/fo_trade.mtm_value`.
+- **A SKIPPED task emits nothing, so re-triggering an ingest does not re-emit
+  its lineage.** Re-running the four `ingest_*` DAGs against an already-ingested
+  date left the old facet in place: `resolve_arrival` short-circuits, the
+  scheduler marks the rest `skipped` WITHOUT starting a task process, and no
+  process means no extractor. Correcting a dataset facet therefore needs a real
+  delivery, not a re-run -- which is how the `***_column` masking above was
+  confirmed fixed. This is the same fact as "a skipped task shows as `RUNNING`
+  in Marquez forever", seen from the producing side.
 - `AIRFLOW__OPENLINEAGE__EXTRACTORS` is read at process start: the airflow
   containers must be **recreated**, not restarted. Separately, the LocalExecutor
   FORKS TASKS FROM THE SCHEDULER, so a module the scheduler has already
