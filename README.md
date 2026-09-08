@@ -80,7 +80,7 @@ flowchart LR
 ```
 
 Casting happens in `prepared`, not at load, so a bad value fails a test instead
-of aborting a 3am load. Every `raw` row carries `_business_date`,
+of aborting a 3am load. Every `raw` row carries `_cob_date`,
 `_ingest_ts`, `_source_file`, `_file_version`, `_row_number` and `_batch_id` —
 the lineage back to the exact delivery.
 
@@ -255,7 +255,7 @@ reporting_platform/            the platform library (NOT named `platform` — th
     retention.yml         retention policy, per environment
     maintenance.yml       maintenance thresholds
   common/                 config loading, Spark session, Nessie REST client,
-                          business-date keep-set calculation
+                          COB-date keep-set calculation
   ingest/                 arrival detection + CSV -> raw Iceberg
   maintenance/            metric-driven compaction, manifests, deletes
   retention/              branch/tag/row/snapshot/orphan expiry, in order
@@ -411,7 +411,7 @@ docker compose exec spark-master /opt/spark/bin/spark-sql -e \
 
 Note that **every source column is a string**. That is deliberate. Casting
 happens in dbt, in `prepared`, where a bad value fails a *test* rather than
-aborting a *load*. Note also the `_` metadata columns: `_business_date`,
+aborting a *load*. Note also the `_` metadata columns: `_cob_date`,
 `_file_version`, `_source_file`, `_batch_id`. Those are the lineage back to the
 exact delivery.
 
@@ -429,8 +429,8 @@ docker compose exec airflow python -m reporting_platform.ingest.ingest_feed \
   --feed fo_trade --object landing/fo_trade/TRADE_20260813_v2.csv
 
 docker compose exec spark-master /opt/spark/bin/spark-sql -e \
-  "SELECT _business_date, _file_version, count(*)
-   FROM lakehouse.raw.fo_trade WHERE _business_date = DATE '2026-08-13'
+  "SELECT _cob_date, _file_version, count(*)
+   FROM lakehouse.raw.fo_trade WHERE _cob_date = DATE '2026-08-13'
    GROUP BY 1,2 ORDER BY 2"
 ```
 
@@ -455,7 +455,7 @@ from reporting_platform.ingest.arrival import find_pending
 from reporting_platform.ingest.ingest_feed import ingest
 fd = feed("$f")
 for key in find_pending(fd):
-    print(ingest(fd.name, key)["business_date"], key)
+    print(ingest(fd.name, key)["cob_date"], key)
 PY
 done
 ```
@@ -549,7 +549,7 @@ Alternatively skip the merge and query at the branch instead, by appending
 
 ```bash
 docker compose exec spark-master /opt/spark/bin/spark-sql -e \
-  "SELECT business_date, change_category, count(*), round(sum(mtm_change),0)
+  "SELECT cob_date, change_category, count(*), round(sum(mtm_change),0)
    FROM lakehouse.reporting.exposure_change
    GROUP BY 1,2 ORDER BY 1 DESC, 2 LIMIT 20"
 ```
@@ -571,8 +571,8 @@ docker compose exec airflow python -m reporting_platform.maintenance.maintain \
 Read `manifest_count`, `max_files_per_partition` and `avg_file_size_mb`.
 
 **The degradation here is manifest sprawl, not small data files** — which is
-worth understanding, because it is not the one people expect. Each business
-date is its own partition (`days(_business_date)`), and each was ingested as a
+worth understanding, because it is not the one people expect. Each COB
+date is its own partition (`days(_cob_date)`), and each was ingested as a
 single file, so you get roughly *one data file per partition*: already optimal,
 with nothing for compaction to combine. But every one of those 55 ingests
 committed its own manifest, and manifest-level partition pruning degrades as
@@ -614,7 +614,7 @@ docker compose exec airflow python -m reporting_platform.retention.retention \
 ```
 
 Check `retained_dates` and `oldest_retained` against what you expect: 10 recent
-business dates plus every month-end in the generated history. Confirm the count
+COB dates plus every month-end in the generated history. Confirm the count
 before running for real.
 
 ```bash
@@ -796,7 +796,7 @@ published `main` answers in about a second:
 ```bash
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 docker compose exec -T airflow python -m scripts.duckdb_console \
-  "select business_date, count(*) from lakehouse.prepared.fo_trade
+  "select cob_date, count(*) from lakehouse.prepared.fo_trade
    group by 1 order by 1 desc limit 5"
 ```
 

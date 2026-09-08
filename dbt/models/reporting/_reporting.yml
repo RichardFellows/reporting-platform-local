@@ -8,7 +8,7 @@ models:
       exposure definition moves all reports together. Replaces the legacy report server's
       "Counterparty Exposure Summary" report set.
     columns:
-      - name: business_date
+      - name: cob_date
         tests: [not_null]
       - name: counterparty_id
         tests: [not_null]
@@ -28,7 +28,7 @@ models:
       - name: reference_carried_forward
         description: >
           True when the counterparty reference feed did not deliver this
-          counterparty on this business date and its attributes were carried
+          counterparty on this COB date and its attributes were carried
           forward from the last version in force. Under the old daily-snapshot
           model this case surfaced as NULL attributes instead; SCD2 carries
           forward (which is what README and ARCHITECTURE always promised) and
@@ -37,7 +37,7 @@ models:
       - name: rating_as_of
         description: >
           When the most recently-changed agency rating behind this row took
-          effect. Rating is a weekly feed, so most business dates legitimately
+          effect. Rating is a weekly feed, so most COB dates legitimately
           carry forward the last known rating; this says how old it is without
           flagging normal weekly behaviour as a gap.
       - name: reference_effective_from
@@ -50,7 +50,7 @@ models:
         tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, counterparty_id]
+          combination_of_columns: [cob_date, counterparty_id]
 
   - name: exposure_by_country
     description: >
@@ -64,11 +64,11 @@ models:
           - dbt_utils.accepted_range: {min_value: 1, inclusive: true}
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, country_code]
+          combination_of_columns: [cob_date, country_code]
       # Reconciliation is the point of the shared lineage — assert it.
       - dbt_utils.equality:
           compare_model: ref('counterparty_exposure')
-          compare_columns: [business_date]
+          compare_columns: [cob_date]
           config:
             severity: warn
 
@@ -78,7 +78,7 @@ models:
       the model the estate's reporting emphasis actually needs, and the one
       that was expensive on the legacy RDBMS.
     columns:
-      - name: business_date
+      - name: cob_date
         tests: [not_null]
       - name: counterparty_id
         tests: [not_null]
@@ -98,7 +98,7 @@ models:
                 severity: warn
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, counterparty_id]
+          combination_of_columns: [cob_date, counterparty_id]
 
 exposures:
   - name: counterparty_exposure_report

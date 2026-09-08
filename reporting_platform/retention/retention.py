@@ -64,7 +64,7 @@ TAG_RE = re.compile(
 
 # `snapshot/<feed>/<bd>/<run>` -- what an INGEST pins now. A different object
 # from a publication and kept for a different reason: it pins the state one
-# feed's ingest left, so a raw business date stays readable after retention
+# feed's ingest left, so a raw COB date stays readable after retention
 # has deleted it from the live table. Its window is
 # `references.snapshot_tags`, which is allowed to be much shorter than a
 # published tag's, because nothing is reproduced FROM it -- it is a
@@ -113,7 +113,7 @@ def check_reproducibility_window() -> dict:
 
     STILL NOT BOUND TO `snapshot_tags`, and that must not creep back in.
     Nothing is reproduced from a snapshot tag; it buys the ability to read a
-    raw business date back after retention removed it, which is a storage
+    raw COB date back after retention removed it, which is a storage
     decision rather than an evidence one. Binding it here would silently
     impose the published window on every feed again.
 
@@ -296,12 +296,12 @@ def clean_working_branches(nessie: Nessie, dry_run: bool = False) -> list[str]:
     return removed
 
 
-def _tag_age(ref: dict, business_date: date) -> tuple[str, date, date | None]:
+def _tag_age(ref: dict, cob_date: date) -> tuple[str, date, date | None]:
     """(what it was judged on, the date to judge it by, the commit date).
 
     THE AGE IS THE COMMIT TIME where there is one -- when the record was made
-    -- with the BUSINESS DATE as a conservative fallback: a tag cannot be cut
-    before the date it is about, so the business date is never later than the
+    -- with the COB DATE as a conservative fallback: a tag cannot be cut
+    before the date it is about, so the COB date is never later than the
     commit time and can only ever keep a tag the commit time would have kept
     too. Deleting a tag is unrecoverable, so everything ambiguous keeps.
 
@@ -320,10 +320,10 @@ def _tag_age(ref: dict, business_date: date) -> tuple[str, date, date | None]:
             commit_date = None
     if committed and commit_date is None:
         log.warning("tag %s has an unreadable commit time %r; judging it on "
-                    "its business date alone", ref.get("name"), committed)
+                    "its COB date alone", ref.get("name"), committed)
     if commit_date is not None:
         return "commit time", commit_date, commit_date
-    return "business date", business_date, None
+    return "COB date", cob_date, None
 
 
 # --------------------------------------------------------------- 2. tag expiry
@@ -338,14 +338,14 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
 
     Two things were wrong with that, and both were live:
 
-      * an ordinary daily publication lost its pin once ten more business
+      * an ordinary daily publication lost its pin once ten more COB
         dates had been published -- about a fortnight -- and month-end pins
         lasted 80/12 ~ 6.7 years against a longer assumed period. The
         evidence expired on a table schedule.
       * within a RETAINED date, only the newest tag survived. The tag name
         carries no feed (`published/<bd>/<run_id>`) and
         `record_publication` runs in every per-feed ingest DAG, so N feeds
-        publishing one business date cut N tags for it and N-1 were deleted
+        publishing one COB date cut N tags for it and N-1 were deleted
         the same night. Observed on the live catalog: three tags for
         2026-08-01, all inside the keep-set, two of them scheduled for
         deletion. The code called them "earlier reruns of the same date"
@@ -354,14 +354,14 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
     Now: FLAT AGE, per report, and every tag is judged on its own.
 
     THE AGE IS THE COMMIT TIME -- when the publication was MADE -- not the
-    business date it is about. A retention period runs from the creation of
-    the record, and a restatement published today for a business date years
+    COB date it is about. A retention period runs from the creation of
+    the record, and a restatement published today for a COB date years
     old is a new record that must survive its own full window. Measuring from
-    the business date instead would expire it on arrival.
+    the COB date instead would expire it on arrival.
 
-    The business date is the FALLBACK, used only when a tag carries no
+    The COB date is the FALLBACK, used only when a tag carries no
     readable commit time. It is conservative by construction: a publication
-    cannot precede the date it reports on, so the business date is never later
+    cannot precede the date it reports on, so the COB date is never later
     than the commit time and can only ever keep a tag the commit time would
     also have kept.
 
@@ -399,7 +399,7 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
         bd = datetime.strptime(m.group("bd"), "%Y-%m-%d").date()
         judged_on, age_date, commit_date = _tag_age(ref, bd)
         keep = age_date >= cutoff
-        log.info("published tag %s: business date %s, published %s, window "
+        log.info("published tag %s: COB date %s, published %s, window "
                  "%dy (cutoff %s), judged on %s%s -> %s",
                  name, bd, commit_date or "unknown", years, cutoff, judged_on,
                  f", report {report!r}" if report else "",
@@ -419,7 +419,7 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
 def expire_snapshot_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
     """`snapshot/<feed>/<bd>/<run>` retention. NOT the same thing as a pin.
 
-    An ingest pins the state it left so a raw business date stays readable
+    An ingest pins the state it left so a raw COB date stays readable
     after retention has removed it from the live table. That is a convenience
     with a cost -- a pinned file cannot be reclaimed by `expire_snapshots` --
     and NOTHING IS REPRODUCED FROM IT: no published figure rests on a snapshot
@@ -428,7 +428,7 @@ def expire_snapshot_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
 
     This is why the ingest DAG's tag was renamed out of `published/`. While it
     lived there it was judged by the published window -- ten years of pinned
-    raw files per feed per business date -- and it was counted by every check
+    raw files per feed per COB date -- and it was counted by every check
     that asks whether a PUBLICATION can still be read.
 
     Judged the same way a published tag is (`_tag_age`), and it keeps
@@ -465,7 +465,7 @@ def expire_snapshot_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
         bd = datetime.strptime(m.group("bd"), "%Y-%m-%d").date()
         judged_on, age_date, _commit = _tag_age(ref, bd)
         keep = age_date >= cutoff
-        log.info("snapshot tag %s: feed %s, business date %s, window %dy "
+        log.info("snapshot tag %s: feed %s, COB date %s, window %dy "
                  "(cutoff %s), judged on %s -> %s", name, m.group("feed"), bd,
                  years, cutoff, judged_on, "keep" if keep else "expire")
         if keep:
@@ -924,7 +924,7 @@ def iceberg_gc_enabled(spark, table: str) -> bool:
 
 
 def is_scd2(spark, table: str) -> bool:
-    """Does this table store one row per VERSION rather than per business date?
+    """Does this table store one row per VERSION rather than per COB date?
 
     DETECTED, not configured. The alternative was a per-table flag in
     retention.yml, and this file already carries the scar of a hand-maintained
@@ -947,7 +947,7 @@ def is_scd2(spark, table: str) -> bool:
 
 def apply_scd2_retention(spark, table: str, layer: str,
                          dry_run: bool = False) -> dict:
-    """Expire CLOSED versions that no retained business date falls inside.
+    """Expire CLOSED versions that no retained COB date falls inside.
 
     Two rules, and the first is absolute:
 
@@ -957,13 +957,13 @@ def apply_scd2_retention(spark, table: str, layer: str,
         cutoff that dropped them would empty the dimension and every
         point-in-time join with it.
       * A closed version is expired only once the whole of its effective range
-        sits before the oldest retained business date. Conservative on
+        sits before the oldest retained COB date. Conservative on
         purpose: a version straddling the cutoff is still in force for a
         retained date and must stay.
 
     AND THIS IS NOT A PARTITION DROP. The snapshot path below deletes whole
-    `business_date` partitions as an Iceberg metadata operation. There is no
-    business_date here, so this is a row-level delete producing delete files,
+    `cob_date` partitions as an Iceberg metadata operation. There is no
+    cob_date here, so this is a row-level delete producing delete files,
     and reclaiming them is `rewrite_data_files` in the maintenance job. That is
     the real cost of SCD2 and it belongs in the open -- see docs/RETENTION.md.
 
@@ -1014,7 +1014,7 @@ def apply_scd2_retention(spark, table: str, layer: str,
 
 def apply_table_retention(spark, table: str, layer: str, date_column: str,
                           dry_run: bool = False) -> dict:
-    # An SCD2 dimension has no business_date to delete by; see is_scd2().
+    # An SCD2 dimension has no cob_date to delete by; see is_scd2().
     if is_scd2(spark, table):
         return apply_scd2_retention(spark, table, layer, dry_run=dry_run)
 
@@ -1034,7 +1034,7 @@ def apply_table_retention(spark, table: str, layer: str, date_column: str,
     }
 
     if to_expire and not dry_run:
-        # business_date is the partition column, so this resolves to a
+        # cob_date is the partition column, so this resolves to a
         # partition-level metadata delete — the Iceberg analogue of partition
         # switching. It does NOT rewrite data files.
         in_list = ", ".join(f"DATE '{d:%Y-%m-%d}'" for d in to_expire)
@@ -1125,7 +1125,7 @@ class RetentionPartialFailure(RuntimeError):
         )
 
 
-def run(tables: list[tuple[str, str]], date_column: str = "business_date",
+def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
         dry_run: bool = False) -> dict:
     """tables: list of (fully_qualified_table, layer)."""
     nessie = Nessie()
@@ -1164,7 +1164,7 @@ def run(tables: list[tuple[str, str]], date_column: str = "business_date",
     try:
         report["tables"] = []
         for table, layer in tables:
-            col = "_business_date" if layer == "raw" else date_column
+            col = "_cob_date" if layer == "raw" else date_column
             # PER TABLE, not one try around the loop. Tables are
             # independent -- each one's row DELETE is its own Nessie commit --
             # so one table failing is no reason the rest go unretained. Before

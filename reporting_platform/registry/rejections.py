@@ -19,7 +19,7 @@ onboard, and both of those want a local file to open. It is now a working
 copy of something durable rather than the only copy.
 
 THE KEY CARRIES THE DATE, and that is deliberate. A quarantined file has no
-business date -- not being nameable is frequently why it was rejected -- so
+COB date -- not being nameable is frequently why it was rejected -- so
 there is nothing in it for a retention sweep to date it by. Putting the
 rejection date in the key means `retention/quarantine.py` dates every object
 from its own name with no lookup and no guess, which is the same property
@@ -45,7 +45,7 @@ QUARANTINE_PREFIX = "quarantine"
 #   unroutable  no feed claims this filename
 #   ambiguous   more than one feed claims it -- rejected, never guessed
 #   identity    a feed claims it and it cannot be NAMED for landing: no
-#               business date, an unparsable control file, a declared version
+#               COB date, an unparsable control file, a declared version
 #               that will not render
 #   member      an archive member that could not be conformed, where the
 #               container itself was fine

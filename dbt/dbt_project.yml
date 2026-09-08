@@ -23,9 +23,9 @@ vars:
   # Nessie branch the build runs on. Injected by the Airflow task; defaults to
   # main for interactive local work.
   nessie_ref: main
-  # Business date being built. Empty means "whatever is latest in raw".
-  business_date: ''
-  # Trailing business dates the incremental models reprocess, covering
+  # COB date being built. Empty means "whatever is latest in raw".
+  cob_date: ''
+  # Trailing COB dates the incremental models reprocess, covering
   # late-arriving corrections without a full rebuild.
   lookback_days: 3
 
@@ -60,7 +60,7 @@ models:
     # INCREMENTALLY on a Nessie branch: the column appeared, the 9 SCD2
     # versions the merge actually wrote carried its value, and the other 1412
     # rows stayed NULL. On an SCD2 dimension that means every CURRENT row
-    # reads NULL until its entity next changes; on a business-date model it
+    # reads NULL until its entity next changes; on a COB-date model it
     # means the lookback window and no further back. If history has to carry
     # the value, that is what --full-refresh is for -- the difference is that
     # it is now a choice about DATA rather than the only way to get the COLUMN.
@@ -69,14 +69,14 @@ models:
 
     prepared:
       +schema: prepared
-      # business_date leads the partition spec on every table. This is a
+      # cob_date leads the partition spec on every table. This is a
       # RETENTION requirement, not a performance one -- see docs/RETENTION.md.
-      +partition_by: ['business_date']
+      +partition_by: ['cob_date']
       +tags: ['prepared']
 
     reporting:
       +schema: reporting
-      +partition_by: ['business_date']
+      +partition_by: ['cob_date']
       +tags: ['reporting']
 
 # No `seeds:` block, and no `raw:` one under `models:` -- there are no seed

@@ -44,14 +44,14 @@ AND IT IS THE CONFORMANCE GATE. `landing/` has a contract -- every object in
 it is correctly named and classified -- and a legacy upstream that sends
 `positions.csv` with the date inside `positions.ctl` does not satisfy it. For
 a feed with an `arrival:` block this watcher waits for the control file,
-verifies what it declares (row count, md5), derives the business date, and
+verifies what it declares (row count, md5), derives the COB date, and
 promotes the delivery under the name `filename_pattern` describes, with a
 `.meta.json` sibling recording what actually arrived. A feed with no
 `arrival:` block is a conformant upstream: its file is uploaded under its own
 name, exactly as before.
 
 **An unchanged file sent twice lands nothing.** The gate compares the bytes
-against what is already landed for that business date and reports `duplicate`
+against what is already landed for that COB date and reports `duplicate`
 -- nothing uploaded, nothing triggered, the inbox copy moved to
 `.processed/`. A conformant upstream gets this free by writing the same key
 twice; the gate had to be taught it, because its rename would otherwise turn
@@ -123,7 +123,7 @@ def route(filename: str) -> tuple[Feed | None, str | None, bool]:
     file and no verification. Making it take the legacy path would demand a
     control file that a conformant sender has no reason to include.
 
-    A CONTROL FILE MATCHES NO DATA PATTERN -- it names no business date, it
+    A CONTROL FILE MATCHES NO DATA PATTERN -- it names no COB date, it
     says something about a delivery that does -- so it is checked only once no
     data pattern claims the name. Without that, the inbox would reject it to
     `.rejected/` and the delivery it belongs to would wait forever on a file
@@ -471,7 +471,7 @@ def _promote(feed: Feed, path: Path,
                 "landed_as": exc.landing_filename, "reason": str(exc)}
     except conform.ConformanceError as exc:
         # AN IDENTITY FAILURE, and the only kind that can happen here. The
-        # delivery cannot be NAMED -- no business date, or a pattern no
+        # delivery cannot be NAMED -- no COB date, or a pattern no
         # concrete filename can be built from -- so there is no landing key to
         # write it to and no amount of waiting fixes it. Content failures are
         # not checked here at all: they land and the ingest refuses.
@@ -511,11 +511,11 @@ def _promote(feed: Feed, path: Path,
     outcome = {"file": path.name, "status": "conformed", "feed": feed.name,
                "key": key, "landed_as": plan["landing_filename"],
                "control_landed_as": plan["control_landing_filename"],
-               "business_date": plan["business_date"].isoformat(),
+               "cob_date": plan["cob_date"].isoformat(),
                "moved_to": str(moved.relative_to(INBOX))}
     outcome.update(_trigger(feed, key))
     log.info("conformed %s -> %s (%s)%s", path.name, key,
-             plan["business_date"].isoformat(),
+             plan["cob_date"].isoformat(),
              "" if outcome.get("triggered") else
              f" (NOT triggered: {outcome.get('reason')})")
     return outcome
@@ -535,12 +535,12 @@ def _promote_archive(feed: Feed, path: Path,
     what arrived stays provable without keeping an object nothing reads.
 
     `taken` is advanced as members land, not read once: two members for the
-    same business date inside one zip would otherwise both render the
+    same COB date inside one zip would otherwise both render the
     unversioned name and the second would overwrite the first.
 
     A CONTAINER RESENT WHOLE is the commonest duplicate here, and it is the
     expensive one: without the md5 check every member restates its own
-    business date at once. Duplicates count as HANDLED -- if they did not, a
+    COB date at once. Duplicates count as HANDLED -- if they did not, a
     zip whose members are all already landed would find nothing to land, stay
     in the inbox, and be unpacked again on every pass forever.
     """
@@ -619,7 +619,7 @@ def _promote_archive(feed: Feed, path: Path,
         outcome = {"file": f"{path.name}!{member_name}", "status": "conformed",
                    "feed": feed.name, "key": key,
                    "landed_as": plan["landing_filename"],
-                   "business_date": plan["business_date"].isoformat(),
+                   "cob_date": plan["cob_date"].isoformat(),
                    "moved_to": str(moved.relative_to(INBOX))}
         outcome.update(_trigger(feed, key))
         results.append(outcome)

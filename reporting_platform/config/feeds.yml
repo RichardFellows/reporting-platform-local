@@ -4,7 +4,7 @@
 # Adding a feed = adding a block here + a dbt source entry + prepared model.
 # No DAG file is edited: airflow/dags/feed_ingest.py generates one DAG per feed.
 #
-# Filename pattern must yield a `business_date` named group. Everything else
+# Filename pattern must yield a `cob_date` named group. Everything else
 # in the pattern is ignored for routing but retained in `_source_file`.
 
 defaults:
@@ -76,7 +76,7 @@ feeds:
   - name: fo_trade
     description: Daily position-level trade extract from the front office.
     source_system: FO_SRC
-    filename_pattern: 'TRADE_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    filename_pattern: 'TRADE_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [trade_id]
     expected_min_rows: 100
     # The front office closes and extracts before the reference systems do.
@@ -95,7 +95,7 @@ feeds:
   - name: ref_counterparty
     convention: ref_src
     description: Counterparty reference data. Slowly changing.
-    filename_pattern: 'CPTY_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    filename_pattern: 'CPTY_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [counterparty_id]
     columns:
       - counterparty_id
@@ -108,13 +108,13 @@ feeds:
   - name: ref_rating
     convention: ref_src
     description: External agency credit ratings.
-    filename_pattern: 'RATING_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    filename_pattern: 'RATING_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [counterparty_id, agency]
     # Agency ratings arrive weekly, not daily. Without this the gap
     # check infers the business calendar from the daily feeds and
     # reports every non-delivery day as a gap -- it did exactly that on its
     # first run, five false gaps in a ten-day window. `weekly` asks only that
-    # each week containing business dates saw at least one delivery.
+    # each week containing COB dates saw at least one delivery.
     cadence: weekly
     columns:
       - counterparty_id
@@ -126,7 +126,7 @@ feeds:
     convention: ref_src
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.
-    filename_pattern: 'COLLATERAL_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    filename_pattern: 'COLLATERAL_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [collateral_id]
     # BEHIND NO PUBLISHED REPORT. `feeds_behind_report` walks the exposures'
     # ref() closure and this feed is in neither report's lineage, so no

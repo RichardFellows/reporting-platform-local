@@ -2,7 +2,7 @@
 
 WHY A TEST AND NOT A COMMENT. Everything that makes a published run
 reproducible is a *pin* — `record_publication` cuts
-`published/<report>/<business_date>/<run_id>` against main, and retention keeps
+`published/<report>/<cob_date>/<run_id>` against main, and retention keeps
 that tag for `references.published_tags`. Nothing about that arrangement
 announces its own failure. A tag deleted too early, a GC cutoff that collected
 a file the tag still referenced, a maintenance step that rewrote data and then
@@ -31,10 +31,10 @@ data files". That is backwards in two ways, and the second is the one that
 bites. `compact()` scopes its rewrite to `date_column >= today −
 recent_partition_days`, so it only ever touches the RECENT partitions and a pin
 ages OUT of the compaction window rather than into it. And compaction is not
-even the mechanism that produces the divergence here: expiring a business date
+even the mechanism that produces the divergence here: expiring a COB date
 is a metadata-level partition delete, so `main` stops referencing that date's
 files while every pin goes on referencing them. On a catalog whose newest
-business date is older than the compaction window — which is every catalog
+COB date is older than the compaction window — which is every catalog
 between deliveries — the age gate opens on a fixed date and reports GREEN on
 a pin that is still byte-identical to `main`. That is the meaningless green the
 gate was written to prevent, arriving on a timer.
@@ -85,7 +85,7 @@ log = logging.getLogger("reproducibility")
 
 # How many DISTINCT pin commits the divergence scan will look at before giving
 # up and reporting `not_yet_meaningful`. A bound is needed because the tag
-# count grows without limit -- one per report per published business date --
+# count grows without limit -- one per report per published COB date --
 # while the scan is oldest-first and stops at its first hit, so on any catalog
 # where retention has actually run it stops at 1. The cap only bites on a
 # catalog that has never removed a file, which is precisely the state in which
@@ -120,7 +120,7 @@ def published_tags(nessie: Nessie) -> list[dict]:
             except ValueError:
                 when = None
         out.append({"tag": ref["name"], "report": m.group("report"),
-                    "business_date": m.group("bd"), "committed": when,
+                    "cob_date": m.group("bd"), "committed": when,
                     # Two exposures publishing one build cut two tags at the
                     # SAME commit, so they name the same file set. The scan
                     # dedupes on this rather than paying for it twice.
@@ -307,7 +307,7 @@ def check_tag(tag: str, tables: list[str]) -> dict:
         COUNT(*)                                    -> 16400
         COUNT(trade_id)                             -> 16400
         COUNT(*) WHERE trade_id IS NOT NULL         -> raised
-        COUNT(*) WHERE _business_date = '2026-08-06'-> raised
+        COUNT(*) WHERE _cob_date = '2026-08-06'-> raised
 
     so the whole check reported `reproduced` on a pin whose data was gone. The
     count proves the METADATA chain resolves, which is worth asserting and is
@@ -432,7 +432,7 @@ def run(tag: str | None = None, scan: bool = True) -> dict:
 
     report.update(check_tag(chosen["tag"], tables))
     report["selected"] = "oldest_diverging"
-    report["business_date"] = chosen["business_date"]
+    report["cob_date"] = chosen["cob_date"]
     report["committed"] = (chosen["committed"].isoformat()
                            if chosen["committed"] else None)
     report["divergence"].update({

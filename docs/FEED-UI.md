@@ -38,7 +38,7 @@ anything shared needs a real identity layer in front of it.
 The **Data** tab has two paths, and they are not the same thing:
 
 - **Deliver real files** uploads straight into `landing/<feed>/`, several at
-  once, oldest business date first, and can trigger the ingest in the same
+  once, oldest COB date first, and can trigger the ingest in the same
   action. Each filename is checked against the feed's pattern *before* anything
   is uploaded, because a name that does not match would land and never be
   ingested. This is the path for a feed you are onboarding.
@@ -120,7 +120,7 @@ Type a real delivered filename into **Example delivered filename** and press
 **Derive pattern**. `COLLATERAL_20260819.csv` gives:
 
 ```
-COLLATERAL_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv
+COLLATERAL_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv
 ```
 
 **Test** runs it the way arrival will and says which part failed. A pattern
@@ -172,7 +172,7 @@ tests. The generated test block carries a comment saying to add them.
 
 What it does generate is the minimum from `ADDING-A-FEED.md`: `not_null` on
 the business key, `unique_combination_of_columns` over
-`[business_date, <business key>]` — which is what proves `dedupe_rank` works —
+`[cob_date, <business key>]` — which is what proves `dedupe_rank` works —
 and a `relationships` test on `counterparty_id` when the `counterparty` model
 exists.
 
@@ -280,7 +280,7 @@ retention and maintenance stop covering them and they grow untended.
 A feed defined five minutes ago has nothing to test against, and
 `generate_feeds.py` cannot help — its generators are hand-written per feed.
 **Generate** on the Data tab emits deliveries from the definition itself: one
-CSV per business date, into `seed/<feed>/`, named so the feed's own pattern
+CSV per COB date, into `seed/<feed>/`, named so the feed's own pattern
 matches it (and refused if it would not — see `sampledata.filename_for`).
 
 Three things it does that a naive generator would not, each of which is the
@@ -288,7 +288,7 @@ difference between a file that tests something and one that does not:
 
 - **Dates come from what the OTHER feeds have in `seed/`**, not from today. A
   `relationships` test compares against reference data on the *same*
-  business_date, so rows dated where `counterparty` has nothing would fail a
+  cob_date, so rows dated where `counterparty` has nothing would fail a
   test that has found nothing wrong with the feed.
 - **Foreign keys are drawn from the real reference data**, read out of the
   other feed's seed CSVs — no Spark, no catalog. Random `CP#####` values fail
@@ -304,12 +304,12 @@ its values across deliveries and changes only when its epoch rolls — months,
 for most column types. Generate five days of a feed and you get five files
 that differ in name and little else, which is what reference data looks like.
 
-That is a fix, not a feature: it used to seed one RNG per business date, so
+That is a fix, not a feature: it used to seed one RNG per COB date, so
 every value in every row changed on every delivery. A feed created here looked
 like the most volatile market data imaginable rather than like the reference
 data most new feeds are, and the change detection the prepared layer exists to
 do had nothing to detect but noise. Date columns are anchored to the epoch
-start for the same reason — anchoring them on the business date slid them
+start for the same reason — anchoring them on the COB date slid them
 forward a day per delivery and defeated the whole thing for any feed with a
 date in it. See `reporting_platform/common/volatility.py`.
 
@@ -365,7 +365,7 @@ cleaned itself up.
 **Data tab** — upload a delivery into `seed/<feed>/`, then land it. An upload
 whose filename does not match the pattern is **refused**, with the reason: a
 non-matching file in `seed/` is invisible work, since it lands and is then
-never ingested. Landing goes oldest business date first, which matters on a
+never ingested. Landing goes oldest COB date first, which matters on a
 first load — a trade file landed ahead of its counterparty file fails the
 `relationships` test on reference data that simply has not arrived yet.
 

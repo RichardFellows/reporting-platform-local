@@ -74,9 +74,9 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
 
     # THE SCOPE COLUMN IS A PROPERTY OF THE TABLE, NOT OF THE LAYER. run()
     # derives it from the layer -- right for every snapshot table, wrong for an
-    # SCD2 dimension, which holds one row per VERSION and has no business_date
+    # SCD2 dimension, which holds one row per VERSION and has no cob_date
     # at all. Iceberg rejects the whole call:
-    #   Cannot parse predicates in where option: business_date >= date "..."
+    #   Cannot parse predicates in where option: cob_date >= date "..."
     # and a failed action fails the maintenance task, which takes the entire
     # nightly chain down with it -- retention, GC and reclamation included. It
     # had never fired because no prepared table had ever reached `main`.
@@ -192,7 +192,7 @@ def run(tables: list[tuple[str, str]], force: bool = False,
     failures: list[str] = []
     try:
         for table, layer in tables:
-            date_column = "_business_date" if layer == "raw" else "business_date"
+            date_column = "_cob_date" if layer == "raw" else "cob_date"
             entry: dict = {"layer": layer}
             try:
                 metrics = collect_metrics(spark, table, defaults["recent_partition_days"])

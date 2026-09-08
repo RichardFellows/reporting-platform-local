@@ -21,7 +21,7 @@ ARCHIVE_PAYLOAD = {
     "name": "cus_position",
     "description": "Custody positions, delivered zipped.",
     "source_system": "CUS",
-    "filename_pattern": r"custodyPositions_(?P<business_date>\d{8})\.zip",
+    "filename_pattern": r"custodyPositions_(?P<cob_date>\d{8})\.zip",
     "business_key": ["position_id"],
     "columns": ["position_id", "counterparty_id", "quantity"],
     "delivery": {"kind": "archive", "member_pattern": r"positions_.*\.csv"},
@@ -31,7 +31,7 @@ CONTROL_PAYLOAD = {
     "name": "trs_margin_call",
     "description": "Treasury margin calls, gated on a control file.",
     "source_system": "TRS",
-    "filename_pattern": r"MarginCall_(?P<business_date>\d{8})\.csv",
+    "filename_pattern": r"MarginCall_(?P<cob_date>\d{8})\.csv",
     "business_key": ["margin_call_id"],
     "columns": ["margin_call_id", "amount"],
     "delivery": {"control": {"pattern": r"{stem}\.ctl",
@@ -81,7 +81,7 @@ def test_archive_feed_creates_and_loads_correctly():
     fd = feeds()["cus_position"]
     assert fd.delivery["kind"] == "archive", fd.delivery
     # Defaults resolve_delivery_config fills in, not written by the form.
-    assert fd.delivery["business_date_from"] == "container", fd.delivery
+    assert fd.delivery["cob_date_from"] == "container", fd.delivery
     assert fd.delivery["parts"] == "concat", fd.delivery
     assert fd.delivery["member_pattern"] == r"positions_.*\.csv", fd.delivery
 

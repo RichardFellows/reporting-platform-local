@@ -155,7 +155,7 @@ def already_ingested(feed: Feed) -> set[str]:
 
 
 def retention_keep_dates(feed: Feed, observed: list[date]) -> set[date]:
-    """Business dates the raw retention policy would keep, given `observed`.
+    """COB dates the raw retention policy would keep, given `observed`.
 
     Deliberately computed from the dates seen in LANDING, not from the table.
     The table has already lost the expired ones -- that is the whole problem
@@ -178,7 +178,7 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False,
     """MANIFEST keys for deliveries that have arrived but not been ingested.
 
     Returns keys under `ready/`, not `landing/`. What ingest consumes is a
-    manifest -- see `ingest.normalize` for why -- and the business date now
+    manifest -- see `ingest.normalize` for why -- and the COB date now
     comes from inside it rather than from a regex re-run here.
 
     `reconcile=True` first gives every landed object a manifest. That is a
@@ -193,13 +193,13 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False,
     `already_ingested()` derives its ledger from the raw table's own
     `_source_file` values, which cannot drift from reality -- but it also
     cannot distinguish "never ingested" from "ingested, then expired by
-    retention". Retention deletes whole business dates, taking their
+    retention". Retention deletes whole COB dates, taking their
     `_source_file` rows with them, so without the second filter every
     retention-expired file reappears as pending and gets re-ingested. That is
     a silent loop: ingest -> expire -> re-ingest -> expire, resurrecting data
     the retention policy deliberately removed and quietly undoing the policy.
 
-    So the second filter recomputes the retention keep-set from the business
+    So the second filter recomputes the retention keep-set from the COB
     dates seen in LANDING -- which still has every date, expired or not -- and
     treats a candidate outside that keep-set as expired rather than new. Note
     a floor check is not enough: the policy keeps "10 recent business days
@@ -211,7 +211,7 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False,
     its window must be >= the raw layer's, precisely because this computation
     needs a prefix that still holds every date. `ready/` is a days-long cache;
     computing the keep-set from it would silently narrow the window and start
-    reporting live business dates as expired. Giving manifests an eight-year
+    reporting live COB dates as expired. Giving manifests an eight-year
     lifetime so they could serve instead is the load-control-table trap in a
     different hat.
     """
@@ -242,7 +242,7 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False,
 
     pending, expired = [], []
     for key, m in fresh:
-        if norm.business_date_of(m) not in keep:
+        if norm.cob_date_of(m) not in keep:
             expired.append(key)
         else:
             pending.append(key)

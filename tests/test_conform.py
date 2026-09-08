@@ -40,14 +40,14 @@ feeds:
   - name: trs_position
     description: Positions from a legacy sender that names nothing usefully.
     source_system: TRS
-    filename_pattern: 'trs_position_(?P<business_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'
+    filename_pattern: 'trs_position_(?P<cob_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'
     business_key: [position_id]
     expected_min_rows: 1
     arrival:
       source_pattern: 'positions\\.csv'
       control:
         pattern: '{stem}\\.ctl'
-        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'
+        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'
     delivery:
       kind: file
       control:
@@ -93,7 +93,7 @@ def test_arrival_block_resolves():
     # IDENTITY ONLY. row_count and md5 belong to delivery.control, so they are
     # checked once for every delivery rather than twice for one of the two
     # arrival paths.
-    assert set(fd.arrival["control"]) == {"pattern", "business_date"}
+    assert set(fd.arrival["control"]) == {"pattern", "cob_date"}
     assert set(fd.delivery["control"]) == {"pattern", "row_count", "md5"}
 
 
@@ -118,26 +118,26 @@ def test_source_pattern_is_required():
 
 def test_the_date_must_come_from_exactly_one_place():
     both = FEED.replace("'positions\\.csv'",
-                        "'positions_(?P<business_date>\\d{8})\\.csv'")
+                        "'positions_(?P<cob_date>\\d{8})\\.csv'")
     assert "One fact, one source" in _bad(both)
 
     neither = FEED.replace(
-        "        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'\n", "")
-    assert "no way to find the business date" in _bad(neither)
+        "        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'\n", "")
+    assert "no way to find the COB date" in _bad(neither)
 
 
 def test_a_dated_source_name_needs_no_control_file():
     """Some legacy names are wrong without being dateless -- POS_20260801.TXT
     for a feed whose landing convention is trs_position_20260801.csv."""
-    yml = FEED.replace("'positions\\.csv'", "'POS_(?P<business_date>\\d{8})\\.TXT'")
+    yml = FEED.replace("'positions\\.csv'", "'POS_(?P<cob_date>\\d{8})\\.TXT'")
     for line in ("      control:\n",
                  "        pattern: '{stem}\\.ctl'\n",
-                 "        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'\n",
+                 "        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'\n",
                  "        row_count: 'ROWS=(?P<rows>\\d+)'\n",
                  "        md5: 'MD5=(?P<md5>[0-9a-fA-F]{32})'\n"):
         yml = yml.replace(line, "")
     fd = _feed(yml)
-    assert fd.source_business_date("POS_20260801.TXT") == date(2026, 8, 1)
+    assert fd.source_cob_date("POS_20260801.TXT") == date(2026, 8, 1)
 
     plan = _conform().conform(fd, "POS_20260801.TXT", DATA)
     assert plan["landing_filename"] == "trs_position_20260801.csv", plan
@@ -149,9 +149,9 @@ def test_control_pattern_must_reference_stem():
 
 
 def test_each_control_regex_needs_its_named_group():
-    assert "(?P<business_date>...)" in _bad(
-        FEED.replace("business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'",
-                     "business_date: 'ReportingDate\\|\\d{8}'"))
+    assert "(?P<cob_date>...)" in _bad(
+        FEED.replace("cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'",
+                     "cob_date: 'ReportingDate\\|\\d{8}'"))
     assert "(?P<rows>...)" in _bad(FEED.replace("(?P<rows>\\d+)", "\\d+"))
     assert "(?P<md5>...)" in _bad(FEED.replace("(?P<md5>[0-9a-fA-F]{32})",
                                                "[0-9a-fA-F]{32}"))
@@ -163,8 +163,8 @@ def test_verification_keys_are_rejected_on_the_arrival_block():
     landing with WEAKER checking than a legacy feed -- the trusted path being
     the less verified one, which is backwards."""
     msg = _bad(FEED.replace(
-        "        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'",
-        "        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'\n"
+        "        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'",
+        "        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'\n"
         "        row_count: 'ROWS=(?P<rows>\\d+)'"))
     assert "unknown key" in msg and "row_count" in msg, msg
 
@@ -179,7 +179,7 @@ def test_a_landing_pattern_with_no_date_is_rejected_naming_the_gate():
     """Already an error for any feed; this says which of the two patterns is
     the problem, which is the whole reason the check is repeated here."""
     msg = _bad(FEED.replace(
-        "'trs_position_(?P<business_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'",
+        "'trs_position_(?P<cob_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'",
         "'trs_position\\.csv'"))
     assert "nowhere to write the date" in msg, msg
 
@@ -301,14 +301,14 @@ def test_metadata_records_what_actually_arrived():
     assert m["source_filename"] == "positions.csv"
     assert m["source_control_filename"] == "positions.ctl"
     assert m["landing_filename"] == "trs_position_20260801.csv"
-    assert m["business_date"] == "2026-08-01"
+    assert m["cob_date"] == "2026-08-01"
     assert m["received_at"].startswith("2026-08-01T06:31:12")
     assert m["row_count"] == 2 and m["bytes"] == len(DATA)
     assert m["source_system"] == "TRS"
     assert m["landing_control_filename"] == "trs_position_20260801.ctl"
     # Normalised to ISO, not kept as the sender wrote it -- nothing is lost,
     # because `control_file_contents` below holds the raw line verbatim.
-    assert m["declared"]["business_date"] == "2026-08-01"
+    assert m["declared"]["cob_date"] == "2026-08-01"
     # NO `checks` key: the gate measures, it does not compare. Integrity is
     # delivery.control's job and it runs at ingest, once, for every delivery.
     assert "checks" not in m, m
@@ -352,11 +352,11 @@ def test_landing_retention_dates_a_metadata_file_from_its_own_name():
     orphaned metadata object still expires instead of accumulating forever."""
     fd = _feed()
     from reporting_platform.retention import landing as land_ret
-    assert land_ret._business_date(fd, "trs_position_20260801.csv") \
+    assert land_ret._cob_date(fd, "trs_position_20260801.csv") \
         == date(2026, 8, 1)
-    assert land_ret._business_date(
+    assert land_ret._cob_date(
         fd, "trs_position_20260801.csv.meta.json") == date(2026, 8, 1)
-    assert land_ret._business_date(fd, "positions.csv") is None
+    assert land_ret._cob_date(fd, "positions.csv") is None
 
 
 # ------------------------------------------------------------- inbox routing
@@ -475,7 +475,7 @@ def test_a_console_save_round_trips_the_arrival_block():
 
     text = (d / "feeds.yml").read_text()
     assert "source_pattern: 'positions\\.csv'" in text, text
-    assert "business_date: 'ReportingDate" in text, text
+    assert "cob_date: 'ReportingDate" in text, text
 
 
 def test_turning_arrival_off_removes_the_block():
@@ -489,7 +489,7 @@ def test_turning_arrival_off_removes_the_block():
     spec = dataclasses.replace(
         registry.spec_from_feed(feeds()["trs_position"]),
         arrival=registry._arrival_from_payload({"control": {"pattern": "x"}}),
-        filename_pattern="trs_position_(?P<business_date>\\d{8})\\.csv")
+        filename_pattern="trs_position_(?P<cob_date>\\d{8})\\.csv")
     registry.update(spec)
     assert feeds()["trs_position"].needs_conforming is False
     assert "arrival:" not in (d / "feeds.yml").read_text()
@@ -542,15 +542,15 @@ defaults:
 
 feeds:
   - name: cust_position
-    description: A weekly zip holding one complete file per business date.
+    description: A weekly zip holding one complete file per COB date.
     source_system: CUST
-    filename_pattern: 'cust_position_(?P<business_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'
+    filename_pattern: 'cust_position_(?P<cob_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'
     business_key: [position_id]
     expected_min_rows: 1
     arrival:
       source_pattern: 'weekly_\\d{8}\\.zip'
       archive:
-        member_pattern: 'POS_(?P<business_date>\\d{8})\\.csv'
+        member_pattern: 'POS_(?P<cob_date>\\d{8})\\.csv'
     columns: [position_id, quantity]
 """
 
@@ -576,22 +576,22 @@ def test_archive_block_resolves():
     fd = _feed(ARCHIVE_FEED, name="cust_position")
     from reporting_platform.ingest import conform as c
     assert c.is_archive(fd) is True
-    assert fd.arrival["archive"]["member_pattern"] == "POS_(?P<business_date>\\d{8})\\.csv"
+    assert fd.arrival["archive"]["member_pattern"] == "POS_(?P<cob_date>\\d{8})\\.csv"
 
 
-def test_member_pattern_must_capture_a_business_date():
+def test_member_pattern_must_capture_a_cob_date():
     """Each member is landed as its OWN delivery, so each must say which day
     it is for. A date on the container instead means the members are parts of
     one delivery -- a different shape, and not built."""
-    msg = _bad(ARCHIVE_FEED.replace("POS_(?P<business_date>\\d{8})\\.csv",
+    msg = _bad(ARCHIVE_FEED.replace("POS_(?P<cob_date>\\d{8})\\.csv",
                                     "POS_\\d{8}\\.csv"))
-    assert "captures no (?P<business_date>...)" in msg, msg
+    assert "captures no (?P<cob_date>...)" in msg, msg
     assert "not built" in msg, msg
 
 
 def test_member_pattern_is_required():
     yml = ARCHIVE_FEED.replace(
-        "        member_pattern: 'POS_(?P<business_date>\\d{8})\\.csv'\n", "")
+        "        member_pattern: 'POS_(?P<cob_date>\\d{8})\\.csv'\n", "")
     assert "empty `arrival.archive:` block" in _bad(yml)
 
 
@@ -603,7 +603,7 @@ def test_an_archive_block_with_an_unknown_key_is_rejected():
 
 def test_the_container_needs_no_date_of_its_own():
     """It is a transport wrapper, not a delivery. `source_pattern` here has no
-    business_date group and that must be fine -- the rule requiring one applies
+    cob_date group and that must be fine -- the rule requiring one applies
     to a plain file, whose name IS the delivery."""
     fd = _feed(ARCHIVE_FEED, name="cust_position")     # no raise
     assert fd.claims_source("weekly_20260803.zip") is True
@@ -634,8 +634,8 @@ def test_a_member_naming_a_path_is_refused():
     written outside this feed's landing prefix, into another feed's evidence."""
     # A STRICT member_pattern filters a path out before the guard is reached;
     # the guard exists for a permissive one, which is when it matters.
-    fd = _feed(ARCHIVE_FEED.replace("'POS_(?P<business_date>\\d{8})\\.csv'",
-                                    "'.*POS_(?P<business_date>\\d{8})\\.csv'"),
+    fd = _feed(ARCHIVE_FEED.replace("'POS_(?P<cob_date>\\d{8})\\.csv'",
+                                    "'.*POS_(?P<cob_date>\\d{8})\\.csv'"),
                name="cust_position")
     c = _conform()
     try:
@@ -690,15 +690,15 @@ def test_the_container_is_recorded_but_never_landed():
     assert m["source_container"] == "weekly_20260803.zip"
     assert m["source_container_md5"] == hashlib.md5(container).hexdigest()
     assert m["source_filename"] == "POS_20260801.csv"
-    assert m["business_date"] == "2026-08-01"
+    assert m["cob_date"] == "2026-08-01"
     assert m["row_count"] == 1
 
 
 def test_two_members_for_one_date_do_not_overwrite_each_other():
     """`taken` has to advance as members land. Read once, both would render
     the unversioned name and the second would silently replace the first."""
-    fd = _feed(ARCHIVE_FEED.replace("'POS_(?P<business_date>\\d{8})\\.csv'",
-                                    "'POS_(?P<business_date>\\d{8})(?:_\\d+)?\\.csv'"),
+    fd = _feed(ARCHIVE_FEED.replace("'POS_(?P<cob_date>\\d{8})\\.csv'",
+                                    "'POS_(?P<cob_date>\\d{8})(?:_\\d+)?\\.csv'"),
                name="cust_position")
     c = _conform()
     container = _zip({"POS_20260801.csv": "position_id,quantity\nP1,10\n",
@@ -799,8 +799,8 @@ def test_a_control_declared_version_is_checked_too():
     """A declared version wins outright over the walk, so it needs its own
     comparison or the one path a sender controls stays unprotected."""
     fd = _feed(FEED.replace(
-        "        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'",
-        "        business_date: 'ReportingDate\\|(?P<business_date>\\d{8})'\n"
+        "        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'",
+        "        cob_date: 'ReportingDate\\|(?P<cob_date>\\d{8})'\n"
         "        version: 'VERSION\\|(?P<version>\\d+)'"))
     c = _conform()
     ctl = _ctl() + "\nVERSION|3"
@@ -818,7 +818,7 @@ def test_a_control_declared_version_is_checked_too():
 
 def test_a_container_resent_whole_restates_nothing():
     """The expensive duplicate: every member of a re-sent zip is identical, so
-    without the check one resend restates every business date it covers."""
+    without the check one resend restates every COB date it covers."""
     fd = _feed(ARCHIVE_FEED, name="cust_position")
     c = _conform()
     container = _zip(ZIP_MEMBERS)

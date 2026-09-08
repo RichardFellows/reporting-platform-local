@@ -35,7 +35,7 @@ def test_manifest_records_date_parts_and_format():
     s3, monkey, fd, norm = _setup()
     try:
         m = norm.normalize(fd, LANDED)
-        assert m["business_date"] == "2026-08-11", m["business_date"]
+        assert m["cob_date"] == "2026-08-11", m["cob_date"]
         assert m["parts"] == [{"object_key": LANDED, "bytes": 25}], m["parts"]
         # Format is captured from feeds.yml AT NORMALIZE TIME, so an ingest
         # can be reproduced later even if the config has moved on.
@@ -174,14 +174,14 @@ def test_ingest_accepts_a_manifest_key_or_a_landing_key():
         uninstall(monkey)
 
 
-def test_business_date_override_beats_the_manifest():
+def test_cob_date_override_beats_the_manifest():
     s3, monkey, fd, norm = _setup()
     try:
         from datetime import date
 
         from reporting_platform.ingest.ingest_feed import resolve_delivery
-        m = resolve_delivery(fd, LANDED, business_date=date(2026, 1, 2))
-        assert m["business_date"] == "2026-01-02", m["business_date"]
+        m = resolve_delivery(fd, LANDED, cob_date=date(2026, 1, 2))
+        assert m["cob_date"] == "2026-01-02", m["cob_date"]
     finally:
         uninstall(monkey)
 
@@ -195,8 +195,8 @@ def test_unparsable_name_with_an_explicit_date_still_ingests():
         from reporting_platform.ingest.ingest_feed import resolve_delivery
         key = "landing/fo_trade/oddly_named.csv"
         s3.put(key, "trade_id\nT9\n")
-        m = resolve_delivery(fd, key, business_date=date(2026, 3, 4))
-        assert m["business_date"] == "2026-03-04"
+        m = resolve_delivery(fd, key, cob_date=date(2026, 3, 4))
+        assert m["cob_date"] == "2026-03-04"
         assert m["parts"][0]["object_key"] == key
         assert m["normalizer"] == "manual/v1"
     finally:

@@ -44,7 +44,7 @@ def seed_dir(feed: Feed) -> Path:
 
 
 def list_seed(feed: Feed) -> list[dict[str, Any]]:
-    """Every CSV under seed/<feed>/, newest business date first.
+    """Every CSV under seed/<feed>/, newest COB date first.
 
     `matches` is the load-bearing column. A file whose name does not match the
     feed's `filename_pattern` can be landed perfectly happily and will then
@@ -62,10 +62,10 @@ def list_seed(feed: Feed) -> list[dict[str, Any]]:
             "filename": p.name,
             "size": p.stat().st_size,
             "matches": parsed is not None,
-            "business_date": parsed[0].isoformat() if parsed else None,
+            "cob_date": parsed[0].isoformat() if parsed else None,
             "version": parsed[1] if parsed else None,
         })
-    return sorted(out, key=lambda r: (r["business_date"] or "", r["filename"]),
+    return sorted(out, key=lambda r: (r["cob_date"] or "", r["filename"]),
                   reverse=True)
 
 
@@ -91,10 +91,10 @@ def list_landed(feed: Feed) -> list[dict[str, Any]]:
             "filename": name,
             "matches": parsed is not None,
             "metadata_file": is_meta,
-            "business_date": parsed[0].isoformat() if parsed else None,
+            "cob_date": parsed[0].isoformat() if parsed else None,
             "version": parsed[1] if parsed else None,
         })
-    return sorted(out, key=lambda r: (r["business_date"] or "", r["filename"]),
+    return sorted(out, key=lambda r: (r["cob_date"] or "", r["filename"]),
                   reverse=True)
 
 
@@ -190,7 +190,7 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
                 f"ingested. Rename it, or fix the pattern.")
         checked.append((filename, content, parsed[0]))
 
-    # Oldest business date first, for the same reason land() does it: the
+    # Oldest COB date first, for the same reason land() does it: the
     # prepared layer's relationships tests compare against whatever reference
     # data has arrived.
     checked.sort(key=lambda t: (t[2], t[0]))
@@ -199,11 +199,11 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
     bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
     bucket = bucket.split("//", 1)[-1].split("/", 1)[0]
     out = []
-    for filename, content, business_date in checked:
+    for filename, content, cob_date in checked:
         key = f"{feed.landing_prefix}/{feed.name}/{filename}"
         s3.put_object(Bucket=bucket, Key=key, Body=content)
         out.append({"filename": filename, "key": key,
-                    "business_date": business_date.isoformat(),
+                    "cob_date": cob_date.isoformat(),
                     "bytes": len(content),
                     **compare_header(feed, header_of(content, feed))})
     return out
@@ -251,7 +251,7 @@ def save_to_seed(feed: Feed, filename: str, content: bytes) -> dict[str, Any]:
 
 
 def land(feed: Feed, filenames: list[str] | None = None) -> list[str]:
-    """Copy seed files into the landing prefix. Oldest business date first.
+    """Copy seed files into the landing prefix. Oldest COB date first.
 
     Order matters for a first load: the prepared layer's `relationships` tests
     compare against whatever reference data has arrived, so landing a trade
@@ -265,7 +265,7 @@ def land(feed: Feed, filenames: list[str] | None = None) -> list[str]:
         unknown = wanted - {f["filename"] for f in files}
         if unknown:
             raise DataError(f"not in seed/{feed.name}: {', '.join(sorted(unknown))}")
-    ordered = sorted(files, key=lambda f: (f["business_date"] or "", f["filename"]))
+    ordered = sorted(files, key=lambda f: (f["cob_date"] or "", f["filename"]))
 
     keys = []
     for f in ordered:

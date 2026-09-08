@@ -116,7 +116,7 @@ class Feed:
     # values, same order, everything a string. Only the identifiers are
     # normalised. See docs/DECISIONS.md#source-column-names
     source_columns: dict[str, str] = field(default_factory=dict)
-    # Whether this feed is expected to deliver on every business date. False
+    # Whether this feed is expected to deliver on every COB date. False
     # opts it out of the gap check in monitoring/completeness.py, which infers
     # the business calendar from what other feeds delivered -- a feed that does
     # not deliver daily would otherwise show every non-delivery day as a gap.
@@ -128,12 +128,12 @@ class Feed:
     # subject. Two meanings under one key, in the file every team edits, is
     # how one of them gets set to answer the other.
     delivery_expected: bool = True
-    # How often the feed is expected to deliver: "daily" (a business date is
+    # How often the feed is expected to deliver: "daily" (a COB date is
     # expected whenever another feed delivered on it) or "weekly" (only that
-    # each week containing business dates saw at least one delivery).
+    # each week containing COB dates saw at least one delivery).
     cadence: str = "daily"
     # REQ-201. The time of day, in the platform's timezone, by which a
-    # delivery for a business date is expected to have ARRIVED. Empty means no
+    # delivery for a COB date is expected to have ARRIVED. Empty means no
     # expectation is declared and lateness is not asserted for this feed.
     #
     # THE ONE LATENESS CONCEPT, and it is deliberately a wall-clock time
@@ -180,7 +180,7 @@ class Feed:
     # Validated at load by `resolve_arrival_config`.
     # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
     arrival: dict[str, Any] = field(default_factory=dict)
-    # How a LATER delivery relates to an earlier one for the same business
+    # How a LATER delivery relates to an earlier one for the same COB
     # date. Absent means `mode: full_snapshot` -- each delivery restates the
     # whole population, newest version wins -- which is what every feed here
     # does and what `dedupe_rank` has always implemented.
@@ -248,8 +248,8 @@ class Feed:
     def source_control_pattern(self) -> str | None:
         return ((self.arrival or {}).get("control") or {}).get("pattern")
 
-    def source_business_date(self, filename: str) -> date | None:
-        """The business date the SOURCE filename carries, if it carries one.
+    def source_cob_date(self, filename: str) -> date | None:
+        """The COB date the SOURCE filename carries, if it carries one.
 
         Some legacy names are wrong without being dateless -- `POS_20260801.TXT`
         for a feed whose landing convention is `trs_position_20260801.csv`.
@@ -260,9 +260,9 @@ class Feed:
         if not pattern:
             return None
         m = re.fullmatch(pattern, filename)
-        if not m or "business_date" not in m.groupdict():
+        if not m or "cob_date" not in m.groupdict():
             return None
-        return datetime.strptime(m.group("business_date"), "%Y%m%d").date()
+        return datetime.strptime(m.group("cob_date"), "%Y%m%d").date()
 
     def source_column(self, name: str) -> str:
         """The name this platform column has in the delivered file."""
@@ -320,11 +320,11 @@ class Feed:
         return f"iceberg://{CATALOG}/{self.raw_namespace}/{self.name}"
 
     def parse_filename(self, filename: str) -> tuple[date, int] | None:
-        """Return (business_date, version) or None if the name does not match."""
+        """Return (cob_date, version) or None if the name does not match."""
         m = re.fullmatch(self.filename_pattern, filename)
         if not m:
             return None
-        bd = datetime.strptime(m.group("business_date"), "%Y%m%d").date()
+        bd = datetime.strptime(m.group("cob_date"), "%Y%m%d").date()
         raw_version = m.groupdict().get("version")
         return bd, int(raw_version) if raw_version else 1
 
@@ -361,9 +361,9 @@ def split_columns(declared: list) -> tuple[list[str], dict[str, str]]:
 # which is the failure this repo keeps having (`schema_drift` was documented
 # and read by nothing for months, so `fail` silently meant `warn`).
 DELIVERY_KINDS = ("file", "archive")
-BUSINESS_DATE_FROM = ("container",)
+COB_DATE_FROM = ("container",)
 PARTS_MODES = ("concat",)
-DELIVERY_KEYS = {"kind", "member_pattern", "business_date_from", "parts", "control"}
+DELIVERY_KEYS = {"kind", "member_pattern", "cob_date_from", "parts", "control"}
 CONTROL_KEYS = {"pattern", "row_count", "md5"}
 
 # Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
@@ -371,7 +371,7 @@ CONTROL_KEYS = {"pattern", "row_count", "md5"}
 # problems with different fixes -- one is a typo, the other is a missing
 # feature and a decision about whether to write it.
 NOT_BUILT = {
-    "business_date_from": {
+    "cob_date_from": {
         "member": "the date is on each member rather than the container, so "
                   "the container name need not match filename_pattern at all "
                   "-- which `matching()` and landing retention both rely on",
@@ -409,7 +409,7 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
 
     out = {"kind": delivery.get("kind", "file")}
     for key, allowed in (("kind", DELIVERY_KINDS),
-                         ("business_date_from", BUSINESS_DATE_FROM),
+                         ("cob_date_from", COB_DATE_FROM),
                          ("parts", PARTS_MODES)):
         value = delivery.get(key)
         if value is None:
@@ -426,7 +426,7 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
         out[key] = value
 
     if out["kind"] == "archive":
-        out.setdefault("business_date_from", "container")
+        out.setdefault("cob_date_from", "container")
         out.setdefault("parts", "concat")
         # No default: which members belong to this feed is not guessable, and
         # a wrong guess silently ingests the wrong files.
@@ -525,7 +525,7 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, str]:
 
 # -------------------------------------------------------------- supersession
 # What `supersession:` may say: HOW A LATER DELIVERY RELATES TO AN EARLIER ONE
-# for the same business date. Every feed here today restates its whole
+# for the same COB date. Every feed here today restates its whole
 # population on every delivery, and `dedupe_rank` has always assumed exactly
 # that -- newest `_file_version` wins, last row in file order wins within it.
 #
@@ -546,13 +546,13 @@ SUPERSESSION_MODES = ("full_snapshot",)
 # are different problems with different fixes.
 SUPERSESSION_NOT_BUILT = {
     "delta_append": (
-        "each delivery carries only what changed, so a business date's "
+        "each delivery carries only what changed, so a COB date's "
         "population is the UNION of its deliveries rather than the newest one "
         "-- `dedupe_rank` would have to rank across versions instead of "
         "selecting the newest, and a deletion would need a tombstone "
         "convention the feed does not have"),
     "correction": (
-        "a delivery restates individual keys of an EARLIER business date, so "
+        "a delivery restates individual keys of an EARLIER COB date, so "
         "supersession crosses the partition `dedupe_rank` ranks within and "
         "the corrected date has to be rebuilt rather than the delivered one"),
 }
@@ -649,14 +649,14 @@ def parse_expected_by(feed_name: str, value: Any) -> str:
 #
 # IDENTITY ONLY. The inbox exists to establish that a delivery is correctly
 # named and has its prerequisites -- which feed, which source system, which
-# business date, which version. It does NOT verify content: `row_count` and
+# COB date, which version. It does NOT verify content: `row_count` and
 # `md5` live on `delivery.control` and are checked at ingest, once, the same
 # way for a legacy delivery and for one an approved sender wrote straight into
 # landing. Putting them here too would be a second implementation of the same
 # check on one of the two paths.
 # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
 ARRIVAL_KEYS = {"source_pattern", "control", "archive"}
-ARRIVAL_CONTROL_KEYS = {"pattern", "business_date", "version"}
+ARRIVAL_CONTROL_KEYS = {"pattern", "cob_date", "version"}
 
 
 def resolve_arrival_config(feed_name: str, arrival: Any,
@@ -699,7 +699,7 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
     out: dict[str, Any] = {"source_pattern": source_pattern}
     # `in`, not `.get() is not None`: `control:` with nothing under it parses
     # as None, and skipping it silently would let the block fall through to
-    # the business-date rule below and fail with a message about dates rather
+    # the COB-date rule below and fail with a message about dates rather
     # than about the empty block that actually caused it.
     for key, resolver in (("control", _resolve_arrival_control),
                           ("archive", _resolve_arrival_archive)):
@@ -712,7 +712,7 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
                 f"empty one reads as configured and does nothing.")
         out[key] = resolver(feed_name, arrival[key])
 
-    # EXACTLY ONE SOURCE FOR THE BUSINESS DATE, and both failures are real.
+    # EXACTLY ONE SOURCE FOR THE COB DATE, and both failures are real.
     # Neither, and the gate cannot name the file it is meant to produce.
     # Both, and one fact has two sources that can disagree, with the winner
     # decided by whichever the gate happens to read first.
@@ -724,18 +724,18 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
     if "archive" in out:
         return _finish_arrival(feed_name, out, filename_pattern)
 
-    in_name = "business_date" in compiled.groupindex
-    in_control = "business_date" in out.get("control", {})
+    in_name = "cob_date" in compiled.groupindex
+    in_control = "cob_date" in out.get("control", {})
     if in_name and in_control:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} takes its business date from both "
-            f"`arrival.source_pattern` and `arrival.control.business_date`. "
+            f"feeds.yml: feed {feed_name!r} takes its COB date from both "
+            f"`arrival.source_pattern` and `arrival.control.cob_date`. "
             f"One fact, one source -- drop whichever is not the real one.")
     if not in_name and not in_control:
         raise ValueError(
             f"feeds.yml: feed {feed_name!r} `arrival:` gives the gate no way "
-            f"to find the business date. Either `source_pattern` captures "
-            f"(?P<business_date>\\d{{8}}), or `arrival.control.business_date` "
+            f"to find the COB date. Either `source_pattern` captures "
+            f"(?P<cob_date>\\d{{8}}), or `arrival.control.cob_date` "
             f"reads it out of the control file -- without one the delivery "
             f"cannot be given the name landing requires.")
 
@@ -754,12 +754,12 @@ def _finish_arrival(feed_name: str, out: dict[str, Any],
     is the problem."""
     if filename_pattern is not None:
         try:
-            if "business_date" not in re.compile(filename_pattern).groupindex:
+            if "cob_date" not in re.compile(filename_pattern).groupindex:
                 raise ValueError(
                     f"feeds.yml: feed {feed_name!r} has an `arrival:` block, so "
                     f"the inbox renames its deliveries to match "
                     f"`filename_pattern` -- but that pattern captures no "
-                    f"(?P<business_date>...), so there is nowhere to write the "
+                    f"(?P<cob_date>...), so there is nowhere to write the "
                     f"date the gate just went and found.")
         except re.error:
             pass          # reported as a filename_pattern error elsewhere
@@ -774,7 +774,7 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
     MEMBERS are landed as ordinary deliveries; `landing/` never holds an
     archive, and nothing downstream needs a reader for one.
 
-    Each member is a complete delivery for its own business date, which is why
+    Each member is a complete delivery for its own COB date, which is why
     `member_pattern` must capture one: unpacking turns one inbox file into N
     inbox files, and each then follows the ordinary single-file path with no
     grouping, no `parts` list and no manifest to hold them together.
@@ -803,10 +803,10 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
         raise ValueError(
             f"feeds.yml: feed {feed_name!r} `arrival.archive.member_pattern` "
             f"is not a valid regex: {exc}") from exc
-    if "business_date" not in compiled.groupindex:
+    if "cob_date" not in compiled.groupindex:
         raise ValueError(
             f"feeds.yml: feed {feed_name!r} `arrival.archive.member_pattern` "
-            f"{pattern!r} captures no (?P<business_date>...). Each member is "
+            f"{pattern!r} captures no (?P<cob_date>...). Each member is "
             f"landed as its own delivery, so each must say which day it is "
             f"for -- a date on the CONTAINER instead would mean the members "
             f"are parts of one delivery, which is a different shape and is "
@@ -821,7 +821,7 @@ def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, str]:
     questions and a legacy feed needs BOTH.
 
     This one is about IDENTITY: which control file belongs to this delivery,
-    and what does it say the delivery's business date and version are -- the
+    and what does it say the delivery's COB date and version are -- the
     facts the inbox needs to give the file its correct name. It is read at the
     door and then the control file is promoted to `landing/` alongside its
     data file, renamed to match.
@@ -866,7 +866,7 @@ def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, str]:
     # Each of these is a regex over the control file's TEXT with one named
     # group, and the group name is the only thing read out of a match.
     # IDENTITY ONLY -- `row_count` and `md5` belong to `delivery.control`.
-    for key, group in (("business_date", "business_date"),
+    for key, group in (("cob_date", "cob_date"),
                        ("version", "version")):
         value = control.get(key)
         if value is None:
@@ -899,7 +899,7 @@ def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
     combination is not merely legal but required:
 
       * `arrival.control` says how to find the control file at the door and
-        what it declares about IDENTITY (business date, version) -- the facts
+        what it declares about IDENTITY (COB date, version) -- the facts
         needed to name the file correctly.
       * `delivery.control` gates the landed delivery on that control file
         being beside it and checks INTEGRITY (row count, md5) at ingest, for
@@ -1672,12 +1672,12 @@ def new_run_id() -> str:
     return f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
 
 
-def branch_name(purpose: str, scope: str, business_date: date, run_id: str) -> str:
-    """<purpose>/<scope>/<business_date>/<run_id> — see docs/ARCHITECTURE.md."""
-    return f"{purpose}/{scope}/{business_date:%Y-%m-%d}/{run_id}"
+def branch_name(purpose: str, scope: str, cob_date: date, run_id: str) -> str:
+    """<purpose>/<scope>/<cob_date>/<run_id> — see docs/ARCHITECTURE.md."""
+    return f"{purpose}/{scope}/{cob_date:%Y-%m-%d}/{run_id}"
 
 
-def published_tag(report: str, business_date: date, run_id: str) -> str:
+def published_tag(report: str, cob_date: date, run_id: str) -> str:
     """The pin a PUBLICATION cuts: published/<report>/<bd>/<run_id>.
 
     THREE SEGMENTS, and the report is not optional. `retention.TAG_RE` accepts
@@ -1693,20 +1693,20 @@ def published_tag(report: str, business_date: date, run_id: str) -> str:
             f"{report!r}. The tag is split on '/' by retention and by "
             f"monitoring, so a missing or slashed name silently reparses into "
             f"the wrong fields.")
-    return f"published/{report}/{business_date:%Y-%m-%d}/{run_id}"
+    return f"published/{report}/{cob_date:%Y-%m-%d}/{run_id}"
 
 
-def snapshot_tag(feed: str, business_date: date, run_id: str) -> str:
+def snapshot_tag(feed: str, cob_date: date, run_id: str) -> str:
     """The pin an INGEST cuts: snapshot/<feed>/<bd>/<run_id>.
 
     THIS USED TO BE CALLED A PUBLICATION and it never was one. The tag was
     `published/<bd>/<run_id>`, cut by `record_publication` at the end of every
     per-feed ingest DAG -- so "published" meant "some feed landed some rows",
-    N feeds publishing one business date cut N tags that carried no feed name
+    N feeds publishing one COB date cut N tags that carried no feed name
     between them, and the reproducibility and evidence checks that read
     `published/` were reading ingests.
 
-    It is still a pin worth cutting: raw is where retention deletes business
+    It is still a pin worth cutting: raw is where retention deletes COB
     dates, so pinning the state each ingest left is what makes that state
     addressable afterwards. It is simply a different thing from a report
     publication, kept for a different reason and for a different length of
@@ -1715,7 +1715,7 @@ def snapshot_tag(feed: str, business_date: date, run_id: str) -> str:
     """
     if not feed or "/" in feed:
         raise ValueError(f"snapshot_tag needs a feed name with no '/', got {feed!r}")
-    return f"snapshot/{feed}/{business_date:%Y-%m-%d}/{run_id}"
+    return f"snapshot/{feed}/{cob_date:%Y-%m-%d}/{run_id}"
 
 
 # ------------------------------------------------------------- code identity

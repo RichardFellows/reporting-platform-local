@@ -24,7 +24,7 @@ feeds:
   - name: trs_margin
     description: Treasury margin calls, gated on a control file.
     source_system: TRS
-    filename_pattern: 'MarginCall_(?P<business_date>\\d{8})\\.csv'
+    filename_pattern: 'MarginCall_(?P<cob_date>\\d{8})\\.csv'
     business_key: [margin_call_id]
     expected_min_rows: 1
     delivery:

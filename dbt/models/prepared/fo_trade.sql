@@ -1,8 +1,8 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'trade_id'],
-    partition_by=['business_date'],
+    unique_key=['cob_date', 'trade_id'],
+    partition_by=['cob_date'],
     tags=['prepared', 'transactional']
   )
 }}
@@ -22,7 +22,7 @@ with raw_rows as (
         *,
         {{ dedupe_rank(['trade_id']) }} as _rn
     from {{ source('raw', 'fo_trade') }}
-    where {{ incremental_window('_business_date', 'business_date') }}
+    where {{ incremental_window('_cob_date', 'cob_date') }}
       and {{ known_as_of() }}
 
 ),
@@ -34,7 +34,7 @@ deduped as (
 typed as (
 
     select
-        _business_date                                    as business_date,
+        _cob_date                                         as cob_date,
         {{ clean_string('trade_id') }}                    as trade_id,
         {{ clean_string('counterparty_id') }}             as counterparty_id,
         {{ clean_string('book') }}                        as book,
@@ -62,7 +62,7 @@ select
     *,
     case
         when maturity_date is null then null
-        when maturity_date < business_date then true
+        when maturity_date < cob_date then true
         else false
     end as is_matured
 from typed

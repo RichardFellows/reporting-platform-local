@@ -1,7 +1,7 @@
 """`find_pending` over manifests, and the two filters that must survive.
 
 Step 2 changed what this returns (manifest keys, not landing keys) and where
-the business date comes from (the manifest, not a regex). What it must NOT
+the COB date comes from (the manifest, not a regex). What it must NOT
 change is which deliveries are pending.
 """
 from __future__ import annotations
@@ -101,7 +101,7 @@ def test_already_ingested_is_matched_on_the_part_not_the_manifest():
 def test_expired_dates_are_not_resurrected():
     """The keep-set filter, and why it comes from landing/.
 
-    A delivery whose business date retention has already expired is not new.
+    A delivery whose COB date retention has already expired is not new.
     Without this filter: ingest -> expire -> re-ingest -> expire, quietly
     undoing the retention policy.
 

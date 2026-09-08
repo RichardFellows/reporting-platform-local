@@ -5,7 +5,7 @@ NOT part of the platform. Three jobs:
   snapshot  photograph the retention-relevant state of a set of tables, so a
             crashed-then-resumed run can be compared byte-for-byte against a
             clean one.
-  inject    add synthetic OLD business dates by copying an existing date's
+  inject    add synthetic OLD COB dates by copying an existing date's
             rows. They are chosen to be neither month-ends nor inside the
             10-business-day window, so they -- and only they -- are what
             retention expires. The test therefore destroys only what it
@@ -28,7 +28,7 @@ from reporting_platform.common.context import Nessie, spark_session
 
 
 def _date_col(layer: str) -> str:
-    return "_business_date" if layer == "raw" else "business_date"
+    return "_cob_date" if layer == "raw" else "cob_date"
 
 
 def _refs() -> list[dict]:
@@ -68,13 +68,13 @@ def inject(table: str, source: str, new_dates: list[str]) -> dict:
         made = {}
         for nd in new_dates:
             proj = ", ".join(
-                f"DATE '{nd}' AS business_date" if c == "business_date" else c
+                f"DATE '{nd}' AS cob_date" if c == "cob_date" else c
                 for c in cols)
             spark.sql(
                 f"INSERT INTO {table} SELECT {proj} FROM {table} "
-                f"WHERE business_date = DATE '{source}'")
+                f"WHERE cob_date = DATE '{source}'")
             made[nd] = spark.sql(
-                f"SELECT COUNT(*) n FROM {table} WHERE business_date = "
+                f"SELECT COUNT(*) n FROM {table} WHERE cob_date = "
                 f"DATE '{nd}'").collect()[0]["n"]
         return {"table": table, "injected": made}
     finally:

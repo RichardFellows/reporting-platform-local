@@ -5,7 +5,7 @@ for the four built-in feeds) and `reporting_platform/ui/sampledata.py` (the
 feed console's "generate a delivery"). They had the same defect independently
 and would have been fixed the same way twice, which is how two copies start.
 
-THE DEFECT. Both drew every attribute from a stream keyed on the business
+THE DEFECT. Both drew every attribute from a stream keyed on the COB
 date, so every value changed on every delivery. A reference dimension held
 5,755 rows expressing 5,755 distinct versions -- LIM00001IS carried 35
 different amounts across its 35 delivered dates -- and `prepared.fo_trade` held
@@ -33,7 +33,7 @@ Two properties are load-bearing:
     random walk over "yesterday's value" would give different answers depending
     on which dates were emitted, and the sparse history would drift from the
     dense one. Blocking the calendar avoids that: `bd` alone decides the epoch.
-    Verified -- the same business date generated with `--dense-days 25` and
+    Verified -- the same COB date generated with `--dense-days 25` and
     `--dense-days 5` produces byte-identical rows.
 
   * INDEPENDENT OF CALL ORDER. A module-level `random` means the numbers any

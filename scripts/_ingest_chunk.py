@@ -39,7 +39,7 @@ def _run(feed_name: str, keys: list[str], spark) -> int:
         drift = ""
         if result.get("missing_columns") or result.get("extra_columns"):
             drift = f"  DRIFT missing={result['missing_columns']} extra={result['extra_columns']}"
-        print(f"  {result['business_date']}  v{result['file_version']}  "
+        print(f"  {result['cob_date']}  v{result['file_version']}  "
               f"{result['rows']} rows  {key}{drift}")
     return 0
 

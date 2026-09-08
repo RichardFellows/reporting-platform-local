@@ -23,7 +23,7 @@ models:
       # point -- an unmigrated prepared table must not publish.
       - name: delivery_id
         tests: [not_null]
-      # SCD2: there is no business_date on this table any more. One row per
+      # SCD2: there is no cob_date on this table any more. One row per
       # VERSION, addressed point-in-time with the as_of() macro.
       - name: counterparty_id
         tests: [not_null]
@@ -40,7 +40,7 @@ models:
         tests:
           - accepted_values: {values: [true, false], quote: false}
     tests:
-      # Replaces [business_date, counterparty_id]. effective_from is in the key and
+      # Replaces [cob_date, counterparty_id]. effective_from is in the key and
       # effective_to is NOT, which is also what lets the incremental merge close an
       # open row in place instead of inserting a second one beside it.
       - dbt_utils.unique_combination_of_columns:
@@ -71,7 +71,7 @@ models:
       # `delivery_ref()` and has not been rebuilt since.
       - name: delivery_id
         tests: [not_null]
-      - name: business_date
+      - name: cob_date
         tests: [not_null]
       - name: trade_id
         tests: [not_null]
@@ -92,7 +92,7 @@ models:
           - not_null
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, trade_id]
+          combination_of_columns: [cob_date, trade_id]
 
   - name: ref_rating
     description: Agency ratings with numeric rank and grade band.
@@ -138,7 +138,7 @@ models:
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.
     # SCAFFOLDED MINIMUM: not_null on the business key, uniqueness
-    # over [business_date, <business key>], and relationships on any
+    # over [cob_date, <business key>], and relationships on any
     # foreign key. That is enough to prove dedupe_rank works and that
     # references resolve -- it is NOT enough to prove the values are
     # right. Add accepted_values / accepted_range for this feed's
@@ -148,7 +148,7 @@ models:
       # `delivery_ref()` and has not been rebuilt since.
       - name: delivery_id
         tests: [not_null]
-      - name: business_date
+      - name: cob_date
         tests: [not_null]
       - name: collateral_id
         tests: [not_null]
@@ -160,4 +160,4 @@ models:
               field: counterparty_id
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, collateral_id]
+          combination_of_columns: [cob_date, collateral_id]

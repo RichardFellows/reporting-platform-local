@@ -72,7 +72,7 @@ flowchart TB
     CTL -->|no| HOLD2["<b>held in inbox</b><br/>not a failure — a late<br/>feed, not a failed one"]
     CTL -->|yes| ID{"can it be<br/>NAMED?"}
 
-    ID -->|"no business date"| REJ2["<b>.rejected/</b><br/>identity failure —<br/>no landing key exists"]
+    ID -->|"no COB date"| REJ2["<b>.rejected/</b><br/>identity failure —<br/>no landing key exists"]
     ID -->|yes| PROMOTE["<b>rename both files</b><br/>+ write .meta.json<br/>+ _v2 if the date is taken"]
 
     ROUTE -->|"arrival.source_pattern<br/>+ arrival.archive"| ZIP["<b>unpack</b><br/>one file in,<br/>N deliveries out"]
@@ -82,7 +82,7 @@ flowchart TB
 ```
 
 **The inbox establishes identity, not integrity.** Which source system, which
-feed, which business date, which version — everything needed to name the file.
+feed, which COB date, which version — everything needed to name the file.
 It does *not* check the row count or the checksum; those are
 `delivery.control`'s job and run at ingest, once, for every delivery however it
 arrived. See
@@ -116,7 +116,7 @@ An object it cannot date is **kept and counted**, never deleted on a guess.
 
 `ingest/normalize.py`. Cheap, idempotent, no Spark. Writes one JSON manifest
 per delivery into `ready/<feed>/` recording the three things every downstream
-reader was otherwise re-deriving: **which business date**, **which objects hold
+reader was otherwise re-deriving: **which COB date**, **which objects hold
 the rows**, and **how to read them**.
 
 | Delivery kind | What normalize does |
@@ -155,7 +155,7 @@ flowchart LR
 
 Raw stays **1:1 with the delivery**: same rows, same values, everything
 `STRING`. Only identifiers are normalised (`source_columns`). Six lineage
-columns are added alongside — `_source_file` per part, then `_business_date`,
+columns are added alongside — `_source_file` per part, then `_cob_date`,
 `_ingest_ts`, `_file_version`, `_row_number` and `_batch_id`.
 
 Three checks, all of which abandon the branch rather than publish:
@@ -207,7 +207,7 @@ to `keep_failed_branch` instead, so the branch survives for inspection.
 | inbox | no feed claims the name | `quarantine/` + a `registry.rejection` row, and `.rejected/` — surfaced in the console's unclaimed queue |
 | inbox | two feeds claim the name | same, classed `ambiguous` — a configuration error, never guessed |
 | inbox | control file not here yet | **held**, silently, retried next poll |
-| inbox | cannot determine a business date | quarantined and `.rejected/` — it cannot be named, so it cannot land |
+| inbox | cannot determine a COB date | quarantined and `.rejected/` — it cannot be named, so it cannot land |
 | normalize | control file not beside it in landing | `awaiting_control`, INFO — picked up by the next poll |
 | normalize | unreadable / unroutable object | counted and skipped; one bad file never blocks the rest |
 | ingest | below `expected_min_rows` | branch kept, `main` untouched |

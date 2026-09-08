@@ -5,7 +5,7 @@ about whether the model produces correct rows. The failures that actually cost
 a dev an afternoon are the ones only a build shows: a column named in the
 model that raw does not have, a `safe_cast` that quietly nulls every value
 because the source format was misread, a `relationships` test failing because
-the reference feed has no data on that business date.
+the reference feed has no data on that COB date.
 
 Today the only way to see those is the full `prepared_build` DAG -- every
 model in the layer, through Airflow. This runs `dbt build` (run **and** test)

@@ -45,7 +45,7 @@ raw_rows as (
     {# Unconditional, for the reason ref_counterparty's copy of this states. #}
     where {{ known_as_of() }}
     {% if is_incremental() %}
-      and r._business_date >= coalesce(p.from_date, date '1900-01-01')
+      and r._cob_date >= coalesce(p.from_date, date '1900-01-01')
     {% endif %}
 
 ),
@@ -57,7 +57,7 @@ deduped as (
 cleaned as (
 
     select
-        _business_date                                  as business_date,
+        _cob_date                                       as cob_date,
         {{ clean_string('counterparty_id') }}           as counterparty_id,
         upper({{ clean_string('agency') }})             as agency,
         upper({{ clean_string('rating') }})             as rating,

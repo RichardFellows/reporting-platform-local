@@ -9,7 +9,7 @@ is "by 07:00", and a duration needs an origin event that a delivery arriving by
 PutObject does not have.
 
 THIS IS NOT THE COMPLETENESS CHECK AND MUST NOT BECOME IT. `completeness.py`
-asks which business dates a feed is MISSING. This asks, of the deliveries that
+asks which COB dates a feed is MISSING. This asks, of the deliveries that
 did arrive, which arrived late. A date with no delivery at all is a gap, not an
 infinitely late delivery, and reporting it here as well would double-report
 every outage -- so a date with nothing registered is simply not judged. The two
@@ -21,8 +21,8 @@ NO SPARK. The arrival time is `registry.delivery.received_at` -- the landing
 object's LastModified, the same value the manifest carries -- so this is
 psycopg2 and nothing else and runs in the task process directly.
 
-THE DEADLINE IS `expected_by` ON THE DAY AFTER THE BUSINESS DATE, and the
-offset is fixed rather than configurable. A delivery describes a business date,
+THE DEADLINE IS `expected_by` ON THE DAY AFTER THE COB DATE, and the
+offset is fixed rather than configurable. A delivery describes a COB date,
 so that date has to have ENDED before the extract can be taken: a position file
 as at Tuesday is produced after Tuesday's close and lands on Wednesday morning.
 Fixing it at +1 day rather than adding a second key is a choice in the
@@ -58,22 +58,22 @@ from reporting_platform.registry import db
 log = logging.getLogger("monitoring.lateness")
 
 
-def deadline(business_date: date, expected_by: str) -> datetime:
-    """When a delivery for `business_date` was due, in UTC.
+def deadline(cob_date: date, expected_by: str) -> datetime:
+    """When a delivery for `cob_date` was due, in UTC.
 
     `expected_by` has already been validated at load by `parse_expected_by`,
     so this parses rather than checks -- a second copy of the validation here
     would be a second place for the rules to differ.
     """
     hh, mm = expected_by.split(":")
-    return datetime.combine(business_date + timedelta(days=1),
+    return datetime.combine(cob_date + timedelta(days=1),
                             time(int(hh), int(mm)), tzinfo=timezone.utc)
 
 
 def is_bulk_load(late: list[dict]) -> bool:
     """Did these late dates all arrive in one load?
 
-    A DERIVATION, NOT A THRESHOLD. More than one business date, and exactly
+    A DERIVATION, NOT A THRESHOLD. More than one COB date, and exactly
     one distinct arrival DAY between them, IS a backfill -- there is no
     tolerance to tune and no way for it to be nearly true. Pulled out of
     `run()` so it can be tested without a database.
@@ -103,26 +103,26 @@ def run(lookback: int | None = None) -> dict:
                 report["skipped_feeds"].append(name)
                 continue
 
-            # The last `lookback` business dates this feed actually has, so a
+            # The last `lookback` COB dates this feed actually has, so a
             # feed that has never delivered is not judged against dates it was
             # never party to. FIRST arrival per date: a `_v2` correction
             # landing days later is a re-delivery, not the original being
             # late, and judging the newest would report every corrected date
             # as a missed deadline.
             cur.execute(
-                "SELECT business_date, MIN(received_at) AS first_arrival, "
+                "SELECT cob_date, MIN(received_at) AS first_arrival, "
                 "       COUNT(*) AS deliveries "
                 "FROM registry.delivery WHERE feed = %s "
-                "GROUP BY business_date ORDER BY business_date DESC LIMIT %s",
+                "GROUP BY cob_date ORDER BY cob_date DESC LIMIT %s",
                 (name, lookback))
             rows = cur.fetchall()
 
             late = []
-            for business_date, first_arrival, deliveries in rows:
-                due = deadline(business_date, fd.expected_by)
+            for cob_date, first_arrival, deliveries in rows:
+                due = deadline(cob_date, fd.expected_by)
                 if first_arrival > due:
                     late.append({
-                        "business_date": business_date.isoformat(),
+                        "cob_date": cob_date.isoformat(),
                         "due": due.isoformat(),
                         "arrived": first_arrival.isoformat(),
                         "hours_late": round(
@@ -135,7 +135,7 @@ def run(lookback: int | None = None) -> dict:
             # of history after an outage -- and reporting it as ten separate
             # findings buries whatever else the check found. This is a
             # derivation, not a threshold: one distinct arrival day across
-            # more than one business date IS a bulk load, by definition.
+            # more than one COB date IS a bulk load, by definition.
             #
             # The finding is DESCRIBED differently, not suppressed. `late` and
             # `total_late` are untouched, so `--fail-on-late` still fails and
@@ -143,7 +143,7 @@ def run(lookback: int | None = None) -> dict:
             # which is the thing a human actually reads.
             #
             # This is what the seeded stack looks like: `generate_feeds.py`
-            # writes every historical business date at once, ~17 days behind
+            # writes every historical COB date at once, ~17 days behind
             # the current date, so all four feeds report every date late with
             # one arrival timestamp. Verified there before it was written.
             arrival_days = {x["arrived"][:10] for x in late}
@@ -157,19 +157,19 @@ def run(lookback: int | None = None) -> dict:
             if bulk:
                 report["bulk_loads"].append(name)
                 log.warning(
-                    "feed %s: %d of %d recent business date(s) are past their "
+                    "feed %s: %d of %d recent COB date(s) are past their "
                     "%s deadline, but all of them arrived on %s -- that is ONE "
                     "backfill, not %d missed deliveries. Dates: %s%s", name,
                     len(late), len(rows), fd.expected_by,
                     sorted(arrival_days)[0], len(late),
-                    ", ".join(x["business_date"] for x in late[:5]),
+                    ", ".join(x["cob_date"] for x in late[:5]),
                     "..." if len(late) > 5 else "")
             elif late:
                 log.warning(
                     "feed %s promised %s and was late on %d of %d recent "
-                    "business date(s); worst %.1fh: %s", name, fd.expected_by,
+                    "COB date(s); worst %.1fh: %s", name, fd.expected_by,
                     len(late), len(rows), max(x["hours_late"] for x in late),
-                    ", ".join(x["business_date"] for x in late[:5]))
+                    ", ".join(x["cob_date"] for x in late[:5]))
 
     if report["skipped_feeds"]:
         log.info("no `expected_by` declared for %s, so no deadline was "
@@ -182,7 +182,7 @@ def main(argv=None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser()
     p.add_argument("--lookback", type=int, default=None,
-                   help="business dates to check back over "
+                   help="COB dates to check back over "
                         "(default: raw layer's keep_business_days)")
     p.add_argument("--fail-on-late", action="store_true",
                    help="exit non-zero if any delivery was late")

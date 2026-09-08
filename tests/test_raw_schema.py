@@ -23,7 +23,7 @@ from tests.support import feeds_from
 # what makes these cases worth having.
 PLATFORM = [
     ("_extra_columns", "map<string,string>"),
-    ("_business_date", "date"),
+    ("_cob_date", "date"),
     ("_ingest_ts", "timestamp"),
     ("_source_file", "string"),
     ("_file_version", "int"),

@@ -17,7 +17,7 @@ See docs/DECISIONS.md#ready-is-a-derived-index and docs/DELIVERY-SHAPES.md.
 
 THE MANIFEST IS THE POINT, not the directory. It records, once, the three
 things every downstream reader was previously re-deriving from the filename
-with its own copy of the same regex: which business date this delivery is
+with its own copy of the same regex: which COB date this delivery is
 for, which objects hold its rows, and how to read them. `Feed.parse_filename`
 had fourteen call sites across seven modules, each free to disagree.
 
@@ -121,7 +121,7 @@ def is_control_file(feed: Feed, filename: str) -> bool:
     -- was tried first and is wrong.
 
     A control file itself never matches `filename_pattern`: it names no
-    business date, only says something about a delivery that does. Without
+    COB date, only says something about a delivery that does. Without
     this, `inbox.route()` would reject it as unroutable and it would never
     reach `landing/`, and the delivery it belongs to would wait on a control
     file that can never arrive.
@@ -164,7 +164,7 @@ def _declared(feed: Feed, control_key: str) -> dict[str, Any]:
     landing side, so they are checked once for every delivery: one an approved
     sender wrote straight into the bucket, and one the inbox renamed and
     promoted. The inbox reads the same file for the delivery's IDENTITY
-    (business date, version) and deliberately checks none of this.
+    (COB date, version) and deliberately checks none of this.
     See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
     """
     control = feed.delivery["control"]
@@ -204,10 +204,10 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
     if parsed is None:
         raise ValueError(
             f"{feed.name}: {filename!r} does not match filename_pattern "
-            f"{feed.filename_pattern!r}, so it has no business date and "
+            f"{feed.filename_pattern!r}, so it has no COB date and "
             f"cannot be normalized. Fix the pattern, or the file is not this "
             f"feed's.")
-    business_date, _version = parsed
+    cob_date, _version = parsed
 
     control_key = None
     declared: dict[str, Any] = {}
@@ -225,7 +225,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
     return {
         "manifest_version": MANIFEST_VERSION,
         "feed": feed.name,
-        "business_date": business_date.isoformat(),
+        "cob_date": cob_date.isoformat(),
         # Deterministic, so re-normalizing is a no-op. Anything time-based
         # here would make an idempotent operation produce a new manifest.
         "delivery_id": filename,
@@ -312,9 +312,9 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
         raise ValueError(
             f"{feed.name}: container {filename!r} does not match "
             f"filename_pattern {feed.filename_pattern!r}, so it has no "
-            f"business date. With `business_date_from: container` the date "
+            f"COB date. With `cob_date_from: container` the date "
             f"lives in the container name and nowhere else.")
-    business_date, _version = parsed
+    cob_date, _version = parsed
 
     head = _head(_bucket(), object_key)
     body = _client().get_object(Bucket=_bucket(), Key=object_key)["Body"].read()
@@ -345,7 +345,7 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
     return {
         "manifest_version": MANIFEST_VERSION,
         "feed": feed.name,
-        "business_date": business_date.isoformat(),
+        "cob_date": cob_date.isoformat(),
         "delivery_id": filename,
         "received_at": head["LastModified"].astimezone(timezone.utc).isoformat(),
         "source_object": object_key,
@@ -416,7 +416,7 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
 
     A STORED MANIFEST IS ALSO REGISTERED. Producing one is the moment the
     platform accepts a landed object as a readable delivery -- it has a
-    business date, parts and a format -- so it is the moment the delivery
+    COB date, parts and a format -- so it is the moment the delivery
     registry (REQ-101) can describe it. Best-effort and never fatal: see
     `registry.deliveries.register_quietly`. `write=False` registers nothing,
     because nothing was accepted into the queue either -- with one caller that
@@ -539,5 +539,5 @@ def reconcile(feed: Feed) -> dict[str, Any]:
             "created": created, "failed": failed, "awaiting_control": awaiting}
 
 
-def business_date_of(manifest: dict[str, Any]) -> date:
-    return date.fromisoformat(manifest["business_date"])
+def cob_date_of(manifest: dict[str, Any]) -> date:
+    return date.fromisoformat(manifest["cob_date"])

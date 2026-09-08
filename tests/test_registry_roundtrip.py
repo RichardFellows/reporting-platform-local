@@ -66,7 +66,7 @@ def test_new_feed_inherits_without_repeating():
     spec = dataclasses.replace(
         registry.spec_from_feed(feeds()["ref_counterparty"]),
         name="ref_newthing", description="A new reference feed.",
-        filename_pattern=r'NEW_(?P<business_date>\d{8})\.csv')
+        filename_pattern=r'NEW_(?P<cob_date>\d{8})\.csv')
     registry.add(spec)
     blk = _block_of((d / "feeds.yml").read_text(), "ref_newthing")
     assert "convention: ref_src" in blk, blk

@@ -63,7 +63,7 @@ def collect(branch: str) -> dict[str, Any]:
     known_feeds = set(feeds())
     out: dict[str, Any] = {"branch": branch, "models": [], "inputs": [],
                            "absent": [], "unreadable": [],
-                           "max_business_date": None, "not_a_feed": []}
+                           "max_cob_date": None, "not_a_feed": []}
     spark = spark_session("run-inputs", ref=branch)
     try:
         for model in models_in("prepared"):
@@ -101,10 +101,10 @@ def collect(branch: str) -> dict[str, Any]:
                                   "deliveries": len(deliveries)})
             out["inputs"].extend([model, d] for d in deliveries)
 
-            # The latest business date this table reflects. `business_date` on
+            # The latest COB date this table reflects. `cob_date` on
             # a per-date table, `effective_from` on an SCD2 one, which drops
-            # business_date entirely -- see scd2_columns().
-            date_column = ("business_date" if "business_date" in columns
+            # cob_date entirely -- see scd2_columns().
+            date_column = ("cob_date" if "cob_date" in columns
                            else "effective_from" if "effective_from" in columns
                            else None)
             if date_column:
@@ -113,8 +113,8 @@ def collect(branch: str) -> dict[str, Any]:
                 ).collect()[0]["d"]
                 if value is not None:
                     seen = value.isoformat()
-                    if out["max_business_date"] is None or seen > out["max_business_date"]:
-                        out["max_business_date"] = seen
+                    if out["max_cob_date"] is None or seen > out["max_cob_date"]:
+                        out["max_cob_date"] = seen
     finally:
         spark.stop()
 

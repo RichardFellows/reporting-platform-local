@@ -47,7 +47,7 @@
     read raw directly.
 
     Already-quoted and qualified names are passed through: a caller that wrote
-    `t.business_date` or `` `Trade Id` `` meant it.
+    `t.cob_date` or `` `Trade Id` `` meant it.
   -#}
   {%- set text = name | string | trim -%}
   {%- if '`' in text or '.' in text or '(' in text -%}{{ text }}
@@ -81,7 +81,7 @@
    Reprocesses a trailing window rather than only the newest date, so a
    late-arriving correction for an earlier date is picked up without a full
    rebuild. lookback_days is set in dbt_project.yml. #}
-{% macro incremental_window(date_column='business_date', target_column=None) %}
+{% macro incremental_window(date_column='cob_date', target_column=None) %}
   {%- if is_incremental() -%}
     {#
       The alias is load-bearing. Without it the unqualified column inside the
@@ -95,8 +95,8 @@
 
       The two column names are also NOT the same on both sides, which is why
       target_column exists. The outer query filters the SOURCE column -- raw
-      carries `_business_date` -- while `this` is the prepared table, whose
-      modelled column is `business_date`. Assuming one name for both is what
+      carries `_cob_date` -- while `this` is the prepared table, whose
+      modelled column is `cob_date`. Assuming one name for both is what
       made the unqualified version bind to the outer table in the first place.
       The reporting layer happens to have matching names on both sides, so it
       never showed the problem.
@@ -280,7 +280,7 @@
 {# Latest file version, and deduplication within it.
 
    Re-deliveries land as a new _file_version rather than overwriting, so every
-   prepared model must select the newest version for each business date. And
+   prepared model must select the newest version for each COB date. And
    within a version, upstream occasionally repeats a business key; we take the
    last occurrence in file order, which matches the legacy ETL tool's behaviour.
 
@@ -291,7 +291,7 @@
   {#-
     `mode` IS THE FEED'S DECLARED SUPERSESSION, not a switch with a
     convenient default. `full_snapshot` -- each delivery restates the whole
-    population for its business date -- is what this macro has always
+    population for its COB date -- is what this macro has always
     implemented and what every feed does, and it was implemented without ever
     being stated. Stating it is what lets `supersession:` in feeds.yml refuse
     a feed this cannot serve, instead of ranking a delta feed as though it
@@ -310,7 +310,7 @@
          ~ "require.") }}
   {%- endif -%}
   ROW_NUMBER() OVER (
-    PARTITION BY _business_date,
+    PARTITION BY _cob_date,
       {%- for k in partition_keys %} {{ ident(k) }}{{ ',' if not loop.last }}{% endfor %}
     ORDER BY _file_version DESC, _row_number DESC
   )
@@ -319,7 +319,7 @@
 {#
   ---------------------------------------------------------------- SCD2
   Slowly-changing-dimension helpers. Used by the prepared reference models
-  that store one row per VERSION rather than one row per business date, and
+  that store one row per VERSION rather than one row per COB date, and
   by the reporting models that join to them point-in-time.
 
   See docs/ARCHITECTURE.md for why only reference tables are shaped this way:
@@ -327,7 +327,7 @@
   a transaction table costs complexity and saves nothing.
 #}
 
-{% macro as_of(alias, business_date_expr) %}
+{% macro as_of(alias, cob_date_expr) %}
   {#
     Point-in-time join predicate against an SCD2 table.
 
@@ -337,7 +337,7 @@
     (the current version simply stops matching and exposure loses its
     reference data).
   #}
-  {{ business_date_expr }} between {{ alias }}.effective_from and {{ alias }}.effective_to
+  {{ cob_date_expr }} between {{ alias }}.effective_from and {{ alias }}.effective_to
 {% endmacro %}
 
 
@@ -387,7 +387,7 @@
     `replay_from` IS THE LOAD-BEARING HALF. A touched entity's currently-open
     version can have begun months or years before the lookback window, and the
     whole of it must be re-derived for lead() to see the new value and CLOSE
-    it. Replaying only the last few business dates appends a new version and
+    it. Replaying only the last few COB dates appends a new version and
     leaves the previous one still claiming effective_to = 9999-12-31 -- two
     versions in force at once, which as_of() then matches BOTH of, silently
     doubling every joined row. The mutually_exclusive_ranges test is what
@@ -400,7 +400,7 @@
 
       select distinct {{ keys }}
       from {{ source_relation }}
-      where _business_date >= (
+      where _cob_date >= (
           select coalesce(max(_inc.effective_from), date '1900-01-01')
                  - interval {{ var('lookback_days', 3) }} day
           from {{ this }} as _inc
@@ -421,9 +421,9 @@
 
 {% macro scd2_changes(source_cte, key_columns) %}
   {#
-    Collapse a per-business-date stream into one row per CHANGE. A delivery
+    Collapse a per-COB-date stream into one row per CHANGE. A delivery
     that restates an unchanged entity produces nothing, which is the point.
-    Expects `{{ source_cte }}` to carry `_row_hash` and `business_date`.
+    Expects `{{ source_cte }}` to carry `_row_hash` and `cob_date`.
   #}
   changes as (
 
@@ -431,7 +431,7 @@
           *,
           lag(_row_hash) over (partition by
             {%- for c in key_columns %} {{ ident(c) }}{{ ',' if not loop.last }}{% endfor %}
-                               order by business_date)          as _prev_hash
+                               order by cob_date)          as _prev_hash
       from {{ source_cte }}
 
   ),
@@ -449,15 +449,15 @@
     reference tables cannot drift in how they express validity -- as_of()
     depends on all of them meaning the same thing everywhere.
   #}
-  business_date                                             as effective_from,
-  {{ scd2_effective_to('business_date', key_columns) }}     as effective_to,
-  lead(business_date) over (partition by
+  cob_date                                                  as effective_from,
+  {{ scd2_effective_to('cob_date', key_columns) }}          as effective_to,
+  lead(cob_date) over (partition by
     {%- for c in key_columns %} {{ ident(c) }}{{ ',' if not loop.last }}{% endfor %}
-                            order by business_date) is null  as is_current,
+                            order by cob_date) is null  as is_current,
   {#
-    business_date is gone as a column, so it cannot be the partition column.
+    cob_date is gone as a column, so it cannot be the partition column.
     Retention deletes by a range predicate against this instead of dropping a
     partition -- see docs/RETENTION.md.
   #}
-  trunc(business_date, 'MM')                                as effective_from_month
+  trunc(cob_date, 'MM')                                     as effective_from_month
 {% endmacro %}

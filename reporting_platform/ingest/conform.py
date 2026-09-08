@@ -4,7 +4,7 @@ WHY THIS EXISTS. `landing/` has a CONTRACT: every object in it is correctly
 named and classified, so `Feed.parse_filename` answers for all of them and
 landing retention can date all of them. That contract is what keeps the rest
 of the platform simple -- one shape, one code path, no feed needing the whole
-pipeline taught a second way to find a business date.
+pipeline taught a second way to find a COB date.
 
 Real upstreams do not honour it. A legacy feed sends `positions.csv` every
 day with the date on a line inside `positions.ctl`. There are two ways to
@@ -14,7 +14,7 @@ module is the second, and the second is much cheaper -- it confines the
 irregularity to one stage instead of spreading it across seven modules.
 
 So: the inbox classifies, waits for the control file, verifies what the
-control file declares, derives the business date, and promotes the delivery
+control file declares, derives the COB date, and promotes the delivery
 into `landing/` under the name the feed's own `filename_pattern` describes,
 with a metadata sibling recording what actually arrived.
 
@@ -26,7 +26,7 @@ feed reporting nothing pending forever -- structurally impossible rather than
 something a test has to remember.
 
 **THIS MODULE ESTABLISHES IDENTITY, NOT INTEGRITY.** Which source system,
-which feed, which business date, which version -- everything needed to give
+which feed, which COB date, which version -- everything needed to give
 the file its correct name and to know its prerequisites are present. It does
 NOT check the row count or the checksum. Those are `delivery.control`'s job,
 they run at ingest, and they run identically for a legacy delivery and for one
@@ -35,7 +35,7 @@ one of the two paths is exactly what would drift.
 
 That split is what makes the two failure modes different, and both are right:
 
-  * an IDENTITY failure -- no feed claims the name, or no business date can be
+  * an IDENTITY failure -- no feed claims the name, or no COB date can be
     found -- means the file CANNOT BE NAMED, so it cannot land at all. It goes
     to `.rejected/`.
   * an INTEGRITY failure -- wrong row count, wrong checksum -- has nothing to
@@ -45,7 +45,7 @@ That split is what makes the two failure modes different, and both are right:
     and leaves `main` untouched, exactly as `expected_min_rows` already does.
 
 There is a third outcome, and it is neither: **an unchanged RESEND is a
-no-op.** A name already taken for a business date used to be versioned to
+no-op.** A name already taken for a COB date used to be versioned to
 `_v2` on sight, which turned a retried transfer into a restatement the
 upstream never made -- see `DuplicateDelivery`. Sameness is decided on the
 bytes (md5), not on the name, and only against deliveries already landed for
@@ -80,7 +80,7 @@ METADATA_VERSION = 1
 
 # The suffix that makes a metadata object recognisable to landing retention
 # without a lookup. See `retention/landing.py` -- an object named
-# `<delivery>.meta.json` carries its own business date in the `<delivery>`
+# `<delivery>.meta.json` carries its own COB date in the `<delivery>`
 # part, so it expires on its own name exactly when its delivery does.
 METADATA_SUFFIX = ".meta.json"
 
@@ -106,7 +106,7 @@ class ConformanceError(Exception):
 
 
 class DuplicateDelivery(Exception):
-    """These exact bytes are already landed for this business date.
+    """These exact bytes are already landed for this COB date.
 
     NOT a `ConformanceError`, deliberately: nothing is wrong with the file and
     it must not go to `.rejected/`. An upstream resending an unchanged file is
@@ -179,7 +179,7 @@ def find_control(feed: Feed, data_filename: str,
 def read_control(feed: Feed, text: str, control_filename: str) -> dict[str, Any]:
     """Everything the control file declares, as configured. Nothing inferred.
 
-    IDENTITY ONLY -- business date and version. The row count and checksum
+    IDENTITY ONLY -- COB date and version. The row count and checksum
     the same file may also declare are read on the LANDING side, by
     `delivery.control`, so that they are checked once for every delivery
     rather than twice for one of the two arrival paths.
@@ -190,7 +190,7 @@ def read_control(feed: Feed, text: str, control_filename: str) -> dict[str, Any]
     control = (feed.arrival or {}).get("control") or {}
     out: dict[str, Any] = {}
 
-    for key, group in (("business_date", "business_date"),
+    for key, group in (("cob_date", "cob_date"),
                        ("version", "version")):
         pattern = control.get(key)
         if pattern is None:
@@ -205,15 +205,15 @@ def read_control(feed: Feed, text: str, control_filename: str) -> dict[str, Any]
                 f"not clear on its own.")
         out[key] = m.group(group)
 
-    if "business_date" in out:
-        raw = out["business_date"]
+    if "cob_date" in out:
+        raw = out["cob_date"]
         try:
-            out["business_date"] = datetime.strptime(raw, "%Y%m%d").date()
+            out["cob_date"] = datetime.strptime(raw, "%Y%m%d").date()
         except ValueError as exc:
             raise ConformanceError(
                 f"{feed.name}: control file {control_filename} declares "
-                f"business date {raw!r}, which is not yyyyMMdd: {exc}. The "
-                f"regex matched, so `arrival.control.business_date` is "
+                f"COB date {raw!r}, which is not yyyyMMdd: {exc}. The "
+                f"regex matched, so `arrival.control.cob_date` is "
                 f"capturing the wrong part of the line.") from exc
     if "version" in out:
         out["version"] = int(out["version"])
@@ -297,7 +297,7 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
     which is what lets this be tested without S3 or a watcher.
 
     `taken` is the set of filenames already in this feed's landing prefix, and
-    it is how a RE-DELIVERY gets its version. A corrected file for a business
+    it is how a RE-DELIVERY gets its version. A corrected file for a COB
     date already landed must not overwrite the first one -- `landing/` is the
     evidence copy, and the original is the evidence of what was originally
     ingested. So the name is rendered with no version, and if that is taken,
@@ -329,16 +329,16 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
                 f"in the inbox. Not a failure -- a late feed, not a failed one.")
         declared = read_control(feed, control_text, control_filename)
 
-    business_date = declared.get("business_date") \
-        or feed.source_business_date(data_filename)
-    if business_date is None:
+    cob_date = declared.get("cob_date") \
+        or feed.source_cob_date(data_filename)
+    if cob_date is None:
         # resolve_arrival_config guarantees one source exists, so reaching
         # here means the configured source produced nothing -- which the
         # readers above would already have raised on. Kept as a guard rather
         # than an assert because it is the one value nothing downstream can
         # do without, and without it the file cannot be named at all.
         raise ConformanceError(
-            f"{feed.name}: no business date for {data_filename} -- neither "
+            f"{feed.name}: no COB date for {data_filename} -- neither "
             f"`arrival.source_pattern` nor the control file yielded one.")
 
     # Measured BEFORE the name is chosen, because the name now depends on it:
@@ -346,7 +346,7 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
     # twice, not the next version of it.
     observed = observe(feed, content)
     try:
-        landing_filename = _free_name(feed, business_date,
+        landing_filename = _free_name(feed, cob_date,
                                       declared.get("version"), taken,
                                       md5=observed["md5"], landed_md5=landed_md5)
         control_landing_filename = landing_control_filename(feed, landing_filename)
@@ -360,7 +360,7 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
         "metadata_version": METADATA_VERSION,
         "feed": feed.name,
         "source_system": feed.source_system,
-        "business_date": business_date.isoformat(),
+        "cob_date": cob_date.isoformat(),
         "landing_filename": landing_filename,
         "landing_control_filename": control_landing_filename,
         # WHAT ACTUALLY ARRIVED. The objects in landing are byte-identical to
@@ -387,12 +387,12 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
         "landing_filename": landing_filename,
         "control_landing_filename": control_landing_filename,
         "metadata_filename": landing_filename + METADATA_SUFFIX,
-        "business_date": business_date,
+        "cob_date": cob_date,
         "metadata": metadata,
     }
 
 
-def _free_name(feed: Feed, business_date: date, version: int | None,
+def _free_name(feed: Feed, cob_date: date, version: int | None,
                taken: set[str] | None, *, md5: str | None = None,
                landed_md5: Callable[[str], str | None] | None = None) -> str:
     """The first landing name for this date that is not already used.
@@ -422,27 +422,27 @@ def _free_name(feed: Feed, business_date: date, version: int | None,
         if landed_md5(name) == md5:
             raise DuplicateDelivery(
                 f"{feed.name}: {name} already holds these exact bytes "
-                f"(md5 {md5}) for {business_date.isoformat()}. An unchanged "
+                f"(md5 {md5}) for {cob_date.isoformat()}. An unchanged "
                 f"resend is not a restatement -- nothing is landed and "
                 f"nothing is ingested.", name)
 
     if version is not None:
-        name = render_filename(feed, business_date, version)
+        name = render_filename(feed, cob_date, version)
         if taken and name in taken:
             _refuse_if_identical(name)
         return name
-    name = render_filename(feed, business_date)
+    name = render_filename(feed, cob_date)
     if not taken or name not in taken:
         return name
     _refuse_if_identical(name)
     for n in range(2, 100):
-        candidate = render_filename(feed, business_date, n)
+        candidate = render_filename(feed, cob_date, n)
         if candidate not in taken:
             return candidate
         _refuse_if_identical(candidate)
     raise ConformanceError(
         f"{feed.name}: 99 versions already landed for "
-        f"{business_date.isoformat()}. Something is re-delivering in a loop.")
+        f"{cob_date.isoformat()}. Something is re-delivering in a loop.")
 
 
 def is_archive(feed: Feed) -> bool:
@@ -512,20 +512,20 @@ def unpack(feed: Feed, container_filename: str,
     return out
 
 
-def member_business_date(feed: Feed, member_filename: str) -> date:
-    """The business date a member carries in its own name."""
+def member_cob_date(feed: Feed, member_filename: str) -> date:
+    """The COB date a member carries in its own name."""
     pattern = feed.arrival["archive"]["member_pattern"]
     m = re.fullmatch(pattern, member_filename)
     if not m:
         raise ConformanceError(
             f"{feed.name}: member {member_filename!r} does not match "
             f"{pattern!r}")
-    raw = m.group("business_date")
+    raw = m.group("cob_date")
     try:
         return datetime.strptime(raw, "%Y%m%d").date()
     except ValueError as exc:
         raise ConformanceError(
-            f"{feed.name}: member {member_filename!r} declares business date "
+            f"{feed.name}: member {member_filename!r} declares COB date "
             f"{raw!r}, which is not yyyyMMdd: {exc}") from exc
 
 
@@ -545,13 +545,13 @@ def conform_member(feed: Feed, container_filename: str, container_content: bytes
 
     Raises `DuplicateDelivery` on the same terms `conform()` does. A container
     resent whole is the commonest way this happens -- the members inside it
-    are byte-identical, and versioning them would restate every business date
+    are byte-identical, and versioning them would restate every COB date
     the archive covers at once.
     """
-    business_date = member_business_date(feed, member_filename)
+    cob_date = member_cob_date(feed, member_filename)
     observed = observe(feed, member_content)
     try:
-        landing_filename = _free_name(feed, business_date, None, taken,
+        landing_filename = _free_name(feed, cob_date, None, taken,
                                       md5=observed["md5"], landed_md5=landed_md5)
     except FilenameError as exc:
         raise ConformanceError(
@@ -563,12 +563,12 @@ def conform_member(feed: Feed, container_filename: str, container_content: bytes
         "landing_filename": landing_filename,
         "control_landing_filename": None,
         "metadata_filename": landing_filename + METADATA_SUFFIX,
-        "business_date": business_date,
+        "cob_date": cob_date,
         "metadata": {
             "metadata_version": METADATA_VERSION,
             "feed": feed.name,
             "source_system": feed.source_system,
-            "business_date": business_date.isoformat(),
+            "cob_date": cob_date.isoformat(),
             "landing_filename": landing_filename,
             "source_filename": member_filename,
             # The container is NOT landed, so this is the only record that it

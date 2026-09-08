@@ -15,7 +15,7 @@ cannot build anything, and that is deliberate three times over:
     branch means no write-audit-publish, so a DuckDB build would write
     straight to `main`.
   * dbt-duckdb silently ignores `partition_by`, so anything it created would
-    be unpartitioned -- and `business_date` partitioning is what makes
+    be unpartitioned -- and `cob_date` partitioning is what makes
     retention's expiry a metadata delete rather than a full rewrite.
   * DuckDB refuses INSERT and UPDATE on a partitioned table by default, so it
     cannot write to the tables the platform already has. Note DELETE is
@@ -33,7 +33,7 @@ both -- one version store, two front doors.
 
     # a one-off query
     docker compose exec -T airflow python -m scripts.duckdb_console \
-        "select business_date, count(*) from lakehouse.prepared.fo_trade
+        "select cob_date, count(*) from lakehouse.prepared.fo_trade
          group by 1 order by 1 desc limit 5"
 
     # what is in there

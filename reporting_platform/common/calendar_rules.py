@@ -1,4 +1,4 @@
-"""Business-date keep-set calculation.
+"""COB-date keep-set calculation.
 
 Deliberately derives everything from the dates actually observed in the data
 rather than from a holiday calendar. Two reasons:
@@ -10,7 +10,7 @@ rather than from a holiday calendar. Two reasons:
    upstream skipped a day, keeping 10 real dates is the correct behaviour and
    a calendar-driven rule would silently keep 9.
 
-Month-end means "the last observed business date within that calendar month",
+Month-end means "the last observed COB date within that calendar month",
 not the 30th/31st — 31 March 2029 is a Saturday and there is no such date.
 """
 from __future__ import annotations
@@ -60,7 +60,7 @@ def keep_set(
     keep_month_ends: int = 0,
     keep_month_ends_years: int | None = None,
 ) -> set[date]:
-    """Compute the set of business dates to retain.
+    """Compute the set of COB dates to retain.
 
     keep_business_days   the N most recent observed dates
     keep_month_ends      the M most recent month-end dates

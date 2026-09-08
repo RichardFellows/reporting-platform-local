@@ -27,7 +27,7 @@ entries. Nothing else in the platform needs to learn the feed's name.
   - name: treasury_margin_call
     description: Margin calls per counterparty and call type, from treasury.
     source_system: TREASURY
-    filename_pattern: 'marginCalls_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+    filename_pattern: 'marginCalls_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
     business_key: [margin_call_id]
     expected_min_rows: 10
     columns: [margin_call_id, counterparty_id, call_type, call_amount,
@@ -40,7 +40,7 @@ Four things that are easy to get wrong:
   `treasury_margin_call` gives `lakehouse.raw.treasury_margin_call`, DAG
   `ingest_margin_call` and landing prefix `landing/treasury_margin_call/`. Use
   lowercase with underscores regardless of what the upstream calls its files.
-- **`filename_pattern` must yield a `business_date` named group**, and it is
+- **`filename_pattern` must yield a `cob_date` named group**, and it is
   matched with `re.fullmatch`, not `search` — a pattern that does not cover
   the whole filename silently matches nothing, and the feed simply never has
   anything pending. It describes the name the file has **in `landing/`**. If
@@ -72,16 +72,16 @@ Optional, and worth a thought rather than a default:
 | Key | When |
 |---|---|
 | `convention: <name>` | Another feed from this source system already exists and shares its delivery arrangement. Inherits everything the convention sets; anything the convention supplies is then left OUT of this block, so it stays in one place. Naming one that is not defined is an error at load, not a silent fallback. See [DECISIONS.md#feed-conventions](DECISIONS.md#feed-conventions). |
-| `cadence: weekly` | The feed does not deliver every business date. Without it the gap check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
-| `delivery_expected: false` | Monthly or ad-hoc. Opts out of the gap check entirely. It answers "is a delivery expected on every business date", which is not the same question as whether a given delivery is *complete* — the reason it is not called `completeness`. |
-| `expected_by: "07:00"` | The upstream has committed to a **wall-clock time**. The deadline is that time on the day *after* the business date (fixed at +1, and forgiving on purpose: a date must have ended before its extract can be taken). `monitoring/lateness.py` reports deliveries that arrived after it. **Quote it** — unquoted, YAML 1.1 reads `7:00` as the integer 420, and a leading zero happens to hide that until the first unpadded hour. Omit it for a feed that has made no promise: the check then skips the feed rather than inventing an expectation for it. See [DECISIONS.md#lateness-is-a-wall-clock-time-not-a-duration](DECISIONS.md#lateness-is-a-wall-clock-time-not-a-duration). |
+| `cadence: weekly` | The feed does not deliver every COB date. Without it the gap check infers the calendar from the other feeds and reports every non-delivery day as a gap. |
+| `delivery_expected: false` | Monthly or ad-hoc. Opts out of the gap check entirely. It answers "is a delivery expected on every COB date", which is not the same question as whether a given delivery is *complete* — the reason it is not called `completeness`. |
+| `expected_by: "07:00"` | The upstream has committed to a **wall-clock time**. The deadline is that time on the day *after* the COB date (fixed at +1, and forgiving on purpose: a date must have ended before its extract can be taken). `monitoring/lateness.py` reports deliveries that arrived after it. **Quote it** — unquoted, YAML 1.1 reads `7:00` as the integer 420, and a leading zero happens to hide that until the first unpadded hour. Omit it for a feed that has made no promise: the check then skips the feed rather than inventing an expectation for it. See [DECISIONS.md#lateness-is-a-wall-clock-time-not-a-duration](DECISIONS.md#lateness-is-a-wall-clock-time-not-a-duration). |
 | `retention_class: <name>` | This feed's landing and quarantine **evidence** is kept for a different window than the default. The name goes here; the years live in `retention.yml` per environment, and naming a class it does not declare is an error at load. A class shorter than a report's pin window is refused for any feed that report is built from — so this is a policy statement, not a tuning knob. Defaults to `standard`; inheritable through a convention. See [DECISIONS.md#retention-classes-name-the-obligation](DECISIONS.md#retention-classes-name-the-obligation). |
 | `schema_drift: fail` | Abort the load on an extra *or* missing column instead of landing and warning. The default `warn` is usually right — a rejected file is a file nobody looks at. |
 | `column_types:` | A column whose prepared-layer treatment is not what its *name* implies. `haircut_pct` reads as a string to the inference but should be `decimal`; `settlement_ccy` is a code, not free text. Only list the disagreements — anything absent falls back to the inference. It is what the feed console writes when you change a type on the form, and what the sample-data generator reads, so the two cannot drift apart. Raw is still all strings; this describes the **prepared** model. |
-| `arrival:` | The upstream does **not** send a correctly named file. `landing/` accepts only conformant names, so a legacy sender goes through the inbox gate instead: `source_pattern` recognises the name as sent, and `control:` (`pattern`, `business_date`, `version`) says how to find the control file and what it declares about the delivery's **identity**. The gate renames the delivery *and its control file* to match, writes both into `landing/` with a `.meta.json` sibling, and a re-delivery for a date already landed becomes `_v2`. It verifies nothing — row count and checksum belong to `delivery.control` and are checked at ingest, so a feed with `arrival:` needs `delivery.control` too. Omit both for any upstream that already names files correctly, which is every feed here today. See [DECISIONS.md#the-inbox-is-the-conformance-gate](DECISIONS.md#the-inbox-is-the-conformance-gate). |
-| `arrival.archive:` | The upstream sends a **zip**. The gate unpacks it and lands each member as its own delivery; the container never reaches `landing/`, and its name and md5 are recorded in each member's `.meta.json`. `member_pattern` says which members belong to this feed and must capture `(?P<business_date>...)` — each member is a complete delivery for its own date. Members that are *parts* of one date are a different shape and are not built. |
+| `arrival:` | The upstream does **not** send a correctly named file. `landing/` accepts only conformant names, so a legacy sender goes through the inbox gate instead: `source_pattern` recognises the name as sent, and `control:` (`pattern`, `cob_date`, `version`) says how to find the control file and what it declares about the delivery's **identity**. The gate renames the delivery *and its control file* to match, writes both into `landing/` with a `.meta.json` sibling, and a re-delivery for a date already landed becomes `_v2`. It verifies nothing — row count and checksum belong to `delivery.control` and are checked at ingest, so a feed with `arrival:` needs `delivery.control` too. Omit both for any upstream that already names files correctly, which is every feed here today. See [DECISIONS.md#the-inbox-is-the-conformance-gate](DECISIONS.md#the-inbox-is-the-conformance-gate). |
+| `arrival.archive:` | The upstream sends a **zip**. The gate unpacks it and lands each member as its own delivery; the container never reaches `landing/`, and its name and md5 are recorded in each member's `.meta.json`. `member_pattern` says which members belong to this feed and must capture `(?P<cob_date>...)` — each member is a complete delivery for its own date. Members that are *parts* of one date are a different shape and are not built. |
 | `delivery.control:` | The delivery is gated on a control file landing beside it, and that file states the row count (`row_count`) or a checksum (`md5`). Checked at ingest for **every** delivery — one an approved sender wrote straight into landing, and one the inbox renamed and promoted — so there is one implementation of the check and the trusted path is not the less-verified one. A mismatch abandons the build branch and leaves `main` untouched. |
-| `supersession:` | Only if a later delivery does **not** simply restate the whole population for its business date. The one built mode is `full_snapshot`, which is the default and what every feed here does; `delta_append` and `correction` are refused at load with the reason. Set it explicitly on a feed whose shape you want stated rather than assumed — the failure it prevents is silent, because a delta feed deduped as a snapshot loses every key its newest file omits and the row counts still look plausible. See [DECISIONS.md#supersession-is-declared-not-assumed](DECISIONS.md#supersession-is-declared-not-assumed). |
+| `supersession:` | Only if a later delivery does **not** simply restate the whole population for its COB date. The one built mode is `full_snapshot`, which is the default and what every feed here does; `delta_append` and `correction` are refused at load with the reason. Set it explicitly on a feed whose shape you want stated rather than assumed — the failure it prevents is silent, because a delta feed deduped as a snapshot loses every key its newest file omits and the row counts still look plausible. See [DECISIONS.md#supersession-is-declared-not-assumed](DECISIONS.md#supersession-is-declared-not-assumed). |
 | `delivery:` | The delivery is a zip (`kind: archive`, plus `member_pattern`) rather than one plain CSV. See [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) for the shapes, and [DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) / [#control-file-gate](DECISIONS.md#control-file-gate) for what each key actually does. The console validates it with the exact function feeds.yml load does, so a typo here fails in the form rather than at the next Airflow parse. |
 
 Verify before moving on:
@@ -133,18 +133,18 @@ Copy the nearest existing model rather than starting blank —
 skeleton is fixed and the three macro calls are not optional:
 
 ```sql
-{{ config(materialized='incremental', unique_key=['business_date','margin_call_id'],
-          partition_by=['business_date'], tags=['prepared','reference']) }}
+{{ config(materialized='incremental', unique_key=['cob_date','margin_call_id'],
+          partition_by=['cob_date'], tags=['prepared','reference']) }}
 
 with raw_rows as (
     select *, {{ dedupe_rank(['margin_call_id']) }} as _rn
     from {{ source('raw', 'treasury_margin_call') }}
-    where {{ incremental_window('_business_date', 'business_date') }}
+    where {{ incremental_window('_cob_date', 'cob_date') }}
 ),
 deduped as (select * from raw_rows where _rn = 1),
 cleaned as (
     select
-        _business_date                       as business_date,
+        _cob_date                            as cob_date,
         {{ clean_string('margin_call_id') }}       as margin_call_id,
         {{ safe_cast(clean_string('call_amount'), 'DECIMAL(18,2)') }} as call_amount,
         {{ parse_date(clean_string('due_date')) }}                  as due_date,
@@ -156,16 +156,16 @@ cleaned as (
 select * from cleaned
 ```
 
-- **`incremental_window('_business_date', 'business_date')` takes two
+- **`incremental_window('_cob_date', 'cob_date')` takes two
   arguments here and one in reporting.** The source column is raw's
-  `_business_date`; the target column is the modelled `business_date`. Passing
+  `_cob_date`; the target column is the modelled `cob_date`. Passing
   one argument makes Spark bind the unqualified name to the outer query and
   the build fails with `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY`. It only
   fires on the *incremental* path, so a first build against a fresh branch
   will not show it — the first build after publishing to `main` will.
 - **`dedupe_rank(business_key)` is what picks the latest `_file_version`.**
   Omit it and a re-delivery doubles the rows.
-- **`partition_by=['business_date']` is a retention requirement, not a
+- **`partition_by=['cob_date']` is a retention requirement, not a
   performance one.** Without it retention deletes become full-table rewrites.
 - **Use `safe_cast` (`TRY_CAST`), never a bare `CAST`.** A bad value must land
   as NULL and fail a *test*; a load must not fail on unparseable input.
@@ -198,11 +198,11 @@ no tests builds green forever and publishes whatever it is given.
           - accepted_values: {values: ['INITIAL', 'VARIATION']}
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, margin_call_id]
+          combination_of_columns: [cob_date, margin_call_id]
 ```
 
 At minimum: `not_null` on the business key, a
-`unique_combination_of_columns` on `[business_date, <business_key>]`, and a
+`unique_combination_of_columns` on `[cob_date, <business_key>]`, and a
 `relationships` test on any foreign key. The uniqueness test is what proves
 `dedupe_rank` is doing its job — without it a broken dedupe is invisible.
 
@@ -234,9 +234,9 @@ Look for `<feed>: N files (from feed definition)` in the output. That generator
 does three things a naive one would not, each the difference between a file
 that tests something and one that does not:
 
-- **It generates for business dates the other feeds delivered on.** A
+- **It generates for COB dates the other feeds delivered on.** A
   `relationships` test compares against reference data on the *same*
-  `business_date`, so rows dated where `counterparty` has nothing are
+  `cob_date`, so rows dated where `counterparty` has nothing are
   guaranteed to fail a test that has found nothing wrong with the feed. It
   therefore runs *after* the hand-written four and raises on an empty `seed/`.
 - **Foreign keys are drawn from the real reference data**, read out of the
@@ -321,7 +321,7 @@ Worth knowing, because it is where the effort would otherwise go:
 ## Two things that will surprise you
 
 **A landed file is not ingested directly; it is normalized first.** The
-`normalize` task turns it into a manifest under `ready/` -- the business date,
+`normalize` task turns it into a manifest under `ready/` -- the COB date,
 the objects holding the rows, and how to read them -- and `ingest` consumes
 that. For an ordinary CSV nothing is copied and nothing about the feed changes,
 but it is why `pending` returns a `ready/...json` key. The single-file CLI form
@@ -343,5 +343,5 @@ docker compose exec -T airflow python -m reporting_platform.ingest.ingest_feed -
 ```
 
 **A new daily feed reports completeness gaps until it has history.** The check
-compares against business dates *other* feeds delivered on. Backfilling
+compares against COB dates *other* feeds delivered on. Backfilling
 landing, as step 1 above does, is what closes them.

@@ -239,13 +239,13 @@ def inputs_changed(report: str, as_at_date: date,
     """Whether `candidate` differs from the input set of the version in force.
 
     THE COMPARISON IS RESTRICTED TO DELIVERIES FOR THIS AS-AT DATE. A run's
-    input set spans every business date its tables hold, so comparing the sets
+    input set spans every COB date its tables hold, so comparing the sets
     whole would report a change on every ordinary daily build -- the newest
     date's deliveries are new by definition. What the lifecycle asks is
     narrower and is the question REQ-502 actually poses: has what we published
     FOR THIS DATE moved?
 
-    The business date comes from `registry.delivery`, joined without a foreign
+    The COB date comes from `registry.delivery`, joined without a foreign
     key (see registry/db.py) -- so a delivery the registry has never seen is
     reported as `unregistered` rather than silently dropped from both sides,
     where it would look like agreement.
@@ -253,7 +253,7 @@ def inputs_changed(report: str, as_at_date: date,
     `unregistered` MEANS UNKNOWN TO THE REGISTRY, NOT "FOR ANOTHER DATE", and
     the difference is most of the input set. A run's inputs are what it
     PUBLISHED: `ref_counterparty` is SCD2, so one reporting build reads ten of
-    its forty deliveries and thirty-odd deliveries for other business dates are
+    its forty deliveries and thirty-odd deliveries for other COB dates are
     in `candidate` perfectly legitimately. Verified on this stack against a
     real 126-delivery input set, where 85 of the 126 are for other dates -- an
     earlier version of this function called all 85 `unregistered`, which is a
@@ -262,7 +262,7 @@ def inputs_changed(report: str, as_at_date: date,
     a finding. See registry/inputs.py for why the input set is shaped this way.
 
     AN `unregistered` DELIVERY DOES NOT FLIP `changed`, and that is a choice.
-    It cannot be attributed to a business date, so it cannot be said to have
+    It cannot be attributed to a COB date, so it cannot be said to have
     moved this date's input set; blocking a publication on it would refuse
     exactly when the registry is behind, which is the moment it is least
     useful to. It is reported instead, and `deliveries.reconcile()` is what
@@ -291,24 +291,24 @@ def inputs_changed(report: str, as_at_date: date,
             "FROM registry.run_input i "
             "JOIN registry.delivery d "
             "  ON d.feed = i.feed AND d.delivery_id = i.delivery_id "
-            "WHERE i.run_id = %s AND d.business_date = %s",
+            "WHERE i.run_id = %s AND d.cob_date = %s",
             (run_id, as_at_date))
         published = {(f, d) for f, d in cur.fetchall()}
 
         # The candidate set, resolved by the same authority -- but asked about
         # THE PAIRS THEMSELVES rather than about the date. Selecting every
-        # delivery for this business date and calling the remainder unknown
+        # delivery for this COB date and calling the remainder unknown
         # conflates "the registry has never seen this" with "this belongs to
         # another date", and the second is the ordinary case.
         on_date: set[tuple[str, str]] = set()
         seen: set[tuple[str, str]] = set()
         if candidate:
             cur.execute(
-                "SELECT feed, delivery_id, business_date FROM registry.delivery "
+                "SELECT feed, delivery_id, cob_date FROM registry.delivery "
                 "WHERE (feed, delivery_id) IN %s", (tuple(sorted(candidate)),))
-            for feed_name, delivery_id, business_date in cur.fetchall():
+            for feed_name, delivery_id, cob_date in cur.fetchall():
                 seen.add((feed_name, delivery_id))
-                if business_date == as_at_date:
+                if cob_date == as_at_date:
                     on_date.add((feed_name, delivery_id))
 
     known = {p for p in candidate if p in on_date}

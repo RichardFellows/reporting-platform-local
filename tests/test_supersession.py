@@ -1,7 +1,7 @@
 """Supersession: how a later delivery relates to an earlier one (REQ-202).
 
 THE BEHAVIOUR IS OLD AND THE DECLARATION IS NEW. `dedupe_rank` has always
-implemented `full_snapshot` -- newest `_file_version` wins within a business
+implemented `full_snapshot` -- newest `_file_version` wins within a COB
 date, last row in file order wins within a version -- and no feed said so.
 These tests hold the two halves together: that the default is what the macro
 already does, and that a mode the macro cannot serve is refused at LOAD rather

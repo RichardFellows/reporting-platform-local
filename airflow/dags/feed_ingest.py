@@ -11,7 +11,7 @@ and emits an Asset on completion, which is what triggers the dbt builds.
 
 `normalize` is the stage that turns whatever the upstream actually delivered
 into the one shape ingest understands -- a manifest in `ready/` naming the
-business date, the objects holding the rows, and how to read them. It costs
+COB date, the objects holding the rows, and how to read them. It costs
 nothing for a plain CSV (a small JSON object, no copy) and it is where zips,
 control files and everything else in docs/DELIVERY-SHAPES.md will be handled,
 so `ingest` keeps exactly one code path.
@@ -83,7 +83,7 @@ def build_feed_dag(feed):
         max_active_runs=1,          # serialise re-deliveries of the same feed
         default_args=DEFAULT_ARGS,
         tags=["reporting-platform", "ingest", feed.source_system],
-        params={"object_key": "", "business_date": ""},
+        params={"object_key": "", "cob_date": ""},
     )
     def _dag():
 
@@ -102,12 +102,12 @@ def build_feed_dag(feed):
             key = conf.get("object_key") or context["params"].get("object_key")
             if key:
                 return {"object_key": key,
-                        "business_date": conf.get("business_date") or None}
+                        "cob_date": conf.get("cob_date") or None}
             pending = _spark_subprocess("pending", feed.name)["pending"]
             if not pending:
                 from airflow.exceptions import AirflowSkipException
                 raise AirflowSkipException(f"no pending arrivals for {feed.name}")
-            return {"object_key": pending[0], "business_date": None}
+            return {"object_key": pending[0], "cob_date": None}
 
         @task(task_id="normalize")
         def normalize_task(arrival: dict) -> dict:
@@ -153,10 +153,10 @@ def build_feed_dag(feed):
             except norm.NotReady as exc:
                 raise AirflowSkipException(str(exc)) from exc
             return {"object_key": norm.manifest_key(fd, key),
-                    "business_date": arrival.get("business_date"),
+                    "cob_date": arrival.get("cob_date"),
                     "normalized": True,
                     "landed_object": key,
-                    "delivery_business_date": manifest["business_date"]}
+                    "delivery_cob_date": manifest["cob_date"]}
 
         @task(task_id="ingest", outlets=[asset], pool="lakehouse_write")
         def ingest_task(arrival: dict, **context) -> dict:
@@ -173,7 +173,7 @@ def build_feed_dag(feed):
                 feed.name,
                 arrival["object_key"],
                 context["run_id"].replace(":", "").replace("+", "")[-24:],
-                arrival.get("business_date") or "",
+                arrival.get("cob_date") or "",
             )
 
         @task(task_id="record_snapshot")
@@ -185,11 +185,11 @@ def build_feed_dag(feed):
             The consequences were not cosmetic: every check that read
             `published/` -- reproducibility, evidence, the per-report
             retention window -- was reading ingests, N feeds landing one
-            business date cut N tags that carried no feed name to tell them
+            COB date cut N tags that carried no feed name to tell them
             apart, and `references.published_tags.per_report` could never match
             anything because no ingest knows which report it serves.
 
-            It is still worth pinning. Raw is where retention deletes business
+            It is still worth pinning. Raw is where retention deletes COB
             dates, so the state each ingest left is exactly what someone may
             need to read back. It is simply a different object with a
             different lifetime: `snapshot/<feed>/<bd>/<run_id>`, kept by
@@ -201,7 +201,7 @@ def build_feed_dag(feed):
             from reporting_platform.common.context import Nessie, snapshot_tag
 
             tag = snapshot_tag(feed.name,
-                               _date.fromisoformat(result["business_date"]),
+                               _date.fromisoformat(result["cob_date"]),
                                result["run_id"])
             try:
                 Nessie().create_tag(tag, from_ref="main")
@@ -232,20 +232,20 @@ def build_feed_dag(feed):
             if result.get("missing_columns") or result.get("extra_columns"):
                 log.warning(
                     "SCHEMA DRIFT %s %s: missing=%s extra=%s",
-                    feed.name, result["business_date"],
+                    feed.name, result["cob_date"],
                     result["missing_columns"], result["extra_columns"])
             if result.get("columns_added"):
                 log.warning(
                     "CONTRACT CHANGE %s %s: added %s to the raw table. "
                     "History reads NULL for it -- added, never backfilled.",
-                    feed.name, result["business_date"],
+                    feed.name, result["cob_date"],
                     result["columns_added"])
             if result.get("columns_orphaned"):
                 log.warning(
                     "CONTRACT CHANGE %s %s: %s is in the raw table and the "
                     "feed no longer declares it. Written as NULL, never "
                     "dropped; settle it deliberately.",
-                    feed.name, result["business_date"],
+                    feed.name, result["cob_date"],
                     result["columns_orphaned"])
             return result
 

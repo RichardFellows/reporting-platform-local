@@ -43,30 +43,30 @@ Copy the nearest existing model rather than starting from blank —
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'country_code'],
-    partition_by=['business_date'],
+    unique_key=['cob_date', 'country_code'],
+    partition_by=['cob_date'],
     tags=['reporting']
   )
 }}
 
 select
-    business_date,
+    cob_date,
     ...
 from {{ ref('counterparty_exposure') }}
-where {{ incremental_window('business_date') }}
-group by business_date, ...
+where {{ incremental_window('cob_date') }}
+group by cob_date, ...
 ```
 
 Five things that are not optional:
 
-- **`partition_by=['business_date']` is a retention requirement, not a
-  performance one.** Retention deletes by business date; without the partition
+- **`partition_by=['cob_date']` is a retention requirement, not a
+  performance one.** Retention deletes by COB date; without the partition
   those deletes become full-table rewrites. Every managed table leads its
-  partition spec with `business_date`. See [RETENTION.md](RETENTION.md).
+  partition spec with `cob_date`. See [RETENTION.md](RETENTION.md).
 - **`incremental_window(...)` takes one argument in `reporting` and two in
-  `prepared`.** In prepared the source column is raw's `_business_date` and the
-  target is the modelled `business_date`, so both must be named. In reporting
-  both are already `business_date`. Passing one argument in prepared makes
+  `prepared`.** In prepared the source column is raw's `_cob_date` and the
+  target is the modelled `cob_date`, so both must be named. In reporting
+  both are already `cob_date`. Passing one argument in prepared makes
   Spark bind the unqualified name to the outer query and the build fails with
   `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY` — and only on the *incremental*
   path, so a first build against a fresh branch will not show it. The first
@@ -113,7 +113,7 @@ of the gate.
           - dbt_utils.accepted_range: {min_value: 1, inclusive: true}
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [business_date, country_code]
+          combination_of_columns: [cob_date, country_code]
 ```
 
 At minimum: `not_null` on the grain columns, a

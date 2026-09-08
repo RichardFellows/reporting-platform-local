@@ -1,8 +1,8 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'country_code'],
-    partition_by=['business_date'],
+    unique_key=['cob_date', 'country_code'],
+    partition_by=['cob_date'],
     tags=['reporting']
   )
 }}
@@ -17,7 +17,7 @@
 #}
 
 select
-    business_date,
+    cob_date,
     coalesce(country_code, 'UNKNOWN')                as country_code,
     count(distinct counterparty_id)                  as counterparty_count,
     sum(trade_count)                                 as trade_count,
@@ -36,5 +36,5 @@ select
     {{ dbt.current_timestamp() }}                    as dbt_updated_at
 
 from {{ ref('counterparty_exposure') }}
-where {{ incremental_window('business_date') }}
-group by business_date, coalesce(country_code, 'UNKNOWN')
+where {{ incremental_window('cob_date') }}
+group by cob_date, coalesce(country_code, 'UNKNOWN')

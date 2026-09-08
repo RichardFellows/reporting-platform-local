@@ -299,8 +299,8 @@ def api_derive_pattern(payload: dict):
     pattern = registry.derive_pattern(example)
     if pattern is None:
         raise HTTPException(
-            400, f"{example!r} has no 8-digit business date in it, so there is "
-                 f"nothing to anchor a (?P<business_date>...) group to")
+            400, f"{example!r} has no 8-digit COB date in it, so there is "
+                 f"nothing to anchor a (?P<cob_date>...) group to")
     return {"pattern": pattern, "example": example}
 
 
@@ -326,13 +326,13 @@ def api_test_pattern(payload: dict):
                 "reason": ("matches only part of the filename -- arrival uses "
                            "fullmatch, so this would match nothing"
                            if partial else "does not match")}
-    if "business_date" not in m.groupdict():
-        return {"ok": False, "reason": "no business_date group"}
+    if "cob_date" not in m.groupdict():
+        return {"ok": False, "reason": "no cob_date group"}
     try:
-        bd = datetime.strptime(m.group("business_date"), "%Y%m%d").date()
+        bd = datetime.strptime(m.group("cob_date"), "%Y%m%d").date()
     except ValueError as exc:
-        return {"ok": False, "reason": f"business_date is not yyyyMMdd: {exc}"}
-    return {"ok": True, "business_date": bd.isoformat(),
+        return {"ok": False, "reason": f"cob_date is not yyyyMMdd: {exc}"}
+    return {"ok": True, "cob_date": bd.isoformat(),
             "version": int(m.groupdict().get("version") or 1)}
 
 
@@ -646,7 +646,7 @@ def api_ingest(name: str, payload: dict | None = None):
                 "pending": keys, "runs_already_in_flight": stale}
 
     conf = {k: v for k, v in payload.items()
-            if k in ("object_key", "business_date") and v}
+            if k in ("object_key", "cob_date") and v}
     run = orchestration.trigger(dag_id, conf=conf, note="triggered from feed console")
     return {"dag_id": dag_id, "run_id": run["dag_run_id"], "state": run.get("state"),
             "run_ids": [run["dag_run_id"]], "unpaused": unpaused,
