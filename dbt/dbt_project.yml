@@ -35,6 +35,38 @@ models:
     +materialized: incremental
     +incremental_strategy: merge
 
+    # A COLUMN ADDED TO A MODEL REACHES THE TABLE IT MERGES INTO. dbt's
+    # default here is `ignore`, and on an incremental model that means a new
+    # column exists in the SELECT and never in the target: the build stays
+    # green, the column is silently absent, and the only fix is a
+    # --full-refresh somebody has to know to run. Adding a column to a feed
+    # that already delivers is the commonest change a live feed ever has
+    # (docs/ADDING-A-COLUMN.md), so the default was wrong for the change this
+    # project makes most.
+    #
+    # `append_new_columns`, NOT `sync_all_columns`, and the asymmetry is the
+    # same one `ingest_feed.plan_raw_schema` draws one layer down: a new
+    # column is added and existing rows read NULL -- added, never backfilled,
+    # which is the honest answer for data that never had a value -- while a
+    # column REMOVED from the model is left in place rather than dropped.
+    # `sync_all_columns` would drop it, and renaming a column is
+    # indistinguishable from removing one and adding another, so it would
+    # delete the history of a column that was only renamed. Dropping one stays
+    # a deliberate act.
+    #
+    # IT ADDS THE COLUMN; IT DOES NOT POPULATE THE ROWS THE RUN DOES NOT
+    # TOUCH, and that surprises people, so it is measured here rather than
+    # described. Adding a column to `prepared.ref_rating` and running it
+    # INCREMENTALLY on a Nessie branch: the column appeared, the 9 SCD2
+    # versions the merge actually wrote carried its value, and the other 1412
+    # rows stayed NULL. On an SCD2 dimension that means every CURRENT row
+    # reads NULL until its entity next changes; on a business-date model it
+    # means the lookback window and no further back. If history has to carry
+    # the value, that is what --full-refresh is for -- the difference is that
+    # it is now a choice about DATA rather than the only way to get the COLUMN.
+    # See docs/DECISIONS.md#a-declared-column-migrates-itself
+    +on_schema_change: append_new_columns
+
     prepared:
       +schema: prepared
       # business_date leads the partition spec on every table. This is a

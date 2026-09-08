@@ -50,13 +50,18 @@ built against an Iceberg no newer than yours.
 
 `NESSIE_SERVER_VERSION` is allowed to be newer than the extensions: Nessie's
 REST API v2 is stable across that range. That is what makes a
-security-mandated server bump possible without moving the Spark jars.
+security-mandated server bump possible without moving the Spark jars. **It is
+also what decides the server's log format** — see
+[nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) — which is why the server
+here is pinned ahead of the extensions rather than level with them.
 
 `hadoop-aws` and `aws-java-sdk-bundle` are deliberately not parameterised. They
 track Spark 3.5's Hadoop, not Iceberg.
 
-Defaults everywhere repeat the combination the stack was validated against, so
-a clone with no `.env` builds what it always built. `docker compose exec
+Defaults everywhere repeat the pinned combination, so a clone with no `.env`
+builds what this one builds — including the server tag, because a default
+behind 0.104 would leave the `quarkus.log.console.json.*` keys in
+`docker-compose.yml` inert. `docker compose exec
 spark-worker env | grep VERSION` reports what is actually baked into the image
 you are running — guessing that from a Dockerfile you have not rebuilt is how
 versions drift in the first place.
@@ -70,6 +75,47 @@ egress at runtime.
 The drivers still resolve via Ivy (see [jar-versions](#jar-versions)) because
 they run pip-installed pyspark, which has none of these jars — the first
 Iceberg SQL statement would fail with `ClassNotFoundException` before it ran.
+
+## nessie-logs-are-ecs-json
+
+Nessie logs JSON in Elastic Common Schema field names —
+`quarkus.log.console.json.enabled` and `quarkus.log.console.json.log-format:
+ECS` on the `nessie:` block — so a collector needs no per-service grok and a
+stack trace arrives as `error.stack_trace` rather than as unparsed lines glued
+onto `message`.
+
+**This is a version decision wearing a config decision's clothes.** JSON
+logging is Quarkus's `quarkus-logging-json`, a **build-time** extension: it is
+either augmented into the image or it is not, and no property, mounted jar or
+environment variable can add it afterwards. It is absent from 0.99.0 and
+present from around 0.104. Verified rather than read off the docs — 0.99.0 with
+`QUARKUS_LOG_CONSOLE_JSON=true` logs plain text, unchanged, and says nothing
+about the property it ignored:
+
+```
+docker compose exec nessie ls /deployments/lib/main | grep -i logging-json
+```
+
+So a server pinned back below 0.104 must lose those two lines with it. Left
+behind they are well-formed configuration that reads as working and does
+nothing, which is the failure mode this file exists to prevent.
+
+Two things the format does not give you:
+
+- **`service.environment` is the Quarkus profile** (`prod`), not
+  `REPORTING_ENV`. The `additional-field` override does not survive env-var
+  mangling of a dotted field name, so it cannot be set from the compose
+  environment block.
+- **Access logs stay unstructured.** `io.quarkus.http.access-log` becomes one
+  ECS record whose `message` holds the whole combined-log line; the HTTP fields
+  are not broken out. Currently that is one record every 10s from the
+  healthcheck alone.
+
+0.108.1 also warns that the `quarkus.datasource.*` keys here are legacy and
+want migrating to `quarkus.datasource.postgresql.*` plus
+`nessie.version.store.persist.jdbc.datasource=postgresql`. It is a warning, not
+a failure, and the version store is the wrong thing to change in passing during
+a logging change.
 
 ## nessie-gc-jar
 
@@ -2768,7 +2814,7 @@ consequence is stated rather than discovered: an as-of query cannot use
 `_source_file`, which resolves to the delivery for both shapes that exist
 today.
 
-**The migration is lazy, and that broke the build.** `ensure_raw_columns` runs
+**The migration is lazy, and that broke the build.** `ensure_raw_schema` runs
 inside `ingest()`, on the branch, for the one feed being ingested — the right
 place, because that is where a table is guaranteed to exist and where a schema
 change can be abandoned with a failed load. But a feed that has not delivered
@@ -2785,6 +2831,109 @@ columns on every feed's raw table in one pass, on a branch, merged; it is
 idempotent, commits nothing when they are all current, and runs first in
 `platform_housekeeping` so a future provenance column cannot leave the build
 broken overnight. Run it by hand when deploying one, BEFORE the next ingest.
+
+It covers the FEEDS' own columns too, for the same reason and by the same
+code — see
+[a-declared-column-migrates-itself](#a-declared-column-migrates-itself).
+
+## a-declared-column-migrates-itself
+
+An upstream extends its extract, and a column is added to a feed that has been
+delivering for months. **This is the most frequent change a live feed ever
+undergoes** — far more common than onboarding a new feed, which the whole of
+[ADDING-A-FEED.md](ADDING-A-FEED.md) exists for — and until this it was the
+one change with no path at all.
+
+It looked handled. `ensure_raw_table` builds its DDL from `columns`, so the
+raw table has always been derived from the contract; but it is `CREATE TABLE
+IF NOT EXISTS`, which is a no-op on the table that already exists.
+`reconcile_schema` was happy — the file has the column, the contract has the
+column, so drift was empty and nothing warned. The failure surfaced at the
+write, and said none of the above:
+
+    [INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS] Cannot write to
+    `lakehouse`.`raw`.`ref_rating`, the reason is too many data columns
+
+Not once, either: on every delivery for that feed from then on, each ingest
+abandoning its branch, with an error naming an arity and neither the column
+nor `feeds.yml`.
+
+**So `ensure_raw_schema` reconciles the whole contract, not just the
+platform's provenance four.** Same place, same branch, same commit discipline:
+the `ALTER TABLE ... ADD COLUMNS` happens after the branch is cut, so an
+ingest that then fails leaves the column no more merged than the rows.
+
+**Added, never backfilled**, exactly as for a provenance column — history
+reads NULL, which is the honest answer for a column the upstream was not
+sending. Where a delivery *did* carry it before it was declared, the value is
+not lost either: it is in `_extra_columns`, which is what would make a
+backfill possible later without making it one now.
+
+### The two directions are not symmetrical
+
+Adding is automatic. **Removing is not, and never will be.** A column the raw
+table has and `feeds.yml` no longer declares is filled with NULL on the way
+in, reported, and kept.
+
+The reason is that the platform cannot tell the two edits apart. Renaming
+`trade_id` to `trade_ref` in `feeds.yml` is character-for-character a drop plus
+an add, and a `DROP COLUMN` issued on that reading would delete the history of
+a column that was only renamed. So the destructive reading of an ambiguous
+edit is the one nothing acts on: the new column appears, the old one stays
+holding what it holds, and both are reported for a human to settle. Dropping
+it is a deliberate `ALTER TABLE ... DROP COLUMN`, made by someone who knows
+which of the two edits it was.
+
+This costs nothing at the write, because **the append resolves by name once
+the arity matches** — verified rather than assumed: a same-arity frame written
+in reversed column order reads back correctly, so the NULL fill can be
+appended at the end of the frame and still land in the right column.
+
+### Which columns are the platform's is derived, not listed
+
+A raw table is the feed's declared columns plus ingest's own, and ingest's own
+all begin with `_`. So a column that is neither declared nor `_`-prefixed is
+one `feeds.yml` used to declare — and no second list of ingest's DDL is needed
+to know it.
+
+That is the same rule `lineage/columns.py:ingest_columns` already uses to
+classify a raw column, which is not a coincidence and is the point: an orphan
+here is the same column `python -m reporting_platform.lineage --columns`
+reports as `unresolved`, so the CI seam that fails on one is the CI seam that
+sees the other. Two lists would have been free to disagree.
+
+### The model layer does the same thing, for the same reason
+
+`dbt_project.yml` sets `on_schema_change: append_new_columns` on every model
+in the project. dbt's default is `ignore`, which on an incremental model means
+the new column exists in the SELECT and never in the target: **the build stays
+green and the column is silently absent**, and the only remedy is a
+`--full-refresh` somebody has to know to run. That default is wrong for the
+change this project makes most often.
+
+`append_new_columns` and not `sync_all_columns`, which is the same asymmetry
+as above one layer up: new columns are added, and a column removed from a
+model is left in place rather than dropped, because a rename is
+indistinguishable from a removal plus an addition.
+
+**It adds the column; it does not populate rows the run does not touch.**
+Measured rather than assumed — a column added to `prepared.ref_rating` and run
+incrementally on a branch: the column appeared with no `--full-refresh`, the 9
+SCD2 versions the merge wrote carried its value, and the other 1,412 rows
+stayed NULL. On an SCD2 dimension that means every *current* row reads NULL
+until its entity next changes; on a business-date model it means the lookback
+window and no further back. `--full-refresh` is therefore still the answer
+when history has to carry the value — the difference is that it is now a
+choice about DATA rather than the only way to obtain the COLUMN.
+
+### The order the change is deployed in
+
+`feeds.yml` and the prepared model change together; the raw table in between
+has to be told, and the table is not in the git diff. Config, migrate, build —
+`docs/ADDING-A-COLUMN.md` has it in order. The lazy path means an ingest will
+migrate its own feed regardless, so the ordering matters for the FEEDS THAT DO
+NOT DELIVER THAT DAY, which is the same failure `migrate_raw.py` was written
+for one requirement earlier.
 
 ## the-evidence-interlock-is-two-halves
 

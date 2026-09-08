@@ -346,6 +346,7 @@ docker compose down -v      # destroys all data and volumes
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, write-audit-publish, why Spark is the only build engine, how Cosmos renders the builds |
 | [`ADDING-A-FEED.md`](ADDING-A-FEED.md) | Onboard a new feed — six files, no DAG edit |
 | [`ADDING-A-MODEL.md`](ADDING-A-MODEL.md) | Add a dbt model — two files, no DAG edit |
+| [`ADDING-A-COLUMN.md`](ADDING-A-COLUMN.md) | Add a column to a feed that already delivers — three files, and the one command that is easy to forget |
 | [`RETENTION.md`](RETENTION.md) | Why tag retention *is* data retention |
 | [`MAINTENANCE.md`](MAINTENANCE.md) | The Iceberg procedures and their ordering |
 

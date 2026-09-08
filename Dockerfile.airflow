@@ -10,7 +10,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 # Nessie GC tool. The only way to collect content unreachable from any Nessie
 # reference; version tracks the server. ~128 MB, most of this image's size.
 # See docs/DECISIONS.md#nessie-gc-jar
-ARG NESSIE_SERVER_VERSION=0.99.0
+ARG NESSIE_SERVER_VERSION=0.108.1
 RUN mkdir -p /opt/platform/lib \
     && curl -fsSL -o /opt/platform/lib/nessie-gc.jar \
        "https://github.com/projectnessie/nessie/releases/download/nessie-${NESSIE_SERVER_VERSION}/nessie-gc-${NESSIE_SERVER_VERSION}.jar" \

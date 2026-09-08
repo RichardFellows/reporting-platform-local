@@ -12,6 +12,10 @@ Design rules this job enforces:
   file we originally received say?" for at least the grace period.
 * Schema drift is recorded, not fatal. New upstream columns land in an
   `_extra_columns` map; missing columns land as NULL and are reported.
+* A change to the feed's DECLARED columns is a different event from drift, and
+  is applied to the raw table on the branch by `ensure_raw_schema`: declaring a
+  new column on an existing feed is the ordinary way a feed changes, so it
+  migrates itself. Undeclaring one never drops it. See `plan_raw_schema`.
 
 Usage:
     python -m reporting_platform.ingest.ingest_feed \
@@ -158,37 +162,113 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     )
 
 
-def ensure_raw_columns(spark, table: str) -> list[str]:
-    """Add any provenance column the table does not have yet. Returns them.
+def plan_raw_schema(fd, have) -> dict[str, list]:
+    """What an existing raw table is missing, and what it carries that the
+    feed no longer declares. PURE -- no Spark, no catalog.
+
+    `have` is the table's columns as (name, type) pairs, exactly what
+    `DataFrame.dtypes` gives. Everything this migration turns on is decided
+    here, out of `feeds.yml` alone, so it is testable without a stack --
+    tests/test_raw_schema.py. `ensure_raw_schema` below is the part that
+    needs Spark and does no deciding.
+
+    THE TWO DIRECTIONS ARE NOT SYMMETRICAL, and that is the whole design:
+
+      add       a column `feeds.yml` declares that the table does not have.
+                APPLIED, automatically, on the branch. An upstream extending
+                its extract is the ordinary event in the life of a feed --
+                far more common than a new feed -- and it must not need a
+                migration somebody remembers to hand-write.
+
+      orphaned  a column the table has that `feeds.yml` no longer declares.
+                NEVER APPLIED. Dropping it would delete history to satisfy a
+                config edit, and a rename in `feeds.yml` is indistinguishable
+                from a drop plus an add -- so the destructive reading of an
+                ambiguous edit is the one this refuses to take. Reported, and
+                filled with NULL on the way in so the append still resolves.
+
+    WHICH IS WHICH IS DERIVED, NOT LISTED, by the same rule
+    `lineage/columns.py:ingest_columns` already uses: a raw table is the
+    feed's declared columns plus the platform's own, the platform's all begin
+    with `_`, so a column that is neither is one `feeds.yml` used to declare.
+    A second list of ingest's own columns here would be exactly the drift
+    this repo keeps refusing -- and because there is only the one rule, an
+    orphan here is the same column that
+    `python -m reporting_platform.lineage --columns` reports as `unresolved`.
+    """
+    present = {name.lower() for name, _ in have}
+    declared = [(c, "STRING") for c in fd.columns]
+    add = [(name, ddl) for name, ddl in declared + list(_PROVENANCE_COLUMNS)
+           if name.lower() not in present]
+    keep = {c.lower() for c in fd.columns}
+    orphaned = [(name, ddl) for name, ddl in have
+                if not name.startswith("_") and name.lower() not in keep]
+    return {"add": add, "orphaned": orphaned}
+
+
+def ensure_raw_schema(spark, table: str, fd) -> dict[str, list]:
+    """Bring an existing raw table up to the feed's current column contract.
 
     THE MIGRATION FOR TABLES THAT ALREADY EXIST. `ensure_raw_table` is
-    `CREATE TABLE IF NOT EXISTS`, so a column added to it reaches new tables
-    only; every raw table already in the catalog would keep the old schema
-    forever and `prepared` would start selecting a column half of them do not
-    have.
+    `CREATE TABLE IF NOT EXISTS`, so a column added to `feeds.yml` -- or to
+    `_PROVENANCE_COLUMNS` -- reaches new tables only; every raw table already
+    in the catalog would keep the old schema forever.
 
-    ADDED, NOT BACKFILLED. Iceberg adds a column as metadata -- no data files
-    are touched -- so rows ingested before this read NULL. That is a deliberate
-    choice and it has a consequence worth stating: an as-of query cannot use
-    `_delivery_id` to reach back past this change, and must fall back to
-    `_source_file`, which resolves to the delivery for both shapes that exist
-    today. The alternative was rewriting every partition of every raw table --
-    new data files under five live published tags, interacting with snapshot
-    expiry and the pins retention was only just corrected to keep.
+    THIS USED TO COVER THE PROVENANCE COLUMNS AND NOTHING ELSE, which left
+    the common case unhandled. Declaring a new column on an existing feed
+    passed every check in this module -- the file has it, the contract has it,
+    drift is empty -- and then failed inside `df.writeTo().append()`, on every
+    delivery for that feed from then on, with
+
+        [INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS] Cannot write to
+        `lakehouse`.`raw`.`ref_rating`, the reason is too many data columns
+
+    -- observed, which is how this came to cover them. Note what that error
+    says and does not say: an ARITY mismatch, naming neither the column nor
+    `feeds.yml`. The append checks the COUNT first and only then resolves BY
+    NAME (verified: a same-arity frame written in reversed column order reads
+    back correctly), which is what makes the NULL fill for an orphan below
+    safe to append at the end of the frame.
+
+    ADDED, NOT BACKFILLED, like the provenance columns before them. Iceberg
+    adds a column as metadata -- no data files are touched -- so rows ingested
+    before this read NULL. That is the honest answer for a column the upstream
+    genuinely was not sending, and where a delivery DID carry it undeclared
+    the value is not lost either: it is in `_extra_columns`, which is what
+    would make a backfill possible later without making it one now.
+
+    For a PROVENANCE column that has a consequence worth restating: an as-of
+    query cannot use `_delivery_id` to reach back past the change and must
+    fall back to `_source_file`. The alternative was rewriting every partition
+    of every raw table -- new data files under live published tags,
+    interacting with snapshot expiry and the pins retention keeps.
 
     Reads the current column list rather than relying on `ADD COLUMNS IF NOT
     EXISTS`, which Iceberg's Spark extensions do not accept: an unconditional
     ADD of an existing column fails the whole statement, and this runs on
     every ingest.
+
+    New columns land at the END of the table's schema rather than in declared
+    order. Nothing reads raw positionally -- the append resolves by name and
+    every model selects by name -- so reordering them would be a commit on
+    every raw table to change a `DESCRIBE`.
     """
-    have = {c.lower() for c in spark.sql(f"SELECT * FROM {table} LIMIT 0").columns}
-    missing = [(n, t) for n, t in _PROVENANCE_COLUMNS if n.lower() not in have]
-    if missing:
-        cols = ", ".join(f"{n} {t}" for n, t in missing)
+    plan = plan_raw_schema(fd, spark.sql(f"SELECT * FROM {table} LIMIT 0").dtypes)
+    if plan["add"]:
+        cols = ", ".join(f"`{name}` {ddl}" for name, ddl in plan["add"])
         spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({cols})")
-        log.info("added provenance columns to %s: %s", table,
-                 ", ".join(n for n, _ in missing))
-    return [n for n, _ in missing]
+        log.info("added columns to %s: %s", table,
+                 ", ".join(name for name, _ in plan["add"]))
+    if plan["orphaned"]:
+        # Not an error, and deliberately not fatal -- see plan_raw_schema.
+        # Loud, though: this is a table and a contract disagreeing, which
+        # `lineage --columns` also reports and which somebody has to settle.
+        log.warning(
+            "%s carries %s, which %s no longer declares. Kept and written as "
+            "NULL; drop it deliberately or re-declare it.", table,
+            ", ".join(name for name, _ in plan["orphaned"]), fd.name)
+    return {"added": [name for name, _ in plan["add"]],
+            "orphaned": plan["orphaned"]}
 
 
 def read_landing(spark, fmt: dict, uri: str):
@@ -422,7 +502,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # and a commit against `main` outside the merge is exactly what
         # write-audit-publish exists to prevent. If the ingest then fails, the
         # branch is abandoned and the column was never added to main either.
-        added = ensure_raw_columns(spark, raw_at_branch)
+        schema = ensure_raw_schema(spark, raw_at_branch, fd)
         version = next_file_version(spark, fd, bdate, raw_at_branch)
 
         # ONE DATAFRAME PER PART, each tagged with its OWN object key, then
@@ -492,6 +572,15 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
               .withColumn("_schema_version", F.lit(fd.schema_version))
               .withColumn("_source_system", F.lit(fd.source_system))
         )
+
+        # A column the table still has and `feeds.yml` no longer declares.
+        # `writeTo().append()` resolves BY NAME and wants a value for every
+        # column the table has, so an orphan has to be written -- and NULL is
+        # the true one: the contract this delivery was read against did not
+        # ask for it. Dropping the column instead would delete history to
+        # satisfy a config edit. See plan_raw_schema.
+        for orphan, dtype in schema["orphaned"]:
+            df = df.withColumn(orphan, F.lit(None).cast(dtype))
 
         row_count = df.count()
         if row_count < fd.expected_min_rows:
@@ -564,7 +653,13 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             "parts": len(parts),
             "delivery_id": manifest["delivery_id"],
             "schema_version": fd.schema_version,
-            "columns_added": added,
+            # What this ingest did to the TABLE, which is a different event
+            # from what it found in the FILE (`missing_columns` /
+            # `extra_columns` below). A contract change shows up here on the
+            # first delivery after the deploy and never again; file drift
+            # shows up per delivery.
+            "columns_added": schema["added"],
+            "columns_orphaned": [name for name, _ in schema["orphaned"]],
             "asset_uri": fd.asset_uri,
             **drift,
         }

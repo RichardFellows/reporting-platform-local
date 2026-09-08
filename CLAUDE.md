@@ -268,13 +268,40 @@ Two corollaries worth holding on to:
   `source_provenance()`** -- `_delivery_id`, `_received_at`, `_schema_version`,
   `_source_system`. **Added, never backfilled**: history reads NULL, and an
   as-of query must fall back to `_source_file` to reach past the change.
-  `ensure_raw_columns` runs inside `ingest()` for the ONE feed being ingested,
+  `ensure_raw_schema` runs inside `ingest()` for the ONE feed being ingested,
   so the migration is LAZY -- a feed that has not delivered keeps the old
   schema and **every prepared model then fails, not just its own**. Run
   `python -m reporting_platform.ingest.migrate_raw` when deploying a new
   provenance column, before the next ingest; `platform_housekeeping` runs it
   first every night for the same reason.
   See `docs/DECISIONS.md#provenance-is-added-not-backfilled`.
+- **ADDING A COLUMN TO AN EXISTING FEED IS THE COMMONEST CHANGE A LIVE FEED
+  EVER HAS, and the raw table is the part not in the git diff.**
+  `ensure_raw_table` is `CREATE TABLE IF NOT EXISTS`, so it does not reconcile
+  an existing table; `ensure_raw_schema` does, on the branch, for the WHOLE
+  declared contract and not just the provenance four. Without it a newly
+  declared column passed every check in `ingest_feed` -- the file has it, the
+  contract has it, drift is empty -- and then died at the write with
+  `INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS`, naming an ARITY and
+  neither the column nor `feeds.yml`, on every delivery from then on.
+  **The two directions are NOT symmetrical**: a declared column is added
+  automatically, an UNdeclared one is NEVER dropped -- renaming a column in
+  `feeds.yml` is character-for-character a drop plus an add, so the
+  destructive reading of an ambiguous edit is the one nothing acts on. An
+  orphan is filled with NULL (the append resolves BY NAME once the arity
+  matches -- verified, not assumed) and reported. Which columns are ingest's
+  own is DERIVED from the `_` prefix, the same rule
+  `lineage/columns.py:ingest_columns` uses, so an orphan here is the column
+  `lineage --columns` calls `unresolved`. `docs/ADDING-A-COLUMN.md` has the
+  three files and the one command in order.
+  **`dbt_project.yml` sets `on_schema_change: append_new_columns`** so the
+  model layer behaves the same way -- dbt's `ignore` default leaves a new
+  column in the SELECT and never in the target, green build and all. It ADDS
+  the column but does NOT populate rows the run did not touch: measured, 9
+  merged SCD2 versions carried the value and 1412 rows stayed NULL, so on an
+  SCD2 dimension every CURRENT row reads NULL until its entity next changes.
+  `--full-refresh` is now a choice about DATA, not the only way to get the
+  COLUMN. See `docs/DECISIONS.md#a-declared-column-migrates-itself`.
 - Retention and GC delete data. `dry_run` first, always. GC defers its deletes
   by design; the deferred-delete pass is the deliberate second step.
 - **A dry run may write to the index; it may not write anything a later step

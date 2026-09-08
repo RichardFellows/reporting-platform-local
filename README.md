@@ -235,6 +235,7 @@ rather than loud:
 | **[docs/PIPELINE.md](docs/PIPELINE.md)** | one delivered file end to end — inbox → landing → ready → raw → prepared → reporting, with the failure mode at every stage |
 | **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the five files a new feed touches, in order, with a worked example |
 | **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
+| **[docs/ADDING-A-COLUMN.md](docs/ADDING-A-COLUMN.md)** | adding a column to an existing feed — the commonest change of all, and the raw table is the part not in the git diff |
 | [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same five files through a form, plus land/ingest/build buttons |
 | [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | all five steps built and live-verified, including creating an archive/control-gated feed through the console's own form |
 | [notebooks/explore.py](notebooks/explore.py) | marimo notebook on :8083 — query landing files and every Iceberg layer through one read-only DuckDB session |
