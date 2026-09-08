@@ -1,6 +1,6 @@
-"""Bring every raw table up to the current provenance schema, in one pass.
+"""Bring every raw table up to its feed's current column contract, in one pass.
 
-WHY THIS EXISTS, AND IT IS NOT A CONVENIENCE. `ensure_raw_columns` runs inside
+WHY THIS EXISTS, AND IT IS NOT A CONVENIENCE. `ensure_raw_schema` runs inside
 `ingest()`, on the branch, for the ONE feed being ingested -- which is the
 right place for it, because that is where a table is guaranteed to exist and
 where a schema change can be abandoned with the rest of a failed load. But it
@@ -16,7 +16,17 @@ after the change makes its own model work and leaves the others failing with
     name `_delivery_id` cannot be resolved.
 
 -- observed, on three of four models, which is how this module came to exist.
-Run it once when deploying a provenance column, BEFORE the next ingest.
+
+IT COVERS THE FEEDS' OWN COLUMNS TOO, not just the platform's provenance
+four, and that is the case it gets run for most. Adding a column to an
+existing feed -- an upstream extends its extract -- changes `feeds.yml` and
+the prepared model together, and the raw table in between has to be told. Run
+this after deploying that change and BEFORE the next ingest or build, in that
+order: config, migrate, build.
+
+A column a feed no longer declares is REPORTED AND NEVER DROPPED, here as in
+`ingest()`. See `plan_raw_schema` for why the two directions are not
+symmetrical.
 
 Idempotent and safe to re-run: a table already carrying the columns is
 untouched and no commit is made for it. A feed whose raw table does not exist
@@ -38,7 +48,7 @@ from reporting_platform.common.context import (
     Nessie, branch_name, feeds, new_run_id, spark_session,
 )
 from reporting_platform.ingest.ingest_feed import (
-    _PROVENANCE_COLUMNS, _at_branch, ensure_raw_columns,
+    _at_branch, ensure_raw_schema, plan_raw_schema,
 )
 
 log = logging.getLogger("migrate_raw")
@@ -53,13 +63,19 @@ def _exists(spark, table: str) -> bool:
 
 
 def migrate(dry_run: bool = False) -> dict:
-    """Add any missing provenance column to every feed's raw table."""
+    """Add every column a feed declares that its raw table does not have.
+
+    Orphans -- a column the table has and the feed no longer declares -- are
+    counted and named on every feed that has one, whether or not anything was
+    added, because this is the tool somebody runs to ask what the tables and
+    the config disagree about. Nothing here ever drops one.
+    """
     from datetime import date
 
     run_id = new_run_id()
     report: dict = {"run_id": run_id, "dry_run": dry_run, "feeds": [],
-                    "migrated": 0, "already_current": 0, "absent": 0}
-    wanted = [n for n, _ in _PROVENANCE_COLUMNS]
+                    "migrated": 0, "already_current": 0, "absent": 0,
+                    "orphaned": 0}
 
     nessie = Nessie()
     spark = spark_session(f"migrate-raw-{run_id}", ref="main")
@@ -71,26 +87,37 @@ def migrate(dry_run: bool = False) -> dict:
                 report["absent"] += 1
                 continue
 
-            have = {c.lower() for c in
-                    spark.sql(f"SELECT * FROM {fd.raw_table} LIMIT 0").columns}
-            missing = [c for c in wanted if c.lower() not in have]
+            plan = plan_raw_schema(
+                fd, spark.sql(f"SELECT * FROM {fd.raw_table} LIMIT 0").dtypes)
+            missing = [name for name, _ in plan["add"]]
+            orphaned = [name for name, _ in plan["orphaned"]]
+            entry: dict = {"feed": fd.name}
+            if orphaned:
+                # Reported on the feed's row rather than raised: dropping a
+                # column to match a config edit is the one thing this must
+                # not do on its own. See plan_raw_schema.
+                log.warning("%s: %s in the table, not declared by the feed",
+                            fd.name, ", ".join(orphaned))
+                entry["orphaned"] = orphaned
+                report["orphaned"] += 1
+
             if not missing:
-                report["feeds"].append({"feed": fd.name,
-                                        "status": "already_current"})
+                entry["status"] = "already_current"
+                report["feeds"].append(entry)
                 report["already_current"] += 1
                 continue
 
             if dry_run:
                 log.info("%s: would add %s", fd.name, ", ".join(missing))
-                report["feeds"].append({"feed": fd.name, "status": "would_add",
+                report["feeds"].append({**entry, "status": "would_add",
                                         "columns": missing})
                 continue
 
             branch = branch_name("migrate", fd.name, date.today(), run_id)
             nessie.create_branch(branch)
             try:
-                added = ensure_raw_columns(spark, _at_branch(fd.raw_table,
-                                                             branch))
+                result = ensure_raw_schema(
+                    spark, _at_branch(fd.raw_table, branch), fd)
                 nessie.merge(branch, into="main")
                 nessie.delete_reference(branch)
             except Exception:
@@ -99,9 +126,9 @@ def migrate(dry_run: bool = False) -> dict:
                 log.error("%s: migration failed, branch %s left in place",
                           fd.name, branch)
                 raise
-            log.info("%s: added %s", fd.name, ", ".join(added))
-            report["feeds"].append({"feed": fd.name, "status": "migrated",
-                                    "columns": added})
+            log.info("%s: added %s", fd.name, ", ".join(result["added"]))
+            report["feeds"].append({**entry, "status": "migrated",
+                                    "columns": result["added"]})
             report["migrated"] += 1
     finally:
         spark.stop()

@@ -216,13 +216,37 @@ def build_feed_dag(feed):
             A new upstream column must not stop the pipeline; it must show up
             as a warning and in _extra_columns, so the dbt model can be
             extended deliberately rather than under incident pressure.
+
+            TWO DIFFERENT EVENTS ARE REPORTED HERE and they are logged apart
+            on purpose. DRIFT is a statement about one delivery: the file did
+            not match the contract, and it can happen on any run. A CONTRACT
+            CHANGE is a statement about the deployment: `feeds.yml` changed
+            and this was the first ingest to carry it into the raw table, so
+            it appears once and then never again for that column. Reading the
+            second as the first sends somebody to the upstream about a change
+            that was made here.
             """
+            import logging
+
+            log = logging.getLogger("airflow.task")
             if result.get("missing_columns") or result.get("extra_columns"):
-                import logging
-                logging.getLogger("airflow.task").warning(
+                log.warning(
                     "SCHEMA DRIFT %s %s: missing=%s extra=%s",
                     feed.name, result["business_date"],
                     result["missing_columns"], result["extra_columns"])
+            if result.get("columns_added"):
+                log.warning(
+                    "CONTRACT CHANGE %s %s: added %s to the raw table. "
+                    "History reads NULL for it -- added, never backfilled.",
+                    feed.name, result["business_date"],
+                    result["columns_added"])
+            if result.get("columns_orphaned"):
+                log.warning(
+                    "CONTRACT CHANGE %s %s: %s is in the raw table and the "
+                    "feed no longer declares it. Written as NULL, never "
+                    "dropped; settle it deliberately.",
+                    feed.name, result["business_date"],
+                    result["columns_orphaned"])
             return result
 
         arrival = resolve_arrival()

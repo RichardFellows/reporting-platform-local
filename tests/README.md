@@ -33,6 +33,13 @@ genuine engine rather than a stand-in of it. What it cannot tell you is
 whether `s3://lakehouse/...` reads work the same way over `httpfs` against
 real MinIO -- that is verified by running it, same as everything else.
 
+`test_raw_schema.py` is the same split applied to a Spark migration:
+`plan_raw_schema` decides what an existing raw table is missing and what it
+carries that `feeds.yml` no longer declares, out of the config alone, so the
+decision is pinned here in a second. Whether Iceberg's `ALTER TABLE ADD
+COLUMNS` actually commits on a Nessie branch is not something a test in this
+directory can honestly claim, and it was verified by running it.
+
 `test_registry.py` covers the registry's PURE parts only -- the projection
 from (feed, manifest, sidecar) to a row, the `schema_version` digest, the
 quarantine key shape and the date retention reads back out of it. Nothing that

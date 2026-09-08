@@ -314,7 +314,9 @@ Worth knowing, because it is where the effort would otherwise go:
 - **No `prepared_build` schedule.** It ORs the asset of every feed, derived
   from `feeds()`, so a new feed triggers rebuilds automatically.
 - **No retention or maintenance policy.** Both are keyed by layer.
-- **No raw DDL.** `ingest_feed.ensure_raw_table` builds it from `columns`.
+- **No raw DDL.** `ingest_feed.ensure_raw_table` builds it from `columns`,
+  and `ensure_raw_schema` keeps an existing table following that list as it
+  changes -- [ADDING-A-COLUMN.md](ADDING-A-COLUMN.md).
 
 ## Two things that will surprise you
 

@@ -408,7 +408,7 @@ CREATE TABLE IF NOT EXISTS registry.submission_item (
 # `ADD COLUMN IF NOT EXISTS` makes each statement idempotent, so this runs on
 # every connection like the schema does. Additive only -- a column that needs
 # dropping or retyping is a real migration and does not belong in a startup
-# path. This is the same lazy, idempotent shape `ensure_raw_columns()` uses one
+# path. This is the same lazy, idempotent shape `ensure_raw_schema()` uses one
 # layer down, for the same reason.
 MIGRATIONS = """
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_project_ref         TEXT;
