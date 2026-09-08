@@ -41,7 +41,7 @@ x-airflow-common: &airflow-common
     context: .
     dockerfile: Dockerfile.airflow
     args:
-      NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.99.0}
+      NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.108.1}
   # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own
   # `id -u`; `.env.example` says how and why.
   #
@@ -227,7 +227,7 @@ services:
   nessie:
     # Kept equal to Dockerfile.airflow's nessie-gc jar; may be newer than the
     # Spark extensions. See docs/DECISIONS.md#jar-versions
-    image: ghcr.io/projectnessie/nessie:${NESSIE_SERVER_VERSION:-0.99.0}
+    image: ghcr.io/projectnessie/nessie:${NESSIE_SERVER_VERSION:-0.108.1}
     depends_on:
       postgres: {condition: service_healthy}
     environment:
@@ -246,6 +246,22 @@ services:
       nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
       nessie.catalog.secrets.access-key.name: ${S3_ACCESS_KEY:-minioadmin}
       nessie.catalog.secrets.access-key.secret: ${S3_SECRET_KEY:-minioadmin123}
+
+      # Structured logs, in ECS field names, so a collector needs no per-service
+      # grok. THIS DEPENDS ON THE IMAGE TAG: `quarkus-logging-json` is a
+      # BUILD-TIME extension, absent from the image before ~0.104, and a server
+      # without it accepts both keys and keeps logging plain text -- no warning,
+      # no unrecognised-property message, nothing. Verified on the tag above,
+      # not read off the docs: `log.level`/`@timestamp`/`ecs.version`, and a
+      # thrown exception in `error.stack_trace` rather than appended to
+      # `message`. See docs/DECISIONS.md#nessie-logs-are-ecs-json, and
+      # #jar-versions for the version rule this pins the server ahead of.
+      #
+      # `service.environment` is the QUARKUS PROFILE (`prod`), not REPORTING_ENV
+      # -- the additional-field override does not survive env-var mangling of a
+      # dotted field name, so do not expect to set it from here.
+      quarkus.log.console.json.enabled: "true"
+      quarkus.log.console.json.log-format: ECS
     ports: ["${NESSIE_HOST_PORT:-19120}:19120"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:19120/api/v2/config"]

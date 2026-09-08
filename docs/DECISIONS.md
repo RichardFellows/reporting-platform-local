@@ -50,13 +50,18 @@ built against an Iceberg no newer than yours.
 
 `NESSIE_SERVER_VERSION` is allowed to be newer than the extensions: Nessie's
 REST API v2 is stable across that range. That is what makes a
-security-mandated server bump possible without moving the Spark jars.
+security-mandated server bump possible without moving the Spark jars. **It is
+also what decides the server's log format** — see
+[nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) — which is why the server
+here is pinned ahead of the extensions rather than level with them.
 
 `hadoop-aws` and `aws-java-sdk-bundle` are deliberately not parameterised. They
 track Spark 3.5's Hadoop, not Iceberg.
 
-Defaults everywhere repeat the combination the stack was validated against, so
-a clone with no `.env` builds what it always built. `docker compose exec
+Defaults everywhere repeat the pinned combination, so a clone with no `.env`
+builds what this one builds — including the server tag, because a default
+behind 0.104 would leave the `quarkus.log.console.json.*` keys in
+`docker-compose.yml` inert. `docker compose exec
 spark-worker env | grep VERSION` reports what is actually baked into the image
 you are running — guessing that from a Dockerfile you have not rebuilt is how
 versions drift in the first place.
@@ -70,6 +75,47 @@ egress at runtime.
 The drivers still resolve via Ivy (see [jar-versions](#jar-versions)) because
 they run pip-installed pyspark, which has none of these jars — the first
 Iceberg SQL statement would fail with `ClassNotFoundException` before it ran.
+
+## nessie-logs-are-ecs-json
+
+Nessie logs JSON in Elastic Common Schema field names —
+`quarkus.log.console.json.enabled` and `quarkus.log.console.json.log-format:
+ECS` on the `nessie:` block — so a collector needs no per-service grok and a
+stack trace arrives as `error.stack_trace` rather than as unparsed lines glued
+onto `message`.
+
+**This is a version decision wearing a config decision's clothes.** JSON
+logging is Quarkus's `quarkus-logging-json`, a **build-time** extension: it is
+either augmented into the image or it is not, and no property, mounted jar or
+environment variable can add it afterwards. It is absent from 0.99.0 and
+present from around 0.104. Verified rather than read off the docs — 0.99.0 with
+`QUARKUS_LOG_CONSOLE_JSON=true` logs plain text, unchanged, and says nothing
+about the property it ignored:
+
+```
+docker compose exec nessie ls /deployments/lib/main | grep -i logging-json
+```
+
+So a server pinned back below 0.104 must lose those two lines with it. Left
+behind they are well-formed configuration that reads as working and does
+nothing, which is the failure mode this file exists to prevent.
+
+Two things the format does not give you:
+
+- **`service.environment` is the Quarkus profile** (`prod`), not
+  `REPORTING_ENV`. The `additional-field` override does not survive env-var
+  mangling of a dotted field name, so it cannot be set from the compose
+  environment block.
+- **Access logs stay unstructured.** `io.quarkus.http.access-log` becomes one
+  ECS record whose `message` holds the whole combined-log line; the HTTP fields
+  are not broken out. Currently that is one record every 10s from the
+  healthcheck alone.
+
+0.108.1 also warns that the `quarkus.datasource.*` keys here are legacy and
+want migrating to `quarkus.datasource.postgresql.*` plus
+`nessie.version.store.persist.jdbc.datasource=postgresql`. It is a warning, not
+a failure, and the version store is the wrong thing to change in passing during
+a logging change.
 
 ## nessie-gc-jar
 
@@ -2768,7 +2814,7 @@ consequence is stated rather than discovered: an as-of query cannot use
 `_source_file`, which resolves to the delivery for both shapes that exist
 today.
 
-**The migration is lazy, and that broke the build.** `ensure_raw_columns` runs
+**The migration is lazy, and that broke the build.** `ensure_raw_schema` runs
 inside `ingest()`, on the branch, for the one feed being ingested — the right
 place, because that is where a table is guaranteed to exist and where a schema
 change can be abandoned with a failed load. But a feed that has not delivered
