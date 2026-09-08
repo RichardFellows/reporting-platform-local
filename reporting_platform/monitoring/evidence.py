@@ -11,7 +11,7 @@ ran against a shorter window last month, an upload that was never actually
 made. The numbers still agree; the evidence is still gone.
 
 So this is the other half, and it is per delivery rather than per window. For
-each live published tag it takes the business date the tag names, asks the
+each live published tag it takes the COB date the tag names, asks the
 registry which deliveries were received for that date, and checks that each
 one's landing object is still there. A pin whose inputs cannot be produced is
 reported as unbacked whether or not the arithmetic in retention.yml is sound.
@@ -30,9 +30,9 @@ TWO WAYS THE INPUT SET IS RESOLVED, and the difference is REQ-400 arriving.
     deliveries it read -- taken off the tables it built, not declared -- so
     the check asks the registry about exactly those and nothing else.
   * APPROXIMATE, where it does not. A tag cut before run records existed
-    carries only a business date, and the best available answer is "every
+    carries only a COB date, and the best available answer is "every
     delivery received for that date". That is generous in one direction only:
-    a published run reads more than one business date (reference data from
+    a published run reads more than one COB date (reference data from
     earlier dates, a month-end window), so it can MISS a delivery the run
     depended on. It cannot raise a false alarm, because everything it checks
     genuinely was received for that date.
@@ -80,7 +80,7 @@ def check(tag_inputs: dict[str, dict]) -> dict:
     """For each pinned tag, are all its input deliveries still landed?
 
     `tag_inputs` maps a tag to `{"rows": [...], "resolution": "run"|
-    "business_date"}` -- see `resolve_inputs`. The landing check itself is one
+    "cob_date"}` -- see `resolve_inputs`. The landing check itself is one
     LIST per prefix over the union of every tag's rows, so a hundred tags
     sharing one feed's deliveries cost one listing, not a hundred.
     """
@@ -102,7 +102,7 @@ def check(tag_inputs: dict[str, dict]) -> dict:
                         if r.get("registered") is False]
         per_tag[tag] = {
             "resolution": value["resolution"],
-            "business_date": value.get("business_date"),
+            "cob_date": value.get("cob_date"),
             "deliveries": len(mine),
             "missing": sorted(r["source_object"] for r in gone),
             "unregistered": sorted(unregistered),
@@ -146,7 +146,7 @@ def resolve_inputs(tags: list[dict]) -> dict[str, dict]:
     from reporting_platform.registry import deliveries as reg
     from reporting_platform.registry import runs as reg_runs
 
-    # One query per business date, shared by every tag naming it -- which is
+    # One query per COB date, shared by every tag naming it -- which is
     # what N feeds publishing one day produces.
     by_date: dict[date, list[dict]] = {}
     out: dict[str, dict] = {}
@@ -166,18 +166,18 @@ def resolve_inputs(tags: list[dict]) -> dict[str, dict]:
                          "run_id": run["run_id"],
                          "report": run.get("report"),
                          "version": run.get("version_no"),
-                         "business_date": str(run.get("business_date") or
-                                              tag["business_date"])}
+                         "cob_date": str(run.get("cob_date") or
+                                              tag["cob_date"])}
             continue
         try:
-            bd = date.fromisoformat(tag["business_date"])
+            bd = date.fromisoformat(tag["cob_date"])
         except (TypeError, ValueError):
             continue
         if bd not in by_date:
             by_date[bd] = [{**r, "registered": True}
                            for r in reg.deliveries_on(bd)]
-        out[name] = {"rows": by_date[bd], "resolution": "business_date",
-                     "business_date": bd.isoformat()}
+        out[name] = {"rows": by_date[bd], "resolution": "cob_date",
+                     "cob_date": bd.isoformat()}
     return out
 
 

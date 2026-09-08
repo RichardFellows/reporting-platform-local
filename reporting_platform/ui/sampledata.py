@@ -10,9 +10,9 @@ emit a file the feed will actually accept.
 Three things it does that a naive generator would not, each of which is the
 difference between a file that tests something and one that does not:
 
-**It generates for business dates the OTHER feeds delivered on.** A
+**It generates for COB dates the OTHER feeds delivered on.** A
 `relationships` test compares against reference data on the *same*
-business_date, so rows dated where `counterparty` has nothing are guaranteed
+cob_date, so rows dated where `counterparty` has nothing are guaranteed
 to fail a test that has found nothing wrong with the feed. The default date
 range is therefore taken from what is already in `seed/`, not from today.
 
@@ -67,12 +67,12 @@ class GenerationError(ValueError):
 #
 # Re-exported under its old name so this module's callers -- and the round-trip
 # check in `generate()` -- read as they did.
-def filename_for(feed: Feed, business_date: date, version: int | None = None) -> str:
+def filename_for(feed: Feed, cob_date: date, version: int | None = None) -> str:
     """Render a filename the feed's own pattern will match. See
     common/filenames.render_filename for how, and why the round-trip check
     that backs it is the whole point."""
     try:
-        return render_filename(feed, business_date, version)
+        return render_filename(feed, cob_date, version)
     except FilenameError as exc:
         # One exception type per layer: callers here already handle
         # GenerationError, and a FilenameError escaping would reach the API as
@@ -82,7 +82,7 @@ def filename_for(feed: Feed, business_date: date, version: int | None = None) ->
 
 # ----------------------------------------------------------------- the dates
 def reference_dates(exclude: str) -> list[date]:
-    """Business dates the OTHER feeds have deliveries for, oldest first.
+    """COB dates the OTHER feeds have deliveries for, oldest first.
 
     Read from seed filenames, so this costs a directory listing rather than a
     Spark session. Used as the default date range because data generated for
@@ -162,7 +162,7 @@ def _enum_for(column: str, rng: random.Random) -> list[str]:
     return [f"{stem}_{s}" for s in ("ALPHA", "BETA", "GAMMA")]
 
 
-def _value(column: str, kind: str, row: int, business_date: date,
+def _value(column: str, kind: str, row: int, cob_date: date,
            rng: random.Random, is_key: bool, fk: list[str]) -> str:
     if fk:
         return rng.choice(fk)
@@ -173,7 +173,7 @@ def _value(column: str, kind: str, row: int, business_date: date,
     if kind == "integer":
         return str(rng.randint(1, 500))
     if kind == "date":
-        d = business_date + timedelta(days=rng.randint(-400, 400))
+        d = cob_date + timedelta(days=rng.randint(-400, 400))
         # Alternate the two formats the platform's parse_date macro handles,
         # so a build actually exercises the COALESCE rather than one branch.
         return f"{d:%Y-%m-%d}" if row % 2 else f"{d:%Y%m%d}"
@@ -184,38 +184,38 @@ def _value(column: str, kind: str, row: int, business_date: date,
     return f"{_prefix(column)}-{rng.randint(1000, 9999)}"
 
 
-def _row_rng(entity: str, column: str, kind: str, business_date: date,
+def _row_rng(entity: str, column: str, kind: str, cob_date: date,
              version: int | None):
     """The stream one cell is drawn from: stable while its epoch is."""
     return stable_rng(entity, column, version or 1,
-                      epoch(f"{entity}|{column}", business_date,
+                      epoch(f"{entity}|{column}", cob_date,
                             hold_for_type(kind)))
 
 
-def _row_anchor(entity: str, column: str, kind: str, business_date: date) -> date:
+def _row_anchor(entity: str, column: str, kind: str, cob_date: date) -> date:
     """What a generated `date` column is measured FROM.
 
-    The business date would be the obvious anchor and is wrong: `_value` emits
+    The COB date would be the obvious anchor and is wrong: `_value` emits
     `anchor + offset`, so anchoring on `bd` slides the result forward one day
     per delivery and a date column changes every single day however stable its
     epoch is -- which quietly defeats the whole point for any feed that has
     one. Anchoring on the epoch start makes the date hold still with everything
     else and move when the value genuinely changes.
 
-    The cost is that a column that really should track the business date (a
+    The cost is that a column that really should track the COB date (a
     valuation date, say) now does not. That is the right way round: the
-    platform already records the delivery date as `_business_date`, so a feed
+    platform already records the delivery date as `_cob_date`, so a feed
     needing "as of today" has it, whereas nothing can recover a stable
     effective_date from one that moves.
     """
-    return epoch_start(f"{entity}|{column}", business_date, hold_for_type(kind))
+    return epoch_start(f"{entity}|{column}", cob_date, hold_for_type(kind))
 
 
 # ---------------------------------------------------------------- generation
 def generate(feed: Feed, *, days: int = 3, rows: int = 0,
              end: date | None = None, version: int | None = None,
              types: dict[str, str] | None = None) -> dict[str, Any]:
-    """Write one CSV per business date into seed/<feed>/.
+    """Write one CSV per COB date into seed/<feed>/.
 
     `rows` defaults to comfortably above `expected_min_rows`, because a file
     below it aborts the ingest by design -- generating one would look like the
@@ -233,7 +233,7 @@ def generate(feed: Feed, *, days: int = 3, rows: int = 0,
         available = [d for d in available if d <= end]
     if not available:
         raise GenerationError(
-            "no business dates found in seed/ for the other feeds, so there is "
+            "no COB dates found in seed/ for the other feeds, so there is "
             "no reference data to generate against. Run generate_feeds.py, or "
             "upload a CSV for this feed instead.")
     chosen = available[-days:] if days > 0 else available
@@ -270,13 +270,13 @@ def generate(feed: Feed, *, days: int = 3, rows: int = 0,
             # See docs/DECISIONS.md#source-column-names
             w.writerow(list(feed.file_header))
             w.writerows(out_rows)
-        written.append({"filename": name, "business_date": bd.isoformat(),
+        written.append({"filename": name, "cob_date": bd.isoformat(),
                         "rows": rows})
 
     return {
         "written": written,
         "rows_each": rows,
-        "dates": [w["business_date"] for w in written],
+        "dates": [w["cob_date"] for w in written],
         "foreign_keys": {c: len(v) for c, v in fk_cache.items() if v},
         "seed_dir": str(target).replace(str(SEED_DIR), "seed"),
     }

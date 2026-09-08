@@ -4,7 +4,7 @@ WHAT THIS IS AND WHY IT IS NOT THE TABLE RULE.
 
 `landing/` holds an immutable copy of every CSV every feed has ever delivered.
 It is the answer to "what did the file we actually received say?" — a question
-normally asked after a restatement, about a business date the table layers have
+normally asked after a restatement, about a COB date the table layers have
 long since expired. So this sweep keeps **everything** for `keep_years` and
 then removes it, rather than sampling by the "10 business days plus 80
 month-ends" keep-set the tables use. Superseded re-deliveries are kept too:
@@ -20,8 +20,8 @@ with four keys, `docs/RETENTION.md` described its behaviour in the present
 tense, and no code read any of it — so the landing prefix grew without bound
 and "we keep every delivery forever" was being decided by omission.
 
-AGE MEANS BUSINESS DATE, NOT UPLOAD TIME. A file re-delivered late carries an
-old business date and a recent `LastModified`; the data in it is still ten
+AGE MEANS COB DATE, NOT UPLOAD TIME. A file re-delivered late carries an
+old COB date and a recent `LastModified`; the data in it is still ten
 years old and the retention question is about the data. Parsing also means a
 key whose name this platform does not recognise is never deleted — see
 `_expiry` below, where that is a deliberate skip rather than a fallback to
@@ -80,7 +80,7 @@ def keep_years(feed: Feed | None = None) -> int:
     feed in hand -- the CLI banner, a test -- actually wants.
 
     THE INTERLOCK IS NOW PER FEED TOO, and it had to move with the window.
-    `find_pending` computes the retention keep-set from the business dates it
+    `find_pending` computes the retention keep-set from the COB dates it
     can see in LANDING, per feed, from that feed's own prefix -- precisely so a
     date expired from the table is recognised as expired rather than
     re-ingested. That only works while a feed's landing prefix still holds
@@ -104,15 +104,15 @@ def keep_years(feed: Feed | None = None) -> int:
             "landing keep_years=%d for %s is shorter than the raw layer's "
             "window (%d month-ends = %.1f years). find_pending derives its "
             "keep-set from the dates present in that feed's landing prefix, so "
-            "live business dates will start being treated as expired.",
+            "live COB dates will start being treated as expired.",
             years, f"feed {feed.name} (class {feed.retention_class})" if feed
             else "the default class", raw_months, raw_years)
     return years
 
 
-def _business_date(feed: Feed, filename: str,
+def _cob_date(feed: Feed, filename: str,
                    siblings: set[str] | None = None) -> date | None:
-    """The business date of one landed object: delivery, metadata or control.
+    """The COB date of one landed object: delivery, metadata or control.
 
     THREE KINDS OF OBJECT LIVE IN A LANDING PREFIX NOW, and this sweep deletes
     things, so each has to be dated correctly or not at all.
@@ -160,20 +160,20 @@ def _business_date(feed: Feed, filename: str,
 
 def _expiry(feed: Feed, key: str, cutoff: date,
             siblings: set[str] | None = None) -> date | None:
-    """Business date of `key` if it is past `cutoff`, else None.
+    """COB date of `key` if it is past `cutoff`, else None.
 
     Returns None for anything unparseable, which means "leave it alone". The
     landing prefix is the evidence copy; an object whose name this platform
     does not recognise is exactly the object not to delete on a guess.
     """
-    bd = _business_date(feed, key.rsplit("/", 1)[-1], siblings)
+    bd = _cob_date(feed, key.rsplit("/", 1)[-1], siblings)
     if bd is None:
         return None
     return bd if bd < cutoff else None
 
 
 def sweep_landing(dry_run: bool = True) -> dict:
-    """Remove landed objects whose business date is older than the window.
+    """Remove landed objects whose COB date is older than the window.
 
     ONE CUTOFF PER FEED, not one for the sweep. A feed's retention class
     decides how long its evidence is kept, so the cutoff is resolved inside the
@@ -218,12 +218,12 @@ def sweep_landing(dry_run: bool = True) -> dict:
         for obj in objects:
             bd = _expiry(feed, obj["Key"], feed_cutoff, siblings)
             if bd is None:
-                # `_business_date`, not `parse_filename`: a metadata sibling
+                # `_cob_date`, not `parse_filename`: a metadata sibling
                 # dates through its delivery's name and a control file
                 # through the delivery it gates, and counting either as
                 # `unrecognised` would report a configuration error for every
                 # conformed delivery in the prefix.
-                if _business_date(feed, obj["Key"].rsplit("/", 1)[-1],
+                if _cob_date(feed, obj["Key"].rsplit("/", 1)[-1],
                                   siblings) is None:
                     unknown += 1
                 else:

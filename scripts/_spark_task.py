@@ -18,7 +18,7 @@ writes to stderr stays out of the way.
 
 Usage:
     python -m scripts._spark_task pending <feed>
-    python -m scripts._spark_task ingest <feed> <key> [run_id] [business_date]
+    python -m scripts._spark_task ingest <feed> <key> [run_id] [cob_date]
     python -m scripts._spark_task maintain-metrics <fqn:layer>...
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
@@ -95,7 +95,7 @@ def main() -> int:
             feed_name=feed_name,
             object_key=key,
             run_id=run_id,
-            business_date=date.fromisoformat(bd) if bd else None,
+            cob_date=date.fromisoformat(bd) if bd else None,
         )
         print(json.dumps(result, default=str))
         return 0

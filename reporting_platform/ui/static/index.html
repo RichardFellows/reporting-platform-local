@@ -328,7 +328,7 @@ function feedForm(f, creating) {
   desc.value = f?.description ?? "";
   const src = el("input", {value: f?.source_system ?? "", placeholder: "MARGIN_SRC"});
   const pattern = el("input", {class: "mono", value: f?.filename_pattern ?? "",
-                               placeholder: "FEED_(?P<business_date>\\d{8})\\.csv"});
+                               placeholder: "FEED_(?P<cob_date>\\d{8})\\.csv"});
   const example = el("input", {class: "mono", placeholder: "marginCalls_20260801.csv"});
   const patternResult = el("div", {class: "sub", style: "font-size:12px;margin-top:6px"});
   const minRows = el("input", {type: "number", min: "0", value: f?.expected_min_rows ?? 10});
@@ -397,7 +397,7 @@ function feedForm(f, creating) {
     const r = await jpost("/api/test-pattern",
       {pattern: pattern.value, filename: example.value});
     patternResult.textContent = r.ok
-      ? `✓ matches — business_date ${r.business_date}, version ${r.version}`
+      ? `✓ matches — cob_date ${r.cob_date}, version ${r.version}`
       : `✗ ${r.reason}`;
     patternResult.style.color = r.ok ? "var(--ok)" : "var(--bad)";
   }
@@ -430,7 +430,7 @@ function feedForm(f, creating) {
     ]),
     field("filename_pattern", "Filename pattern (in landing)", pattern,
       "Matched with re.fullmatch, so it must cover the whole filename, and must contain " +
-      "a (?P<business_date>\\d{8}) group. This is the name the file has IN LANDING. If the " +
+      "a (?P<cob_date>\\d{8}) group. This is the name the file has IN LANDING. If the " +
       "upstream sends something else — no date, a wrong prefix — leave this as the name you " +
       "want and describe the real one under Arrival below; the inbox renames it on the way in. " +
       "A pattern that matches nothing is silent: the feed simply never has anything pending."),
@@ -450,8 +450,8 @@ function feedForm(f, creating) {
   const arrCtlPattern = el("input", {class: "mono",
     value: f?.arrival?.control?.pattern ?? "", placeholder: "{stem}\\.ctl"});
   const arrCtlDate = el("input", {class: "mono",
-    value: f?.arrival?.control?.business_date ?? "",
-    placeholder: "ReportingDate\\|(?P<business_date>\\d{8})"});
+    value: f?.arrival?.control?.cob_date ?? "",
+    placeholder: "ReportingDate\\|(?P<cob_date>\\d{8})"});
 
   const arrivalFields = el("div", {}, [
     el("div", {class: "field", style: "margin-top:10px"}, [
@@ -460,7 +460,7 @@ function feedForm(f, creating) {
       el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
         "A regex, fullmatched against the name in the inbox — a different " +
         "string from the landing pattern above. It may capture " +
-        "(?P<business_date>\\d{8}) if the sender's name has a date but is " +
+        "(?P<cob_date>\\d{8}) if the sender's name has a date but is " +
         "otherwise wrong; if it does not, the control file below must supply " +
         "the date. Exactly one of the two, never both."),
     ]),
@@ -475,12 +475,12 @@ function feedForm(f, creating) {
         "and not landed."),
     ]),
     el("div", {class: "field", style: "margin-top:10px"}, [
-      el("label", {}, "Business date pattern"),
+      el("label", {}, "COB date pattern"),
       arrCtlDate,
       el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
         "Read from the control file's contents. For a line like " +
         "ReportingDate|20260801 that is " +
-        "'ReportingDate\\|(?P<business_date>\\d{8})'. Required unless the " +
+        "'ReportingDate\\|(?P<cob_date>\\d{8})'. Required unless the " +
         "upstream filename above already captures the date."),
     ]),
     el("div", {class: "sub", style: "font-size:12px;margin-top:10px"},
@@ -547,7 +547,7 @@ function feedForm(f, creating) {
       "Which members inside the zip belong to this feed, required -- a zip " +
       "routinely carries a checksum, a manifest or another feed's file " +
       "alongside the data, and a wrong guess would silently ingest the wrong " +
-      "files. Every member is assumed to share the delivery's business date, " +
+      "files. Every member is assumed to share the delivery's COB date, " +
       "read from the CONTAINER's own filename above -- member- or " +
       "path-sourced dates are described in DELIVERY-SHAPES.md but not built."),
   ]);
@@ -696,7 +696,7 @@ function feedForm(f, creating) {
       bits.push("this filename carries no 8-digit date, so it cannot land " +
         "under it. Turned on Arrival and pre-filled the upstream pattern — " +
         "now set the landing filename pattern above to the name you want " +
-        "(e.g. myfeed_(?P<business_date>\\d{8})\\.csv) and give the business " +
+        "(e.g. myfeed_(?P<cob_date>\\d{8})\\.csv) and give the COB " +
         "date pattern in the control file");
     }
     if (r.business_key_candidates && r.business_key_candidates.length)
@@ -714,7 +714,7 @@ function feedForm(f, creating) {
           : `nothing to guess it from, fill it in by hand.`));
       if (!r.container_has_date)
         bits.push("the container's filename has no 8-digit date -- " +
-          "business_date_from: container, the only value this platform reads, " +
+          "cob_date_from: container, the only value this platform reads, " +
           "will not work for it, so this feed cannot be onboarded until it has " +
           "one");
     }
@@ -831,14 +831,14 @@ function feedForm(f, creating) {
         el("label", {}, "Delivery expected"),
         el("div", {class: "row"}, [deliveryExpected,
           el("span", {class: "sub", style: "font-size:12px"},
-             "Whether a delivery is expected on every business date. Unchecked opts the " +
+             "Whether a delivery is expected on every COB date. Unchecked opts the " +
              "feed out of gap detection entirely (monthly or ad-hoc feeds).")]),
       ]),
     ]),
     el("div", {class: "grid2"}, [
       field("expected_by", "Expected by", expectedBy,
         "Wall-clock time (HH:MM, UTC) the upstream commits to, judged on the day AFTER the " +
-        "business date. Leave blank to assert no deadline \u2014 the lateness check then skips " +
+        "COB date. Leave blank to assert no deadline \u2014 the lateness check then skips " +
         "the feed rather than inventing an expectation for it."),
       field("retention_class", "Retention class", retentionClass,
         "How long this feed's landing and quarantine evidence is kept. The windows live in " +
@@ -895,7 +895,7 @@ function feedForm(f, creating) {
     if (sp) out.source_pattern = sp;
     const control = {};
     for (const [k, input] of [["pattern", arrCtlPattern],
-                              ["business_date", arrCtlDate]]) {
+                              ["cob_date", arrCtlDate]]) {
       const v = input.value.trim();
       if (v) control[k] = v;
     }
@@ -994,7 +994,7 @@ function newFeed(draft) {
       bits.push(`"${draft._sniffedFrom}" carries no 8-digit date, so it ` +
         "cannot land under that name. Turned on Arrival and pre-filled the " +
         "upstream pattern — set the landing filename pattern to the name you " +
-        "want, and give the business date pattern found in the control file");
+        "want, and give the COB date pattern found in the control file");
     }
     if (draft.archive_members) {
       // feedForm reads f?.delivery?.kind / f?.delivery?.member_pattern --
@@ -1008,7 +1008,7 @@ function newFeed(draft) {
           : "nothing to guess it from, fill it in by hand."));
       if (!draft.container_has_date)
         bits.push("the container's filename has no 8-digit date -- " +
-          "business_date_from: container, the only value this platform reads, " +
+          "cob_date_from: container, the only value this platform reads, " +
           "will not work for it, so this feed cannot be onboarded until it has one");
     }
     d.append(el("div", {class: "note"}, bits.join(" · ")));
@@ -1140,7 +1140,7 @@ async function paneData(pane, f) {
   pane.append(el("h3", {}, "Generate a delivery from the definition"),
     el("div", {class: "row"}, [
       el("div", {style: "flex:1;min-width:130px"},
-         [el("label", {}, "business dates"), gDays]),
+         [el("label", {}, "COB dates"), gDays]),
       el("div", {style: "flex:1;min-width:130px"},
          [el("label", {}, "rows each (blank = auto)"), gRows]),
       el("button", {class: "act primary", onclick: async (e) => {
@@ -1263,7 +1263,7 @@ async function paneRefreshFiles(f, box) {
   const table = el("table");
   table.append(el("thead", {}, el("tr", {}, [
     el("th", {style: "width:26px"}, ""), el("th", {}, "seed file"),
-    el("th", {}, "business date"), el("th", {}, "v"),
+    el("th", {}, "COB date"), el("th", {}, "v"),
     el("th", {}, "matches pattern"), el("th", {}, "landed"), el("th", {}, "")])));
   const tbody = el("tbody");
   for (const s of data.seed) {
@@ -1274,7 +1274,7 @@ async function paneRefreshFiles(f, box) {
     tbody.append(el("tr", {}, [
       el("td", {}, cb),
       el("td", {class: "mono"}, s.filename),
-      el("td", {}, s.business_date || "—"),
+      el("td", {}, s.cob_date || "—"),
       el("td", {}, s.version ?? "—"),
       el("td", {}, el("span", {class: "pill " + (s.matches ? "ok" : "bad")},
                       s.matches ? "yes" : "no")),
@@ -1296,7 +1296,7 @@ async function paneRefreshFiles(f, box) {
         const r = await jpost(`/api/feeds/${f.name}/land`, {filenames: picked});
         pendingOut.textContent = "";
         pendingOut.append(el("div", {class: "note"},
-          `Landed ${r.count} object(s), oldest business date first.`));
+          `Landed ${r.count} object(s), oldest COB date first.`));
         paneRefreshFiles(f, box);
       });
     }}, "Land selected"),

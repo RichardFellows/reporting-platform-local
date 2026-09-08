@@ -111,7 +111,7 @@ def open_run(run_id: str, purpose: str, branch: str, *,
 
 
 def finish_run(run_id: str, status: str, *, merged_hash: str | None = None,
-               business_date: date | None = None,
+               cob_date: date | None = None,
                error: str | None = None) -> None:
     """Close a run. `status` is PUBLISHED or FAILED."""
     if status not in (PUBLISHED, FAILED):
@@ -120,9 +120,9 @@ def finish_run(run_id: str, status: str, *, merged_hash: str | None = None,
         cur.execute(
             "UPDATE registry.run SET status = %s, finished_at = now(), "
             "merged_hash = COALESCE(%s, merged_hash), "
-            "business_date = COALESCE(%s, business_date), "
+            "cob_date = COALESCE(%s, cob_date), "
             "error = %s WHERE run_id = %s",
-            (status, merged_hash, business_date, (error or None)[:2000]
+            (status, merged_hash, cob_date, (error or None)[:2000]
              if error else None, run_id))
         if cur.rowcount == 0:
             # Not fatal, but it means the run was never opened -- which is a
@@ -310,7 +310,7 @@ def diff(report: str, as_at_date: date, from_version: int | None = None,
 
         def _inputs(run_id: str) -> dict[tuple[str, str], dict[str, Any]]:
             cur.execute(
-                "SELECT i.feed, i.delivery_id, d.business_date, d.received_at, "
+                "SELECT i.feed, i.delivery_id, d.cob_date, d.received_at, "
                 "       d.md5, d.source_filename "
                 "FROM registry.run_input i "
                 "LEFT JOIN registry.delivery d "
@@ -366,7 +366,7 @@ def run_for_tag(tag: str) -> dict[str, Any] | None:
     """
     with db.connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT r.run_id, r.purpose, r.status, r.business_date, "
+            "SELECT r.run_id, r.purpose, r.status, r.cob_date, "
             "       r.code_ref, r.code_ref_kind, r.dbt_manifest_ref, "
             "       r.change_ref, r.merged_hash, r.finished_at, "
             "       v.report, v.as_at_date, v.version_no "
@@ -387,7 +387,7 @@ def inputs_for_run(run_id: str) -> list[dict[str, str]]:
 
 
 def recent(limit: int = 20, purpose: str | None = None) -> list[dict[str, Any]]:
-    sql = ("SELECT run_id, purpose, status, environment, branch, business_date, "
+    sql = ("SELECT run_id, purpose, status, environment, branch, cob_date, "
            "       started_at, finished_at, code_ref, code_ref_kind, "
            "       dbt_manifest_ref, change_ref, dbt_project_ref, "
            "       deployment_change_ref, deployment_pipeline_ref, "

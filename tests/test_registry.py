@@ -20,7 +20,7 @@ from tests.support import config_dir, feeds_from, synthetic
 MANIFEST = {
     "manifest_version": 1,
     "feed": "fo_trade",
-    "business_date": "2026-08-11",
+    "cob_date": "2026-08-11",
     "delivery_id": "TRADE_20260811.csv",
     "received_at": "2026-08-11T06:00:00+00:00",
     "source_object": "landing/fo_trade/TRADE_20260811.csv",
@@ -50,7 +50,7 @@ def test_a_direct_delivery_projects_to_a_row():
     assert row["feed"] == "fo_trade"
     assert row["delivery_id"] == "TRADE_20260811.csv"
     assert row["source_system"] == fd.source_system
-    assert row["business_date"] == date(2026, 8, 11)
+    assert row["cob_date"] == date(2026, 8, 11)
     assert row["bytes"] == 25
     assert row["normalizer"] == "file/v1"
     assert row["parts"] == [{"part_no": 0, "bytes": 25,

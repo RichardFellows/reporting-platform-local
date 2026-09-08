@@ -7,7 +7,7 @@ kind that reaches production.
 
 The generated data deliberately includes the awkward cases:
 
-  * a re-delivered business date (_v2), to exercise version handling
+  * a re-delivered COB date (_v2), to exercise version handling
   * a day where the counterparty feed is late/absent, to exercise carry-forward
   * a trade referencing a counterparty missing from the reference feed
   * an unparseable notional, to prove the load lands and the TEST fails
@@ -20,7 +20,7 @@ reference and the unparseable notional) while keeping everything else --
 redelivery, the absent feed, schema drift, mixed representations. It exists so
 a build can be produced that genuinely passes its tests, which is what a
 publish-to-main demonstration needs. Combine with `--version 2` to emit the
-clean history as a redelivery of the same business dates: the prepared layer
+clean history as a redelivery of the same COB dates: the prepared layer
 takes the latest `_file_version`, so the restatement supersedes the bad data
 exactly as a real upstream correction would.
 
@@ -37,7 +37,7 @@ the feed console tomorrow -- is generated afterwards by
 That is not a lesser fallback: for a feed whose interest is that it exists and
 joins correctly, deriving the columns from the definition is the more accurate
 thing to do, and it means adding a feed does not also mean editing this script.
-It runs SECOND because it takes its business dates and its foreign keys from
+It runs SECOND because it takes its COB dates and its foreign keys from
 what the other feeds have already written, and raises on an empty seed
 directory.
 
@@ -182,7 +182,7 @@ def gen_rating(bd: date, out: Path, version: int = 1) -> None:
     See docs/DECISIONS.md#generated-data-must-hold-still
 
     `rating_date` is now the date the CURRENT GRADE came into force, not the
-    business date. A rating_date equal to the delivery date on every row is
+    COB date. A rating_date equal to the delivery date on every row is
     the delivery date under another name, and it guaranteed that every row
     differed from yesterday's even when the rating had not moved.
     """
@@ -258,7 +258,7 @@ def gen_trade(bd: date, out: Path, version: int = 1, inject_bad: bool = False,
               clean: bool = False) -> None:
     """A PERSISTING BOOK, not 400 brand-new trades every morning.
 
-    `trade_id` must NOT embed the business date, or every delivery invents a new
+    `trade_id` must NOT embed the COB date, or every delivery invents a new
     portfolio, nothing can be compared to itself, and `exposure_change` never
     sees an UNCHANGED row. See docs/DECISIONS.md#generated-data-must-hold-still
 
@@ -348,7 +348,7 @@ def main() -> int:
                         "and mixed representations are all still generated.")
     p.add_argument("--version", type=int, default=1,
                    help="emit every file with a _vN suffix, i.e. as a "
-                        "redelivery of the same business dates. Use with "
+                        "redelivery of the same COB dates. Use with "
                         "--clean to restate a bad history.")
     a = p.parse_args()
 
@@ -406,7 +406,7 @@ def main() -> int:
     derived = [f for f in feeds().values() if f.name not in HAND_WRITTEN]
     for feed in derived:
         try:
-            # days=0 is every business date the other feeds delivered on, not
+            # days=0 is every COB date the other feeds delivered on, not
             # sampledata's default of 3: this is a history generator, and three
             # days of collateral against 30 months of trades would make the
             # joins look broken.
@@ -430,7 +430,7 @@ def main() -> int:
             # reference data no other feed provides.
             print(f"  {feed.name}: NOT generated -- {exc}")
 
-    print(f"generated {len(days)} business dates into {a.out}/")
+    print(f"generated {len(days)} COB dates into {a.out}/")
     print(f"  dense (every business day): {min(dense)}.. {max(dense)}")
     print(f"  sparse (month-ends only):   {min(sparse)}.. {max(sparse)}")
     print(f"  counterparty feed absent:   {skip_cpty}")

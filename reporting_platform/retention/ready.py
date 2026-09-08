@@ -124,7 +124,7 @@ def sweep_feed(feed: Feed, cutoff, dry_run: bool = True) -> dict:
             continue
         derived = [p["object_key"] for p in manifest["parts"]
                    if p["object_key"].startswith(f"{feed.ready_prefix}/")]
-        if not derived or norm.business_date_of(manifest) >= cutoff:
+        if not derived or norm.cob_date_of(manifest) >= cutoff:
             retained += 1
             continue
         candidates.append((key, manifest, derived))

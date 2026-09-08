@@ -948,7 +948,7 @@ On the old seed the honest answer to both was "cannot tell from here".
 
 Three specific traps this closes:
 
-- **`trade_id` must not embed the business date.** `TRD{bd}{n}` means every
+- **`trade_id` must not embed the COB date.** `TRD{bd}{n}` means every
   delivery invents an entirely new portfolio and no trade ever appears twice --
   16,400 rows with 16,400 distinct `trade_id`s across 41 dates, a book with no
   continuity, in which `exposure_change` never sees an UNCHANGED row.
@@ -1135,7 +1135,7 @@ the distinction that matters, and it is not stylistic:
   do not, and must not.
 
 Already-qualified or already-quoted names pass through untouched, so
-`as_of('r', 'business_date')` and `r.counterparty_id` still work.
+`as_of('r', 'cob_date')` and `r.counterparty_id` still work.
 
 With [source-column-names](#source-column-names) doing the normalising at
 ingest, the prepared layer rarely sees an awkward identifier at all. This is
@@ -1326,7 +1326,7 @@ the data.
 
 One delivery, one JSON object, recording the three things every downstream
 reader was previously re-deriving from the filename with its own copy of the
-same regex: the business date, which objects hold the rows, and how to read
+same regex: the COB date, which objects hold the rows, and how to read
 them. `Feed.parse_filename` had **fourteen call sites across seven modules**,
 each free to disagree.
 
@@ -1376,7 +1376,7 @@ the retention keep-set is still computed from the dates observed in
 **`landing/`** — the only prefix that still holds every date after raw has
 expired them, which is what `retention.yml`'s `landing:` comment is about.
 Computing it from a days-long cache would silently narrow the window and start
-reporting live business dates as expired. Giving manifests an eight-year
+reporting live COB dates as expired. Giving manifests an eight-year
 lifetime so they could serve instead is the load-control-table trap in a
 different hat.
 
@@ -1392,8 +1392,8 @@ leave a queue entry behind.
 Step 3 of `docs/DELIVERY-SHAPES.md`: `custodyPositions_20260903.zip` holding
 CSVs whose own names say nothing about which day they are for. The date is on
 the container, not the members, and that is the one case this builds --
-`delivery: {kind: archive, business_date_from: container, parts: concat}`.
-`business_date_from: member`/`path` and `parts: separate` are recognised keys
+`delivery: {kind: archive, cob_date_from: container, parts: concat}`.
+`cob_date_from: member`/`path` and `parts: separate` are recognised keys
 with no implementation behind them.
 
 **Unbuilt values raise "NOT BUILT", not "unknown".** A typo and a missing
@@ -1408,7 +1408,7 @@ the message.
 landing retention run `filename_pattern` over the container exactly as they do
 for a plain CSV, so archives need no special case in either -- routing and the
 evidence sweep stay ignorant that this feed unpacks at all. That is only true
-because `business_date_from: container` is the one case built: the date comes
+because `cob_date_from: container` is the one case built: the date comes
 from the same name `parse_filename` already parses.
 
 **This is the first normalizer that copies bytes, and the copies live under
@@ -1555,7 +1555,7 @@ the answer: see [#no-arrival-timeout](#no-arrival-timeout).
 
 **Inbox routing is a second gap `route()`'s data-file-only matching created,
 and it had to be closed for this to work at all locally.** A control file
-never matches any feed's `filename_pattern` -- it names no business date --
+never matches any feed's `filename_pattern` -- it names no COB date --
 so `inbox.py`'s original `route()` would reject it to `.rejected/` and it
 would never reach `landing/`, permanently starving the delivery it belongs
 to. `is_control_file` (`ingest/normalize.py:111`) gives `route()` a second
@@ -1704,7 +1704,7 @@ is a candidate and `member_pattern_candidate` groups them by extension as a
 starting guess; passed (the re-sniff-an-existing-feed case), only matching
 members are considered.
 
-**Only `business_date_from: container` is ever proposed.** `member`/`path`
+**Only `cob_date_from: container` is ever proposed.** `member`/`path`
 sourcing is real, described in `docs/DELIVERY-SHAPES.md`, and NOT BUILT
 (`context.NOT_BUILT` rejects it at load) -- proposing it would suggest a
 value guaranteed to fail. `_container_has_a_date` reuses
@@ -1871,7 +1871,7 @@ first kind.
 
 This is the line the whole design turns on, and the first implementation got
 it wrong. The inbox exists to ensure a delivery is correctly named and has its
-prerequisites: which source system, which feed, which business date, which
+prerequisites: which source system, which feed, which COB date, which
 version. It does **not** check the row count or the checksum.
 
 The first version did check them, at the door, and rejected a mismatch before
@@ -1894,7 +1894,7 @@ arrival:                       # IDENTITY -- read by the inbox
   source_pattern: 'positions\.csv'
   control:
     pattern: '{stem}\.ctl'
-    business_date: 'ReportingDate\|(?P<business_date>\d{8})'
+    cob_date: 'ReportingDate\|(?P<cob_date>\d{8})'
 delivery:                      # INTEGRITY -- read in landing, checked at ingest
   control:
     pattern: '{stem}\.ctl'
@@ -1952,7 +1952,7 @@ never matches it, and the feed reports nothing pending forever.
 
 ### Versions, so a re-delivery cannot overwrite evidence
 
-A corrected file for a business date already landed must not overwrite the
+A corrected file for a COB date already landed must not overwrite the
 first one -- `landing/` is the evidence copy and the original is the evidence
 of what was originally ingested. The gate renders the unversioned name, and if
 the listing shows it taken, tries `_v2`, `_v3` and so on. A version the
@@ -1961,7 +1961,7 @@ this is, and second-guessing that is worse than obeying it.
 
 ### Two failure modes, and they land differently
 
-* **IDENTITY failure** -- no feed claims the name, or no business date can be
+* **IDENTITY failure** -- no feed claims the name, or no COB date can be
   found. The file cannot be NAMED, so there is no landing key to write it to
   and it cannot land at all. `.rejected/`.
 * **INTEGRITY failure** -- wrong row count, wrong checksum. Nothing to do with
@@ -2205,7 +2205,7 @@ manifest holding members together, and nothing downstream needs to know an
 archive was ever involved.
 
 That is only true because **each member is a complete delivery for its own
-business date** -- `member_pattern` must capture one, and a pattern that does
+COB date** -- `member_pattern` must capture one, and a pattern that does
 not is rejected at load naming the gap. Members that are PARTS of one delivery
 (a single date split for size) are a genuinely different shape: they would
 have to stay grouped, which needs something to record the grouping, and that
@@ -2248,7 +2248,7 @@ guarantee.
 ### Two details that are easy to get wrong
 
 **`taken` advances as members land, it is not read once.** Two members
-resolving to the same business date inside one zip would otherwise both render
+resolving to the same COB date inside one zip would otherwise both render
 the unversioned name and the second would silently overwrite the first, inside
 the evidence copy. The set is seeded from `list_landing` and added to after
 each member, so the second becomes `_v2`.
@@ -2272,7 +2272,7 @@ An **empty sub-block was silently ignored**. `arrival.control:` or
 `arrival.archive:` with nothing under it parses as `None`, and the resolver
 skipped it with `.get(key) is not None` -- so the feed loaded as though the
 block were absent. For `archive:` that fell through to the plain-file
-business-date rule and failed with a message about dates, which is not the
+COB-date rule and failed with a message about dates, which is not the
 problem. Both are now checked with `in` and an empty block is its own error
 naming itself.
 
@@ -2302,7 +2302,7 @@ original destroys the evidence of what was originally ingested. It was wrong
 for a resend, and the cost is not an extra object. `_v2` is a `_source_file`
 value the raw table has never seen, so `already_ingested` does not match it,
 `next_file_version` gives it `MAX+1`, and `dedupe_rank` — which ranks
-`_file_version DESC, _row_number DESC` within `(_business_date,
+`_file_version DESC, _row_number DESC` within `(_cob_date,
 business_key)` — lets the copy **supersede the delivery it is a copy of**.
 The rows are identical, so nothing looks wrong anywhere: the only artefact is
 a restatement in the history that the upstream never made.
@@ -2316,7 +2316,7 @@ resend -> trs_position_20260801_v2.csv  517263d1618098b81bb21c1cb7cfed25
 ```
 
 **Sameness is decided on the bytes, not on the name**, and only against
-deliveries already landed for the same business date. `conform()` and
+deliveries already landed for the same COB date. `conform()` and
 `conform_member()` take a `landed_md5` callable beside `taken`; `_free_name`
 compares every candidate that is already taken — including one a control file
 declared a `version` for — and raises `DuplicateDelivery` on a match instead
@@ -2356,7 +2356,7 @@ makes it idempotent for free.
 
 `Feed.completeness` is now `Feed.delivery_expected`.
 
-It is a boolean meaning "a delivery is expected on every business date",
+It is a boolean meaning "a delivery is expected on every COB date",
 read only by `monitoring/completeness.py` to opt a feed out of gap detection.
 "Completeness" separately means "is *this delivery* whole, and by what
 evidence" — a declared row count, a checksum, a control file. Different
@@ -2371,7 +2371,7 @@ config of its own, which is the only cheap moment to do it.
 
 The check keeps its name: `monitoring/completeness.py`, the `completeness` op
 in `scripts/_spark_task.py` and the `completeness_check` housekeeping task all
-still do business-date completeness, and that is what they are called.
+still do COB-date completeness, and that is what they are called.
 
 A hard rename with no compatibility shim. No feed block in `feeds.yml` set the
 key, and the YAML allowlist is derived from `Feed.__dataclass_fields__`, so a
@@ -2433,13 +2433,13 @@ evidence nightly.
 Two effects, both live and both observed on the running catalog rather than
 inferred:
 
-* an ordinary daily publication lost its pin once ten more business dates had
+* an ordinary daily publication lost its pin once ten more COB dates had
   been published — about a fortnight — and month-end pins lasted 80/12 ≈ 6.7
   years against a period assumed to be longer;
 * within a **retained** date, only the newest tag survived. The tag name
-  carries no feed (`published/<business_date>/<run_id>`) and
+  carries no feed (`published/<cob_date>/<run_id>`) and
   `record_publication` runs in *every* per-feed ingest DAG, so N feeds
-  publishing one business date cut N tags for it. The code called the others
+  publishing one COB date cut N tags for it. The code called the others
   "earlier reruns of the same date" pinning "files for no benefit"; they were
   other feeds' publications. A dry run against the live catalog said:
 
@@ -2493,16 +2493,16 @@ seven.
 **`per_report` matches nothing today**, and it is written down as a forward
 hook rather than presented as a working mechanism: no publication yet knows
 which report it is for, so every tag resolves to the default. `TAG_RE` accepts
-`published/<report>/<business_date>/<run_id>` beside today's shape, so when a
+`published/<report>/<cob_date>/<run_id>` beside today's shape, so when a
 publication does name its report, retention already honours it instead of
 silently applying the default to a report that declared otherwise. Naming that
 plainly is the point — a guard written against a mechanism that does not exist
 is the failure mode this repo keeps rediscovering.
 
-**Age is the commit time**, not the business date. A retention period runs from
-when the record was made, and a restatement published today for an old business
+**Age is the commit time**, not the COB date. A retention period runs from
+when the record was made, and a restatement published today for an old COB
 date is a new record that needs its own full window; measuring from the
-business date would expire it on arrival. The business date is the fallback for
+COB date would expire it on arrival. The COB date is the fallback for
 a tag with no readable commit time, and it is conservative by construction —
 a publication cannot precede the date it reports on, so it can only ever keep a
 tag the commit time would also have kept.
@@ -2577,10 +2577,10 @@ compacts partitions older than that cutoff and so rewrites their data files.
 `compact()` scopes its rewrite to `date_column >= today − recent_partition_days`
 — only the RECENT partitions — so a pin ages OUT of the compaction window
 rather than into it. And compaction is not the mechanism that produces
-divergence on this platform anyway: expiring a business date is a
+divergence on this platform anyway: expiring a COB date is a
 metadata-level partition delete, so `main` stops referencing that date's files
 while every pin goes on referencing them, which is how REQ-700's reclamation
-run produced a genuinely divergent pin. On a catalog whose newest business date
+run produced a genuinely divergent pin. On a catalog whose newest COB date
 is older than the compaction window — which is every catalog between deliveries
 — the age gate opens on a fixed date and reports GREEN on a pin still
 byte-identical to `main`. Worse than an unverified check: a check that turns
@@ -2611,7 +2611,7 @@ the pin referenced and `main` did not:
 COUNT(*)                                     -> 16400
 COUNT(trade_id)                              -> 16400
 COUNT(*) WHERE trade_id IS NOT NULL          -> raised
-COUNT(*) WHERE _business_date = '2026-08-06' -> raised
+COUNT(*) WHERE _cob_date = '2026-08-06' -> raised
 ```
 
 The whole check reported `reproduced` on a pin whose data was gone. The count
@@ -2658,7 +2658,7 @@ eight tables, selected it, and read all eleven managed tables at it:
 
 **And the BROKEN branch has now executed**, which it never had before. One of
 those 37 files — a `raw.fo_trade` parquet under
-`_business_date_day=2026-08-06`, referenced by the pins and by nothing on
+`_cob_date_day=2026-08-06`, referenced by the pins and by nothing on
 `main` — was copied out of MinIO and deleted, so the blast radius was the pin
 under test. The check went red and named it:
 
@@ -2666,7 +2666,7 @@ under test. The check went red and named it:
 EXIT=1  status BROKEN  ok false
 unreadable: 1 of 41 data file(s) the pin references are no longer in object
             storage, e.g. warehouse/raw/fo_trade_…/data/
-            _business_date_day=2026-08-06/00000-6-…-00001.parquet
+            _cob_date_day=2026-08-06/00000-6-…-00001.parquet
 ```
 
 The identical bytes were then put back (md5 `5405b5ef…1c6f`, 17310 bytes, equal
@@ -2682,7 +2682,7 @@ REQ-101, as amended. `reporting_platform/registry/`, in the Postgres
 connected to it.
 
 The registry is the platform's record of what arrived: one row per delivery,
-carrying the business date, arrival time, size, checksum, the name the upstream
+carrying the COB date, arrival time, size, checksum, the name the upstream
 used, the control file's declarations and the column contract it was read
 against. It is the first thing that can answer "did they send it, and what was
 in it?" without listing object storage by hand.
@@ -2743,7 +2743,7 @@ log. Nothing recorded what it was, what was wrong with it, or that it had ever
 arrived; the evidence lived on one host, under no retention policy, and
 `docker compose down -v` took it with it. A rejected delivery is evidence
 exactly as much as an accepted one: it is frequently the entire explanation for
-a missing business date.
+a missing COB date.
 
 So the bytes go to `quarantine/` in object storage and `registry.rejection`
 says what they were and why. `.rejected/` stays and is written second — it is
@@ -2921,7 +2921,7 @@ Measured rather than assumed — a column added to `prepared.ref_rating` and run
 incrementally on a branch: the column appeared with no `--full-refresh`, the 9
 SCD2 versions the merge wrote carried its value, and the other 1,412 rows
 stayed NULL. On an SCD2 dimension that means every *current* row reads NULL
-until its entity next changes; on a business-date model it means the lookback
+until its entity next changes; on a COB-date model it means the lookback
 window and no further back. `--full-refresh` is therefore still the answer
 when history has to carry the value — the difference is that it is now a
 choice about DATA rather than the only way to obtain the COLUMN.
@@ -2950,7 +2950,7 @@ shorter window last month, an upload that was never actually made. The numbers
 still agree; the evidence is still gone.
 
 So the second half is per delivery. For each live published tag it takes the
-business date the tag names, asks the registry which deliveries were received
+COB date the tag names, asks the registry which deliveries were received
 for that date, and checks each one's landing object is still there. It runs
 AFTER the retention chain, because it has to observe what that chain left
 behind, and after `registry_reconcile`, because a delivery with no row looks
@@ -2967,7 +2967,7 @@ were deliberately removed, which is exactly the condition, correctly placed in
 the weaker category because nothing left can prove which it was.
 
 **Together they are still an approximation, and this is the honest limit.** A
-published tag names ONE business date, because `record_publication` cuts it
+published tag names ONE COB date, because `record_publication` cuts it
 from the date of the ingest that triggered the build, and a published run reads
 more than that date. So the check can miss a delivery from another date the run
 depended on; it cannot raise a false alarm, because everything it does check
@@ -2984,7 +2984,7 @@ and `arrival:` before it. One key, `mode`, and one built value,
 
 **The behaviour is old; the declaration is new, and that is the point.**
 `dedupe_rank` has always implemented exactly one supersession rule — newest
-`_file_version` wins within a business date, last row in file order wins within
+`_file_version` wins within a COB date, last row in file order wins within
 a version — and no feed anywhere said that was its shape. The assumption was
 true for all four feeds and invisible, which is the combination that eventually
 costs something: a feed whose second delivery is a DELTA rather than a
@@ -2999,7 +2999,7 @@ whole of the value:
 
     feeds.yml: feed 'x' `supersession.mode: delta_append` is described in the
     requirements (REQ-202) but NOT BUILT -- each delivery carries only what
-    changed, so a business date's population is the UNION of its deliveries
+    changed, so a COB date's population is the UNION of its deliveries
     rather than the newest one [...]
 
 Two levels, deliberately. `SUPERSESSION_NOT_BUILT` refuses at config load,
@@ -3090,9 +3090,9 @@ feed cannot be the one model without it.
 
 ## an-ingest-is-not-a-publication
 
-`feed_ingest` cut `published/<business_date>/<run_id>` at the end of every
-per-feed ingest DAG. It now cuts `snapshot/<feed>/<business_date>/<run_id>`,
-and a REPORT publication — `published/<report>/<business_date>/<run_id>` — is
+`feed_ingest` cut `published/<cob_date>/<run_id>` at the end of every
+per-feed ingest DAG. It now cuts `snapshot/<feed>/<cob_date>/<run_id>`,
+and a REPORT publication — `published/<report>/<cob_date>/<run_id>` — is
 cut by the reporting build, which is the only thing that knows what it
 published.
 
@@ -3100,15 +3100,15 @@ The old name was not a cosmetic problem. Three consequences, all live:
 
   * **Every check that read `published/` was reading ingests.**
     `monitoring/reproducibility.py` exercised an ingest pin,
-    `monitoring/evidence.py` asked what a business date received rather than
+    `monitoring/evidence.py` asked what a COB date received rather than
     what a run read, and both correctly reported on a thing nobody publishes.
   * **`references.published_tags.per_report` could never match anything**, so
     the per-report retention window was a resolver with no input.
   * **An ingest was retained for the reproducibility window** — ten years of
-    pinned raw data files per feed per business date, because nothing is
+    pinned raw data files per feed per COB date, because nothing is
     reclaimable while a tag references it.
 
-An ingest pin is still worth cutting: raw is where retention deletes business
+An ingest pin is still worth cutting: raw is where retention deletes COB
 dates, so the state an ingest left is exactly what somebody may need to read
 back. It is simply a different object with a different lifetime, and
 `references.snapshot_tags` says so — seven years locally against the published
@@ -3244,7 +3244,7 @@ submitted`, and back to `reopened` only deliberately. `registry.as_at_transition
 is append-only and **`open` is the ABSENCE of a row**.
 
 Open is not stored because storing it would require every pair to be seeded,
-and that set is DERIVED — from the exposures and from whichever business dates
+and that set is DERIVED — from the exposures and from whichever COB dates
 have deliveries. A seeded table is a second list of reports, and it goes stale
 the moment somebody adds an exposure. Absence costs nothing and cannot drift.
 It also makes the table honestly append-only: there is no
@@ -3284,7 +3284,7 @@ unchanged deliveries with both code refs moved.
 **The comparison is restricted to deliveries for that as-at date**, and
 `unregistered` means unknown to the registry — not "for another date". A run's
 inputs are what it PUBLISHED, so an SCD2 reference feed contributes deliveries
-for many business dates: on this stack, 123 of a 127-delivery input set are
+for many COB dates: on this stack, 123 of a 127-delivery input set are
 legitimately off-date. An earlier version of `inputs_changed` called all of
 them `unregistered`, which would have sent somebody looking for a registry gap
 that was not there. They are counted as `off_date` instead. See
@@ -3355,7 +3355,7 @@ live exposures alone would quietly stop honouring a window still being applied.
 
 **`snapshot_tags` stays outside the interlock**, and must not creep back in.
 Nothing is reproduced from a snapshot tag; it buys the ability to read a raw
-business date back after retention removed it, which is a storage decision
+COB date back after retention removed it, which is a storage decision
 rather than an evidence one. Binding it here would impose the published window
 on every feed again and undo the whole thing.
 
@@ -3369,7 +3369,7 @@ never fire or never stop.
 **`quarantine:` ships with no `classes:` block, and the absence is the point.**
 A class that shortens landing and says nothing about quarantine gets
 quarantine's own window — the over-retaining direction. The two answer to
-different things: a rejected delivery explains a missing business date whether
+different things: a rejected delivery explains a missing COB date whether
 or not anything published depends on the feed.
 
 **The sweep's summary was renamed.** It reported `keep_years` and `cutoff` at
@@ -3389,8 +3389,8 @@ mechanism once.
 A wall clock rather than a duration because what an upstream actually commits
 to is "by 07:00", and a duration needs an origin event that a delivery arriving
 by `PutObject` does not have. **The deadline is `expected_by` on the day AFTER
-the business date**, fixed rather than configurable: a delivery describes a
-business date, so that date has to have ended before the extract can be taken.
+the COB date**, fixed rather than configurable: a delivery describes a
+COB date, so that date has to have ended before the extract can be taken.
 Fixing it at +1 is a choice in the FORGIVING direction — a reference snapshot
 that legitimately arrives the same day is judged against a later deadline than
 it needed — so the check can under-report lateness and cannot invent it.
@@ -3405,7 +3405,7 @@ rather than folded to midnight: a delivery due at the end of the day is due at
 believe some rollover rule is implemented. There is none.
 
 **This is not the completeness check and must not become it.**
-`completeness.py` asks which business dates a feed is MISSING; this asks, of
+`completeness.py` asks which COB dates a feed is MISSING; this asks, of
 the deliveries that did arrive, which arrived late. A date with no delivery at
 all is a gap, not an infinitely late delivery, and reporting it in both places
 would double-report every outage. A feed with no `expected_by` has made no
@@ -3416,7 +3416,7 @@ measure is how a monitor starts reporting policy it made up.
 on the same calendar day, that is one bulk load — a seed, a migration, a
 re-delivery of history after an outage — and the log says so instead of listing
 ten missed deadlines. It is a derivation with nothing to tune: more than one
-business date, exactly one arrival day. The finding is described differently,
+COB date, exactly one arrival day. The finding is described differently,
 never suppressed: `total_late` and `--fail-on-late` are unaffected, because a
 backfill of dates that were due weeks ago genuinely is late. The seeded stack
 is exactly this case — `generate_feeds.py` writes ~17 days of history in one
@@ -3473,7 +3473,7 @@ objects that are already ingested, since a manifest for an ingested delivery is
 not a queue entry anybody needs. That breaks the property that makes the
 registry an index rather than a second source of truth. `deliveries.reconcile`
 walks MANIFESTS — the registry follows the platform having accepted a delivery
-as readable, not a raw landing object whose business date nothing has yet
+as readable, not a raw landing object whose COB date nothing has yet
 established — so with the manifests swept and reconcile taught not to rebuild
 them, dropping the registry and rebuilding it would re-register only the last
 `keep_days` of deliveries. "Rebuildable from object storage by the same code
@@ -3765,7 +3765,7 @@ the names the FILE carries, before ingest renames them. The graph therefore
 shows the rename this platform performs, and the ingest's own contribution
 becomes visible as columns: `landing/fo_trade` has the upstream's 9,
 `raw.fo_trade` has 20, and the 11 added are `_extra_columns` (drift),
-`_business_date`, `_ingest_ts`, `_source_file`, `_file_version`, `_row_number`,
+`_cob_date`, `_ingest_ts`, `_source_file`, `_file_version`, `_row_number`,
 `_batch_id` and the four provenance columns.
 
 ### Column lineage is parsed, from the COMPILED SQL
@@ -3932,7 +3932,7 @@ bites.
   `reporting.exposure_by_country`. `ref_collateral` is correctly absent from
   that traversal — it feeds no report, which is the same reason
   `feeds_behind_report()` does not name it.
-- Driven by a real delivery rather than a replay: one new business date
+- Driven by a real delivery rather than a replay: one new COB date
   (2026-08-20) landed for all four feeds, ingested by the `ingest_*` DAGs,
   which cascaded through `prepared_build` to `reporting_build` on their assets
   and carried 2026-08-20 into `reporting.counterparty_exposure`.

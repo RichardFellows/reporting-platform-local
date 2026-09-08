@@ -10,20 +10,20 @@ SCD2 would drift the same way — except the failure would be worse, since
 retention would run the wrong delete against a table it believed was a
 snapshot. The chosen mode is reported in the result JSON, so it is visible.
 
-**Snapshot tables** — `DELETE ... WHERE business_date IN (...)`. Because
-`business_date` leads the partition spec this is an Iceberg metadata
+**Snapshot tables** — `DELETE ... WHERE cob_date IN (...)`. Because
+`cob_date` leads the partition spec this is an Iceberg metadata
 operation, the analogue of partition switching. It rewrites no data files.
-This is why `partition_by=['business_date']` is described throughout this
+This is why `partition_by=['cob_date']` is described throughout this
 document as a retention requirement.
 
 **SCD2 tables** (`prepared.ref_counterparty`, `prepared.ref_rating`,
 `prepared.ref_counterparty`) — that requirement does not apply,
-because there is no `business_date` to partition by. Instead:
+because there is no `cob_date` to partition by. Instead:
 
 - a **current** version is never expired, however old — it is the answer to
   "what is this now", and dropping it would empty the dimension
 - a **closed** version is expired only once its whole range sits before the
-  oldest retained business date
+  oldest retained COB date
 
 This is a **row-level delete**: it produces delete files, and reclaiming them
 is `rewrite_data_files` in the maintenance job rather than a metadata drop.
@@ -138,7 +138,7 @@ See *The reproducibility window* below.
 **`snapshot_tags` is a different window for a different object.**
 `published/<report>/<bd>/<run_id>` is cut by the reporting build for a report
 it published; `snapshot/<feed>/<bd>/<run_id>` is cut by an ingest, and pins the
-raw state that ingest left so a business date stays readable after retention
+raw state that ingest left so a COB date stays readable after retention
 removes it from the live table. Nothing is REPRODUCED from a snapshot, so its
 window is a storage decision rather than an evidence one — it is not bound by
 the landing interlock, and it is set shorter than the published window on
@@ -147,18 +147,18 @@ purpose. See
 
 ### `keep_business_days`
 
-The N most recent **business dates actually present in the table**, not the last
+The N most recent **COB dates actually present in the table**, not the last
 N calendar days. If upstream skipped a day, we keep 10 real dates, not 9 plus a
 gap. This matches the legacy behaviour and is what report users expect when they
 ask for "the last two weeks".
 
-Business dates are read from the table itself
-(`SELECT DISTINCT business_date`), not from a calendar table. This deliberately
+COB dates are read from the table itself
+(`SELECT DISTINCT cob_date`), not from a calendar table. This deliberately
 avoids maintaining a holiday calendar for every jurisdiction in scope.
 
 ### `keep_month_ends`
 
-The last available business date **in each month**, not the calendar last day of
+The last available COB date **in each month**, not the calendar last day of
 the month. 30 March 2029 is a Friday; 31 March is a Saturday; the month-end
 snapshot is the 30th. Deriving this from observed dates rather than a calendar
 is again the safer choice.
@@ -182,7 +182,7 @@ was built from is gone. `retention.py` refuses to sweep if it does not — see
 That is deliberate, and it is the opposite of what an earlier draft of this
 document specified. Landing exists to answer *"what did the file we actually
 received say?"* — a question normally asked after a restatement, about a
-business date the table layers expired years ago. Sampling it by keep-set, or
+COB date the table layers expired years ago. Sampling it by keep-set, or
 dropping superseded versions, destroys exactly the evidence it exists to
 preserve, and saves the cheapest bytes in the estate: flat CSV on object
 storage.
@@ -197,15 +197,15 @@ docker compose exec -T airflow python -m reporting_platform.retention.landing
 
 Three properties worth knowing:
 
-- **Age means business date, not upload time.** A file re-delivered late
-  carries an old business date and a recent `LastModified`; the data in it is
+- **Age means COB date, not upload time.** A file re-delivered late
+  carries an old COB date and a recent `LastModified`; the data in it is
   still ten years old, and retention is a question about the data.
 - **An object whose name matches no feed pattern is never deleted.** It is
   counted and warned about, not swept. Deleting something unidentifiable out
   of the evidence prefix is not this job's call.
 - **`keep_years` must be ≥ the raw layer's window** (`keep_month_ends / 12`,
   currently 6.7 years). `find_pending` derives its retention keep-set from the
-  business dates present in *landing*, precisely so a date expired from the
+  COB dates present in *landing*, precisely so a date expired from the
   table is recognised as expired rather than re-ingested. Truncate
   landing below the raw window and live month-ends start looking expired.
   `landing.py` warns; it does not refuse, because the failure is gradual and
@@ -322,7 +322,7 @@ docker compose exec -T airflow python -m reporting_platform.retention.quarantine
 **Kept the way `landing:` is** — flat age, everything, no keep-set — because it
 answers the same question from the other side: *what did they actually send
 us?*, asked about a delivery that never arrived. A rejected file is frequently
-the whole explanation for a missing business date, and the explanation is
+the whole explanation for a missing COB date, and the explanation is
 needed for as long as the date it is missing from.
 
 **Its own key, not a reference to landing's**, even though the value is the
@@ -353,13 +353,13 @@ It was, until this was corrected. `references.published_tags` carried
 `keep_business_days: 10` and `keep_month_ends: 80` — the numbers the table
 layers use. In practice that meant:
 
-- an ordinary daily publication lost its pin once ten more business dates had
+- an ordinary daily publication lost its pin once ten more COB dates had
   been published, roughly a fortnight;
 - month-end pins lasted 80 ÷ 12 ≈ 6.7 years, short of the assumed period;
 - and within a *retained* date, only the newest tag survived. The tag name
-  carries no feed (`published/<business_date>/<run_id>`) and
+  carries no feed (`published/<cob_date>/<run_id>`) and
   `record_publication` runs in every per-feed ingest DAG, so N feeds
-  publishing one business date cut N tags for it and N−1 were deleted the same
+  publishing one COB date cut N tags for it and N−1 were deleted the same
   night. Observed on the live catalog: three tags for `2026-08-01`, all inside
   the keep-set, two of them scheduled for deletion.
 
@@ -384,24 +384,24 @@ permanently, so it is set to the longest plausible value rather than the
 assumed seven.
 
 `per_report` **now matches something.** A reporting build cuts one tag per
-report — `published/<report>/<business_date>/<run_id>` — so naming a report
+report — `published/<report>/<cob_date>/<run_id>` — so naming a report
 here gives it its own window. It is left empty because no report has yet
 declared a period different from the default, and inventing one would be a
 policy nobody made. `TAG_RE` still accepts the two-segment shape as well: tags
 cut before publication knew its report are real pins, and a sweep that fails
 to recognise something skips it forever rather than judging it.
 
-The `published/<business_date>/<run_id>` shape was cut by the INGEST DAGs, and
+The `published/<cob_date>/<run_id>` shape was cut by the INGEST DAGs, and
 that is what the third defect above describes. Ingests now cut
-`snapshot/<feed>/<business_date>/<run_id>`, judged against
+`snapshot/<feed>/<cob_date>/<run_id>`, judged against
 `references.snapshot_tags` — a shorter window, because nothing is reproduced
 from a snapshot. See
 [`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication).
 
-**Age is measured from the commit time**, not the business date: a retention
+**Age is measured from the commit time**, not the COB date: a retention
 period runs from when the record was made, and a restatement published today
-for an old business date is a new record that must survive its own full
-window. The business date is the fallback when a tag carries no readable
+for an old COB date is a new record that must survive its own full
+window. The COB date is the fallback when a tag carries no readable
 commit time, and it is conservative by construction — a publication cannot
 precede the date it reports on.
 
@@ -434,7 +434,7 @@ the lineage that would say which feeds were behind it is gone.
 
 **`snapshot_tags` is deliberately outside this**, and must stay outside it.
 Nothing is reproduced from a snapshot tag: it buys the ability to read a raw
-business date back after retention removed it, which is a storage decision
+COB date back after retention removed it, which is a storage decision
 rather than an evidence one. Binding it here would impose the published window
 on every feed again.
 
@@ -495,11 +495,11 @@ docker compose exec -T airflow python -m reporting_platform.monitoring.reproduci
 
 `reporting_platform/retention/retention.py` executes, per table:
 
-1. Read the distinct business-date values. Note the column name differs by
-   layer: `raw` carries the ingest metadata column `_business_date`, while
-   `prepared` and `reporting` carry a modelled `business_date`. `retention.py`
+1. Read the distinct COB-date values. Note the column name differs by
+   layer: `raw` carries the ingest metadata column `_cob_date`, while
+   `prepared` and `reporting` carry a modelled `cob_date`. `retention.py`
    selects between them per layer — see `run()`.
-2. Compute the keep-set: last N business dates ∪ last M month-end dates.
+2. Compute the keep-set: last N COB dates ∪ last M month-end dates.
 3. `DELETE FROM <table> WHERE <date_column> IN (<expiry-set>)`, where the
    expiry set is the observed dates minus the keep-set. Because that column is
    the partition column, Iceberg resolves this to a partition-level metadata
@@ -604,13 +604,13 @@ merely expired data, so it deserves the extra caution.
 
 ## Partitioning is a retention decision
 
-`business_date` must be the leading partition field on every table in `raw`,
+`cob_date` must be the leading partition field on every table in `raw`,
 `prepared` and `reporting`. If it is not, retention deletes become row-level
 deletes: read every file, rewrite it without the expired rows, leave delete
 files behind. That turns a metadata operation into a full table rewrite every
 single night.
 
-Use `days(business_date)` (Iceberg's identity-ish day transform) rather than a
+Use `days(cob_date)` (Iceberg's identity-ish day transform) rather than a
 derived `yyyymm` string, so partition pruning works for range predicates too.
 
 Do not add a second high-cardinality partition field "for query performance"

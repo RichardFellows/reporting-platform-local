@@ -135,7 +135,7 @@ def platform_housekeeping():
 
         AFTER THE MAINTENANCE CHAIN, and that ordering is the whole test.
         `maintain` rewrites data files; `enforce_retention` then expires
-        published tags, expires business dates out of the tables, runs Nessie
+        published tags, expires COB dates out of the tables, runs Nessie
         GC and executes the deferred deletes an earlier sweep queued. Every one
         of those can break a pin while leaving a catalog that looks healthy,
         and none of them announces it. Running the check first would exercise
@@ -282,7 +282,7 @@ def platform_housekeeping():
 
         Resolves each pin's input set from its RUN RECORD where there is one
         (exact -- the deliveries that run actually read) and from the tag's
-        business date where there is not (approximate, and generous only in
+        COB date where there is not (approximate, and generous only in
         the direction of missing something). The counts are logged separately.
 
         WARNS, and does not fail, when a pinned tag has no registered
@@ -322,20 +322,20 @@ def platform_housekeeping():
             return report
         # EXACT vs APPROXIMATE is worth saying out loud every night: a green
         # from a tag resolved through its run record means the deliveries that
-        # run actually read; a green from a tag resolved by business date
+        # run actually read; a green from a tag resolved by COB date
         # means the deliveries that happened to arrive that day. The second is
         # weaker, and a log line that did not distinguish them would let the
         # weaker one pass for the stronger.
         log.info("evidence: %d delivery(ies) behind %d pinned tag(s), all "
                  "still landed (%d exact from run records, %d approximated "
-                 "from the tag's business date)",
+                 "from the tag's COB date)",
                  report.get("deliveries_checked"), report.get("tags_checked"),
                  report.get("exact"), report.get("approximate"))
         return report
 
     @task
     def completeness_check(**context) -> dict:
-        """Business dates a feed is missing that other feeds prove existed.
+        """COB dates a feed is missing that other feeds prove existed.
 
         WHY THIS EXISTS. `dbt source freshness` measures the age of the newest
         `_ingest_ts`, so it catches a feed that has STOPPED arriving and is
@@ -369,7 +369,7 @@ def platform_housekeeping():
                     len(f["missing"]), ", ".join(f["missing"]))
         if report.get("total_missing") and context["params"].get("fail_on_gap"):
             raise AirflowException(
-                f"{report['total_missing']} business date(s) are missing; "
+                f"{report['total_missing']} COB date(s) are missing; "
                 "see the per-feed detail above")
         return report
 
@@ -378,7 +378,7 @@ def platform_housekeeping():
         """Deliveries that arrived after the time the feed promised. REQ-201.
 
         BESIDE `completeness_check`, NOT INSIDE IT, and the split is the
-        point: that one asks which business dates are MISSING, this asks which
+        point: that one asks which COB dates are MISSING, this asks which
         of the deliveries that arrived were late. A date with nothing
         registered is a gap and is not judged here, so an outage is reported
         once rather than by both checks in different words.
@@ -403,7 +403,7 @@ def platform_housekeeping():
         for f in report.get("feeds", []):
             for entry in f.get("late", []):
                 log.warning("feed %s: %s arrived %.1fh after its %s deadline",
-                            f["feed"], entry["business_date"],
+                            f["feed"], entry["cob_date"],
                             entry["hours_late"], f["expected_by"])
         if report.get("total_late") and context["params"].get("fail_on_late"):
             raise AirflowException(

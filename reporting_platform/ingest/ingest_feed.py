@@ -6,7 +6,7 @@ Design rules this job enforces:
   where it is testable. A load must never fail because a value was unparseable
   — it must land, and then fail a *test*.
 * The write happens on a Nessie branch, never on main. Publication is a merge.
-* Re-delivery of a business date does not overwrite: it lands as a new
+* Re-delivery of a COB date does not overwrite: it lands as a new
   `_file_version`. `prepared` picks the latest version; retention removes the
   superseded ones later. This preserves the ability to answer "what did the
   file we originally received say?" for at least the grace period.
@@ -126,7 +126,7 @@ _PROVENANCE_COLUMNS = (
 def ensure_raw_table(spark, fd, table: str | None = None) -> None:
     """Create the raw table if absent.
 
-    business_date is the LEADING partition field on every table. This is not a
+    cob_date is the LEADING partition field on every table. This is not a
     performance choice, it is a retention choice: if it is not the partition
     field, retention deletes become full-table rewrites every night rather than
     metadata operations. See docs/RETENTION.md.
@@ -137,7 +137,7 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
         CREATE TABLE IF NOT EXISTS {table or fd.raw_table} (
         {cols},
         _extra_columns MAP<STRING, STRING>,
-        _business_date DATE,
+        _cob_date DATE,
         _ingest_ts     TIMESTAMP,
         _source_file   STRING,
         _file_version  INT,
@@ -149,7 +149,7 @@ def ensure_raw_table(spark, fd, table: str | None = None) -> None:
         _source_system STRING
         )
         USING iceberg
-        PARTITIONED BY (days(_business_date))
+        PARTITIONED BY (days(_cob_date))
         TBLPROPERTIES (
           'write.format.default'          = 'parquet',
           'write.parquet.compression-codec' = 'zstd',
@@ -334,12 +334,12 @@ def reconcile_schema(df, fd) -> tuple:
     return df, {"missing_columns": missing, "extra_columns": extra}
 
 
-def next_file_version(spark, fd, business_date: date,
+def next_file_version(spark, fd, cob_date: date,
                       table: str | None = None) -> int:
     try:
         row = spark.sql(
             f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {table or fd.raw_table} "
-            f"WHERE _business_date = DATE '{business_date:%Y-%m-%d}'"
+            f"WHERE _cob_date = DATE '{cob_date:%Y-%m-%d}'"
         ).collect()[0]
         return int(row["v"]) + 1
     except Exception:
@@ -390,7 +390,7 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
             spark.stop()
 
 
-def resolve_delivery(fd, key: str, business_date: date | None = None) -> dict:
+def resolve_delivery(fd, key: str, cob_date: date | None = None) -> dict:
     """The manifest for `key`, whether it names a manifest or a landing object.
 
     Ingest consumes MANIFESTS (see ingest/normalize.py). A landing key is
@@ -399,7 +399,7 @@ def resolve_delivery(fd, key: str, business_date: date | None = None) -> dict:
     walkthrough and docs/ADDING-A-FEED.md tell you to type, and a one-off
     manual ingest should not leave a queue entry behind.
 
-    `business_date` overrides whatever the delivery says, which is how a file
+    `cob_date` overrides whatever the delivery says, which is how a file
     whose name carries no parsable date gets ingested at all.
     """
     from reporting_platform.ingest import normalize as norm
@@ -410,14 +410,14 @@ def resolve_delivery(fd, key: str, business_date: date | None = None) -> dict:
         try:
             manifest = norm.normalize(fd, key, write=False)
         except ValueError:
-            if business_date is None:
+            if cob_date is None:
                 raise
             # No parsable date in the name, but the caller supplied one.
             # Build the manifest by hand rather than refusing: this is the
             # documented escape hatch for a delivery the pattern cannot route.
             manifest = {
                 "manifest_version": norm.MANIFEST_VERSION,
-                "feed": fd.name, "business_date": business_date.isoformat(),
+                "feed": fd.name, "cob_date": cob_date.isoformat(),
                 "delivery_id": key.rsplit("/", 1)[-1], "received_at": None,
                 "source_object": key,
                 "parts": [{"object_key": key, "bytes": None}],
@@ -426,19 +426,19 @@ def resolve_delivery(fd, key: str, business_date: date | None = None) -> dict:
                 "control_object": None, "declared_row_count": None,
                 "normalizer": "manual/v1",
             }
-    if business_date is not None:
-        manifest = {**manifest, "business_date": business_date.isoformat()}
+    if cob_date is not None:
+        manifest = {**manifest, "cob_date": cob_date.isoformat()}
     return manifest
 
 
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
-           business_date: date | None = None, dry_run: bool = False,
+           cob_date: date | None = None, dry_run: bool = False,
            spark=None) -> dict:
     """Land one delivery into `raw` on its own Nessie branch, then merge.
 
     `object_key` is a MANIFEST key under `ready/`, or a landing object key --
     see `resolve_delivery`. Everything after that point reads the manifest and
-    never the filename: the business date, which objects hold the rows, and
+    never the filename: the COB date, which objects hold the rows, and
     the delimiter/quoting/encoding all come from it.
 
     `spark` is an OPTIONAL session to reuse. Pass one when ingesting several
@@ -459,8 +459,8 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     fd = get_feed(feed_name)
     run_id = run_id or new_run_id()
 
-    manifest = resolve_delivery(fd, object_key, business_date)
-    bdate = date.fromisoformat(manifest["business_date"])
+    manifest = resolve_delivery(fd, object_key, cob_date)
+    bdate = date.fromisoformat(manifest["cob_date"])
     parts = manifest["parts"]
     if not parts:
         raise ValueError(
@@ -555,7 +555,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
 
         row_win = Window.orderBy(F.monotonically_increasing_id())
         df = (
-            df.withColumn("_business_date", F.lit(bdate.isoformat()).cast("date"))
+            df.withColumn("_cob_date", F.lit(bdate.isoformat()).cast("date"))
               .withColumn("_ingest_ts", F.lit(datetime.now(timezone.utc)).cast("timestamp"))
               .withColumn("_file_version", F.lit(version).cast("int"))
               .withColumn("_row_number", F.row_number().over(row_win).cast("bigint"))
@@ -564,7 +564,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
               # contract, not from the filename. `received_at` is the
               # delivery's arrival time -- the landing object's LastModified
               # -- and is null only for the hand-built manifest of the
-              # `--business-date` escape hatch, which has no landed object to
+              # `--cob-date` escape hatch, which has no landed object to
               # take it from.
               .withColumn("_delivery_id", F.lit(manifest["delivery_id"]))
               .withColumn("_received_at",
@@ -638,7 +638,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
 
         result = {
             "feed": fd.name,
-            "business_date": bdate.isoformat(),
+            "cob_date": bdate.isoformat(),
             "file_version": version,
             "rows": row_count,
             "run_id": run_id,
@@ -680,10 +680,10 @@ def main(argv=None) -> int:
                    help="a manifest key under ready/, or a landing object key "
                         "(normalized on the fly, not written to ready/)")
     p.add_argument("--run-id")
-    p.add_argument("--business-date", type=lambda s: datetime.strptime(s, "%Y-%m-%d").date())
+    p.add_argument("--cob-date", type=lambda s: datetime.strptime(s, "%Y-%m-%d").date())
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args(argv)
-    print(json.dumps(ingest(a.feed, a.object, a.run_id, a.business_date, a.dry_run), indent=2))
+    print(json.dumps(ingest(a.feed, a.object, a.run_id, a.cob_date, a.dry_run), indent=2))
     return 0
 
 

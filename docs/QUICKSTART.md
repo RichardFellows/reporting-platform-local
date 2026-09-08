@@ -170,7 +170,7 @@ trade: ignoring 14 landed object(s) outside the retention keep-set
 ```
 
 Retention keeps "10 recent business days plus 80 month-ends". A landed file
-whose business date is outside that set is treated as **expired rather than
+whose COB date is outside that set is treated as **expired rather than
 new** — ingesting it would only be undone by the next retention run, and
 re-ingesting it forever is a real bug this once had. So on a
 cold load the middle of the dense tail is skipped by design, and
@@ -236,7 +236,7 @@ without starting Spark:
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 
 docker compose exec -T airflow python -m scripts.duckdb_console \
-  "select business_date, count(*) as rows
+  "select cob_date, count(*) as rows
    from lakehouse.reporting.exposure_change
    group by 1 order by 1 desc limit 5"
 ```
@@ -273,7 +273,7 @@ quicker for a first load. Everything is published to `main`; nothing has been
 time travel once a tag exists.
 
 **`published/*` tags are a different thing and come from the reporting
-build.** One per report — `published/<report>/<business_date>/<run_id>` — cut
+build.** One per report — `published/<report>/<cob_date>/<run_id>` — cut
 when `reporting_build` merges, alongside a row in `registry.report_version`
 saying which version of that report it is. An ingest pins raw state; only a
 report publication is a publication. See

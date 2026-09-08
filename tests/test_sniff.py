@@ -244,11 +244,11 @@ def test_propose_feed_adds_filename_pattern():
     r = sniff.propose_feed("MarginCall_20260904.csv",
                            b"margin_call_id,amount\nM1,100\n")
     assert r["filename_pattern"] == \
-        r"MarginCall_(?P<business_date>\d{8})(?:_v(?P<version>\d+))?\.csv", r
+        r"MarginCall_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv", r
 
 
 def test_propose_feed_flags_an_archive_with_no_date_on_the_container():
-    """business_date_from: member/path is real, described in
+    """cob_date_from: member/path is real, described in
     DELIVERY-SHAPES.md, and NOT BUILT (context.NOT_BUILT) -- proposing it
     would suggest a value guaranteed to fail at load."""
     r = sniff.propose_feed("positions.zip", _zip(TWO_MEMBERS))

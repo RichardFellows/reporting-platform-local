@@ -43,9 +43,9 @@ behaviours the legacy RDBMS gave us for free.
 |---|---|---|---|---|
 | `landing` | CSV as received, uncompressed | none (object keys) | landing task | one object per feed arrival |
 | `raw` | Iceberg | Nessie `lakehouse.raw` | ingest task (Spark) | 1:1 with source rows, all columns as-received + ingest metadata |
-| `prepared` | Iceberg | Nessie `lakehouse.prepared` | dbt | conformed, typed, deduplicated, one row per business key per business date |
+| `prepared` | Iceberg | Nessie `lakehouse.prepared` | dbt | conformed, typed, deduplicated, one row per business key per COB date |
 | `reporting` | Iceberg | Nessie `lakehouse.reporting` | dbt | report-shaped marts, shared lineage |
-| `serving` | Postgres / an enterprise RDBMS | n/a | export task | latest business date only, BI-tool-specific |
+| `serving` | Postgres / an enterprise RDBMS | n/a | export task | latest COB date only, BI-tool-specific |
 
 ### Why `landing` is separate from `raw`
 
@@ -69,10 +69,10 @@ Ingest metadata columns added to every `raw` table:
 
 | Column | Type | Meaning |
 |---|---|---|
-| `_business_date` | date | the date the data describes (from filename or feed config) |
+| `_cob_date` | date | the date the data describes (from filename or feed config) |
 | `_ingest_ts` | timestamp | when we ingested it |
 | `_source_file` | string | full object key in `landing` |
-| `_file_version` | int | 1, 2, 3… for re-deliveries of the same business date |
+| `_file_version` | int | 1, 2, 3… for re-deliveries of the same COB date |
 | `_row_number` | bigint | position in the source file, for diagnosis |
 | `_batch_id` | string | ingest run identifier, = Nessie branch name suffix |
 
@@ -170,7 +170,7 @@ whereas a gap is a report that runs, returns numbers, and is quietly wrong for
 one date forever.
 
 `reporting_platform/monitoring/completeness.py` covers the gap case. It infers the
-business calendar from the platform's own data — a business date is one on
+business calendar from the platform's own data — a COB date is one on
 which at least one feed delivered — so no holiday calendar is needed and a
 holiday can never be reported as a gap. Its blind spot is a day on which every
 feed missed; that is the orchestrator's and the watchdog's territory.
@@ -191,7 +191,7 @@ main ────────────●────────────
   build/prepared/2026-08-11/r7 ───●───●
 ```
 
-Branch naming: `<purpose>/<scope>/<business_date>/<run_id>`.
+Branch naming: `<purpose>/<scope>/<cob_date>/<run_id>`.
 
 This gives us three things the legacy RDBMS never did cheaply:
 
@@ -203,7 +203,7 @@ This gives us three things the legacy RDBMS never did cheaply:
    a regulator question about a figure published on a given date is answerable.
 
 Tags are cut on `main` after each successful publication:
-`published/<business_date>/<run_id>`. Retention of *tags* is what determines
+`published/<cob_date>/<run_id>`. Retention of *tags* is what determines
 how far back you can time-travel, and is a separate policy from row retention.
 
 ---
@@ -254,9 +254,9 @@ the project files, so it is paid again only when a model actually changes.
 ## Slowly-changing dimensions in `prepared`
 
 `prepared.ref_counterparty` and `prepared.ref_rating` store **one row per version**,
-not one per business date. `trade` and `collateral` stay daily snapshots.
+not one per COB date. `trade` and `collateral` stay daily snapshots.
 
-The split is measured, not stylistic. Against 40 retained business dates:
+The split is measured, not stylistic. Against 40 retained COB dates:
 
 Measured, built:
 
@@ -288,7 +288,7 @@ exactly that.
 
 ### How consumers read it
 
-`{{ as_of('c', 'a.business_date') }}` — a `between effective_from and effective_to`
+`{{ as_of('c', 'a.cob_date') }}` — a `between effective_from and effective_to`
 predicate. `effective_to` is `DATE '9999-12-31'` on the open version rather than
 NULL, so no consumer needs an `or effective_to is null` branch, which is silently
 wrong when forgotten.
@@ -315,7 +315,7 @@ the last known rating forward and that count is now **zero**. It is not
 flagged as "carried forward", because for a weekly feed that is the design
 rather than a gap — `rating_as_of` says how old the rating is instead.
 
-**Retention stops being a partition drop.** There is no `business_date`
+**Retention stops being a partition drop.** There is no `cob_date`
 column, so `retention.py` uses a row-level delete for these tables. See
 RETENTION.md.
 
@@ -403,7 +403,7 @@ prove less than it looked:
 | | |
 |---|---|
 | Cannot address a Nessie branch | the ref rides in the Iceberg REST prefix, which DuckDB takes from `/v1/config` and cannot override — so no write-audit-publish |
-| Silently drops `partition_by` | produces unpartitioned tables, and `business_date` partitioning is what makes retention's expiry a metadata delete rather than a full rewrite |
+| Silently drops `partition_by` | produces unpartitioned tables, and `cob_date` partitioning is what makes retention's expiry a metadata delete rather than a full rewrite |
 | Cannot `INSERT`/`UPDATE` a partitioned table | so it cannot write to the tables the platform already has, without an explicit override |
 
 Any one of those is disqualifying.
@@ -417,7 +417,7 @@ through the same catalog.
 ```
 docker compose exec -T airflow python -m scripts.duckdb_console --tables
 docker compose exec -T airflow python -m scripts.duckdb_console \
-    "select business_date, count(*) from lakehouse.prepared.fo_trade group by 1"
+    "select cob_date, count(*) from lakehouse.prepared.fo_trade group by 1"
 ```
 
 It is a script rather than a dbt target deliberately. The engine macros are

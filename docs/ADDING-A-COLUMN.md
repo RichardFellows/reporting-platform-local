@@ -125,7 +125,7 @@ If the column matters enough to test, test it on the dates that have it:
         tests:
           - not_null:
               config:
-                where: "business_date >= '2026-08-27'"
+                where: "cob_date >= '2026-08-27'"
 ```
 
 ---
@@ -151,7 +151,7 @@ depends on the model's shape:
 
 | Model | What an incremental run populates |
 |---|---|
-| business-date incremental (`fo_trade`) | the lookback window, and no further back |
+| COB-date incremental (`fo_trade`) | the lookback window, and no further back |
 | SCD2 (`ref_rating`, `ref_counterparty`) | only versions cut from here on — **every current row reads NULL until its entity next changes** |
 
 For a current-state dimension that is usually not what you want, so decide

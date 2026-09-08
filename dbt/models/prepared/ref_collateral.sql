@@ -1,8 +1,8 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'collateral_id'],
-    partition_by=['business_date'],
+    unique_key=['cob_date', 'collateral_id'],
+    partition_by=['cob_date'],
     tags=['prepared', 'reference']
   )
 }}
@@ -24,7 +24,7 @@ with raw_rows as (
         *,
         {{ dedupe_rank(['collateral_id']) }} as _rn
     from {{ source('raw', 'ref_collateral') }}
-    where {{ incremental_window('_business_date', 'business_date') }}
+    where {{ incremental_window('_cob_date', 'cob_date') }}
       and {{ known_as_of() }}
 
 ),
@@ -36,7 +36,7 @@ deduped as (
 cleaned as (
 
     select
-        _business_date                                                 as business_date,
+        _cob_date                                                      as cob_date,
         {{ clean_string('collateral_id') }}                            as collateral_id,
         {{ clean_string('counterparty_id') }}                          as counterparty_id,
         upper({{ clean_string('collateral_type') }})                   as collateral_type,

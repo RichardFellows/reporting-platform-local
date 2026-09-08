@@ -16,9 +16,9 @@
   in prepared and referencing it with ref() is that divergence becomes visible
   in the lineage graph.
 
-  ONE ROW PER VERSION, NOT PER BUSINESS DATE. This table held 2,400 rows to
+  ONE ROW PER VERSION, NOT PER COB DATE. This table held 2,400 rows to
   express 70 versions: 60 counterparties that changed 10 times between them
-  across 40 retained business dates, restated in full every day. Consumers
+  across 40 retained COB dates, restated in full every day. Consumers
   join point-in-time with `as_of()` instead of on equality.
 
   (70, not the 68 distinct attribute tuples the table contains: two names
@@ -67,7 +67,7 @@ raw_rows as (
     #}
     where {{ known_as_of() }}
     {% if is_incremental() %}
-      and r._business_date >= coalesce(p.from_date, date '1900-01-01')
+      and r._cob_date >= coalesce(p.from_date, date '1900-01-01')
     {% endif %}
 
 ),
@@ -79,7 +79,7 @@ deduped as (
 cleaned as (
 
     select
-        _business_date                                              as business_date,
+        _cob_date                                                   as cob_date,
         {{ clean_string('counterparty_id') }}                       as counterparty_id,
         {{ clean_string('legal_name') }}                            as legal_name,
         upper({{ clean_string('country_code') }})                   as country_code,

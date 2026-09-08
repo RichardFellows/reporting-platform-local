@@ -10,7 +10,7 @@ Two things these tests hold to, both of which were live defects:
 
   * the window is FLAT AGE in years, resolved per report, never a keep-set;
   * every tag for a date is judged on its own. The old sweep kept only the
-    newest tag per business date, and since the tag name carries no feed and
+    newest tag per COB date, and since the tag name carries no feed and
     `record_publication` runs in every per-feed ingest DAG, that deleted other
     feeds' publications for the same date.
 
@@ -96,7 +96,7 @@ YEAR = 365.25
 # ---------------------------------------------------------------- the window
 def test_the_window_is_years_not_a_keep_set():
     """The defect this replaces: an ordinary daily publication used to lose
-    its pin after ten more published business dates, about a fortnight."""
+    its pin after ten more published COB dates, about a fortnight."""
     R = _retention()
     n = FakeNessie([_tag(f"published/2026-08-{d:02d}/run{d}", days_ago=d)
                     for d in range(1, 26)])
@@ -122,7 +122,7 @@ def test_a_dry_run_deletes_nothing():
 def test_every_tag_for_a_date_is_kept():
     """The quieter half of the defect. `published/<bd>/<run_id>` carries no
     feed, and record_publication runs in every per-feed ingest DAG, so N feeds
-    publishing one business date cut N tags for it -- and the old sweep kept
+    publishing one COB date cut N tags for it -- and the old sweep kept
     only the newest. Observed live: three tags for 2026-08-01, two of them
     scheduled for deletion while inside the keep-set."""
     R = _retention()
@@ -185,9 +185,9 @@ def test_a_branch_under_published_is_not_a_tag():
     assert R.expire_tags(n, dry_run=True) == []
 
 
-def test_a_tag_with_no_commit_time_falls_back_to_its_business_date():
+def test_a_tag_with_no_commit_time_falls_back_to_its_cob_date():
     """Conservative by construction: a publication cannot precede the date it
-    reports on, so the business date is never later than the commit time and
+    reports on, so the COB date is never later than the commit time and
     can only keep a tag the commit time would also have kept."""
     R = _retention()
     n = FakeNessie([_tag("published/2026-08-01/recent", days_ago=None),
@@ -509,7 +509,7 @@ def test_the_two_sweeps_do_not_touch_each_others_tags():
 
 
 def test_every_snapshot_for_a_date_is_kept_on_its_own_merits():
-    """N feeds landing one business date cut N snapshot tags. The defect this
+    """N feeds landing one COB date cut N snapshot tags. The defect this
     inherits from the published sweep kept only the newest per date."""
     R = _retention(SNAP_YML)
     n = FakeNessie([_tag(f"snapshot/{f}/2026-08-01/r{i}", days_ago=1)

@@ -105,7 +105,7 @@ def observations(feed: Feed, manifest: dict[str, Any],
         "feed": feed.name,
         "delivery_id": manifest["delivery_id"],
         "source_system": feed.source_system,
-        "business_date": date.fromisoformat(manifest["business_date"]),
+        "cob_date": date.fromisoformat(manifest["cob_date"]),
         "received_at": manifest["received_at"],
         "source_object": manifest["source_object"],
         "normalizer": manifest["normalizer"],
@@ -141,7 +141,7 @@ def observations(feed: Feed, manifest: dict[str, Any],
 
 
 # ------------------------------------------------------------------- writing
-_COLUMNS = ("feed", "delivery_id", "source_system", "business_date",
+_COLUMNS = ("feed", "delivery_id", "source_system", "cob_date",
             "received_at", "source_object", "manifest_key", "normalizer",
             "bytes", "md5", "schema_version", "origin", "origin_uri",
             "source_filename", "source_container", "control_object",
@@ -253,7 +253,7 @@ def reconcile(feed: Feed, *, normalize_first: bool = True) -> dict[str, Any]:
     follows manifests, not landing objects, because a manifest is the platform
     having ACCEPTED the delivery as readable -- a file still waiting on its
     control file has landed but is not yet a delivery anything can describe,
-    and giving it a row would mean inventing a business date the platform has
+    and giving it a row would mean inventing a COB date the platform has
     not yet been told.
 
     AND IT IS THE ONE WRITE A DRY RUN MUST NOT MAKE. `normalize_first` writes
@@ -362,13 +362,13 @@ def coverage(feed: Feed) -> dict[str, Any]:
             "manifest_expired": len(rows - manifests)}
 
 
-def deliveries_on(business_date: date, feed: str | None = None
+def deliveries_on(cob_date: date, feed: str | None = None
                   ) -> list[dict[str, Any]]:
-    """Every registered delivery for one business date. Used by REQ-602."""
-    sql = ("SELECT feed, delivery_id, source_object, business_date, "
+    """Every registered delivery for one COB date. Used by REQ-602."""
+    sql = ("SELECT feed, delivery_id, source_object, cob_date, "
            "       received_at, md5, bytes "
-           "FROM registry.delivery WHERE business_date = %s")
-    args: list[Any] = [business_date]
+           "FROM registry.delivery WHERE cob_date = %s")
+    args: list[Any] = [cob_date]
     if feed:
         sql += " AND feed = %s"
         args.append(feed)
@@ -381,7 +381,7 @@ def deliveries_on(business_date: date, feed: str | None = None
 def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
     """The registered deliveries named by (feed, delivery_id). REQ-602/REQ-400.
 
-    What `deliveries_on` is for a business date, this is for a RUN's recorded
+    What `deliveries_on` is for a COB date, this is for a RUN's recorded
     input set -- the exact deliveries a published run read, rather than every
     delivery that happened to arrive for the date its tag names.
 
@@ -393,7 +393,7 @@ def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
     if not pairs:
         return []
     wanted = sorted(set(pairs))
-    sql = ("SELECT feed, delivery_id, source_object, business_date, "
+    sql = ("SELECT feed, delivery_id, source_object, cob_date, "
            "       received_at, md5, bytes "
            "FROM registry.delivery WHERE (feed, delivery_id) IN %s")
     with db.connect() as conn, conn.cursor() as cur:
@@ -407,7 +407,7 @@ def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
             out.append({**row, "registered": True})
         else:
             out.append({"feed": feed, "delivery_id": delivery_id,
-                        "source_object": None, "business_date": None,
+                        "source_object": None, "cob_date": None,
                         "received_at": None, "md5": None, "bytes": None,
                         "registered": False})
     return out

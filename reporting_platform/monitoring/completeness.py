@@ -1,4 +1,4 @@
-"""Business-date completeness: which days are MISSING from a feed's history.
+"""COB-date completeness: which days are MISSING from a feed's history.
 
 WHY THIS EXISTS AND WHAT FRESHNESS CANNOT DO. `dbt source
 freshness` measures the age of the newest `_ingest_ts`. It catches a feed that
@@ -19,7 +19,7 @@ per jurisdiction — and for a completeness check it is worse than that: every
 public holiday the calendar did not know about becomes a false gap, and a
 check that cries wolf on Boxing Day is a check people switch off.
 
-So the calendar is inferred from the platform's own data: **a business date is
+So the calendar is inferred from the platform's own data: **a COB date is
 one on which at least one feed delivered.** A holiday needs no entry anywhere
 because no feed delivers on it. A date where trade and rating landed but
 counterparty did not is unambiguously a gap in counterparty, and saying so
@@ -35,7 +35,7 @@ blind spot is undocumented is worse than no monitor:
   * A feed that does not deliver daily. Corroboration would mark every
     non-delivery day a gap -- the seed's `rating` feed arrives weekly and the
     first run of this check duly reported five false gaps for it. Hence
-    `cadence: weekly`, which asks only that each week containing business
+    `cadence: weekly`, which asks only that each week containing COB
     dates saw at least one delivery, and `delivery_expected: false` to opt
     out entirely. Note what opting out costs: a `delivery_expected: false`
     feed that stops delivering for a month is invisible here, and only
@@ -65,8 +65,8 @@ DEFAULT_LOOKBACK = None
 
 def observed_dates(spark, table: str) -> set[date]:
     rows = spark.sql(
-        f"SELECT DISTINCT _business_date AS bd FROM {table} "
-        f"WHERE _business_date IS NOT NULL"
+        f"SELECT DISTINCT _cob_date AS bd FROM {table} "
+        f"WHERE _cob_date IS NOT NULL"
     ).collect()
     return {r["bd"] for r in rows}
 
@@ -80,13 +80,13 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
     and it should not need thirty seconds of JVM start-up to test.
     """
     calendar = sorted(set().union(*per_feed.values())) if per_feed else []
-    # Bound to the most recent `lookback` business dates. Note this counts
+    # Bound to the most recent `lookback` COB dates. Note this counts
     # OBSERVED dates, not calendar days, exactly as keep_business_days does --
     # so a run of holidays does not silently shorten the window checked.
     window = set(calendar[-lookback:]) if lookback else set(calendar)
 
     cadence = cadence or {}
-    report: dict = {"business_dates_in_window": len(window),
+    report: dict = {"cob_dates_in_window": len(window),
                     "lookback_business_days": lookback, "feeds": []}
     for name, dates in sorted(per_feed.items()):
         if not dates:
@@ -102,10 +102,10 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
         how = cadence.get(name, "daily")
 
         if how == "weekly":
-            # Ask only that each ISO week containing business dates saw at
+            # Ask only that each ISO week containing COB dates saw at
             # least one delivery. Weeks are used rather than a "at most N days
             # between deliveries" rule because a week is unambiguous and needs
-            # no calendar: a run of holidays shortens the week's business
+            # no calendar: a run of holidays shortens the week's COB
             # dates without changing which week they are in.
             weeks = {(d.isocalendar()[0], d.isocalendar()[1]) for d in expected}
             got = {(d.isocalendar()[0], d.isocalendar()[1]) for d in dates}
@@ -168,7 +168,7 @@ def main(argv=None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser()
     p.add_argument("--lookback", type=int, default=None,
-                   help="business dates to check back over "
+                   help="COB dates to check back over "
                         "(default: raw layer's keep_business_days)")
     p.add_argument("--fail-on-gap", action="store_true",
                    help="exit non-zero if any gap is found")

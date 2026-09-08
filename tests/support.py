@@ -82,7 +82,7 @@ feeds:
   - name: t_one
     description: d
     source_system: SRC
-    filename_pattern: 'A_(?P<business_date>\\d{{8}})\\.csv'
+    filename_pattern: 'A_(?P<cob_date>\\d{{8}})\\.csv'
     business_key: [k]
     columns: [k, v]
 {feed_extra}"""

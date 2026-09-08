@@ -210,7 +210,7 @@ def _select_expression(column: str, kind: str) -> str:
 
 def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
     key_list = ", ".join(f"'{c}'" for c in spec.business_key)
-    unique_key = ", ".join(f"'{c}'" for c in ["business_date", *spec.business_key])
+    unique_key = ", ".join(f"'{c}'" for c in ["cob_date", *spec.business_key])
     tag = "reference" if len(spec.business_key) == 1 else "transactional"
 
     # `source_provenance()` goes in beside `audit_columns()` below rather than
@@ -224,7 +224,7 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
     # safe_cast does not push its own alias out of line with the rest.
     rendered = [(col, _select_expression(col, types.get(col, "string")))
                 for col in spec.columns]
-    widest = max([len("_business_date")]
+    widest = max([len("_cob_date")]
                  + [len(e) for _, e in rendered if "\n" not in e])
     at = 8 + min(widest + 1, 64)
 
@@ -236,7 +236,7 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
             return f"        {head}\n{last.ljust(at)}as {alias},"
         return f"        {expr}".ljust(at) + f"as {alias},"
 
-    body = "\n".join([_line("_business_date", "business_date")]
+    body = "\n".join([_line("_cob_date", "cob_date")]
                      + [_line(expr, col) for col, expr in rendered]
                      + [_line("_source_file", "source_file"),
                         _line("_file_version", "source_file_version")])
@@ -245,7 +245,7 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
   config(
     materialized='incremental',
     unique_key=[{unique_key}],
-    partition_by=['business_date'],
+    partition_by=['cob_date'],
     tags=['prepared', '{tag}']
   )
 }}}}
@@ -267,7 +267,7 @@ with raw_rows as (
         *,
         {{{{ dedupe_rank([{key_list}]) }}}} as _rn
     from {{{{ source('raw', '{spec.name}') }}}}
-    where {{{{ incremental_window('_business_date', 'business_date') }}}}
+    where {{{{ incremental_window('_cob_date', 'cob_date') }}}}
       and {{{{ known_as_of() }}}}
 
 ),
@@ -306,7 +306,7 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
     A feed with no tests builds green forever and publishes whatever it is
     given. The minimum the doc asks for is generated unconditionally:
     `not_null` on the business key, a uniqueness test over
-    [business_date, <business key>], and a `relationships` test on any foreign
+    [cob_date, <business key>], and a `relationships` test on any foreign
     key -- which is the one that turns a bad reference into a failed test and
     an unmerged branch instead of a bad published figure.
     """
@@ -331,7 +331,7 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
     entry.yaml_set_comment_before_after_key(
         "columns", indent=4,
         before=("SCAFFOLDED MINIMUM: not_null on the business key, uniqueness\n"
-                "over [business_date, <business key>], and relationships on any\n"
+                "over [cob_date, <business key>], and relationships on any\n"
                 "foreign key. That is enough to prove dedupe_rank works and that\n"
                 "references resolve -- it is NOT enough to prove the values are\n"
                 "right. Add accepted_values / accepted_range for this feed's\n"
@@ -339,7 +339,7 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
 
     cols = CommentedSeq()
     bd = CommentedMap()
-    bd["name"] = "business_date"
+    bd["name"] = "cob_date"
     bd["tests"] = _flow(["not_null"])
     cols.append(bd)
 
@@ -391,7 +391,7 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
 
     combo = CommentedMap()
     inner = CommentedMap()
-    inner["combination_of_columns"] = _flow(["business_date", *spec.business_key])
+    inner["combination_of_columns"] = _flow(["cob_date", *spec.business_key])
     combo["dbt_utils.unique_combination_of_columns"] = inner
     entry["tests"] = CommentedSeq([combo])
 

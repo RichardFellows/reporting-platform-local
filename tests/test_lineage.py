@@ -204,7 +204,7 @@ def test_ingest_column_lineage_is_the_declared_rename():
 def test_ingest_classifies_the_platforms_own_columns_rather_than_omitting_them():
     """R-LIN-8, the ingest half.
 
-    `_business_date`, `_ingest_ts` and the provenance four come from no file
+    `_cob_date`, `_ingest_ts` and the provenance four come from no file
     column. They used to be dropped, which made them indistinguishable from a
     declared column whose mapping had gone missing -- one is by construction,
     the other is a defect, and silence reported them identically. They are
@@ -220,14 +220,14 @@ def test_ingest_classifies_the_platforms_own_columns_rather_than_omitting_them()
     from reporting_platform.lineage import columns, schemas
 
     schemas._TABLES = {"raw.t_one": [("k", "string"), ("v", "string"),
-                                     ("_business_date", "date"),
+                                     ("_cob_date", "date"),
                                      ("_delivery_id", "string")]}
     try:
         traced = columns.ingest_columns("t_one")
-        assert set(traced) == {"k", "v", "_business_date", "_delivery_id"}
-        assert traced["_business_date"].classification == columns.INGEST_ADDED
+        assert set(traced) == {"k", "v", "_cob_date", "_delivery_id"}
+        assert traced["_cob_date"].classification == columns.INGEST_ADDED
         assert traced["_delivery_id"].classification == columns.INGEST_ADDED
-        assert traced["_business_date"].sources == [], "sourceless by construction"
+        assert traced["_cob_date"].sources == [], "sourceless by construction"
         assert traced["k"].classification == columns.SOURCED
         assert not columns.unresolved_columns(traced), (
             "a platform column is not a defect")

@@ -24,10 +24,10 @@ layers:
     strategy: binpack        # raw is append-only and rarely filtered on sort keys
   prepared:
     strategy: sort
-    sort_order: "business_date, counterparty_id"
+    sort_order: "cob_date, counterparty_id"
   reporting:
     strategy: sort
-    sort_order: "business_date, counterparty_id"
+    sort_order: "cob_date, counterparty_id"
 
 orphan_files:
   # NEVER lower this. Too-recent older_than deletes files belonging to an

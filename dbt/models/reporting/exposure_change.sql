@@ -1,8 +1,8 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'counterparty_id'],
-    partition_by=['business_date'],
+    unique_key=['cob_date', 'counterparty_id'],
+    partition_by=['cob_date'],
     tags=['reporting', 'change-detection']
   )
 }}
@@ -14,7 +14,7 @@
   emphasis across the estate is on highlighting CHANGE over time, and on
   the legacy RDBMS that meant either keeping wide history in the reporting schema or
   running comparisons against an archive. Here it is a self-join over the
-  retained business dates, on data that is already partitioned by date.
+  retained COB dates, on data that is already partitioned by date.
 
   It also demonstrates why the retention rule matters operationally: with
   10 business days retained, day-on-day comparison always works; month-on-month
@@ -28,19 +28,19 @@ with current_exposure as (
 
     select *
     from {{ ref('counterparty_exposure') }}
-    where {{ incremental_window('business_date') }}
+    where {{ incremental_window('cob_date') }}
 
 ),
 
--- Rank the retained dates so "previous business date" means the previous
+-- Rank the retained dates so "previous COB date" means the previous
 -- date WE HAVE, not calendar yesterday. Matches the retention semantics.
 date_sequence as (
 
     select
-        business_date,
-        lag(business_date) over (order by business_date) as prior_business_date
+        cob_date,
+        lag(cob_date) over (order by cob_date) as prior_cob_date
     from (
-        select distinct business_date from {{ ref('counterparty_exposure') }}
+        select distinct cob_date from {{ ref('counterparty_exposure') }}
     ) d
 
 ),
@@ -48,30 +48,30 @@ date_sequence as (
 month_end_dates as (
 
     select
-        business_date,
+        cob_date,
         row_number() over (
-            partition by extract(year from business_date), extract(month from business_date)
-            order by business_date desc
+            partition by extract(year from cob_date), extract(month from cob_date)
+            order by cob_date desc
         ) as rn
-    from (select distinct business_date from {{ ref('counterparty_exposure') }}) m
+    from (select distinct cob_date from {{ ref('counterparty_exposure') }}) m
 
 ),
 
 prior_month_end as (
 
     select
-        c.business_date,
-        max(m.business_date) as prior_month_end_date
-    from (select distinct business_date from {{ ref('counterparty_exposure') }}) c
+        c.cob_date,
+        max(m.cob_date) as prior_month_end_date
+    from (select distinct cob_date from {{ ref('counterparty_exposure') }}) c
     left join month_end_dates m
            on m.rn = 1
-          and m.business_date < c.business_date
-    group by c.business_date
+          and m.cob_date < c.cob_date
+    group by c.cob_date
 
 )
 
 select
-    cur.business_date,
+    cur.cob_date,
     cur.counterparty_id,
     cur.legal_name,
     cur.country_code,
@@ -114,15 +114,15 @@ select
 from current_exposure cur
 
 join date_sequence ds
-  on ds.business_date = cur.business_date
+  on ds.cob_date = cur.cob_date
 
 left join {{ ref('counterparty_exposure') }} prev
-       on prev.business_date   = ds.prior_business_date
+       on prev.cob_date   = ds.prior_cob_date
       and prev.counterparty_id = cur.counterparty_id
 
 left join prior_month_end pme
-       on pme.business_date = cur.business_date
+       on pme.cob_date = cur.cob_date
 
 left join {{ ref('counterparty_exposure') }} me
-       on me.business_date   = pme.prior_month_end_date
+       on me.cob_date   = pme.prior_month_end_date
       and me.counterparty_id = cur.counterparty_id

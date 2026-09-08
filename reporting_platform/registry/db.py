@@ -120,7 +120,7 @@ SCHEMA = """
 CREATE SCHEMA IF NOT EXISTS registry;
 
 -- One row per DELIVERY: a set of bytes this platform accepted into landing/
--- for one feed and one business date. The natural key is the landing
+-- for one feed and one COB date. The natural key is the landing
 -- filename, because that is what identity means here -- `_v2` is a different
 -- delivery from the file it corrects, and that is the whole point of the
 -- versioning `conform._free_name` does.
@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS registry.delivery (
     -- does and does not preserve.
     sequence_no        BIGSERIAL   NOT NULL UNIQUE,
     source_system      TEXT        NOT NULL,
-    business_date      DATE        NOT NULL,
+    cob_date      DATE        NOT NULL,
     -- The DELIVERY's arrival time -- the landing object's LastModified, the
     -- same value the manifest carries -- not the moment this row was written.
     received_at        TIMESTAMPTZ NOT NULL,
@@ -164,9 +164,9 @@ CREATE TABLE IF NOT EXISTS registry.delivery (
 );
 
 CREATE INDEX IF NOT EXISTS delivery_feed_date
-    ON registry.delivery (feed, business_date);
-CREATE INDEX IF NOT EXISTS delivery_business_date
-    ON registry.delivery (business_date);
+    ON registry.delivery (feed, cob_date);
+CREATE INDEX IF NOT EXISTS delivery_cob_date
+    ON registry.delivery (cob_date);
 
 -- The objects that actually hold the rows. One for a plain CSV (pointing back
 -- into landing/), N for an archive (pointing into ready/). Separate from the
@@ -234,10 +234,10 @@ CREATE TABLE IF NOT EXISTS registry.run (
     airflow_run_id    TEXT,
     branch            TEXT        NOT NULL,
     merged_hash       TEXT,
-    -- The business date the run PUBLISHED: the maximum business date present
+    -- The COB date the run PUBLISHED: the maximum COB date present
     -- in what it built. Null until it publishes, because until then nothing
     -- has been read to establish it.
-    business_date     DATE,
+    cob_date     DATE,
     started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at       TIMESTAMPTZ,
     -- REQ-404. What code produced this. `code_ref_kind` says whether the

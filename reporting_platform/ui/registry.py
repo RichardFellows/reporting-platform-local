@@ -132,7 +132,7 @@ class FeedSpec:
     columns: list[str]
     expected_min_rows: int = 10
     cadence: str = "daily"
-    # "expected to deliver on every business date" -- see Feed.delivery_expected
+    # "expected to deliver on every COB date" -- see Feed.delivery_expected
     # for why it is not called `completeness`.
     delivery_expected: bool = True
     schema_drift: str = "warn"
@@ -236,7 +236,7 @@ def _arrival_from_payload(raw: Any) -> dict[str, Any]:
     control = raw.get("control")
     if isinstance(control, dict):
         c: dict[str, Any] = {}
-        for key in ("pattern", "business_date", "version"):
+        for key in ("pattern", "cob_date", "version"):
             value = str(control.get(key) or "").strip()
             if value:
                 c[key] = value
@@ -274,9 +274,9 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
     member_pattern = str(raw.get("member_pattern") or "").strip()
     if member_pattern:
         out["member_pattern"] = member_pattern
-    business_date_from = str(raw.get("business_date_from") or "").strip()
-    if business_date_from:
-        out["business_date_from"] = business_date_from
+    cob_date_from = str(raw.get("cob_date_from") or "").strip()
+    if cob_date_from:
+        out["cob_date_from"] = cob_date_from
     parts = str(raw.get("parts") or "").strip()
     if parts:
         out["parts"] = parts
@@ -367,11 +367,11 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         except re.error as exc:
             errors["filename_pattern"] = f"not a valid regex: {exc}"
         else:
-            if "business_date" not in compiled.groupindex:
+            if "cob_date" not in compiled.groupindex:
                 errors["filename_pattern"] = (
-                    "must contain a named group (?P<business_date>...) -- "
+                    "must contain a named group (?P<cob_date>...) -- "
                     "this is the name the file has IN LANDING, and everything "
-                    "downstream reads the business date out of it. If the "
+                    "downstream reads the COB date out of it. If the "
                     "UPSTREAM sends no date in the name, leave this as the "
                     "name you want and describe the real one under Arrival "
                     "below; the inbox renames it on the way in")
@@ -511,7 +511,7 @@ def derive_pattern(example_filename: str) -> str | None:
     caller can still edit the result.
 
     Returns None when the example holds no 8-digit date, because then there is
-    nothing to anchor a business_date group to.
+    nothing to anchor a cob_date group to.
     """
     m = re.search(r"(?<!\d)(\d{8})(?!\d)", example_filename)
     if not m:
@@ -520,7 +520,7 @@ def derive_pattern(example_filename: str) -> str | None:
     tail = example_filename[m.end():]
     # A trailing _v<N> in the example is a version marker, not part of the name.
     tail = re.sub(r"^_v\d+", "", tail)
-    return (head + "(?P<business_date>\\d{8})"
+    return (head + "(?P<cob_date>\\d{8})"
             + "(?:_v(?P<version>\\d+))?" + re.escape(tail))
 
 
@@ -567,7 +567,7 @@ def _arrival_block(value: dict[str, Any]) -> CommentedMap:
         cv = CommentedMap()
         # Fixed order rather than dict order: pattern first because it is what
         # finds the file, then what is read out of it.
-        for key in ("pattern", "business_date", "version"):
+        for key in ("pattern", "cob_date", "version"):
             if key in control:
                 cv[key] = SQ(control[key])
         av["control"] = cv
@@ -577,7 +577,7 @@ def _arrival_block(value: dict[str, Any]) -> CommentedMap:
 def _delivery_block(value: dict[str, Any]) -> CommentedMap:
     """`spec.delivery` -> the nested YAML mapping, in the order
     docs/DELIVERY-SHAPES.md's own examples use: kind, member_pattern,
-    business_date_from, parts, control.
+    cob_date_from, parts, control.
 
     `member_pattern` and `control.pattern`/`control.row_count` are regexes,
     single-quoted like `filename_pattern` so their backslashes stay literal.
@@ -587,8 +587,8 @@ def _delivery_block(value: dict[str, Any]) -> CommentedMap:
         dv["kind"] = value["kind"]
     if "member_pattern" in value:
         dv["member_pattern"] = SQ(value["member_pattern"])
-    if "business_date_from" in value:
-        dv["business_date_from"] = value["business_date_from"]
+    if "cob_date_from" in value:
+        dv["cob_date_from"] = value["cob_date_from"]
     if "parts" in value:
         dv["parts"] = value["parts"]
     control = value.get("control")

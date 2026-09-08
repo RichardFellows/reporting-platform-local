@@ -34,9 +34,9 @@ class FilenameError(ValueError):
     """A `filename_pattern` no concrete filename can be built from."""
 
 
-def render_filename(feed: Feed, business_date: date,
+def render_filename(feed: Feed, cob_date: date,
                     version: int | None = None) -> str:
-    """The name this feed's delivery for `business_date` should have."""
+    """The name this feed's delivery for `cob_date` should have."""
     out: list[str] = []
     i, pattern = 0, feed.filename_pattern
     while i < len(pattern):
@@ -45,9 +45,9 @@ def render_filename(feed: Feed, business_date: date,
             if i + 1 >= len(pattern):
                 raise FilenameError("filename_pattern ends in a backslash")
             out.append(pattern[i + 1]); i += 2; continue
-        if pattern.startswith("(?P<business_date>", i):
+        if pattern.startswith("(?P<cob_date>", i):
             j = _closing_paren(pattern, i)
-            out.append(f"{business_date:%Y%m%d}"); i = j + 1; continue
+            out.append(f"{cob_date:%Y%m%d}"); i = j + 1; continue
         if pattern.startswith("(?P<version>", i):
             j = _closing_paren(pattern, i)
             out.append(str(version or 1)); i = j + 1; continue
@@ -59,9 +59,9 @@ def render_filename(feed: Feed, business_date: date,
                 # The re-delivery marker: render it only when a version was
                 # asked for, so a v1 file is `FEED_20260819.csv` and not
                 # `FEED_20260819_v1.csv`.
-                out.append(_render_inner(inner, business_date, version))
+                out.append(_render_inner(inner, cob_date, version))
             elif not optional:
-                out.append(_render_inner(inner, business_date, version))
+                out.append(_render_inner(inner, cob_date, version))
             i = j + (2 if optional else 1); continue
         if ch in "[]*+?{}()|^$.":
             raise FilenameError(
@@ -72,7 +72,7 @@ def render_filename(feed: Feed, business_date: date,
 
     candidate = "".join(out)
     parsed = feed.parse_filename(candidate)
-    if parsed is None or parsed[0] != business_date:
+    if parsed is None or parsed[0] != cob_date:
         raise FilenameError(
             f"generated name {candidate!r} does not match the feed's own "
             f"pattern ({feed.filename_pattern}). Refusing to write a file that "
@@ -80,7 +80,7 @@ def render_filename(feed: Feed, business_date: date,
     return candidate
 
 
-def _render_inner(inner: str, business_date: date, version: int | None) -> str:
+def _render_inner(inner: str, cob_date: date, version: int | None) -> str:
     out: list[str] = []
     i = 0
     while i < len(inner):
@@ -89,9 +89,9 @@ def _render_inner(inner: str, business_date: date, version: int | None) -> str:
         if inner.startswith("(?P<version>", i):
             j = _closing_paren(inner, i)
             out.append(str(version or 1)); i = j + 1; continue
-        if inner.startswith("(?P<business_date>", i):
+        if inner.startswith("(?P<cob_date>", i):
             j = _closing_paren(inner, i)
-            out.append(f"{business_date:%Y%m%d}"); i = j + 1; continue
+            out.append(f"{cob_date:%Y%m%d}"); i = j + 1; continue
         if inner[i] in "[]*+?{}()|^$.":
             raise FilenameError("unsupported construct inside an optional group")
         out.append(inner[i]); i += 1

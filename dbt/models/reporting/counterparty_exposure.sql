@@ -1,8 +1,8 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['business_date', 'counterparty_id'],
-    partition_by=['business_date'],
+    unique_key=['cob_date', 'counterparty_id'],
+    partition_by=['cob_date'],
     tags=['reporting', 'core']
   )
 }}
@@ -24,7 +24,7 @@ with trades as (
 
     select *
     from {{ ref('fo_trade') }}
-    where {{ incremental_window('business_date') }}
+    where {{ incremental_window('cob_date') }}
       and coalesce(is_matured, false) = false
 
 ),
@@ -54,7 +54,7 @@ counterparties as (
 delivered as (
 
     select
-        _business_date                          as business_date,
+        _cob_date                               as cob_date,
         {{ clean_string('counterparty_id') }}   as counterparty_id
     from {{ source('raw', 'ref_counterparty') }}
     group by 1, 2
@@ -65,26 +65,26 @@ delivered as (
 -- across agencies. Documented here because it is a business rule, not a
 -- technical one, and report owners need to be able to find it.
 --
--- `rating` is SCD2 now, so there is no business_date to group by: the dates
+-- `rating` is SCD2 now, so there is no cob_date to group by: the dates
 -- come from the exposure side and the ratings are joined point-in-time onto
--- them. `dates` is the set of (business_date, counterparty_id) pairs the
+-- them. `dates` is the set of (cob_date, counterparty_id) pairs the
 -- report is being built for, taken from the trades themselves so that a
 -- counterparty with no trades on a date contributes no rating row -- which is
 -- what the old equality join did implicitly.
 dates as (
-    select distinct business_date, counterparty_id from trades
+    select distinct cob_date, counterparty_id from trades
 ),
 
 worst_rating as (
 
     select
-        d.business_date,
+        d.cob_date,
         d.counterparty_id,
         max(r.rating_rank)                                      as worst_rating_rank,
         min(case when r.grade_band = 'SUB_INVESTMENT_GRADE' then 0 else 1 end) as is_investment_grade_flag,
         -- How recent the ratings behind this row are. NOT flagged as
         -- "carried forward" the way counterparty is: rating is a WEEKLY feed
-        -- (cadence: weekly in feeds.yml), so a business date with no delivery
+        -- (cadence: weekly in feeds.yml), so a COB date with no delivery
         -- is the design rather than a gap, and flagging it would be noise on
         -- three days in four. A date is still useful -- it distinguishes a
         -- rating set last week from one set two years ago.
@@ -92,15 +92,15 @@ worst_rating as (
     from dates d
     join {{ ref('ref_rating') }} r
       on r.counterparty_id = d.counterparty_id
-     and {{ as_of('r', 'd.business_date') }}
-    group by d.business_date, d.counterparty_id
+     and {{ as_of('r', 'd.cob_date') }}
+    group by d.cob_date, d.counterparty_id
 
 ),
 
 aggregated as (
 
     select
-        t.business_date,
+        t.cob_date,
         t.counterparty_id,
         count(*)                                                as trade_count,
         sum(t.notional)                                         as total_notional,
@@ -112,12 +112,12 @@ aggregated as (
         max(t.maturity_date)                                    as latest_maturity_date,
         max(t.source_batch_id)                                  as source_batch_id
     from trades t
-    group by t.business_date, t.counterparty_id
+    group by t.cob_date, t.counterparty_id
 
 )
 
 select
-    a.business_date,
+    a.cob_date,
     a.counterparty_id,
     c.legal_name,
     c.country_code,
@@ -159,16 +159,16 @@ from aggregated a
 -- The last good version IS carried forward under SCD2, and
 -- `reference_carried_forward` above is what keeps that gap visible.
 -- POINT-IN-TIME, not equality: `counterparty` is SCD2 now, holding one row
--- per version rather than one per business date. as_of() expands to a
+-- per version rather than one per COB date. as_of() expands to a
 -- `between effective_from and effective_to` predicate; effective_to is 9999-12-31 on the
 -- open version, so the current row matches every date at or after its
 -- effective_from with no null-handling branch here.
 left join counterparties c
        on c.counterparty_id  = a.counterparty_id
-      and {{ as_of('c', 'a.business_date') }}
+      and {{ as_of('c', 'a.cob_date') }}
 left join delivered d
        on d.counterparty_id  = a.counterparty_id
-      and d.business_date    = a.business_date
+      and d.cob_date    = a.cob_date
 left join worst_rating r
-       on r.business_date    = a.business_date
+       on r.cob_date    = a.cob_date
       and r.counterparty_id  = a.counterparty_id

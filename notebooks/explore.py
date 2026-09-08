@@ -98,7 +98,7 @@ def _(mo):
 def _(mo):
     query = mo.ui.text_area(
         value=(
-            "select business_date, count(*) as rows\n"
+            "select cob_date, count(*) as rows\n"
             "from lakehouse.reporting.exposure_change\n"
             "group by 1 order by 1 desc limit 10"
         ),
@@ -171,11 +171,11 @@ def _(mo):
 
     The example below is the one most likely to catch you out.
     `counterparty` and `rating` are **SCD2**: one row per
-    version, not per business date, with `effective_from` / `effective_to`.
+    version, not per COB date, with `effective_from` / `effective_to`.
 
     An equality join against them does not fail and does not return
     nothing — it returns a **plausible-looking subset**. Joining
-    `c.effective_from = t.business_date` on this data gives 463 rows where
+    `c.effective_from = t.cob_date` on this data gives 463 rows where
     the correct join gives the lot: only the dates a version happened to
     start on. Numbers that look reasonable and are silently incomplete are
     worse than an error.
@@ -190,7 +190,7 @@ def _(mo):
 def _(con, mo):
     _sql = """
     select
-        t.business_date,
+        t.cob_date,
         c.legal_name,
         c.country_code,
         count(*)                as trades,
@@ -198,11 +198,11 @@ def _(con, mo):
     from lakehouse.prepared.fo_trade t
     join lakehouse.prepared.ref_counterparty c
       on  c.counterparty_id = t.counterparty_id
-      -- POINT-IN-TIME, not c.business_date = t.business_date. effective_to is
+      -- POINT-IN-TIME, not c.cob_date = t.cob_date. effective_to is
       -- DATE '9999-12-31' on the open version, so no null handling is needed.
-      and t.business_date between c.effective_from and c.effective_to
+      and t.cob_date between c.effective_from and c.effective_to
     group by 1, 2, 3
-    order by t.business_date desc, notional desc
+    order by t.cob_date desc, notional desc
     limit 15
     """
     scd2_example = mo.vstack(
@@ -222,7 +222,7 @@ def _(mo):
 
     The question worth asking of any change: does `prepared` still account
     for what `raw` received? Raw is all strings and holds every delivered
-    version; prepared keeps the latest `_file_version` per business date.
+    version; prepared keeps the latest `_file_version` per COB date.
     A gap here is a dedupe or an incremental-window problem.
     """)
     return
@@ -232,28 +232,28 @@ def _(mo):
 def _(con, mo):
     _sql = """
     with raw_latest as (
-        select _business_date as business_date, count(distinct trade_id) as ids
+        select _cob_date as cob_date, count(distinct trade_id) as ids
         from lakehouse.raw.fo_trade
         group by 1
     ),
     prep as (
-        select business_date, count(distinct trade_id) as ids
+        select cob_date, count(distinct trade_id) as ids
         from lakehouse.prepared.fo_trade
         group by 1
     )
     select
-        coalesce(r.business_date, p.business_date) as business_date,
+        coalesce(r.cob_date, p.cob_date) as cob_date,
         r.ids as raw_ids,
         p.ids as prepared_ids,
         coalesce(p.ids, 0) - coalesce(r.ids, 0) as difference
     from raw_latest r
-    full outer join prep p on p.business_date = r.business_date
+    full outer join prep p on p.cob_date = r.cob_date
     where coalesce(p.ids, 0) <> coalesce(r.ids, 0)
     order by 1 desc
     """
     recon = mo.vstack(
         [
-            mo.md("Business dates where raw and prepared disagree on trade count "
+            mo.md("COB dates where raw and prepared disagree on trade count "
                   "— **empty is the healthy answer**:"),
             mo.ui.table(con.execute(_sql).df(), selection=None),
         ]

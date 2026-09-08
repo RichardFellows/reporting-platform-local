@@ -25,7 +25,7 @@ feeds:
   - name: cus_position
     description: Custody positions, delivered zipped.
     source_system: CUS
-    filename_pattern: 'custodyPositions_(?P<business_date>\\d{8})\\.zip'
+    filename_pattern: 'custodyPositions_(?P<cob_date>\\d{8})\\.zip'
     business_key: [position_id]
     expected_min_rows: 1
     delivery:
@@ -70,7 +70,7 @@ def test_delivery_block_resolves():
     s3, monkey, fd, norm = _setup()
     try:
         assert fd.delivery["kind"] == "archive", fd.delivery
-        assert fd.delivery["business_date_from"] == "container", fd.delivery
+        assert fd.delivery["cob_date_from"] == "container", fd.delivery
         assert fd.delivery["parts"] == "concat", fd.delivery
     finally:
         uninstall(monkey)
@@ -101,7 +101,7 @@ def test_not_built_values_say_so_rather_than_unknown():
                             "      kind: archive\n      parts: separate"))
     assert "NOT BUILT" in msg, msg
     msg = _bad(FEED.replace("      kind: archive",
-                            "      kind: archive\n      business_date_from: member"))
+                            "      kind: archive\n      cob_date_from: member"))
     assert "NOT BUILT" in msg, msg
 
 
@@ -115,7 +115,7 @@ def test_members_become_parts_with_the_containers_date():
     s3, monkey, fd, norm = _setup(TWO_PARTS)
     try:
         m = norm.normalize(fd, ZIP_KEY)
-        assert m["business_date"] == "2026-09-03", m["business_date"]
+        assert m["cob_date"] == "2026-09-03", m["cob_date"]
         assert m["normalizer"] == "archive/v1"
         assert [p["member"] for p in m["parts"]] == ["positions_1.csv",
                                                      "positions_2.csv"]

@@ -51,7 +51,7 @@ reporting_platform.lineage --columns` exits non-zero on any unresolved column,
 and `tests/test_lineage.py` asserts the class is both reachable and empty.
 
 THE TRANSFORMATION IS REPORTED, not just the dependency. A rename shows as an
-input field with a different name (`_business_date` -> `business_date`) and no
+input field with a different name (`_cob_date` -> `cob_date`) and no
 description; a computation carries the SQL that performs it, e.g.
 `TRY_CAST(NULLIF(NULLIF(NULLIF(TRIM(deduped.notional), ''), 'NULL'), 'N/A') AS
 DECIMAL(28,4))`. That is the deepest non-trivial expression on the path from
@@ -142,7 +142,7 @@ def ingest_columns(feed_name: str) -> dict[str, ColumnLineage]:
     query, so the mapping IS `Feed.source_column()`.
 
     THE PLATFORM'S OWN COLUMNS ARE CLASSIFIED, NOT OMITTED (R-LIN-8). Raw
-    carries `_business_date`, `_ingest_ts`, `_source_file`, the provenance
+    carries `_cob_date`, `_ingest_ts`, `_source_file`, the provenance
     four and the rest; they come from no file column, and dropping them made
     them indistinguishable from a column whose mapping had gone missing. They
     are `ingest_added`: sourceless by construction.

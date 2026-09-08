@@ -3,7 +3,7 @@
 # Reproduces the legacy the legacy RDBMS behaviour (10 working days + 80 month-end
 # dates, enforced nightly by partition switching) on Iceberg/Nessie.
 #
-# `keep_business_days` / `keep_month_ends` count DISTINCT business dates
+# `keep_business_days` / `keep_month_ends` count DISTINCT COB dates
 # observed in the table, not calendar days. A skipped upstream day does not
 # silently shorten the retained window.
 
@@ -71,7 +71,7 @@ environments:
     #
     # >= the raw layer's window (keep_month_ends/12 years), or find_pending
     # starts computing its keep-set from a landing prefix that no longer holds
-    # every date and treats live business dates as expired. landing.py WARNS
+    # every date and treats live COB dates as expired. landing.py WARNS
     # if that is violated -- gradual, and recoverable by raising this.
     #
     # >= the longest `references.published_tags` window below, because a
@@ -90,7 +90,7 @@ environments:
         # above the raw layer's own window (keep_month_ends 80 = 6.7 years),
         # because `find_pending` computes its keep-set per feed from that
         # feed's landing prefix and a shorter window would start reporting
-        # live business dates as expired. That band -- under the pin window,
+        # live COB dates as expired. That band -- under the pin window,
         # over the raw window -- is the whole space a class has to move in.
         operational: {keep_years: 7}
 
@@ -103,7 +103,7 @@ environments:
     # age, everything, no keep-set -- because it answers the same question
     # from the other side: "what did they actually send us?", asked about a
     # delivery that never arrived. A rejected file is frequently the whole
-    # explanation for a missing business date, and the explanation is needed
+    # explanation for a missing COB date, and the explanation is needed
     # for as long as the date it is missing from.
     #
     # A SEPARATE KEY, not a reference to landing's, even though the value is
@@ -114,7 +114,7 @@ environments:
     # own; shortening landing is not.
     #
     # Dated from the object's own key -- `quarantine/<feed>/<yyyy>/<mm>/...`
-    # -- because a quarantined file frequently has no parsable business date,
+    # -- because a quarantined file frequently has no parsable COB date,
     # not being nameable being a common reason it is here at all.
     quarantine:
       keep_years: 10
@@ -122,7 +122,7 @@ environments:
       # `landing:` and says nothing about quarantine gets quarantine's own
       # window, because the two answer to different things -- this block's
       # comment above already says quarantine has neither of landing's hard
-      # floors. A rejected delivery explains a missing business date whether or
+      # floors. A rejected delivery explains a missing COB date whether or
       # not the feed is behind a published report, so there is no reason yet
       # for `operational` to shorten it. Add an entry here if that changes.
 
@@ -192,9 +192,9 @@ environments:
 # commit pins every data file that commit referenced, and expire_snapshots
 # cannot reclaim it.
 references:
-  # published/<report>/<business_date>/<run_id> — cut on main by
+  # published/<report>/<cob_date>/<run_id> — cut on main by
   # dbt_builds.publish, once per report, when a REPORTING build merges.
-  # The two-segment `published/<business_date>/<run_id>` shape is still
+  # The two-segment `published/<cob_date>/<run_id>` shape is still
   # matched by the sweep, because tags cut under it before publication knew
   # its report are real pins; nothing writes it any more.
   #
@@ -203,7 +203,7 @@ references:
   # the TABLES use — which is a category error: a table window says how much
   # history is queryable today, a tag says how far back a published result can
   # be REPRODUCED. Under the old values an ordinary daily publication lost its
-  # pin after ten more published business dates, roughly a fortnight, and
+  # pin after ten more published COB dates, roughly a fortnight, and
   # month-end pins lasted 80/12 ≈ 6.7 years against a period assumed to be
   # longer than that. The evidence was expiring on the wrong schedule and had
   # been since publication started.
@@ -256,7 +256,7 @@ references:
     # that loses evidence.
     per_report: {}
 
-  # snapshot/<feed>/<business_date>/<run_id> — cut on main by the ingest DAG
+  # snapshot/<feed>/<cob_date>/<run_id> — cut on main by the ingest DAG
   # after each feed's delivery is merged.
   #
   # A DIFFERENT OBJECT FROM A PUBLISHED TAG, and the split is the point. This
@@ -268,7 +268,7 @@ references:
   #
   # NOTHING IS REPRODUCED FROM ONE. No published figure rests on a snapshot
   # tag, so this window is a storage decision rather than an evidence one: it
-  # buys the ability to read a raw business date back after retention has
+  # buys the ability to read a raw COB date back after retention has
   # removed it from the live table, and it costs every data file that ingest
   # referenced staying unreclaimable for the duration. Set to comfortably
   # outlive the raw keep-set (80 month-ends ≈ 6.7 years is the long tail there)

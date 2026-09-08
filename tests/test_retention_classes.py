@@ -117,7 +117,7 @@ def test_classes_govern_the_evidence_prefixes_only():
     """`PREFIX_CLASSES` is closed. A raw or prepared window is per LAYER --
     per-feed raw retention would fight `find_pending`, which derives one
     keep-set per feed from that feed's landing prefix, and the two would
-    disagree about which business dates still exist."""
+    disagree about which COB dates still exist."""
     ctx, _ = _ctx()
     assert set(ctx.PREFIX_CLASSES) == {"landing", "quarantine"}
     for prefix in ("raw", "prepared", "reporting", "ready"):
@@ -199,9 +199,9 @@ def test_no_expected_by_is_not_a_deadline_of_midnight():
     assert ctx.feeds()["t_one"].expected_by == ""
 
 
-def test_the_deadline_is_the_day_after_the_business_date():
+def test_the_deadline_is_the_day_after_the_cob_date():
     """Deliberately fixed at +1 rather than configurable, and deliberately in
-    the FORGIVING direction: a business date has to have ENDED before the
+    the FORGIVING direction: a COB date has to have ENDED before the
     extract can be taken, and a reference snapshot that legitimately arrives
     the same day is then judged against a later deadline than it needed. This
     check can under-report lateness and cannot invent it."""
@@ -217,7 +217,7 @@ def test_a_backfill_is_one_event_and_not_n_missed_deadlines():
     migration, a re-delivery of history after an outage. Reporting it as ten
     findings buries anything else the check found, which is how a monitor
     stops being read. It is a derivation with nothing to tune: more than one
-    business date, exactly one arrival day.
+    COB date, exactly one arrival day.
 
     The finding is DESCRIBED differently, never suppressed. `total_late` and
     `--fail-on-late` are unaffected, because a backfill of dates that were due

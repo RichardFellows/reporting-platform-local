@@ -22,8 +22,8 @@ Combines many small files into fewer right-sized files.
 CALL lakehouse.system.rewrite_data_files(
   table => 'raw.fo_trade',
   strategy => 'sort',
-  sort_order => 'business_date, counterparty_id',
-  where => 'business_date >= date "2026-08-01"',
+  sort_order => 'cob_date, counterparty_id',
+  where => 'cob_date >= date "2026-08-01"',
   options => map('target-file-size-bytes','268435456',
                  'min-input-files','5',
                  'partial-progress.enabled','true')

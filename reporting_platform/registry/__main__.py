@@ -4,7 +4,7 @@
     python -m reporting_platform.registry coverage
     python -m reporting_platform.registry schema
     python -m reporting_platform.registry provenance
-    python -m reporting_platform.registry deliveries --business-date 2026-08-01
+    python -m reporting_platform.registry deliveries --cob-date 2026-08-01
     python -m reporting_platform.registry rejections
     python -m reporting_platform.registry runs [--purpose reporting]
     python -m reporting_platform.registry versions [--report NAME]
@@ -68,7 +68,7 @@ def main(argv=None) -> int:
                    help="the code and deployment identity a run would record")
 
     dl = sub.add_parser("deliveries", help="registered deliveries for a date")
-    dl.add_argument("--business-date", required=True,
+    dl.add_argument("--cob-date", required=True,
                     type=lambda s: date.fromisoformat(s))
     dl.add_argument("--feed")
 
@@ -227,7 +227,7 @@ def main(argv=None) -> int:
                "declared_digest": os.environ.get("DBT_PROJECT_DIGEST", "").strip(),
                "drift": ctx.check_project_drift() or ""}
     elif a.command == "deliveries":
-        out = deliveries.deliveries_on(a.business_date, a.feed)
+        out = deliveries.deliveries_on(a.cob_date, a.feed)
     else:
         out = rejections.recent(a.limit, a.feed)
 

@@ -48,16 +48,16 @@ mechanism.
 ## The assumption everything else breaks against
 
 **One landed object is one file, is one delivery, and its NAME carries the
-business date.**
+COB date.**
 
 `Feed.parse_filename` (`common/context.py:142`) does `re.fullmatch` on a
-filename and returns `(business_date, version)`. It has **14 call sites across
+filename and returns `(cob_date, version)`. It has **14 call sites across
 7 modules**, and they are not all the ones you would guess:
 
 | Module | What it decides |
 |---|---|
 | `ingest/arrival.py` (3) | what is pending, and which dates landing believes exist |
-| `ingest/ingest_feed.py` (1) | the business date of the write |
+| `ingest/ingest_feed.py` (1) | the COB date of the write |
 | `ingest/inbox.py` (1) | which feed claims a dropped file |
 | `retention/landing.py` (2) | **what may be deleted from the evidence prefix** |
 | `ui/feeddata.py` (4) | seed listing, landed listing, delivery, upload validation |
@@ -71,7 +71,7 @@ object to ingest, and "ready" stops meaning "stopped growing"
 ([DECISIONS.md#inbox-is-polled](DECISIONS.md#inbox-is-polled)).
 
 More regex does not fix this. One concept has to become three: **what arrived**,
-**when it is ready**, and **what business date it is for**.
+**when it is ready**, and **what COB date it is for**.
 
 ---
 
@@ -106,7 +106,7 @@ Normalization writes one JSON manifest per delivery into `ready/<feed>/`:
 
 ```json
 { "feed": "treasury_margin_call",
-  "business_date": "2026-08-01",
+  "cob_date": "2026-08-01",
   "delivery_id": "20260801T063112-a1b2c3",
   "received_at": "2026-08-01T06:31:12Z",
   "source_object": "landing/treasury_margin_call/marginCalls_20260801.zip",
@@ -164,7 +164,7 @@ conventions:
     schema_drift: fail
     delivery:
       kind: archive
-      business_date_from: container
+      cob_date_from: container
 
 feeds:
   - name: treasury_margin_call
@@ -203,7 +203,7 @@ goes through `scripts/_spark_task.py` like everything else
 ([DECISIONS.md#spark-in-a-subprocess](DECISIONS.md#spark-in-a-subprocess)).
 
 With `kind: file` — the default, and what every existing feed gets — the
-normalizer resolves the business date from the filename exactly as
+normalizer resolves the COB date from the filename exactly as
 `parse_filename` did, writes a manifest whose single part references the
 landing object, and copies nothing. **Observable behaviour is unchanged**, and
 that was the entire success criterion.
@@ -217,7 +217,7 @@ rows with `_source_file = landing/fo_trade/TRADE_20260903.csv`, and the next
 
 Downstream of the manifest boundary, nothing changes: same reader, same branch
 per delivery, same `_source_file` ledger, same merge. `ingest()` already
-accepts an explicit `business_date` that takes precedence over the parsed one
+accepts an explicit `cob_date` that takes precedence over the parsed one
 (`ingest_feed.py:248`), so the manifest date flows in through a parameter that
 exists today.
 
@@ -230,7 +230,7 @@ still needs it to decide what is ours (`retention/landing.py:94`), and the
 console, sample-data and seed-landing uses are about local files *before*
 landing and legitimately keep it.
 
-**The win is not the call-site count.** It is that the business date is derived
+**The win is not the call-site count.** It is that the COB date is derived
 **once**, at normalize, and read thereafter — instead of seven modules
 independently re-running the same regex with the standing ability to disagree.
 
@@ -283,7 +283,7 @@ follows is what was built.
 delivery:
   kind: archive               # file | archive
   member_pattern: '.*\.csv'   # which members belong to this feed
-  business_date_from: container   # container | member | path -- only container is built
+  cob_date_from: container   # container | member | path -- only container is built
   parts: concat               # concat | separate -- only concat is built
 ```
 
@@ -291,7 +291,7 @@ The normalizer reads the container from `landing/`, explodes matching members
 into `ready/<feed>/<stem>/`, and writes one manifest whose `parts` list them.
 This is the first normalizer that actually copies bytes; the derived copies
 live in `ready/`, where short retention and rebuildability apply, never under
-`landing/`. `business_date_from: member`/`path` and `parts: separate` are
+`landing/`. `cob_date_from: member`/`path` and `parts: separate` are
 recognised keys that raise a "NOT BUILT" error naming the gap rather than
 being silently accepted (`context.NOT_BUILT`).
 
@@ -383,7 +383,7 @@ With a real file in hand the guess can simply be right.
 Archives are handled too (`sniff_archive`): extracts a matching member to a
 local temp file and sniffs it, and proposes `member_pattern` grouped by
 extension when there is no existing feed to have declared one already. Only
-`business_date_from: container` is ever proposed -- `member`/`path` are
+`cob_date_from: container` is ever proposed -- `member`/`path` are
 real, described above, and NOT BUILT, and proposing either would suggest a
 value guaranteed to fail at load; `container_has_date` says plainly when
 the container's own name has nothing to source it from.
@@ -459,7 +459,7 @@ observed in **`landing/`** (`retention_keep_dates`, `arrival.py:85`) — landing
 is the only place holding every date after raw has expired them, which is
 exactly what the `landing:` block in `retention.yml` warns about in its own
 comment. Compute the keep-set from `ready/` and it silently narrows to the
-cache window, and live business dates start looking expired. The tempting fix —
+cache window, and live COB dates start looking expired. The tempting fix —
 give manifests an eight-year lifetime so the keep-set can come from them — is
 the control-table-drift trap again, wearing a different hat.
 

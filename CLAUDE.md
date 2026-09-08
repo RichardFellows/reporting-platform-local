@@ -151,7 +151,7 @@ Two corollaries worth holding on to:
   conformance gate** (`ingest/conform.py`, driven by `ingest/inbox.py`). A feed
   with an **`arrival:`** block is the second kind.
   **THE INBOX ESTABLISHES IDENTITY; INGESTION VERIFIES INTEGRITY**, and the
-  keys are split to enforce it: `arrival.control` carries `business_date` and
+  keys are split to enforce it: `arrival.control` carries `cob_date` and
   `version` (what the file must be NAMED) and rejects `row_count`/`md5` at
   load; `delivery.control` carries `row_count` and `md5`, is read in landing
   and checked at ingest — once, for every delivery however it arrived, so the
@@ -172,14 +172,14 @@ Two corollaries worth holding on to:
   **A zip is unpacked AT THE GATE** (`arrival.archive.member_pattern`) and its
   members land as ordinary deliveries — one inbox file in, N deliveries out,
   container never landed but recorded in each member's metadata. Each member
-  must carry its own business date; members that are *parts* of one date are a
+  must carry its own COB date; members that are *parts* of one date are a
   different shape and NOT BUILT here. That leaves `landing/` holding only
   objects Spark can read, and `ready/` holding only manifests.
   See `docs/DECISIONS.md#the-inbox-is-the-conformance-gate` and
   `#unpacking-happens-at-the-gate`.
 - **`landing/` is the evidence copy; `ready/` is the work queue.** A
   **normalize** stage between them turns a delivery into a MANIFEST -- one
-  JSON object naming the business date, the objects holding the rows, and the
+  JSON object naming the COB date, the objects holding the rows, and the
   delimiter/quoting/encoding to read them with. `ingest` consumes manifests;
   `find_pending` returns manifest keys. For a plain CSV nothing is copied (the
   part points back into `landing/`), so `ingest` keeps one code path while
@@ -247,7 +247,7 @@ Two corollaries worth holding on to:
   are cached on the file's **mtime** — do not put a plain `@lru_cache` back on
   them or a new feed will never reach the DAG processor.
 - **The delivery registry is an INDEX, not a ledger** (`reporting_platform/
-  registry/`, Postgres `platform`). One row per delivery -- business date,
+  registry/`, Postgres `platform`). One row per delivery -- COB date,
   arrival time, size, md5, the name the upstream used, the column contract it
   was read against -- and **no verdicts**: no `ingested`, no `superseded`, no
   `status`. Whether a delivery reached raw stays derived from `_source_file`;
@@ -396,7 +396,7 @@ Two corollaries worth holding on to:
   cannot describe a per-feed sweep. See
   `docs/DECISIONS.md#retention-classes-name-the-obligation`.
 - **`expected_by:` is the ONE lateness concept** — a wall-clock `"HH:MM"`,
-  judged on the day AFTER the business date (fixed at +1, forgiving on
+  judged on the day AFTER the COB date (fixed at +1, forgiving on
   purpose). **Quote it**: YAML 1.1 reads `7:00` as 420, and a leading zero
   hides that until the first unpadded hour. A feed without one is skipped, not
   defaulted to midnight. A backfill — every late date sharing one arrival day —

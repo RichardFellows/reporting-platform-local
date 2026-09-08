@@ -323,7 +323,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                  the only check here that must be able to stop the
                  publication -- and after the merge it could not. REQ-500/502.
               2. The merge carries a COMMIT MESSAGE naming the purpose, the
-                 business date and the change reference. REQ-405. Nessie
+                 COB date and the change reference. REQ-405. Nessie
                  otherwise synthesises "Merge <hash> into main", which names
                  two hashes and no reason.
               3. A REPORTING build cuts one tag PER REPORT --
@@ -349,10 +349,10 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             change_ref = (context["params"].get("change_ref") or "").strip() or None
 
             # 1. What this build read, from the branch it built on.
-            inputs, business_date = {}, None
+            inputs, cob_date = {}, None
             try:
                 inputs = _spark_run("run-inputs", branch)
-                business_date = inputs.get("max_business_date")
+                cob_date = inputs.get("max_cob_date")
                 if inputs.get("unreadable"):
                     # NOT fatal, and deliberately so: the tables are audited
                     # and correct, and refusing to publish them because their
@@ -382,7 +382,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             # other failure here is best-effort because the tables are audited
             # and correct; this one says the tables must not become main's.
             carried_forward: list[dict] = []
-            if purpose == "reporting" and business_date:
+            if purpose == "reporting" and cob_date:
                 from datetime import date as _date
 
                 from reporting_platform.registry import lifecycle
@@ -391,7 +391,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                              in inputs.get("inputs", [])}
                 for report in sorted(reports()):
                     verdict = lifecycle.check_publishable(
-                        report, _date.fromisoformat(business_date), candidate)
+                        report, _date.fromisoformat(cob_date), candidate)
                     if verdict["carried_forward"]:
                         # The policy said carry forward, so the publication
                         # proceeds -- but "we knowingly did not restate this"
@@ -401,23 +401,23 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
 
             # 2. The merge, with something written on it.
             n = Nessie()
-            message = (f"publish({purpose}): {business_date or 'no business date'}"
+            message = (f"publish({purpose}): {cob_date or 'no COB date'}"
                        f" run {run_id}"
                        + (f" [{change_ref}]" if change_ref else ""))
             n.merge(branch, into="main", message=message,
                     properties={"purpose": purpose, "run_id": run_id,
                                 "change_ref": change_ref or "",
-                                "business_date": business_date or ""})
+                                "cob_date": cob_date or ""})
             merged = n.get_reference("main")["reference"]["hash"]
             n.delete_reference(branch)
 
             # 3. The pins, one per report, and the version each one is.
             published: list[dict] = []
             version_errors: list[str] = []
-            if purpose == "reporting" and business_date:
+            if purpose == "reporting" and cob_date:
                 from datetime import date as _date
 
-                as_at = _date.fromisoformat(business_date)
+                as_at = _date.fromisoformat(cob_date)
                 for report in sorted(reports()):
                     tag = published_tag(report, as_at, run_id)
                     try:
@@ -449,7 +449,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             elif purpose == "reporting":
                 log.error(
                     "reporting build on %s published no report: the input set "
-                    "yielded no business date, so there is nothing to pin an "
+                    "yielded no COB date, so there is nothing to pin an "
                     "as-at date to. See the run-inputs error above.", branch)
 
             # 4. Close the run.
@@ -465,15 +465,15 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                     for v in carried_forward]
                 runs.finish_run(
                     run_id, runs.PUBLISHED, merged_hash=merged,
-                    business_date=_date.fromisoformat(business_date)
-                    if business_date else None,
+                    cob_date=_date.fromisoformat(cob_date)
+                    if cob_date else None,
                     error="; ".join(notes) or None)
             except Exception as exc:                            # noqa: BLE001
                 log.warning("could not close run %s: %s", run_id,
                             f"{type(exc).__name__}: {exc}")
 
             return {"merged": branch, "run_id": run_id, "hash": merged,
-                    "business_date": business_date,
+                    "cob_date": cob_date,
                     "inputs": len(inputs.get("inputs", [])),
                     "carried_forward": carried_forward,
                     "published": published}

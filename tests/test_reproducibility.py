@@ -69,7 +69,7 @@ def test_absent_objects_finds_a_collected_file():
     monkey: list = []
     install(monkey, s3)
     try:
-        base = "warehouse/raw/fo_trade_abc/data/_business_date_day=2026-08-06"
+        base = "warehouse/raw/fo_trade_abc/data/_cob_date_day=2026-08-06"
         s3.put(f"{base}/00000-a.parquet", "x")
         paths = {f"s3a://lakehouse/{base}/00000-a.parquet",
                  f"s3a://lakehouse/{base}/00001-b.parquet"}

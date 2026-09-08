@@ -225,7 +225,7 @@ def _file_headers(prompt: str) -> list[str]:
 def candidate_keys(con, path: str, prompt: str, names: list[str]) -> list[str]:
     """Platform column names whose values are unique across the WHOLE file.
 
-    Single-column candidates only -- a composite key ("business_date plus
+    Single-column candidates only -- a composite key ("cob_date plus
     counterparty_id") is still a human's call, per
     docs/DELIVERY-SHAPES.md#5-onboard-from-a-real-file.
 
@@ -332,7 +332,7 @@ def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> d
     extension. Passed, only matching members are considered, which is the
     re-sniff-an-existing-feed case.
 
-    Only proposes `business_date_from: "container"`, the one value this
+    Only proposes `cob_date_from: "container"`, the one value this
     platform actually reads (`context.NOT_BUILT` rejects `member`/`path` at
     load) -- see `_container_has_a_date`.
     """
@@ -361,9 +361,9 @@ def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> d
 
 def _container_has_a_date(filename: str) -> bool:
     """Whether the CONTAINER's own name has an 8-digit run to anchor a
-    `business_date` group to -- reusing `ui.registry.derive_pattern`'s own
+    `cob_date` group to -- reusing `ui.registry.derive_pattern`'s own
     check, since that is exactly what decides whether
-    `business_date_from: container` (the only value this platform reads) is
+    `cob_date_from: container` (the only value this platform reads) is
     even proposable. If not, this platform genuinely cannot onboard the
     archive yet -- `member`/`path` sourcing is real, described in
     docs/DELIVERY-SHAPES.md, and NOT BUILT (`context.NOT_BUILT`) -- and the
@@ -379,7 +379,7 @@ def propose_feed(filename: str, data: bytes) -> dict:
     `sniff_bytes`/`sniff_archive` return, plus the `filename_pattern`
     `ui.registry.derive_pattern` would suggest from `filename` and, for an
     archive, whether the container's own name has a date to source
-    `business_date_from: container` from at all.
+    `cob_date_from: container` from at all.
 
     What the console calls. Opens its own `duckdb.connect()` -- callers pass
     a filename and bytes, not a connection to manage.
@@ -396,14 +396,14 @@ def propose_feed(filename: str, data: bytes) -> dict:
 
     # A PLAIN FILE WITH NO DATE IN ITS NAME IS ONBOARDABLE, and the proposal
     # has to say how or the console dead-ends: `derive_pattern` returns None,
-    # the form requires a business_date group, and there is no obvious way to
+    # the form requires a cob_date group, and there is no obvious way to
     # say "this one arrives through the inbox and gets renamed". So propose
     # the arrival shape -- the source pattern is the name as sent, escaped,
     # and the landing pattern is left for the operator, who is the only one
     # who knows what this feed should be called.
     #
     # Only for a plain file. An archive with no date on the container is a
-    # different gap (`business_date_from: member`, still NOT BUILT), and the
+    # different gap (`cob_date_from: member`, still NOT BUILT), and the
     # inbox gate does not unpack archives.
     if dated is None and not filename.lower().endswith(".zip"):
         proposal["arrival_source_pattern"] = re.escape(filename)
