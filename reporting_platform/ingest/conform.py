@@ -62,6 +62,7 @@ from reporting_platform.common.context import Feed
 from reporting_platform.common.filenames import (
     FilenameError, literal_from_regex, render_filename,
 )
+from reporting_platform.ingest import control as control_mod
 
 METADATA_VERSION = 1
 
@@ -173,24 +174,23 @@ def read_control(feed: Feed, text: str, control_filename: str) -> dict[str, Any]
 
     A key absent from `arrival.control` is absent from the result: "the sender
     did not say" and "the sender said zero" are different facts.
-    """
-    control = (feed.arrival or {}).get("control") or {}
-    out: dict[str, Any] = {}
 
-    for key, group in (("cob_date", "cob_date"),
-                       ("version", "version")):
-        pattern = control.get(key)
-        if pattern is None:
-            continue
-        m = re.search(pattern, text)
-        if not m:
-            raise ConformanceError(
-                f"{feed.name}: control file {control_filename} does not match "
-                f"`arrival.control.{key}` {pattern!r}. The control file "
-                f"arrived and does not say what it was configured to say -- a "
-                f"format change upstream, not a timing problem, so it will "
-                f"not clear on its own.")
-        out[key] = m.group(group)
+    HOW the file is read is `arrival.control.format`'s answer and
+    `ingest/control.py` is the only implementation of it -- a regex over the
+    text, a column of a delimited table, and one day something else. What is
+    read out of it, and what a value has to be for this gate to name a file
+    after it, stays here.
+    """
+    control_cfg = (feed.arrival or {}).get("control") or {}
+    try:
+        out: dict[str, Any] = control_mod.read(
+            control_cfg, text, fields=("cob_date", "version"),
+            feed_name=feed.name, filename=control_filename,
+            block="arrival.control")
+    except control_mod.ControlParseError as exc:
+        # An IDENTITY failure: the delivery cannot be NAMED, so it cannot
+        # land. Re-raised as the exception the inbox routes to `.rejected/`.
+        raise ConformanceError(str(exc)) from exc
 
     if "cob_date" in out:
         raw = out["cob_date"]
@@ -199,11 +199,17 @@ def read_control(feed: Feed, text: str, control_filename: str) -> dict[str, Any]
         except ValueError as exc:
             raise ConformanceError(
                 f"{feed.name}: control file {control_filename} declares "
-                f"COB date {raw!r}, which is not yyyyMMdd: {exc}. The "
-                f"regex matched, so `arrival.control.cob_date` is "
-                f"capturing the wrong part of the line.") from exc
+                f"COB date {raw!r}, which is not yyyyMMdd: {exc}. The file "
+                f"was read, so `arrival.control.cob_date` is pointing at the "
+                f"wrong part of it.") from exc
     if "version" in out:
-        out["version"] = int(out["version"])
+        try:
+            out["version"] = int(out["version"])
+        except ValueError as exc:
+            raise ConformanceError(
+                f"{feed.name}: control file {control_filename} declares "
+                f"version {out['version']!r}, which is not a number -- and "
+                f"the landing name is built out of it.") from exc
     return out
 
 

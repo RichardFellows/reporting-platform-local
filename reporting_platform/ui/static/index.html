@@ -452,6 +452,15 @@ function feedForm(f, creating) {
   const arrCtlDate = el("input", {class: "mono",
     value: f?.arrival?.control?.cob_date ?? "",
     placeholder: "ReportingDate\\|(?P<cob_date>\\d{8})"});
+  // Retitled by syncControlFormat() below: under a delimited control file
+  // this names a COLUMN, and a label still saying "pattern" beside a
+  // placeholder showing a regex is worse than no help at all.
+  const arrCtlDateLabel = el("label", {}, "COB date pattern");
+  const arrCtlDateHelp = el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+    "Read from the control file's contents. For a line like " +
+    "ReportingDate|20260801 that is " +
+    "'ReportingDate\\|(?P<cob_date>\\d{8})'. Required unless the " +
+    "upstream filename above already captures the date.");
 
   const arrivalFields = el("div", {}, [
     el("div", {class: "field", style: "margin-top:10px"}, [
@@ -475,13 +484,9 @@ function feedForm(f, creating) {
         "and not landed."),
     ]),
     el("div", {class: "field", style: "margin-top:10px"}, [
-      el("label", {}, "COB date pattern"),
+      arrCtlDateLabel,
       arrCtlDate,
-      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
-        "Read from the control file's contents. For a line like " +
-        "ReportingDate|20260801 that is " +
-        "'ReportingDate\\|(?P<cob_date>\\d{8})'. Required unless the " +
-        "upstream filename above already captures the date."),
+      arrCtlDateHelp,
     ]),
     el("div", {class: "sub", style: "font-size:12px;margin-top:10px"},
       "Row count and checksum are NOT set here \u2014 they belong to the " +
@@ -540,6 +545,46 @@ function feedForm(f, creating) {
     value: f?.delivery?.control?.md5 ?? "",
     placeholder: "MD5=(?P<md5>[0-9a-fA-F]{32})  (optional)"});
 
+  // HOW the control file is read -- ONE widget for BOTH control blocks. The
+  // gate promotes the control file into landing/ byte for byte, so the two
+  // blocks parse the same bytes and context.check_gates_are_coherent refuses
+  // two readings of them. Writing one answer into both is how the form makes
+  // that collision unreachable rather than an error to be understood.
+  const ctlFormat0 = f?.delivery?.control?.format ?? f?.arrival?.control?.format;
+  const isDelimited0 = ctlFormat0?.kind === "delimited";
+  const ctlFormat = el("select", {}, [
+    el("option", {value: "regex", selected: isDelimited0 ? null : "selected"},
+       "text \u2014 a pattern per field"),
+    el("option", {value: "delimited", selected: isDelimited0 ? "selected" : null},
+       "delimited \u2014 a column per field"),
+  ]);
+  const ctlDelimiter = el("input", {class: "mono", style: "max-width:90px",
+    value: ctlFormat0?.delimiter ?? "|", placeholder: "|"});
+  const ctlColumns = el("input", {class: "mono",
+    value: (ctlFormat0?.columns ?? []).join(", "),
+    placeholder: "leave blank when the file has a header row"});
+  const ctlFormatFields = el("div", {}, [
+    el("div", {class: "field", style: "margin-top:10px"}, [
+      el("label", {}, "Delimiter"),
+      ctlDelimiter,
+      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+        "One character, and NOT inherited from the data file's delimiter " +
+        "above \u2014 a comma-separated file routinely arrives beside a " +
+        "pipe-separated control file. Reading a pipe file as commas does not " +
+        "fail: it finds one column whose name is the whole header line, and " +
+        "every field below then reports as missing."),
+    ]),
+    el("div", {class: "field", style: "margin-top:10px"}, [
+      el("label", {}, "Column names (only if the file has no header row)"),
+      ctlColumns,
+      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+        "Comma-separated, in the order the sender writes them. Leave blank " +
+        "for the usual case, where the file's own header row names them \u2014 " +
+        "one source for the names, or a sender who reorders the columns is " +
+        "read against a stale list and every field finds the wrong value."),
+    ]),
+  ]);
+
   const memberPatternField = el("div", {class: "field", style: "margin-top:10px"}, [
     el("label", {}, "Member pattern"),
     memberPattern,
@@ -561,8 +606,10 @@ function feedForm(f, creating) {
       "file. While set, a delivery is not normalized until a sibling matching " +
       "this pattern has also landed -- not a failure, a late feed."),
   ]);
+  const controlMd5Label = el("label", {}, "Checksum pattern (optional)");
+  const controlRowCountLabel = el("label", {}, "Declared row count pattern (optional)");
   const controlMd5Field = el("div", {class: "field", style: "margin-top:10px"}, [
-    el("label", {}, "Checksum pattern (optional)"),
+    controlMd5Label,
     controlMd5,
     el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
       "A regex with a named group (?P<md5>...) read from the control file, " +
@@ -572,7 +619,7 @@ function feedForm(f, creating) {
       "build branch and leaves main untouched."),
   ]);
   const controlRowCountField = el("div", {class: "field", style: "margin-top:10px"}, [
-    el("label", {}, "Declared row count pattern (optional)"),
+    controlRowCountLabel,
     controlRowCount,
     el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
       "A regex with a named group (?P<rows>...) to read the EXACT row count out " +
@@ -580,6 +627,43 @@ function feedForm(f, creating) {
       "at ingest -- next to the expected_min_rows floor below, not instead of " +
       "it. Leave blank for a control file that only gates readiness."),
   ]);
+
+  const ctlFormatField = el("div", {class: "field", style: "margin-top:10px"}, [
+    el("label", {}, "Control file format"),
+    ctlFormat,
+    el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+      "How the control file is READ, for both gates \u2014 the inbox promotes " +
+      "it into landing/ unchanged, so one file, one answer. Text is the " +
+      "default and the original: every field below is a regex over the " +
+      "file's whole contents with one named group. Delimited is for a file " +
+      "that is a small table \u2014 a header row and one row of values \u2014 " +
+      "where every field below names a COLUMN instead. A regex can express " +
+      "that shape and has to count the fields before the one it wants, so a " +
+      "column inserted upstream reads the wrong value rather than failing."),
+  ]);
+
+  // The fields below name a regex or a column depending on the format, and a
+  // label saying "pattern" over a box wanting RECORD_COUNT is worse than no
+  // label. Retitled rather than duplicated: it is the same setting either way.
+  function syncControlFormat() {
+    const delimited = ctlFormat.value === "delimited";
+    ctlFormatFields.style.display = delimited ? "" : "none";
+    arrCtlDateLabel.textContent = delimited ? "COB date column" : "COB date pattern";
+    arrCtlDateHelp.style.display = delimited ? "none" : "";
+    arrCtlDate.placeholder = delimited
+      ? "BUSINESS_DATE" : "ReportingDate\\|(?P<cob_date>\\d{8})";
+    controlRowCountLabel.textContent = delimited
+      ? "Declared row count column (optional)"
+      : "Declared row count pattern (optional)";
+    controlRowCount.placeholder = delimited
+      ? "RECORD_COUNT  (optional)" : "ROWS=(?P<rows>\\d+)  (optional)";
+    controlMd5Label.textContent = delimited
+      ? "Checksum column (optional)" : "Checksum pattern (optional)";
+    controlMd5.placeholder = delimited
+      ? "FILE_HASH  (optional)" : "MD5=(?P<md5>[0-9a-fA-F]{32})  (optional)";
+  }
+  ctlFormat.addEventListener("change", syncControlFormat);
+  syncControlFormat();
 
   function syncDeliveryVisibility() {
     const isArchive = deliveryKind.value === "archive";
@@ -589,6 +673,9 @@ function feedForm(f, creating) {
     // combination, so the form does not offer it rather than let someone
     // fill it in and hit that error at save.
     controlPatternField.style.display = isArchive ? "none" : "";
+    ctlFormatField.style.display = isArchive ? "none" : "";
+    ctlFormatFields.style.display =
+      isArchive || ctlFormat.value !== "delimited" ? "none" : "";
     controlRowCountField.style.display = isArchive ? "none" : "";
     controlMd5Field.style.display = isArchive ? "none" : "";
   }
@@ -600,8 +687,8 @@ function feedForm(f, creating) {
       "Plain file: one object, one delivery -- the ordinary case. Zip archive: a " +
       "dated container holding one or more members, exploded into ready/ at " +
       "normalize time."),
-    memberPatternField, controlPatternField, controlRowCountField,
-    controlMd5Field,
+    memberPatternField, controlPatternField, ctlFormatField, ctlFormatFields,
+    controlRowCountField, controlMd5Field,
   );
 
   // ------------------------------------------------------------- columns
@@ -888,6 +975,21 @@ function feedForm(f, creating) {
   // Mirrors ui.registry._arrival_from_payload: blanks dropped, and an
   // unchecked box sends {} rather than a half-filled block, so toggling it
   // off genuinely removes the feed's arrival: block on the next save.
+  // The SAME object into both control blocks -- see the widget's comment.
+  // Null when the format is the default, so an ordinary feed's block keeps
+  // the shape it has always had in the diff.
+  const readControlFormat = () => {
+    if (ctlFormat.value !== "delimited") return null;
+    const out = {kind: "delimited", delimiter: ctlDelimiter.value};
+    const cols = ctlColumns.value.split(",").map(c => c.trim()).filter(Boolean);
+    if (cols.length) out.columns = cols;
+    // Not offered as a field -- a control file's quoting is almost never
+    // interesting -- but carried through, or editing a feed in the form
+    // would silently drop one somebody set by hand in feeds.yml.
+    if (ctlFormat0?.quote_char) out.quote_char = ctlFormat0.quote_char;
+    return out;
+  };
+
   const readArrival = () => {
     if (!hasArrival.checked) return {};
     const out = {};
@@ -899,6 +1001,8 @@ function feedForm(f, creating) {
       const v = input.value.trim();
       if (v) control[k] = v;
     }
+    const fmt = readControlFormat();
+    if (fmt && Object.keys(control).length) control.format = fmt;
     if (Object.keys(control).length) out.control = control;
     return out;
   };
@@ -912,6 +1016,8 @@ function feedForm(f, creating) {
     const pat = controlPattern.value.trim();
     if (!pat) return {};
     const control = {pattern: pat};
+    const fmt = readControlFormat();
+    if (fmt) control.format = fmt;
     const rc = controlRowCount.value.trim();
     if (rc) control.row_count = rc;
     const md5 = controlMd5.value.trim();

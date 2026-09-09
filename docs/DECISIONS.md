@@ -1602,6 +1602,105 @@ depend on and was not exercised to depend on it. The feed, raw table and
 landed/ready objects were all removed afterward -- this was verification,
 not onboarding.
 
+## control-file-formats
+
+`control.format` names HOW a control file is read, separately from WHAT is
+read out of it. The original reading -- a regex per field over the file's
+whole text -- stays the default and the name of a format nobody has to write
+down; the second is `kind: delimited`, for a control file that is a small
+table.
+
+```yaml
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'          # required, never inherited
+    row_count: RECORD_COUNT   # a COLUMN NAME, not a regex
+    md5: CHECKSUM
+```
+
+against
+
+```
+FEED|BUSINESS_DATE|RECORD_COUNT|CHECKSUM
+POSITIONS|20260801|2|517263d1618098b81bb21c1cb7cfed25
+```
+
+**The field values change meaning with the format, and that is the point.**
+A regex over a delimited line has to count the fields in front of the one it
+wants -- `^(?:[^|]*\|){3}(?P<rows>\d+)` -- so a column inserted upstream
+reads the wrong value rather than failing. Naming the column moves the
+question to the header row, where the sender answers it on every delivery.
+
+**One reader, two callers.** `arrival.control` (identity: COB date, version,
+read at the door) and `delivery.control` (integrity: row count, md5, read on
+the landing side) are the same file: the gate PROMOTES the control file into
+`landing/` byte for byte rather than consuming it, see
+[#the-inbox-is-the-conformance-gate](#the-inbox-is-the-conformance-gate).
+They had a regex loop each, identical but for the wording of the error.
+A second format would have made that two implementations of one dispatch, so
+`ingest/control.py` is now the only place a control file is parsed and the
+loops are gone. What each caller does with the strings it gets back stays
+where it was -- `conform` turns `cob_date` into a date it must name a file
+after, `ingest_feed` compares `row_count` against rows it counted -- because
+that boundary is the identity/integrity split and it does not belong inside a
+parser.
+
+**The format is declared on each block, and `check_gates_are_coherent`
+refuses two that disagree.** The alternative was one declaration inherited by
+the other block, which is fewer lines and leaves `arrival.control` unable to
+say how to read the file it is handed; `resolve_arrival_config` would also
+have needed the delivery block threaded into it, including on the console's
+validation path where the two are validated apart. Declaring it twice is safe
+only because disagreement is a LOAD error: the two blocks parse the same
+bytes, so a divergence would not fail at load, it would fail later, on one of
+the two paths, looking exactly like an upstream format change.
+
+**Refusals, and why each is a refusal rather than a guess:**
+
+* **No `delimiter`, and it is never defaulted from the feed's own.** A
+  comma-separated data file routinely arrives beside a pipe-separated control
+  file. Reading pipes as commas raises nothing anywhere in `csv` -- it yields
+  ONE column whose name is the entire header line -- so the error names that
+  as the likely cause, because it is the mistake that produces it.
+* **Exactly one row of values.** A control file with several describes
+  several deliveries, and which row belongs to this one is not decidable from
+  the delivery's name. Taking the first would pick silently, and wrongly on
+  the day it mattered.
+* **`columns:` or a header row, never both.** With both, a sender who
+  reorders their columns and updates their header is read against the stale
+  list: every field found, all of them the wrong value.
+* **A field naming an undeclared column.** Only decidable at load for a
+  headerless file, where the list is the only thing that can say where a value
+  is -- so it is checked there, and left to the delivery where a real header
+  row will answer it.
+
+**Verified on the live stack**, not only against `tests/fakes3.py`: a
+throwaway feed whose control file is the pipe table above went through the
+real gate -- `conform` named the landing file `trs_ctlfmt_20260801.csv` out of
+the `BUSINESS_DATE` COLUMN -- into real MinIO, and back out through
+`normalize`, whose manifest carried `declared_row_count: 2` and the matching
+`declared_md5`. Renaming `RECORD_COUNT` to `ROW_COUNT` in the landed control
+file then failed at `normalize` naming the missing column and listing the ones
+present, rather than passing with nothing checked. Separately, the real
+`inbox` watcher was run over `positions.csv` + `positions.ctl` dropped in the
+inbox: `route` classified the pair, and the sweep promoted both into
+`landing/` as `trs_ctlfmt_20260801.csv` / `.ctl` with the date taken from the
+control column. The feed, its objects and its registry row were removed
+afterward -- this was verification, not onboarding.
+
+**The console writes the format too, and that is not decoration.** The feed
+console rewrites a feed's whole block from the form payload, so a key the form
+does not carry is a key the next save DELETES. A delimited control file
+silently reverting to the regex reading is not a validation failure anywhere:
+the fields simply stop matching, at ingest, on a feed nobody touched. One
+widget writes one format into both control blocks, which makes the coherence
+error above unreachable from the form rather than something to be understood
+in it.
+
+
 ## the-sniffer
 
 The sniffer backend for step 5 of `docs/DELIVERY-SHAPES.md`

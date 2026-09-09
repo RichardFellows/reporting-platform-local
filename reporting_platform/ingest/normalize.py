@@ -52,6 +52,7 @@ from reporting_platform.common.context import Feed
 from reporting_platform.ingest.arrival import (
     _bucket, _client, list_landing, matching,
 )
+from reporting_platform.ingest import control as control_mod
 
 log = logging.getLogger("normalize")
 
@@ -169,21 +170,28 @@ def _declared(feed: Feed, control_key: str) -> dict[str, Any]:
     body = _client().get_object(Bucket=_bucket(), Key=control_key)["Body"].read()
     text = body.decode(feed.file_encoding, errors="replace")
 
-    out: dict[str, Any] = {}
-    for key, group in (("row_count", "rows"), ("md5", "md5")):
-        pattern = control.get(key)
-        if pattern is None:
-            continue
-        m = re.search(pattern, text)
-        if not m:
-            raise ValueError(
-                f"{feed.name}: control file {control_key} does not match "
-                f"`delivery.control.{key}` {pattern!r}. The control file "
-                f"arrived but does not say what it was validated to say -- a "
-                f"format change upstream, not a timing problem.")
-        out[key] = m.group(group)
+    # HOW the file is read is `delivery.control.format`'s answer, and
+    # `ingest/control.py` is the only implementation of it -- the same reader
+    # the gate used on these same bytes at the door, so a delivery cannot be
+    # named from one reading of its control file and verified against another.
+    # `ControlParseError` is a ValueError, which is what this has always
+    # raised when the file does not say what it was configured to say.
+    out: dict[str, Any] = control_mod.read(
+        control, text, fields=("row_count", "md5"),
+        feed_name=feed.name, filename=control_key, block="delivery.control")
     if "row_count" in out:
-        out["row_count"] = int(out["row_count"])
+        try:
+            out["row_count"] = int(out["row_count"])
+        except ValueError as exc:
+            # Reachable only for a `delimited` control file: a `(?P<rows>...)`
+            # group is a regex the config chose, so it matches digits or it
+            # does not match at all. A COLUMN holds whatever the sender put in
+            # it, and `invalid literal for int()` names neither the file, the
+            # feed, nor the column.
+            raise ValueError(
+                f"{feed.name}: control file {control_key} declares row count "
+                f"{out['row_count']!r} in {control['row_count']!r}, which is "
+                f"not a number.") from exc
     if "md5" in out:
         out["md5"] = out["md5"].lower()
     return out

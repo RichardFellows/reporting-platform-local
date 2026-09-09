@@ -152,6 +152,15 @@ Shapes and mechanism: `docs/DELIVERY-SHAPES.md`,
 - **An identity failure is QUARANTINED to `.rejected/`; an integrity failure
   LANDS and fails at ingest** — landing is the evidence copy, and a bad
   delivery is what it exists to prove.
+- **HOW a control file is read is `control.format`; WHAT is read out of it is
+  the fields.** The default is `regex` -- a pattern per field over the whole
+  text -- and `delimited` makes every field a COLUMN NAME instead, for a
+  pipe-or-whatever table with its own headers. `ingest/control.py` is the ONLY
+  parser, for both blocks and both formats. The two blocks read the SAME
+  PROMOTED BYTES, so a format declared on each must be identical and load
+  refuses otherwise; `delimiter` is required and never inherited from the
+  feed's own, because pipes read as commas is not an error, it is one column
+  named by the whole header line. (`#control-file-formats`)
 - **A zip is unpacked AT THE GATE** (`arrival.archive.member_pattern`): one
   file in, N ordinary deliveries out, container never landed but recorded in
   each member's metadata. Each member carries its own COB date; members that
