@@ -315,6 +315,30 @@ delivery:
     row_count: 'ROWS=(?P<rows>\d+)' # optional; a pure gate needs no row_count
 ```
 
+**How the file is read is `format:`, and the default reading is the one
+above.** Each field is a regex over the file's whole text with one named
+group. A control file that is a small table -- a header row and one row of
+values, in whatever delimiter the sender chose -- is `kind: delimited`
+instead, and every field then names a COLUMN:
+
+```yaml
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'          # required; never inherited from the data file
+      # header: false         # and then `columns: [...]`, for a file with none
+    row_count: RECORD_COUNT
+    md5: CHECKSUM
+```
+
+Both control blocks take a `format:` and it must be the SAME one -- they read
+the same promoted bytes -- which is checked at load. `ingest/control.py` is
+the only place a control file is parsed, for either block and either format.
+See [DECISIONS.md#control-file-formats](DECISIONS.md#control-file-formats)
+for the refusals and what each one prevents.
+
 Only on top of `kind: file`; combining `control:` with `kind: archive` is
 rejected at load as NOT BUILT, alongside archive's own unbuilt corners.
 `normalize()` will not emit a manifest until a sibling in the same landing

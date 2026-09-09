@@ -230,15 +230,10 @@ def _arrival_from_payload(raw: Any) -> dict[str, Any]:
     source_pattern = str(raw.get("source_pattern") or "").strip()
     if source_pattern:
         out["source_pattern"] = source_pattern
-    control = raw.get("control")
-    if isinstance(control, dict):
-        c: dict[str, Any] = {}
-        for key in ("pattern", "cob_date", "version"):
-            value = str(control.get(key) or "").strip()
-            if value:
-                c[key] = value
-        if c:
-            out["control"] = c
+    control = _control_from_payload(raw.get("control"),
+                                    ("pattern", "cob_date", "version"))
+    if control:
+        out["control"] = control
     # An `arrival:` block with only a control block and no source_pattern is
     # meaningless -- nothing would match it -- and returning {} means a form
     # whose arrival fields are present but unused produces a feed with no
@@ -276,18 +271,59 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
     parts = str(raw.get("parts") or "").strip()
     if parts:
         out["parts"] = parts
-    control = raw.get("control")
-    if isinstance(control, dict):
-        c: dict[str, Any] = {}
-        pattern = str(control.get("pattern") or "").strip()
-        if pattern:
-            c["pattern"] = pattern
-        for key in ("row_count", "md5"):
-            value = str(control.get(key) or "").strip()
-            if value:
-                c[key] = value
-        if c:
-            out["control"] = c
+    control = _control_from_payload(raw.get("control"),
+                                    ("pattern", "row_count", "md5"))
+    if control:
+        out["control"] = control
+    return out
+
+
+def _control_from_payload(raw: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    """One `control` object -> the sparse dict the resolvers expect.
+
+    Shared by both blocks: they take different fields but the same treatment,
+    and `format` in particular has to survive BOTH round trips. A key the form
+    does not send is a key the next save deletes -- the console rewrites the
+    whole feed block from the payload -- so a delimited control file edited
+    through the form would come back parsed as a regex, which is not a
+    validation failure anywhere: the fields simply stop matching, at ingest,
+    on a feed nobody changed.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in keys:
+        value = str(raw.get(key) or "").strip()
+        if value:
+            out[key] = value
+    # Added only to a block that exists, and only when it is not the default
+    # -- otherwise a form whose format inputs always have a value would turn
+    # every feed into one with a control block. What a format may SAY is
+    # `context.resolve_control_format`'s to decide, in `validate()`, which is
+    # the same function feeds.yml load calls.
+    fmt = raw.get("format")
+    if out and isinstance(fmt, dict) and str(fmt.get("kind") or "") == "delimited":
+        out["format"] = _format_from_payload(fmt)
+    return out
+
+
+def _format_from_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """One `control.format` object -> the sparse dict `resolve_control_format`
+    expects. Blanks dropped, nothing defaulted and nothing judged: an empty
+    `delimiter` has to reach the resolver to be reported as the missing thing
+    it is, rather than being quietly filled in with a comma here."""
+    out: dict[str, Any] = {"kind": "delimited"}
+    for key in ("delimiter", "quote_char"):
+        value = str(raw.get(key) or "")
+        if value:
+            out[key] = value
+    columns = [str(c).strip() for c in (raw.get("columns") or [])
+               if str(c).strip()]
+    # A headerless file is the only reason to list them, so the two travel
+    # together -- the resolver rejects either one alone.
+    if columns:
+        out["header"] = False
+        out["columns"] = columns
     return out
 
 
@@ -398,10 +434,13 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         except ValueError as exc:
             errors["delivery"] = str(exc)
 
-    # The two control-file gates are mutually exclusive, and setting both
-    # stalls the feed silently rather than failing -- see
-    # context.check_gates_are_coherent. Checked after both blocks so the
-    # message names the collision rather than one half of it.
+    # The two control-file gates are COMPLEMENTARY -- one file, read at the
+    # door for identity and on the landing side for integrity -- so what fails
+    # here is a pair that does not add up: an `arrival.control` with no
+    # `delivery.control` to read the promoted file, or two `format` blocks
+    # disagreeing about the shape of it. See context.check_gates_are_coherent.
+    # Checked after both blocks so the message names the pair rather than one
+    # half of it.
     if "arrival" not in errors and "delivery" not in errors:
         from reporting_platform.common import context
 
@@ -545,24 +584,58 @@ def _inherited(spec: FeedSpec) -> dict[str, Any]:
 def _arrival_block(value: dict[str, Any]) -> CommentedMap:
     """`spec.arrival` -> the nested YAML mapping.
 
-    Every value here is a regex, so all of them are single-quoted like
+    `source_pattern` is a regex, so it is single-quoted like
     `filename_pattern` and for the same reason: a double-quoted
     `'{stem}\\.ctl'` would have YAML eat the backslash, and the pattern would
-    then match a literal dot only by accident.
+    then match a literal dot only by accident. The control block is
+    `_control_block`'s, shared with `delivery:` so one control file cannot be
+    written down two ways.
     """
     av = CommentedMap()
     if "source_pattern" in value:
         av["source_pattern"] = SQ(value["source_pattern"])
     control = value.get("control")
     if isinstance(control, dict) and control:
-        cv = CommentedMap()
-        # Fixed order rather than dict order: pattern first because it is what
-        # finds the file, then what is read out of it.
-        for key in ("pattern", "cob_date", "version"):
-            if key in control:
-                cv[key] = SQ(control[key])
-        av["control"] = cv
+        av["control"] = _control_block(control, ("cob_date", "version"))
     return av
+
+
+def _control_block(control: dict[str, Any], fields: tuple[str, ...]) -> CommentedMap:
+    """One `control` block -> the nested YAML mapping, in a fixed order:
+    pattern first because it is what finds the file, then how the file is
+    read, then what is read out of it.
+
+    Single-quoted for the same reason `filename_pattern` is: under
+    `kind: regex` these are regexes, and a double-quoted `'{stem}\\.ctl'`
+    would have YAML eat the backslash so the pattern matched a literal dot
+    only by accident. Under `kind: delimited` they are column names, where the
+    quoting is merely harmless.
+    """
+    cv = CommentedMap()
+    if "pattern" in control:
+        cv["pattern"] = SQ(control["pattern"])
+    fmt = control.get("format")
+    if isinstance(fmt, dict) and fmt:
+        fv = CommentedMap()
+        # A RESOLVED format arrives here on any edit -- `spec_from_feed`
+        # hands back what the loader filled in -- so the two defaults are
+        # dropped again on the way out, the same rule `_block` follows for
+        # inherited values. `header: false` is never a default and always
+        # travels, because `columns` alone is rejected without it.
+        fv["kind"] = fmt.get("kind", "delimited")
+        if fmt.get("delimiter"):
+            fv["delimiter"] = SQ(fmt["delimiter"])
+        if fmt.get("quote_char", '"') != '"':
+            fv["quote_char"] = SQ(fmt["quote_char"])
+        if fmt.get("header", True) is False:
+            fv["header"] = False
+        if fmt.get("columns"):
+            fv["columns"] = CommentedSeq(fmt["columns"])
+        cv["format"] = fv
+    for key in fields:
+        if key in control:
+            cv[key] = SQ(control[key])
+    return cv
 
 
 def _delivery_block(value: dict[str, Any]) -> CommentedMap:
@@ -570,8 +643,8 @@ def _delivery_block(value: dict[str, Any]) -> CommentedMap:
     docs/DELIVERY-SHAPES.md's own examples use: kind, member_pattern,
     cob_date_from, parts, control.
 
-    `member_pattern` and `control.pattern`/`control.row_count` are regexes,
-    single-quoted like `filename_pattern` so their backslashes stay literal.
+    `member_pattern` is a regex, single-quoted like `filename_pattern` so its
+    backslashes stay literal; the control block is `_control_block`'s.
     """
     dv = CommentedMap()
     if "kind" in value:
@@ -584,13 +657,7 @@ def _delivery_block(value: dict[str, Any]) -> CommentedMap:
         dv["parts"] = value["parts"]
     control = value.get("control")
     if isinstance(control, dict) and control:
-        cv = CommentedMap()
-        if "pattern" in control:
-            cv["pattern"] = SQ(control["pattern"])
-        for key in ("row_count", "md5"):
-            if key in control:
-                cv[key] = SQ(control[key])
-        dv["control"] = cv
+        dv["control"] = _control_block(control, ("row_count", "md5"))
     return dv
 
 

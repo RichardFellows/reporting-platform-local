@@ -301,7 +301,21 @@ DELIVERY_KINDS = ("file", "archive")
 COB_DATE_FROM = ("container",)
 PARTS_MODES = ("concat",)
 DELIVERY_KEYS = {"kind", "member_pattern", "cob_date_from", "parts", "control"}
-CONTROL_KEYS = {"pattern", "row_count", "md5"}
+CONTROL_KEYS = {"pattern", "format", "row_count", "md5"}
+
+# WHAT a control file may declare, and the regex group each field's pattern
+# must capture under `kind: regex`. One table, because both control blocks
+# read one file: `arrival.control` takes the identity pair at the door,
+# `delivery.control` the integrity pair on the landing side.
+CONTROL_FIELD_GROUPS = {"cob_date": "cob_date", "version": "version",
+                        "row_count": "rows", "md5": "md5"}
+
+# HOW it is read. Every kind here is a reader in `ingest/control.py` -- the
+# only place a control file is parsed -- and the choice CHANGES WHAT THE
+# FIELDS ABOVE MEAN: a regex with a named group under `regex`, a column name
+# under `delimited`. That is why the format is resolved before them.
+CONTROL_FORMATS = ("regex", "delimited")
+CONTROL_FORMAT_KEYS = {"kind", "delimiter", "quote_char", "header", "columns"}
 
 # Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
 # error can say "not built" rather than "unknown": one is a typo, the other a
@@ -397,7 +411,157 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
     return out
 
 
-def _resolve_control(feed_name: str, control: Any) -> dict[str, str]:
+def resolve_control_format(feed_name: str, block: str,
+                           fmt: Any) -> dict[str, Any]:
+    """Validate a `control.format` block and fill its defaults.
+
+    HOW the control file is read, resolved before WHAT is read out of it,
+    because the two are coupled: under `kind: delimited` every field in
+    `CONTROL_FIELD_GROUPS` is a COLUMN NAME rather than a regex, and the field
+    checks branch on what this returns.
+
+    An absent block is `kind: regex` -- the format every control file had
+    before this existed, so a feed written against it keeps working and its
+    resolved block keeps its old shape.
+    """
+    if fmt is None:
+        return {"kind": "regex"}
+    if not isinstance(fmt, dict):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format` must be a "
+            f"mapping, got {type(fmt).__name__}")
+
+    unknown = set(fmt) - CONTROL_FORMAT_KEYS
+    if unknown:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format` has unknown "
+            f"key(s) {', '.join(sorted(unknown))}. Valid: "
+            f"{', '.join(sorted(CONTROL_FORMAT_KEYS))}")
+
+    kind = fmt.get("kind", "regex")
+    if kind not in CONTROL_FORMATS:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format.kind: {kind!r}` "
+            f"is not recognised. Valid: {', '.join(CONTROL_FORMATS)}")
+
+    if kind == "regex":
+        extra = set(fmt) - {"kind"}
+        if extra:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `{block}.format` is "
+                f"`kind: regex` and sets {', '.join(sorted(extra))}. A regex "
+                f"is searched over the file's whole TEXT, so it has no "
+                f"delimiter, quoting or columns -- those are read only for "
+                f"`kind: delimited`, and leaving them here would suggest a "
+                f"setting that never runs.")
+        return {"kind": "regex"}
+
+    out: dict[str, Any] = {"kind": "delimited"}
+    # NOT defaulted from the feed's own `delimiter`. A comma-separated data
+    # file routinely arrives beside a pipe-separated control file, and reading
+    # a pipe file as commas does not fail -- it yields one column whose name
+    # is the entire header line, and every field then reports as missing.
+    delimiter = fmt.get("delimiter")
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format` is `kind: "
+            f"delimited` and its `delimiter` is {delimiter!r}, not a single "
+            f"character. It is deliberately not inherited from the feed's own "
+            f"`delimiter` -- a control file's separator is the sender's "
+            f"choice and routinely differs from the data file's.")
+    out["delimiter"] = delimiter
+
+    quote_char = fmt.get("quote_char", '"')
+    if not isinstance(quote_char, str) or len(quote_char) != 1:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format.quote_char` is "
+            f"{quote_char!r}, not a single character.")
+    out["quote_char"] = quote_char
+
+    header = fmt.get("header", True)
+    if not isinstance(header, bool):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format.header` is "
+            f"{header!r}, not true or false.")
+    out["header"] = header
+
+    # ONE SOURCE FOR THE COLUMN NAMES: the file's own header row, or this
+    # list. With both, a sender who reorders the columns and updates the
+    # header is read against the stale list -- every field found, all of them
+    # the wrong value, which is the failure this whole module exists to avoid.
+    columns = fmt.get("columns")
+    if columns is None:
+        if not header:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `{block}.format` sets "
+                f"`header: false` and no `columns`. A headerless file names "
+                f"nothing, so nothing can name a field -- list the columns in "
+                f"the order the sender writes them.")
+        return out
+    if header:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format` sets `columns` "
+            f"with `header: true`. One source for the names: the header row "
+            f"the file carries, or this list. Add `header: false` if the "
+            f"sender writes no header row.")
+    if not isinstance(columns, list) or not columns or not all(
+            isinstance(c, str) and c.strip() for c in columns):
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format.columns` must be "
+            f"a non-empty list of names, got {columns!r}")
+    names = [c.strip() for c in columns]
+    dupes = sorted({c for c in names if names.count(c) > 1})
+    if dupes:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.format.columns` names "
+            f"{', '.join(dupes)} more than once -- a field naming one of them "
+            f"would not say which.")
+    out["columns"] = names
+    return out
+
+
+def _resolve_control_field(feed_name: str, block: str, key: str, value: Any,
+                           fmt: dict[str, Any], reader: str) -> str:
+    """One thing a control file declares, validated the way `fmt` reads it.
+
+    Shared by both control blocks. They differ only in which fields they take
+    and in who reads the answer, which is `reader` -- the rest is one rule,
+    and it was two copies of one loop before a second format made the
+    difference between them matter.
+    """
+    if fmt["kind"] == "delimited":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `{block}.{key}` is "
+                f"{value!r}. Under `kind: delimited` it names a COLUMN of the "
+                f"control file, not a regex.")
+        name = value.strip()
+        declared = fmt.get("columns")
+        if declared is not None and name not in declared:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} `{block}.{key}` names column "
+                f"{name!r}, which is not one of "
+                f"`{block}.format.columns` ({', '.join(declared)}). The file "
+                f"has no header row, so that list is the only thing that can "
+                f"say where the value is.")
+        return name
+
+    group = CONTROL_FIELD_GROUPS[key]
+    try:
+        compiled = re.compile(value)
+    except (re.error, TypeError) as exc:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.{key}` is not a valid "
+            f"regex: {exc}") from exc
+    if group not in compiled.groupindex:
+        raise ValueError(
+            f"feeds.yml: feed {feed_name!r} `{block}.{key}` {value!r} has no "
+            f"`(?P<{group}>...)` group -- that is the only thing {reader} "
+            f"reads out of a match.")
+    return value
+
+
+def _resolve_control(feed_name: str, control: Any) -> dict[str, Any]:
     """Validate a `delivery.control` block and fill its defaults.
 
     Same reasoning as the rest of `delivery:`: every key here is read by
@@ -434,27 +598,25 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, str]:
             f"feeds.yml: feed {feed_name!r} `delivery.control.pattern` is not "
             f"a valid regex once `{{stem}}` is filled in: {exc}") from exc
 
-    out = {"pattern": pattern}
+    out: dict[str, Any] = {"pattern": pattern}
+    # HOW the file is read, before WHAT is read out of it: a `delimited`
+    # format makes each field below a column name. Omitted from the result
+    # when it is the default, so a feed that declares none keeps the resolved
+    # block it has always had.
+    fmt = resolve_control_format(feed_name, "delivery.control",
+                                 control.get("format"))
+    if fmt["kind"] != "regex":
+        out["format"] = fmt
     # The INTEGRITY checks, both optional -- a control file may be a pure
     # readiness gate. Read on the landing side and checked at ingest, so they
     # run once for every delivery however it arrived.
     # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
-    for key, group in (("row_count", "rows"), ("md5", "md5")):
+    for key in ("row_count", "md5"):
         value = control.get(key)
         if value is None:
             continue
-        try:
-            compiled = re.compile(value)
-        except re.error as exc:
-            raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.control.{key}` "
-                f"is not a valid regex: {exc}") from exc
-        if group not in compiled.groupindex:
-            raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.control.{key}` "
-                f"{value!r} has no `(?P<{group}>...)` group -- that is the "
-                f"only thing normalize reads out of a match.")
-        out[key] = value
+        out[key] = _resolve_control_field(feed_name, "delivery.control", key,
+                                          value, fmt, "normalize")
     return out
 
 
@@ -578,7 +740,7 @@ def parse_expected_by(feed_name: str, value: Any) -> str:
 # delivery and for one written straight into landing.
 # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
 ARRIVAL_KEYS = {"source_pattern", "control", "archive"}
-ARRIVAL_CONTROL_KEYS = {"pattern", "cob_date", "version"}
+ARRIVAL_CONTROL_KEYS = {"pattern", "format", "cob_date", "version"}
 
 
 def resolve_arrival_config(feed_name: str, arrival: Any,
@@ -729,7 +891,7 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
     return {"member_pattern": pattern}
 
 
-def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, str]:
+def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, Any]:
     """Validate `arrival.control` -- the control file AS IT ARRIVES.
 
     A separate block from `delivery.control` because they answer different
@@ -773,27 +935,23 @@ def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, str]:
             f"feeds.yml: feed {feed_name!r} `arrival.control.pattern` is not a "
             f"valid regex once `{{stem}}` is filled in: {exc}") from exc
 
-    out = {"pattern": pattern}
-    # Each of these is a regex over the control file's TEXT with one named
-    # group, and the group name is the only thing read out of a match.
+    out: dict[str, Any] = {"pattern": pattern}
+    # HOW the file is read -- see `resolve_control_format`. The same file is
+    # read again on the landing side, so `check_gates_are_coherent` refuses
+    # two blocks that disagree about its shape.
+    fmt = resolve_control_format(feed_name, "arrival.control",
+                                 control.get("format"))
+    if fmt["kind"] != "regex":
+        out["format"] = fmt
+    # Under `kind: regex` each of these is a regex over the control file's
+    # TEXT with one named group; under `kind: delimited`, a column name.
     # IDENTITY ONLY -- `row_count` and `md5` belong to `delivery.control`.
-    for key, group in (("cob_date", "cob_date"),
-                       ("version", "version")):
+    for key in ("cob_date", "version"):
         value = control.get(key)
         if value is None:
             continue
-        try:
-            compiled = re.compile(value)
-        except re.error as exc:
-            raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `arrival.control.{key}` is not "
-                f"a valid regex: {exc}") from exc
-        if group not in compiled.groupindex:
-            raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `arrival.control.{key}` "
-                f"{value!r} has no `(?P<{group}>...)` group -- that is the "
-                f"only thing the gate reads out of a match.")
-        out[key] = value
+        out[key] = _resolve_control_field(feed_name, "arrival.control", key,
+                                          value, fmt, "the gate")
     return out
 
 
@@ -825,6 +983,29 @@ def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
             f"nothing checks the row count or checksum, for a legacy feed, "
             f"which is the last place to skip them. Add "
             f"`delivery: {{control: {{pattern: ...}}}}`.")
+
+    # ONE FILE, ONE SHAPE. The gate promotes the control file into `landing/`
+    # byte for byte, so both blocks read the SAME BYTES -- one for identity at
+    # the door, one for integrity at ingest. Two different readings of one
+    # file cannot both be right, and the wrong one does not fail at load: it
+    # fails later, on one of the two paths, looking like an upstream format
+    # change. Declaring the format twice is the price of each block staying a
+    # complete recipe for the file it is handed; this is what makes the copies
+    # unable to drift.
+    arrival_control = arrival.get("control") or {}
+    delivery_control = (delivery or {}).get("control") or {}
+    if arrival_control and delivery_control:
+        default = {"kind": "regex"}
+        a_fmt = arrival_control.get("format") or default
+        d_fmt = delivery_control.get("format") or default
+        if a_fmt != d_fmt:
+            raise ValueError(
+                f"feeds.yml: feed {feed_name!r} reads one control file two "
+                f"ways -- `arrival.control.format` is {a_fmt} and "
+                f"`delivery.control.format` is {d_fmt}. The gate promotes the "
+                f"control file into landing/ unchanged, so both blocks parse "
+                f"the same bytes and only one of these can be the file the "
+                f"sender writes.")
 
 
 # A convention may set anything a feed block may, EXCEPT these two.
