@@ -3,25 +3,22 @@
 WHY COMPILED AND NOT THE MODEL FILE. The models are Jinja: `clean_string()`,
 `safe_cast()`, `dedupe_rank()`, `source_provenance()`. The template says
 nothing about which columns a macro reads -- that is decided when dbt renders
-it -- so the parseable artefact is `target/compiled/**/<model>.sql`, which dbt
-writes on every build and which persists at DBT_TARGET_PATH.
+it -- so the parseable artefact is `target/compiled/**/<model>.sql`.
 
 WHY sqlglot AND NOT THE PARSER ALREADY IN THE IMAGE. `openlineage-sql` ships
-with the provider and produces column lineage, but not usable column lineage
-here, measured: of 59 fields it emitted, 26 resolved to a real table and the
-rest named the CTE the column came through (`trades`, `deduped`). The prepared
-layer -- which is the layer that does the renaming and casting anybody wants to
-see -- produced ZERO, because those models open with `select *` and no parser
-can expand a star without knowing the table's columns. sqlglot resolves CTEs
-and takes a schema, and THE PLATFORM ALREADY READS THAT SCHEMA (`schemas.py`,
-off the catalog).
+with the provider and produces column lineage, but not usable lineage here,
+measured: of 59 fields it emitted, 26 resolved to a real table and the rest
+named the CTE the column came through. The prepared layer -- the one that does
+the renaming and casting anybody wants to see -- produced ZERO, because those
+models open with `select *` and no parser can expand a star without knowing the
+table's columns. sqlglot resolves CTEs and takes a schema, and THE PLATFORM
+ALREADY READS THAT SCHEMA (`schemas.py`).
 
 EVERY COLUMN IS CLASSIFIED, AND THAT IS THE POINT OF THIS MODULE (R-LIN-8).
 Reporting only the columns that trace makes a column's ABSENCE ambiguous: a
 literal, an aggregate over rows, and a parser failure nobody noticed all look
 identical -- like nothing. Those are three different facts and an auditor asks
-which. So every column of the table gets a `ColumnLineage`, carrying the class
-it falls into:
+which. So every column gets a `ColumnLineage` carrying its class:
 
     sourced          computed from >=1 upstream table column, which is named
     row_aggregate    an aggregate over ROWS, not columns: `count(*)`
@@ -30,42 +27,35 @@ it falls into:
     ingest_added     ingest's own column, sourceless by construction
     unresolved       THE DEFECT CLASS -- see below
 
-Measured on the shipped project: 136 columns, 116 `sourced`, 20 sourceless
-(17 literal/build_metadata, 1 `count(*)`, and the rest ingest's own), 0
+Measured on the shipped project: 136 columns, 116 `sourced`, 20 sourceless, 0
 `unresolved`.
 
 `unresolved` IS A DEFECT AND IT DOES NOT FAIL A BUILD. It is reachable and
-detectable -- sqlglot raises "Cannot find column 'x' in query" whenever the
-TABLE has a column the current SQL does not produce -- and it means the export
-is describing something it could not read, which is exactly what silence used
-to hide. But it is reported, not enforced, for two reasons. This package runs
+detectable -- sqlglot raises whenever the TABLE has a column the current SQL
+does not produce -- and it means the export is describing something it could
+not read. But it is reported, not enforced, for two reasons: this package runs
 inside an OpenLineage extractor where an exception costs the DATASETS of
 whatever was being extracted, so nothing here may raise; and an export is not
-an authority (docs/DECISIONS.md#openlineage-is-an-export-not-a-record), so a
-DESCRIPTION of the pipeline must never be able to stop the pipeline. Worse, the
-condition is legitimately transient: the compiled SQL on disk is from the last
-build while the table schema is read from `main`, so mid-change the two
-disagree by construction and a build-time refusal would fire on a correct
-deployment. The seam is therefore CI, not runtime: `python -m
-reporting_platform.lineage --columns` exits non-zero on any unresolved column,
-and `tests/test_lineage.py` asserts the class is both reachable and empty.
+an authority, so a DESCRIPTION of the pipeline must never be able to stop the
+pipeline. The condition is also legitimately transient -- compiled SQL on disk
+is from the last build while the schema is read from `main`, so mid-change the
+two disagree by construction. The seam is therefore CI: `python -m
+reporting_platform.lineage --columns` exits non-zero on any unresolved column.
 
 THE TRANSFORMATION IS REPORTED, not just the dependency. A rename shows as an
 input field with a different name (`_cob_date` -> `cob_date`) and no
-description; a computation carries the SQL that performs it, e.g.
-`TRY_CAST(NULLIF(NULLIF(NULLIF(TRIM(deduped.notional), ''), 'NULL'), 'N/A') AS
-DECIMAL(28,4))`. That is the deepest non-trivial expression on the path from
-the output column to its source, which is where the work actually happens --
-the outermost one is always a passthrough from the final CTE -- and it is also
-what the classifier reads: the node type of that same deepest expression is
-what says `count(*)` from `current_timestamp()` from a cast literal.
+description; a computation carries the SQL that performs it. That is the
+deepest non-trivial expression on the path from the output column to its
+source, which is where the work actually happens -- the outermost is always a
+passthrough from the final CTE -- and it is also what the classifier reads, so
+the two can never describe different nodes.
 
 COST. 0.02s to parse a model and 0.17s to trace all its columns, once per task
 process, on top of the schema read `schemas.py` already does.
 
-TOTAL, like everything else in this package: this runs inside an OpenLineage
-extractor, where an exception costs the datasets of whatever was being
-extracted, so every failure returns no column lineage and none of them raise.
+TOTAL, like everything else in this package: an exception here costs the
+datasets of whatever was being extracted, so every failure returns no column
+lineage and none of them raise.
 """
 from __future__ import annotations
 
@@ -222,9 +212,8 @@ def classify_sql(sql: str, columns: list[str],
         except Exception as err:                             # noqa: BLE001
             # sqlglot raises for a column the query does not produce, which
             # happens whenever the TABLE has a column the current SQL does not
-            # -- a column added by a later model version, or dropped from it.
-            # It used to be skipped, which reported it as though it did not
-            # exist. It is the defect class now.
+            # -- added by a later model version, or dropped from it. It used to
+            # be skipped, which reported it as though it did not exist.
             out[column] = ColumnLineage(
                 UNRESOLVED, detail=" ".join(str(err).split())[:200])
             continue

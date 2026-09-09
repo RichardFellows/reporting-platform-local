@@ -1,42 +1,35 @@
 """The OpenLineage extractor that puts `graph.py`'s datasets on the real runs.
 
-WHY AN EXTRACTOR AND NOT A SECOND EMITTER. The obvious alternative -- a task
-that posts its own OpenLineage events -- would create a second job node per
-model in Marquez, next to the one Airflow already emits, and the graph would
-show every transformation twice. An extractor attaches the datasets to the
-run Airflow is ALREADY reporting, so there is exactly one node per task and
-the operational record and the data flow are the same object.
+WHY AN EXTRACTOR AND NOT A SECOND EMITTER. A task posting its own OpenLineage
+events would create a second job node per model in Marquez, next to the one
+Airflow already emits, and the graph would show every transformation twice. An
+extractor attaches the datasets to the run Airflow is ALREADY reporting, so
+there is one node per task and the operational record and the data flow are the
+same object.
 
 HOW IT IS SELECTED. `ExtractorManager.get_extractor_class` checks
-`task.task_type in self.extractors` BEFORE it looks for
+`task.task_type in self.extractors` BEFORE looking for
 `get_openlineage_facets_on_*` on the operator, so a custom extractor wins over
 Cosmos's own -- which matters, because Cosmos HAS one and it returns nothing
 here: `openlineage-integration-common` raises `NotImplementedError` for dbt's
-`method: session`, and `method: session` is load-bearing on this platform.
-Registered through AIRFLOW__OPENLINEAGE__EXTRACTORS in
-docker-compose.yml, which is read at process start -- the airflow containers
-must be RECREATED, not restarted.
+`method: session`, which is load-bearing on this platform. Registered through
+AIRFLOW__OPENLINEAGE__EXTRACTORS, read at process start -- the airflow
+containers must be RECREATED, not restarted.
 
 IT CLAIMS `_PythonDecoratedOperator`, WHICH IS EVERY `@task` IN THE ESTATE.
-There is no narrower hook: the ingest task is a plain decorated function, so
-the only class name to register is the one they all share. Two consequences
-this file has to honour. It runs on `open_branch`, `publish`, every
-housekeeping task and everything added later, so it must be CHEAP -- it does
-no I/O until it has recognised the task. And it must be TOTAL: an extractor
-that raises is caught and logged by the manager rather than failing the task,
-but it would take the DATASETS of whatever it was extracting with it, so
-every path here returns an empty lineage instead of raising.
+There is no narrower hook. Two consequences this file must honour: it runs on
+`open_branch`, `publish`, every housekeeping task and everything added later,
+so it must be CHEAP -- no I/O until it has recognised the task -- and it must
+be TOTAL, because an extractor that raises would take the DATASETS of whatever
+it was extracting with it. Every path here returns an empty lineage instead.
 
 An unrecognised task returns `OperatorLineage()` with nothing in it, and the
-manager then falls back to the task's own inlets and outlets exactly as it
-does today -- so nothing that currently emits stops emitting.
+manager falls back to the task's own inlets and outlets.
 
-WHAT IS DELIBERATELY NOT HERE. `dbt_test` produces no dataset: a test reads
-the models and writes nothing, and drawing it as a transformation would put a
-node in the graph that never produced a table. The audit half of
-write-audit-publish is visible in Airflow and in `registry.run`, which is
-where a verdict belongs. See
-docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project.
+WHAT IS DELIBERATELY NOT HERE. `dbt_test` produces no dataset: a test reads the
+models and writes nothing, and drawing it as a transformation would put a node
+in the graph that never produced a table.
+See docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project.
 """
 from __future__ import annotations
 

@@ -13,18 +13,15 @@ The important thing this job encodes is ORDER. See docs/RETENTION.md:
     6. sweep orphan table prefixes            <-- what GC structurally cannot see
     7. sweep the landing prefix               <-- the evidence copy, flat 8y
 
-Ordering matters: run GC before tags are expired and the tags still pin the
-content, so it collects nothing while appearing to succeed. That is the failure
-mode to watch for -- the storage graph flatlines and nobody notices for a
-quarter.
+Run GC before tags are expired and the tags still pin the content, so it
+collects nothing while appearing to succeed -- the storage graph flatlines and
+nobody notices for a quarter.
 
-A correction the docs got wrong for a long time: under a Nessie catalog,
-`expire_snapshots` is NOT the step that reclaims storage. NessieCatalog sets
-`gc.enabled=false` on every table, so Iceberg refuses to delete files at all --
-correctly, because data files are shared across references and no single table
-pointer knows what another branch still needs. Nessie GC is the only mechanism
-that can decide safely. Steps 5 are kept, guarded, so the code still works
-against a non-Nessie catalog.
+Under a Nessie catalog `expire_snapshots` is NOT the step that reclaims
+storage: NessieCatalog sets `gc.enabled=false` on every table, correctly,
+because data files are shared across references and no single table pointer
+knows what another branch still needs. Step 5 is kept, guarded, so the code
+still works against a non-Nessie catalog.
 """
 from __future__ import annotations
 
@@ -49,14 +46,12 @@ log = logging.getLogger("retention")
 HELPTEXT = ("every table the platform manages, from managed_tables() -- the "
             "same list platform_housekeeping uses")
 
-# TWO SHAPES, and only one of them is still written. `published/<report>/<bd>/
-# <run>` is what `dbt_builds.publish` cuts for each report a reporting build
-# publishes, which is what makes `references.published_tags.per_report` mean
-# something. `published/<bd>/<run>` is what the INGEST DAG used to cut before
-# a publication knew which report it was for; nothing writes it any more, and
-# it is still matched here because tags cut under it are real pins that this
-# sweep must recognise rather than skip. A report name may not contain "/", so
-# the two alternatives cannot both match one name.
+# TWO SHAPES, and only one is still written. `published/<report>/<bd>/<run>` is
+# what `dbt_builds.publish` cuts per report, which is what makes
+# `references.published_tags.per_report` mean something. `published/<bd>/<run>`
+# is what the INGEST DAG cut before a publication knew its report; nothing
+# writes it now, and it is still matched because tags cut under it are real
+# pins. A report name may not contain "/", so the two cannot both match.
 TAG_RE = re.compile(
     r"^published/"
     r"(?:(?P<report>[^/]+)/)?"
@@ -64,11 +59,9 @@ TAG_RE = re.compile(
 
 # `snapshot/<feed>/<bd>/<run>` -- what an INGEST pins now. A different object
 # from a publication and kept for a different reason: it pins the state one
-# feed's ingest left, so a raw COB date stays readable after retention
-# has deleted it from the live table. Its window is
-# `references.snapshot_tags`, which is allowed to be much shorter than a
-# published tag's, because nothing is reproduced FROM it -- it is a
-# convenience for reading back, not evidence a published figure rests on.
+# feed's ingest left, so a raw COB date stays readable after retention deleted
+# it from the live table. Its window (`references.snapshot_tags`) may be much
+# shorter than a published tag's, because nothing is reproduced FROM it.
 SNAPSHOT_RE = re.compile(
     r"^snapshot/(?P<feed>[^/]+)/(?P<bd>\d{4}-\d{2}-\d{2})/(?P<run>.+)$")
 
@@ -81,68 +74,50 @@ WORKING_RE = re.compile(r"^(ingest|build)/")
 def check_reproducibility_window() -> dict:
     """REFUSE to sweep if landing expires before the published pins do.
 
-    A published tag pins the TABLES. Reproducing a published run means being
-    able to show its inputs as well, and `landing/` is the only copy of what
-    the upstream actually sent -- so a pin that outlives its landing evidence
-    is a pin you cannot fully honour.
+    A published tag pins the TABLES. Reproducing a published run means showing
+    its inputs too, and `landing/` is the only copy of what the upstream sent
+    -- so a pin outliving its landing evidence cannot be fully honoured.
 
-    PER FEED SINCE RETENTION CLASSES (REQ-600/601), and that changed what this
-    compares. It used to be two global numbers: `landing.keep_years` against
-    the longest window ANY report resolves to. With classes there is no single
-    landing window, so the question is asked the way it should always have been
-    asked -- for each report, does every feed BEHIND that report keep its
-    evidence at least as long as that report's pin? `feeds_behind_report`
-    answers it by walking the project's `ref()`s from the exposure, the same
-    derivation `managed_tables()` and `reports()` already use.
+    PER FEED SINCE RETENTION CLASSES (REQ-600/601). It used to be two global
+    numbers; with classes there is no single landing window, so the question
+    is asked per report: does every feed BEHIND it keep its evidence at least
+    as long as that report's pin? `feeds_behind_report` answers it by walking
+    the project's `ref()`s, the same derivation `managed_tables()` uses.
 
-    THIS IS A NARROWER REFUSAL THAN THE OLD ONE, deliberately. A feed behind no
-    published report -- `ref_collateral` here today -- is no longer bound by
-    any report's pin, because nothing published is reproduced from it. That is
-    the entire point of having classes: without it no class could ever be
-    shorter than the longest pin, and the feature would be decoration. What it
-    costs is that a feed's window is now only as protected as the lineage
-    derivation is correct, which is why `feeds_behind_report` raises on a ref
-    it cannot resolve rather than returning a short list.
+    THIS IS A NARROWER REFUSAL THAN THE OLD ONE, deliberately. A feed behind
+    no published report is no longer bound by any pin, because nothing
+    published is reproduced from it -- without that, no class could ever be
+    shorter than the longest pin and the feature would be decoration. The cost
+    is that a window is only as protected as the lineage derivation is
+    correct, which is why `feeds_behind_report` raises on an unresolvable ref.
 
-    A `per_report` ENTRY NAMING NO LIVE EXPOSURE binds every feed. A report
-    removed from the project keeps the tags it already cut, `expire_tags`
-    still resolves their window by the name in the tag, and the lineage that
-    would say which feeds were behind it is gone -- so the conservative answer
-    is the only available one. Iterating live exposures alone would quietly
-    stop honouring a window that is still being applied to real pins.
+    A `per_report` ENTRY NAMING NO LIVE EXPOSURE binds every feed: the tags it
+    already cut still resolve their window by name, and the lineage that would
+    say which feeds were behind it is gone.
 
     STILL NOT BOUND TO `snapshot_tags`, and that must not creep back in.
-    Nothing is reproduced from a snapshot tag; it buys the ability to read a
-    raw COB date back after retention removed it, which is a storage
-    decision rather than an evidence one. Binding it here would silently
+    Nothing is reproduced from a snapshot tag; binding it here would silently
     impose the published window on every feed again.
 
-    THIS ONE REFUSES, where `landing.keep_years()`'s own interlock warns. The
-    difference is what the failure costs. Landing running short of the raw
-    window degrades `find_pending` gradually and is recoverable by raising it.
-    Deleting landing evidence a live pin depends on is not recoverable at all,
-    and the sweep that would do it runs nightly and unattended.
+    THIS ONE REFUSES, where `landing.keep_years()`'s interlock warns, because
+    of what the failure costs: landing running short of the raw window
+    degrades `find_pending` gradually and is recoverable, deleting evidence a
+    live pin depends on is not, and this sweep runs nightly and unattended.
 
-    NOT REQ-602 IN FULL, and the gap is stated rather than papered over. This
-    compares WINDOWS, so it catches the configuration that guarantees the loss
-    and cannot catch a specific delivery expiring early inside an otherwise
-    coherent one. `monitoring/evidence.py` is the per-delivery half, and it
-    runs after this chain rather than before it, because it has to observe what
-    the sweep left behind.
-
-    Returns what it checked, so the caller can log the windows rather than a
-    single number that no longer exists.
+    NOT REQ-602 IN FULL. This compares WINDOWS, so it catches the
+    configuration that guarantees the loss and cannot catch a specific
+    delivery expiring early inside a coherent one. `monitoring/evidence.py` is
+    the per-delivery half, and it runs after this chain because it has to
+    observe what the sweep left.
     """
     known = reports()
     every_feed = feeds()
 
-    # A `per_report` entry naming no live exposure is NOT ignored, and this is
-    # the subtle half. A report removed from the project keeps the tags it
-    # already cut -- `expire_tags` resolves their window by the report name in
-    # the tag, so that entry is still in force for pins that still exist -- and
-    # its lineage is gone, so which feeds were behind it can no longer be
-    # derived. It therefore binds EVERY feed. Iterating live exposures alone
-    # would quietly stop honouring a window that is still being applied.
+    # A `per_report` entry naming no live exposure is NOT ignored. A report
+    # removed from the project keeps the tags it already cut -- `expire_tags`
+    # resolves their window by the report name in the tag -- and its lineage is
+    # gone, so which feeds were behind it can no longer be derived. It
+    # therefore binds EVERY feed.
     orphans = sorted(set(
         (reference_policy("published_tags").get("per_report") or {})) - set(known))
 
@@ -181,8 +156,8 @@ def check_reproducibility_window() -> dict:
     if unbound:
         # NOT a problem, and said out loud so it is not read as one. These
         # feeds reach no exposure, so no published figure is reproduced from
-        # them and no pin binds their window. It is also the list to look at
-        # first if a report was expected to depend on one of them.
+        # them. It is also the list to look at first if a report was expected
+        # to depend on one of them.
         log.info("landing evidence for %s is bound by no published tag: those "
                  "feeds are behind no report", ", ".join(unbound))
     return {"checked": checked, "unbound_feeds": unbound,
@@ -236,31 +211,26 @@ def clean_working_branches(nessie: Nessie, dry_run: bool = False) -> list[str]:
     removed = []
     # fetch_all=True is REQUIRED: without it Nessie returns no metadata block,
     # so commitTime below is always None. That made the age check dead code and
-    # this function deleted every working branch on sight -- including branches
-    # an ingest or dbt build was actively writing to.
+    # this function deleted every working branch on sight.
     for ref in nessie.list_references(fetch_all=True):
         if ref.get("type") != "BRANCH":
             continue
         m = WORKING_RE.match(ref["name"])
         # Anything outside ingest/ and build/ is not swept, which is what
         # makes the hold/ convention work: renaming a branch under
-        # investigation to hold/<name> exempts it by construction, with no
-        # special case here to forget or get wrong.
+        # investigation to hold/<name> exempts it by construction.
         if not m:
             continue
         cutoff = now - timedelta(hours=windows[m.group(1)])
         meta = ref.get("metadata") or {}
 
         # A branch with no commits of its own POINTS AT ITS BASE's commit, so
-        # commitMetaOfHEAD describes main, not this branch, and the age below
-        # would be main's age. On a quiet main -- a long weekend, a platform
-        # that publishes weekly -- a branch opened seconds ago reads as days
-        # old and the next sweep deletes it while a build is writing to it.
-        # Nessie exposes no branch-creation timestamp, so the age is genuinely
-        # unknowable; fall back to the same fail-safe as a missing commit time.
-        # The cost is that an empty abandoned branch is never swept and keeps
-        # pinning the commit it forked from; the watchdog's working-branch
-        # count is what catches those accumulating.
+        # commitMetaOfHEAD describes main and the age below would be main's. On
+        # a quiet main a branch opened seconds ago reads as days old and the
+        # next sweep deletes it mid-build. Nessie exposes no branch-creation
+        # timestamp, so the age is genuinely unknowable; fail safe as for a
+        # missing commit time. The cost is that an empty abandoned branch is
+        # never swept; the watchdog's branch count catches those.
         if meta.get("numCommitsAhead") == 0:
             log.info("working branch %s has no commits of its own; its age is "
                      "unknowable, leaving it", ref["name"])
@@ -281,9 +251,8 @@ def clean_working_branches(nessie: Nessie, dry_run: bool = False) -> list[str]:
             continue
         age_h = (now - ts).total_seconds() / 3600
         # Log the decision, not just the deletions. With per-prefix windows
-        # (D5) "why is that branch still there" is now a question with two
-        # possible answers, and a log that only records removals cannot
-        # distinguish "inside its window" from "the sweep never saw it".
+        # "why is that branch still there" has two possible answers, and a log
+        # of removals alone cannot distinguish them.
         log.info("working branch %s: %.1fh old, %s window %dh -> %s",
                  ref["name"], age_h, m.group(1), windows[m.group(1)],
                  "keep" if ts > cutoff else "sweep")
@@ -331,39 +300,32 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
     """Published-tag retention. TAG RETENTION IS DATA RETENTION.
 
     A tag pins every data file its commit referenced, and `expire_snapshots`
-    cannot reclaim a pinned file. So this sweep decides, for every published
-    run, how long that run stays REPRODUCIBLE -- which is a different question
-    from how much history the tables serve, and it used to be answered with
-    the tables' own keep-set (`keep_business_days: 10 / keep_month_ends: 80`).
+    cannot reclaim a pinned file. So this sweep decides how long a published
+    run stays REPRODUCIBLE -- a different question from how much history the
+    tables serve, and it used to be answered with the tables' own keep-set.
 
     Two things were wrong with that, and both were live:
 
-      * an ordinary daily publication lost its pin once ten more COB
-        dates had been published -- about a fortnight -- and month-end pins
-        lasted 80/12 ~ 6.7 years against a longer assumed period. The
-        evidence expired on a table schedule.
+      * an ordinary daily publication lost its pin once ten more COB dates had
+        been published -- about a fortnight. The evidence expired on a table
+        schedule.
       * within a RETAINED date, only the newest tag survived. The tag name
-        carries no feed (`published/<bd>/<run_id>`) and
-        `record_publication` runs in every per-feed ingest DAG, so N feeds
-        publishing one COB date cut N tags for it and N-1 were deleted
-        the same night. Observed on the live catalog: three tags for
-        2026-08-01, all inside the keep-set, two of them scheduled for
-        deletion. The code called them "earlier reruns of the same date"
-        pinning "files for no benefit"; they were other feeds' publications.
+        carried no feed, and `record_publication` ran in every per-feed ingest
+        DAG, so N feeds publishing one COB date cut N tags and N-1 were
+        deleted the same night. Observed live: three tags for 2026-08-01, two
+        scheduled for deletion as "earlier reruns"; they were other feeds'
+        publications.
 
-    Now: FLAT AGE, per report, and every tag is judged on its own.
+    Now: FLAT AGE, per report, every tag judged on its own.
 
-    THE AGE IS THE COMMIT TIME -- when the publication was MADE -- not the
-    COB date it is about. A retention period runs from the creation of
-    the record, and a restatement published today for a COB date years
-    old is a new record that must survive its own full window. Measuring from
-    the COB date instead would expire it on arrival.
+    THE AGE IS THE COMMIT TIME -- when the publication was MADE -- not the COB
+    date it is about. A retention period runs from the creation of the record,
+    and a restatement published today for an old COB date must survive its own
+    full window. Measuring from the COB date would expire it on arrival.
 
-    The COB date is the FALLBACK, used only when a tag carries no
-    readable commit time. It is conservative by construction: a publication
-    cannot precede the date it reports on, so the COB date is never later
-    than the commit time and can only ever keep a tag the commit time would
-    also have kept.
+    The COB date is the FALLBACK, used only when a tag carries no readable
+    commit time. Conservative by construction: a publication cannot precede
+    the date it reports on.
 
     Deleting a tag is unrecoverable, so everything ambiguous here keeps.
     """
@@ -419,20 +381,19 @@ def expire_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
 def expire_snapshot_tags(nessie: Nessie, dry_run: bool = False) -> list[str]:
     """`snapshot/<feed>/<bd>/<run>` retention. NOT the same thing as a pin.
 
-    An ingest pins the state it left so a raw COB date stays readable
-    after retention has removed it from the live table. That is a convenience
-    with a cost -- a pinned file cannot be reclaimed by `expire_snapshots` --
-    and NOTHING IS REPRODUCED FROM IT: no published figure rests on a snapshot
-    tag, so its window is a storage decision rather than an evidence one, and
-    it is allowed to be far shorter than a published tag's.
+    An ingest pins the state it left so a raw COB date stays readable after
+    retention removed it from the live table. That is a convenience with a
+    cost -- a pinned file cannot be reclaimed -- and NOTHING IS REPRODUCED
+    FROM IT, so its window is a storage decision rather than an evidence one
+    and may be far shorter than a published tag's.
 
-    This is why the ingest DAG's tag was renamed out of `published/`. While it
-    lived there it was judged by the published window -- ten years of pinned
-    raw files per feed per COB date -- and it was counted by every check
-    that asks whether a PUBLICATION can still be read.
+    This is why the ingest DAG's tag was renamed out of `published/`. There it
+    was judged by the published window -- ten years of pinned raw files per
+    feed per COB date -- and counted by every check asking whether a
+    PUBLICATION can still be read.
 
-    Judged the same way a published tag is (`_tag_age`), and it keeps
-    everything it does not positively recognise, for the same reason.
+    Judged the same way a published tag is (`_tag_age`), keeping everything it
+    does not positively recognise.
     """
     policy = reference_policy("snapshot_tags")
     years = policy.get("keep_years")
@@ -535,24 +496,21 @@ _GC_SCHEMA_READY = False
 def _ensure_gc_schema(cfg: dict) -> None:
     """Create the GC live-set tables if this database has never had them.
 
-    WHY THIS EXISTS. `scripts/init-postgres.sql` creates the `nessie_gc`
-    DATABASE but no tables, and the GC tool does not create them on demand --
-    it has a dedicated `create-sql-schema` command that nothing in this repo
-    ever ran. The tables then survive in the Postgres volume forever, which is
-    why four sessions of GC work never noticed. Rebuilding from `docker
-    compose down -v` to verify the quick-start put a genuinely empty database
-    underneath it and the first mark-live died with:
+    `scripts/init-postgres.sql` creates the `nessie_gc` DATABASE but no
+    tables, and the GC tool does not create them on demand -- it has a
+    `create-sql-schema` command nothing in this repo ever ran. The tables then
+    survive in the Postgres volume forever, which is why four sessions of GC
+    work never noticed. A rebuild from `docker compose down -v` put a
+    genuinely empty database underneath and the first mark-live died with
+    `relation "gc_live_sets" does not exist`.
 
-        ERROR: relation "gc_live_sets" does not exist
-
-    That is not a soft failure. `nessie_gc()` is deliberately not wrapped in a
+    Not a soft failure: `nessie_gc()` is deliberately not wrapped in a
     try/except, because Nessie GC is the ONLY thing that reclaims storage here
- and a silent skip would be worse than a red run -- so the first
-    `platform_housekeeping` of every new install went red.
+    and a silent skip would be worse than a red run.
 
-    Runs once per process and tolerates the already-created case; the
+    Runs once per process and tolerates the already-created case;
     `--jdbc-schema=CREATE_IF_NOT_EXISTS` in _gc_jdbc() is what makes the
-    command return 0 rather than 1 on a database that already has the tables.
+    command return 0 on a database that already has the tables.
     """
     global _GC_SCHEMA_READY
     if _GC_SCHEMA_READY:
@@ -584,29 +542,27 @@ def _gc_fileio() -> list[str]:
 def nessie_gc(dry_run: bool = False) -> dict:
     """Identify (and optionally sweep) content unreachable from any live ref.
 
-    THE GAP THIS FILLS. Iceberg's `expire_snapshots` only knows about snapshots
-    reachable from the single table pointer it is handed. Nessie holds many
-    pointers -- every branch, every tag -- so a file can be unreferenced from
-    `main` yet still live because some abandoned build branch's commit contains
-    it. Nessie GC is the only thing that reasons across all references.
-    `docs/MAINTENANCE.md` has documented this as step 3 of the nightly chain
-    since the beginning; until now nothing implemented it.
+    THE GAP THIS FILLS. Iceberg's `expire_snapshots` only knows about
+    snapshots reachable from the single table pointer it is handed. Nessie
+    holds many pointers -- every branch, every tag -- so a file can be
+    unreferenced from `main` yet still live because some abandoned build
+    branch's commit contains it. Nessie GC is the only thing that reasons
+    across all references.
 
-    There is no server-side GC endpoint and no REST call for this: it runs via
-    the external `nessie-gc` tool, baked into the image by Dockerfile.airflow.
+    There is no server-side GC endpoint: it runs via the external `nessie-gc`
+    tool, baked into the image by Dockerfile.airflow.
 
     Safety model, which is the tool's own three-stage one:
 
-      dry_run=True   -> `mark-live` only. Walks the commit graph and records a
-                        live-content-set. Deletes nothing, ever.
+      dry_run=True   -> `mark-live` only. Records a live-content-set and
+                        deletes nothing, ever.
       dry_run=False  -> `mark-live`, then `sweep`. With `defer_deletes: true`
                         (the default) the sweep RECORDS files to delete rather
-                        than deleting them, so a human can review with
-                        `nessie-gc list-deferred` and then run
-                        `nessie-gc deferred-deletes`.
+                        than deleting them, for review with
+                        `nessie-gc list-deferred`.
 
-    So even a non-dry run removes nothing by default. That is deliberate: this
-    is the one step in the retention chain with no undo.
+    So even a non-dry run removes nothing by default -- this is the one step
+    in the retention chain with no undo.
     """
     cfg = nessie_gc_config()
     if not cfg.get("enabled", False):
@@ -616,9 +572,8 @@ def nessie_gc(dry_run: bool = False) -> dict:
     cutoff = cfg.get("default_cutoff", "NONE")
 
     # INTERLOCK: a cutoff shorter than the longest snapshot retention would
-    # collect files that still-valid snapshots reference -- breaking time
-    # travel and the extracts snapshot_retention_days exists to protect. This
-    # is a refuse-to-run condition, not a warning: the damage is unrecoverable.
+    # collect files still-valid snapshots reference, breaking time travel. A
+    # refuse-to-run condition, not a warning: the damage is unrecoverable.
     longest = max(all_snapshot_retention_days() or [0])
     days = _cutoff_days(cutoff)
     if days is None:
@@ -710,7 +665,7 @@ def _run_gc(cmd: list[str], phase: str) -> dict:
 # ------------------------------------------- 2c. deferred deletes
 # `nessie-gc list` prints a fixed-width table after its logback banner. Anchor
 # on the shape of a row -- uuid, status, ISO timestamp -- rather than on column
-# offsets or line numbers, both of which the banner and an Error column shift.
+# offsets or line numbers, which the banner and an Error column shift.
 _LIVE_SET_ROW = re.compile(
     r"^\s*(?P<id>[0-9a-f]{8}-[0-9a-f-]{27})\s+"
     r"(?P<status>[A-Z_]+)\s+"
@@ -719,8 +674,7 @@ _LIVE_SET_ROW = re.compile(
 )
 # A deferred-delete row from `list-deferred`. NOTE the path is printed as TWO
 # columns -- the content's base location, then the file relative to it -- so a
-# naive `s3://\S+` match captures only the directory and silently looks like a
-# file that does not exist. Match both halves.
+# naive `s3://\S+` match captures only the directory. Match both halves.
 _DEFERRED_FILE_RE = re.compile(
     r"^\s*\S+\s+(?P<base>s3[an]?://\S+)\s+(?P<path>\S+)\s*$", re.MULTILINE)
 
@@ -760,52 +714,44 @@ def _deferred_file_count(cfg: dict, live_set: str) -> int:
 def deferred_deletes(dry_run: bool = False, after_hours: int | None = None) -> dict:
     """Execute the deferred deletes recorded by sweeps older than the window.
 
-    WHY THIS MATTERS. `nessie_gc()` above runs `sweep
-    --defer-deletes`, which RECORDS the files it would remove against the
-    live-set and deletes nothing. Until this function existed, the second step
-    was `nessie-gc deferred-deletes` typed by a human -- which meant, in
-    practice, that nothing was ever reclaimed unattended. The warehouse only
-    shrank when somebody remembered, and two separate guards built to detect
-    reclamation failure (`storage_report`'s tripwire and the watchdog's
-    warehouse trend) had to be held at warn-only because a flat warehouse was
-    the correct, expected state.
+    `nessie_gc()` runs `sweep --defer-deletes`, which RECORDS the files it
+    would remove and deletes nothing. Until this function existed the second
+    step was `nessie-gc deferred-deletes` typed by a human -- so in practice
+    nothing was ever reclaimed unattended. The warehouse only shrank when
+    somebody remembered, and two guards built to detect reclamation failure
+    had to be held at warn-only because a flat warehouse was the expected
+    state.
 
-    The deferral period is kept -- it is a genuine safety feature -- but it
+    The deferral period is kept -- it is a genuine safety feature -- but
     becomes a POLICY VALUE (`deferred_delete_after_hours`) instead of a manual
-    step. A sweep never deletes what it just recorded; a later run does, once
-    the window has passed. Review time is preserved and reclamation happens on
-    its own.
+    step. A sweep never deletes what it just recorded; a later run does.
 
-    Note the `deferred-deletes` subcommand takes a live-set id and nothing
-    else: there is no "--older-than" flag in the tool. The window is enforced
-    here, by choosing which live-sets to hand it.
+    The `deferred-deletes` subcommand takes a live-set id and nothing else:
+    there is no "--older-than" flag, so the window is enforced here, by
+    choosing which live-sets to hand it.
 
     THE RISK THE WINDOW CREATES. A file recorded as unreachable is deleted
-    later, so anything that makes it reachable again in between -- reassigning
-    a Nessie ref backwards, or branching from a pre-sweep commit -- is
-    resurrecting content this pass will then delete. That is inherent in
-    deferral and was true of the manual step too; a longer window widens it.
-    Do not point a ref at an old hash while deferred deletes are outstanding.
+    later, so anything making it reachable again in between -- reassigning a
+    ref backwards, branching from a pre-sweep commit -- is resurrecting
+    content this pass will then delete. Inherent in deferral, and a longer
+    window widens it. Do not point a ref at an old hash while deferred deletes
+    are outstanding.
 
-    Live-sets are dropped once acted on (nothing is left to act on, and
-    leaving them means re-running `deferred-deletes` against already-deleted
-    files every night forever). Sets that only ever completed mark-live -- one
-    per dry run -- are pruned on age alone.
+    Live-sets are dropped once acted on, or re-running would hand
+    `deferred-deletes` already-deleted files every night forever. Sets that
+    only completed mark-live are pruned on age alone.
 
-    CRASHING BETWEEN THE DELETES AND THE DROP is survivable, and that is now
-    tested rather than assumed. The live-set is left
-    EXPIRY_SUCCESS and past its window, `list-deferred` still reports its
-    files -- the tool lists what was RECORDED, not what is still present --
-    and the next run hands it to `deferred-deletes` again. The tool exits 0 on
-    files that are already gone, so the pass completes and drops the row.
+    CRASHING BETWEEN THE DELETES AND THE DROP is survivable, and tested rather
+    than assumed: the live-set is left EXPIRY_SUCCESS and past its window,
+    `list-deferred` still reports its files (the tool lists what was RECORDED,
+    not what is still present), and the next run hands it over again. The tool
+    exits 0 on files already gone.
 
-    What that costs is counter accuracy: `files_deleted` is the count
-    `list-deferred` reported, so a live-set actioned twice is counted twice
-. The tool offers
-    no "files removed" figure to read instead. Treat this number as "files
-    actioned", and treat the watchdog's deferred_backlog check -- which reads
-    the object store, not this counter -- as the authority on whether
-    reclamation is really happening.
+    What that costs is counter accuracy: `files_deleted` is what
+    `list-deferred` reported, so a live-set actioned twice is counted twice.
+    Treat it as "files actioned", and the watchdog's deferred_backlog check --
+    which reads the object store -- as the authority on whether reclamation is
+    really happening.
     """
     cfg = nessie_gc_config()
     if not cfg.get("enabled", False):
@@ -832,10 +778,9 @@ def deferred_deletes(dry_run: bool = False, after_hours: int | None = None) -> d
             # mark-live only, or a failed phase. Prune the successful-identify
             # leftovers; leave failures alone, they are evidence.
             #
-            # But REPORT the failures. Left merely un-pruned they accumulate
-            # in silence, and a sweep that fails every night looks from the
-            # outside exactly like a platform with nothing to collect — which
-            # is the failure mode this whole subsystem keeps producing.
+            # But REPORT the failures: left merely un-pruned they accumulate in
+            # silence, and a sweep failing every night looks from the outside
+            # exactly like a platform with nothing to collect.
             if s["status"] not in ("IDENTIFY_SUCCESS", "IDENTIFY_IN_PROGRESS",
                                    "EXPIRY_IN_PROGRESS"):
                 result["failed_live_sets"].append(
@@ -902,18 +847,14 @@ def observed_dates(spark, table: str, column: str) -> list[date]:
 def iceberg_gc_enabled(spark, table: str) -> bool:
     """Whether Iceberg-level file deletion is permitted on this table.
 
-    NessieCatalog sets `gc.enabled=false` (and `nessie.gc.no-warning=true`) on
-    every table it creates, and it is right to. Under Nessie many references
-    can share the same data files, so deleting files based on ONE table
-    pointer's snapshot view can corrupt what another branch or tag sees.
-    Iceberg therefore refuses:
-
-        Cannot expire snapshots: GC is disabled (deleting files may corrupt
-        other tables)
+    NessieCatalog sets `gc.enabled=false` on every table it creates, and it is
+    right to. Under Nessie many references can share the same data files, so
+    deleting files based on ONE table pointer's snapshot view can corrupt what
+    another branch or tag sees. Iceberg therefore refuses with "Cannot expire
+    snapshots: GC is disabled".
 
     Do NOT "fix" this by forcing gc.enabled=true. That disables the guard, not
-    the hazard. Under Nessie, physical reclamation is Nessie GC's job -- see
-    nessie_gc() above and docs/MAINTENANCE.md.
+    the hazard. Under Nessie, physical reclamation is Nessie GC's job.
     """
     try:
         rows = spark.sql(f"SHOW TBLPROPERTIES {table}").collect()
@@ -926,17 +867,15 @@ def iceberg_gc_enabled(spark, table: str) -> bool:
 def is_scd2(spark, table: str) -> bool:
     """Does this table store one row per VERSION rather than per COB date?
 
-    DETECTED, not configured. The alternative was a per-table flag in
-    retention.yml, and this file already carries the scar of a hand-maintained
-    table list that drifted -- five tables against the DAG's nine, silently
-    leaving four unretained. A list of which tables are SCD2 would drift the
-    same way, and the failure would be worse: retention would run the WRONG
-    delete against a table it believed was a snapshot.
+    DETECTED, not configured. This file already carries the scar of a
+    hand-maintained table list that drifted -- five tables against the DAG's
+    nine, silently leaving four unretained. A list of which tables are SCD2
+    would drift the same way, and worse: retention would run the WRONG delete
+    against a table it believed was a snapshot.
 
-    Reading the columns asks the table what it actually is. All three columns
-    are required so an unrelated table with a `effective_from` cannot be mistaken
-    for one of these. Which mode was chosen is reported in the result JSON, so
-    the detection is visible rather than silent.
+    All three columns are required so an unrelated table with an
+    `effective_from` cannot be mistaken for one of these. Which mode was
+    chosen is reported in the result JSON, so the detection is visible.
     """
     try:
         cols = {f.name for f in spark.table(table).schema.fields}
@@ -1041,12 +980,10 @@ def apply_table_retention(spark, table: str, layer: str, date_column: str,
         spark.sql(f"DELETE FROM {table} WHERE {date_column} IN ({in_list})")
         log.info("%s: logically expired %d dates", table, len(to_expire))
 
-    # Physical reclamation. Must run AFTER tag expiry.
-    #
-    # ... except that under Nessie it does not run here at all. NessieCatalog
-    # sets gc.enabled=false on its tables, so expire_snapshots raises rather
-    # than deleting anything. That is correct: files are shared across refs and
-    # only Nessie GC can safely decide what is dead. See iceberg_gc_enabled().
+    # Physical reclamation, which must run AFTER tag expiry -- except that
+    # under Nessie it does not run here at all. NessieCatalog sets
+    # gc.enabled=false on its tables, so expire_snapshots raises. That is
+    # correct: files are shared across refs. See iceberg_gc_enabled().
     if not dry_run and not iceberg_gc_enabled(spark, table):
         result["snapshot_expiry"] = "skipped: gc.enabled=false (Nessie-managed)"
         log.info(
@@ -1132,11 +1069,10 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
     report: dict = {"env": ENV, "dry_run": dry_run,
                     "started": datetime.now(timezone.utc).isoformat()}
 
-    # FIRST, and before a dry-run check, because this refuses on
-    # CONFIGURATION rather than on anything observed -- a dry run that passes
-    # here while the real run would refuse teaches the wrong thing. Raising
-    # aborts the whole chain, which is the point: every step below this line
-    # deletes something.
+    # FIRST, and before a dry-run check, because this refuses on CONFIGURATION
+    # rather than on anything observed -- a dry run that passes here while the
+    # real run would refuse teaches the wrong thing. Raising aborts the chain:
+    # every step below this line deletes something.
     report["reproducibility_window"] = check_reproducibility_window()
 
     report["working_branches_removed"] = clean_working_branches(nessie, dry_run)
@@ -1148,11 +1084,9 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
     # Step 3 of the documented chain, and it MUST land here: after tag expiry
     # (a tag pins every file its commit referenced) and before expire_snapshots.
     report["nessie_gc"] = nessie_gc(dry_run)
-    # Step 3b: execute the deletes that PREVIOUS sweeps deferred and whose
-    # review window has now passed. Deliberately after the sweep above -- the
-    # set that sweep just recorded is the newest one and cannot be eligible, so
-    # this reads as "yesterday's findings, actioned today". Never fail the
-    # nightly chain over it: the rest of retention is still correct without it.
+    # Step 3b: execute the deletes PREVIOUS sweeps deferred and whose review
+    # window has passed. After the sweep above, so this reads as "yesterday's
+    # findings, actioned today". Never fail the nightly chain over it.
     # See docs/DECISIONS.md#gc-lag-and-assertions
     try:
         report["deferred_deletes"] = deferred_deletes(dry_run)
@@ -1165,13 +1099,11 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
         report["tables"] = []
         for table, layer in tables:
             col = "_cob_date" if layer == "raw" else date_column
-            # PER TABLE, not one try around the loop. Tables are
-            # independent -- each one's row DELETE is its own Nessie commit --
-            # so one table failing is no reason the rest go unretained. Before
-            # this, a failure on table 2 of 9 meant tables 3-9 were silently
-            # skipped for the night and the only evidence was a traceback.
-            # The run still FAILS, at the end, naming what was applied and
-            # what was not; it just does the work it can do first.
+            # PER TABLE, not one try around the loop. Each table's row DELETE
+            # is its own Nessie commit, so one failing is no reason the rest go
+            # unretained -- a failure on table 2 of 9 used to skip 3-9 silently.
+            # The run still FAILS at the end, naming what was applied; it just
+            # does the work it can do first.
             try:
                 r = apply_table_retention(spark, table, layer, col, dry_run)
                 r.update(sweep_orphans(spark, table, dry_run))
@@ -1183,10 +1115,9 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
     finally:
         spark.stop()
 
-    # Step 0-ish, and it runs LAST because it is independent of everything
-    # else: landing is flat object storage, touched by no Nessie ref and no
-    # Iceberg snapshot. Never fail the chain over it -- the table layers are
-    # still correctly retained without it.
+    # Runs LAST because it is independent of everything else: landing is flat
+    # object storage, touched by no Nessie ref and no Iceberg snapshot. Never
+    # fail the chain over it -- the table layers are still correctly retained.
     try:
         from reporting_platform.retention.landing import sweep_landing
 
@@ -1196,9 +1127,8 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
         report["landing"] = {"error": str(e)[:200]}
 
     # Same shape, same reasoning, different prefix: `ready/` is flat object
-    # storage too. It is a CACHE -- everything in it is rebuildable by
-    # re-normalizing from landing -- so failing the chain over it would be
-    # even less justified than failing over landing.
+    # storage too, and a CACHE -- everything in it is rebuildable by
+    # re-normalizing from landing.
     try:
         from reporting_platform.retention.ready import sweep_ready
 
@@ -1219,9 +1149,8 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
         report["quarantine"] = {"error": str(e)[:200]}
 
     # Step 6: prefixes no reference points at. Runs LAST, after GC has had its
-    # chance -- GC can only collect files of content it enumerates from live
-    # refs, so anything left after it is either live or genuinely stranded.
-    # See orphan_storage for why neither GC nor remove_orphan_files covers this.
+    # chance -- GC only collects files it enumerates from live refs, so
+    # anything left is either live or genuinely stranded. See orphan_storage.
     try:
         from reporting_platform.retention.orphan_storage import sweep_orphan_prefixes
 
@@ -1235,8 +1164,7 @@ def run(tables: list[tuple[str, str]], date_column: str = "cob_date",
     # A half-applied run is the failure shape this chain actually produces, so
     # it must report which tables were applied rather than throwing that away
     # with the exception. Re-running is safe -- every step recomputes what is
-    # left to do rather than replaying what it did -- but that is only useful to
-    # someone who knows what state they are re-running from.
+    # left -- but only useful to someone who knows what state they are in.
     # See docs/DECISIONS.md#retention-partial-failure-report
     failed = [t["table"] for t in report["tables"] if t.get("error")]
     if failed:

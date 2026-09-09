@@ -178,42 +178,37 @@ def find_pending(feed: Feed, skip_ingested_check: bool = False,
     """MANIFEST keys for deliveries that have arrived but not been ingested.
 
     Returns keys under `ready/`, not `landing/`. What ingest consumes is a
-    manifest -- see `ingest.normalize` for why -- and the COB date now
-    comes from inside it rather than from a regex re-run here.
+    manifest, and the COB date comes from inside it rather than a regex re-run
+    here.
 
-    `reconcile=True` first gives every landed object a manifest. That is a
-    cheap, idempotent, Spark-free pass over object storage, and it is what
-    makes `ready/` a DERIVED INDEX of landing rather than a queue that can be
-    left unfilled: the production arrival path is an agent doing a PutObject
-    straight into the bucket, which runs no code of ours. Pass False for a
-    genuinely read-only view.
+    `reconcile=True` first gives every landed object a manifest -- a cheap,
+    idempotent, Spark-free pass that makes `ready/` a DERIVED INDEX of landing
+    rather than a queue that can be left unfilled, because the production
+    arrival path is an agent doing a PutObject that runs no code of ours.
 
     Two filters after that, and the second is not optional.
 
     `already_ingested()` derives its ledger from the raw table's own
     `_source_file` values, which cannot drift from reality -- but it also
     cannot distinguish "never ingested" from "ingested, then expired by
-    retention". Retention deletes whole COB dates, taking their
-    `_source_file` rows with them, so without the second filter every
-    retention-expired file reappears as pending and gets re-ingested. That is
-    a silent loop: ingest -> expire -> re-ingest -> expire, resurrecting data
-    the retention policy deliberately removed and quietly undoing the policy.
+    retention". Retention deletes whole COB dates, taking their `_source_file`
+    rows with them, so without the second filter every retention-expired file
+    reappears as pending: ingest -> expire -> re-ingest -> expire, silently
+    undoing the policy.
 
-    So the second filter recomputes the retention keep-set from the COB
-    dates seen in LANDING -- which still has every date, expired or not -- and
-    treats a candidate outside that keep-set as expired rather than new. Note
-    a floor check is not enough: the policy keeps "10 recent business days
-    PLUS 80 month-ends", so expired dates are gaps in the middle of the range,
-    not everything below some cutoff.
+    So the second filter recomputes the retention keep-set from the COB dates
+    seen in LANDING -- which still has every date -- and treats a candidate
+    outside it as expired rather than new. A floor check is not enough: the
+    policy keeps "10 recent business days PLUS 80 month-ends", so expired dates
+    are gaps in the middle of the range, not everything below a cutoff.
 
     THE KEEP-SET COMES FROM `landing/`, NOT FROM THE MANIFESTS, and that is
-    load-bearing. `retention.yml`'s `landing:` block carries a comment saying
-    its window must be >= the raw layer's, precisely because this computation
-    needs a prefix that still holds every date. `ready/` is a days-long cache;
-    computing the keep-set from it would silently narrow the window and start
-    reporting live COB dates as expired. Giving manifests an eight-year
-    lifetime so they could serve instead is the load-control-table trap in a
-    different hat.
+    load-bearing. `retention.yml`'s `landing:` window must be >= the raw
+    layer's precisely because this needs a prefix that still holds every date.
+    `ready/` is a days-long cache; computing the keep-set from it would
+    silently narrow the window and start reporting live COB dates as expired.
+    Giving manifests an eight-year lifetime instead is the load-control-table
+    trap in a different hat.
     """
     from reporting_platform.ingest import normalize as norm
 

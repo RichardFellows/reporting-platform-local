@@ -215,13 +215,11 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
 
     # `source_provenance()` goes in beside `audit_columns()` below rather than
     # being rendered column by column here. Both are macros for the same
-    # reason: a scaffolded model that omitted the delivery provenance would
-    # reopen REQ-304 once per feed, quietly, in the file nobody re-reads after
-    # the console writes it.
+    # reason: a scaffolded model omitting the delivery provenance would reopen
+    # REQ-304 once per feed, quietly, in the file nobody re-reads.
     #
     # Align every `as <alias>` in one column, the way the hand-written models
-    # do -- computed from the widest expression rather than fixed, so a long
-    # safe_cast does not push its own alias out of line with the rest.
+    # do -- computed from the widest expression rather than fixed.
     rendered = [(col, _select_expression(col, types.get(col, "string")))
                 for col in spec.columns]
     widest = max([len("_cob_date")]
@@ -347,8 +345,7 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
     # without it. `source_provenance()` projects `delivery_ref()`, which is
     # never NULL for a table built after that macro -- so a NULL means the
     # table has not been rebuilt since, and its rows cannot name the delivery
-    # they came from. See the comment this writes into _prepared.yml for the
-    # rest of the reasoning.
+    # they came from.
     did = CommentedMap()
     did["name"] = "delivery_id"
     did["tests"] = _flow(["not_null"])
@@ -373,10 +370,9 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
             tests.append(rel_test)
         # NO GENERATED accepted_range OR accepted_values. Both are statements
         # about the feed's domain that only its owner can make, and guessing
-        # produces the worst outcome available: `min_value: 0` on a decimal is
-        # right for a notional and wrong for an MTM, and a scaffold whose
-        # tests fail on correct data teaches people to ignore failing tests.
-        # The generated block carries a comment saying to add them.
+        # produces the worst outcome available: `min_value: 0` is right for a
+        # notional and wrong for an MTM, and a scaffold whose tests fail on
+        # correct data teaches people to ignore failing tests.
         if not tests:
             continue
         c = CommentedMap()

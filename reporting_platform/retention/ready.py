@@ -1,73 +1,57 @@
 """`ready/` retention: the work queue is a cache, and expires in days.
 
-NOT THE LANDING RULE, and the difference is the whole reason the two prefixes
-were split. `landing/` is the evidence copy -- what the upstream actually
-sent, kept for `keep_years` and never deleted on a guess. `ready/` holds
-manifests and any parts a normalizer derived from them, all of which can be
-reconstructed by re-normalizing. It is deletable precisely because it is
-derived, and that property is worth protecting: the moment something in
-`ready/` cannot be rebuilt from `landing/`, it has quietly become a third copy
-of the data.
+NOT THE LANDING RULE, and the difference is why the two prefixes were split.
+`landing/` is the evidence copy, kept for `keep_years` and never deleted on a
+guess. `ready/` holds manifests and any parts a normalizer derived, all
+reconstructible by re-normalizing. It is deletable precisely because it is
+derived -- the moment something in `ready/` cannot be rebuilt from `landing/`
+it has quietly become a third copy of the data.
 
 THE FLOOR IS OPERATIONAL, NOT POLICY. `landing:` must be >= the raw window
-because `find_pending` computes its retention keep-set from the dates present
-in landing. Nothing computes anything from `ready/`, so `keep_days` has no
-correctness floor at all -- the rule below is what stops a delivery being
-swept between being normalized and being ingested, and it holds at any age.
-Seven days is a convenience: it keeps a recently extracted archive member
-around while something is being diagnosed, and re-normalizing with `--force`
-is what rebuilds an older one.
+because `find_pending` computes its keep-set from the dates present in
+landing. Nothing computes anything from `ready/`, so `keep_days` has no
+correctness floor -- the rule below is what stops a delivery being swept
+between being normalized and being ingested. Seven days is a convenience.
 
-WHAT `keep_days` GOVERNS IS NARROWER THAN IT LOOKS, and the next section is
-the correction that made it so. It bounds the DERIVED PARTS. It does not bound
-the manifests, which live as long as the landing objects they describe.
+WHAT `keep_days` GOVERNS IS NARROWER THAN IT LOOKS: it bounds the DERIVED
+PARTS, not the manifests, which live as long as the landing objects they
+describe.
 
 WHAT IS ACTUALLY RECLAIMABLE, AND WHAT ONLY LOOKED IT. This swept manifests
 past `keep_days` whose parts were all ingested, and reported them deleted. It
 was deleting nothing: `normalize.reconcile` creates a manifest for every
-landing object that lacks one, which after the sweep is all of them, so the
-two subsystems undid each other every night. Measured inside one housekeeping
-run, three tasks apart -- `enforce_retention` deleted 157 manifests and
-`registry_reconcile` re-created all 157, newly registering 0. Nothing was
-corrupted, and both logged success.
+landing object that lacks one, so the two subsystems undid each other every
+night. Measured inside one housekeeping run, three tasks apart --
+`enforce_retention` deleted 157 manifests and `registry_reconcile` re-created
+all 157, newly registering 0. Both logged success.
 
 THE SWEEP WAS THE ONE IN THE WRONG. Making `normalize.reconcile` skip landing
-objects that are already ingested would stop the churn and break something
-load-bearing: the registry follows MANIFESTS, so `deliveries.reconcile` --
-the path that makes the registry rebuildable from object storage rather than a
-second source of truth -- can only see a delivery that has one. Sweep the
-manifests and teach reconcile not to rebuild them, and dropping the registry
-would re-register only the deliveries of the last `keep_days`. The manifest is
-not merely a queue entry; it is the delivery's description of record in object
-storage, and it is 1KB against a landing object it outlives nothing of.
+objects already ingested would stop the churn and break something
+load-bearing: the registry follows MANIFESTS, so `deliveries.reconcile` -- the
+path that makes the registry rebuildable from object storage -- can only see a
+delivery that has one. The manifest is not merely a queue entry; it is the
+delivery's description of record.
 
-So two things go, and neither of them comes back:
+So two things go, and neither comes back:
 
   * DERIVED PARTS -- a zip member `_normalize_archive` extracted -- of a
     manifest past `keep_days` whose parts are all ingested. This is the real
-    duplication: a second copy of data landing already holds. The manifest
-    stays, so `normalize.reconcile` skips the landing object and nothing
-    re-extracts them; `normalize --force` is what rebuilds them if anything
-    ever needs to.
-  * ORPHANED MANIFESTS -- whose `source_object` is no longer in `landing/`,
-    at any age. Nothing recreates one, because `reconcile` walks landing.
-    These are what the landing sweep leaves behind, which is why it runs
-    immediately before this one in `retention.run()`.
+    duplication. The manifest stays, so `reconcile` skips the landing object;
+    `normalize --force` rebuilds them if anything needs them.
+  * ORPHANED MANIFESTS -- whose `source_object` is no longer in `landing/`, at
+    any age. Nothing recreates one, because `reconcile` walks landing. These
+    are what the landing sweep leaves behind, which is why it runs immediately
+    before this one in `retention.run()`.
 
-A manifest whose landing object is still there is KEPT, at any age. That is
-the honest answer to "what does the `ready:` window reclaim": the parts, and
-the manifests landing has already let go of.
+A manifest whose landing object is still there is KEPT, at any age.
 
-THE INGEST RULE STILL HOLDS, and it is still the negative one that matters. A
+THE INGEST RULE STILL HOLDS, and it is the negative one that matters. A
 manifest whose parts are not yet in the raw table's `_source_file` values has
 its parts left alone at any age. Deleting them is not data loss -- landing
-still holds the object -- but nothing would re-normalize it on its own, so it
-is a SILENT drop, and a silent drop is worse than a loud one. Note this is a
-read of `already_ingested`, not a status flag in the manifest: the manifest
-never records derived state, for the reason ingest/normalize.py's header
-gives. It costs a Spark session, so it is taken LAZILY -- on a queue of plain
-CSV manifests, where every part points back into `landing/` and there is
-nothing derived to sweep, it is never taken at all.
+still holds the object -- but nothing would re-normalize it, so it is a SILENT
+drop. Note this is a read of `already_ingested`, not a status flag in the
+manifest: the manifest never records derived state. It costs a Spark session,
+so it is taken LAZILY.
 """
 from __future__ import annotations
 

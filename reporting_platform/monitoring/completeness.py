@@ -1,45 +1,38 @@
 """COB-date completeness: which days are MISSING from a feed's history.
 
-WHY THIS EXISTS AND WHAT FRESHNESS CANNOT DO. `dbt source
-freshness` measures the age of the newest `_ingest_ts`. It catches a feed that
-has stopped arriving. It cannot catch a hole in the middle of a history that
-later resumed, because a newer delivery resets the clock — the seed's
-deliberately absent counterparty day raises no freshness warning at all.
-`ARCHITECTURE.md`'s claim that "the freshness test flags it" is therefore true
-only of the still-late case.
+WHY THIS EXISTS AND WHAT FRESHNESS CANNOT DO. `dbt source freshness` measures
+the age of the newest `_ingest_ts`, so it catches a feed that has stopped
+arriving. It cannot catch a hole in the middle of a history that later resumed,
+because a newer delivery resets the clock -- the seed's deliberately absent
+counterparty day raises no freshness warning at all.
 
 A gap is worse than a late feed. A late feed is visibly missing and the report
-is visibly incomplete. A gap is a report that runs, returns numbers, and is
+visibly incomplete. A gap is a report that runs, returns numbers, and is
 quietly wrong for one date, forever.
 
 HOW THE EXPECTED CALENDAR IS DERIVED, AND WHY NOT FROM A HOLIDAY FILE. The
 obvious implementation is Mon-Fri minus a holiday calendar. `calendar_rules`
-already argues against maintaining one — it is a dataset and a support burden
-per jurisdiction — and for a completeness check it is worse than that: every
-public holiday the calendar did not know about becomes a false gap, and a
-check that cries wolf on Boxing Day is a check people switch off.
+already argues against maintaining one, and for a completeness check it is
+worse: every public holiday the calendar did not know about becomes a false
+gap, and a check that cries wolf on Boxing Day is one people switch off.
 
-So the calendar is inferred from the platform's own data: **a COB date is
-one on which at least one feed delivered.** A holiday needs no entry anywhere
-because no feed delivers on it. A date where trade and rating landed but
-counterparty did not is unambiguously a gap in counterparty, and saying so
-needs no external knowledge.
+So the calendar is inferred from the platform's own data: **a COB date is one
+on which at least one feed delivered.** A holiday needs no entry because no
+feed delivers on it. A date where trade and rating landed but counterparty did
+not is unambiguously a gap in counterparty.
 
-WHAT THIS DELIBERATELY CANNOT SEE, stated plainly because a monitor whose
-blind spot is undocumented is worse than no monitor:
+WHAT THIS DELIBERATELY CANNOT SEE, stated plainly because a monitor whose blind
+spot is undocumented is worse than no monitor:
 
   * A day on which EVERY feed missed. There is no corroborating evidence, so
-    the date simply is not in the inferred calendar. A platform-wide outage is
-    invisible here — that is the orchestrator's and freshness's job, and the
-    watchdog's.
+    the date is not in the inferred calendar. A platform-wide outage is
+    invisible here -- that is the orchestrator's, freshness's and the
+    watchdog's job.
   * A feed that does not deliver daily. Corroboration would mark every
-    non-delivery day a gap -- the seed's `rating` feed arrives weekly and the
-    first run of this check duly reported five false gaps for it. Hence
-    `cadence: weekly`, which asks only that each week containing COB
-    dates saw at least one delivery, and `delivery_expected: false` to opt
-    out entirely. Note what opting out costs: a `delivery_expected: false`
-    feed that stops delivering for a month is invisible here, and only
-    freshness will notice.
+    non-delivery day a gap -- the seed's weekly `rating` feed produced five
+    false gaps on the first run. Hence `cadence: weekly`, and
+    `delivery_expected: false` to opt out entirely. Opting out costs
+    visibility: such a feed that stops for a month is invisible here.
   * Anything outside a feed's own observed range: dates before its first
     delivery are not gaps, they are history it does not have.
 """
@@ -56,10 +49,10 @@ from reporting_platform.common.context import feeds, retention_policy, spark_ses
 log = logging.getLogger("completeness")
 
 # How far back to look. Bounded because a gap older than retention is not
-# actionable -- the date is about to be expired anyway -- and an unbounded
-# check re-reports the same ancient hole every night until someone mutes it.
-# Defaults to the raw layer's own keep_business_days so the window that is
-# checked is exactly the window that still exists.
+# actionable -- the date is about to be expired -- and an unbounded check
+# re-reports the same ancient hole every night until someone mutes it. Defaults
+# to the raw layer's keep_business_days, so the window checked is the window
+# that still exists.
 DEFAULT_LOOKBACK = None
 
 
@@ -102,11 +95,11 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
         how = cadence.get(name, "daily")
 
         if how == "weekly":
-            # Ask only that each ISO week containing COB dates saw at
-            # least one delivery. Weeks are used rather than a "at most N days
-            # between deliveries" rule because a week is unambiguous and needs
-            # no calendar: a run of holidays shortens the week's COB
-            # dates without changing which week they are in.
+            # Ask only that each ISO week containing COB dates saw at least
+            # one delivery. Weeks rather than "at most N days between
+            # deliveries" because a week is unambiguous and needs no calendar:
+            # a run of holidays shortens the week's COB dates without changing
+            # which week they are in.
             weeks = {(d.isocalendar()[0], d.isocalendar()[1]) for d in expected}
             got = {(d.isocalendar()[0], d.isocalendar()[1]) for d in dates}
             missing = [f"{y}-W{w:02d}" for y, w in sorted(weeks - got)]

@@ -4,37 +4,33 @@ WHY THIS EXISTS. `landing/` was doing two jobs with opposite requirements: it
 is the immutable evidence copy, kept for years and never deleted on a guess,
 AND it was the work queue. The tension is visible in `retention/landing.py`,
 which refuses to delete an object whose name it cannot parse -- correct for
-evidence, and the reason anything the platform does not recognise accumulates
-in the queue forever.
+evidence, and the reason anything unrecognised accumulated in the queue
+forever.
 
 So the two are split:
 
     landing/<feed>/   what the upstream sent, byte for byte, kept for years
     ready/<feed>/     a manifest per delivery, plus any derived parts
 
-and this module is the stage between them.
 See docs/DECISIONS.md#ready-is-a-derived-index and docs/DELIVERY-SHAPES.md.
 
 THE MANIFEST IS THE POINT, not the directory. It records, once, the three
-things every downstream reader was previously re-deriving from the filename
-with its own copy of the same regex: which COB date this delivery is
-for, which objects hold its rows, and how to read them. `Feed.parse_filename`
-had fourteen call sites across seven modules, each free to disagree.
+things every downstream reader was re-deriving from the filename with its own
+copy of the same regex: which COB date this delivery is for, which objects hold
+its rows, and how to read them. `Feed.parse_filename` had fourteen call sites
+across seven modules, each free to disagree.
 
 FOR A PLAIN CSV NOTHING IS COPIED. The manifest's single part points straight
 back at the landing object, so the common case costs one small JSON object
-rather than a second copy of every delivery -- and ingest still has exactly
-one code path, because it reads `parts` and neither knows nor cares whether
-they point into `landing/` or `ready/`. A normalizer copies bytes only when it
-genuinely transforms them, which the archive normalizer will and this one does
-not.
+rather than a second copy of every delivery -- and ingest still has exactly one
+code path, because it reads `parts` and neither knows nor cares where they
+point. A normalizer copies bytes only when it genuinely transforms them.
 
 WHAT IS NOT IN THE MANIFEST: whether the delivery has been ingested.
 `arrival.already_ingested` derives that from `_source_file` in the raw table
-precisely so it cannot drift from reality; the legacy `stg` load-control
-tables are what that avoids. A manifest carrying `"ingested": true` would be
-that table under a new name. The manifest records OBSERVATIONS about an event
--- what arrived, how big it was, how to read it -- never derived state.
+precisely so it cannot drift; a manifest carrying `"ingested": true` would be
+the legacy `stg` load-control table under a new name. The manifest records
+OBSERVATIONS about an event, never derived state.
 
 A MANIFEST IS A PURE FUNCTION OF (feed config, landing object). `received_at`
 is the landing object's LastModified, not the time this ran, so re-normalizing
@@ -433,10 +429,9 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
         # WRITE IS NOT OPTIONAL FOR AN ARCHIVE. `write=False` exists so a
         # manual `--object landing/...` ingest does not leave a queue entry
         # behind, which is free when the part IS the landing object. An
-        # archive's parts have to be materialised before anything can read
-        # them, so skipping the manifest would leave extracted members that
-        # the `ready/` sweep -- which iterates manifests -- could never
-        # collect. Cheaper to enqueue and let it be marked ingested.
+        # archive's parts must be materialised before anything can read them,
+        # so skipping the manifest would leave extracted members the `ready/`
+        # sweep -- which iterates manifests -- could never collect.
         manifest = _normalize_archive(feed, object_key)
         key = write_manifest(feed, manifest)
         _register(feed, manifest, key)
@@ -448,10 +443,9 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
         if force or not _exists(key):
             write_manifest(feed, manifest)
         # Outside the `_exists` guard on purpose. The manifest is written once
-        # and the registry row may still be missing -- a registry that was
-        # down when this delivery first normalized is exactly the case
-        # `register_quietly` tolerates, and re-registering an already-known
-        # delivery is an upsert that changes nothing.
+        # and the registry row may still be missing -- a registry that was down
+        # when this delivery first normalized is what `register_quietly`
+        # tolerates, and re-registering is an upsert that changes nothing.
         _register(feed, manifest, key)
     return manifest
 
@@ -505,21 +499,19 @@ def reconcile(feed: Feed) -> dict[str, Any]:
             continue
         try:
             # `write=False` and then writing it here, rather than
-            # `normalize(feed, key)`: the manifest key for an archive comes
-            # from the manifest itself, not from the landing object, so
-            # write_manifest is the one thing that knows where it went.
+            # `normalize(feed, key)`: an archive's manifest key comes from the
+            # manifest itself, not the landing object, so write_manifest is the
+            # one thing that knows where it went.
             #
             # THE REGISTRATION HAS TO BE REPEATED HERE, and its absence was a
             # real gap. `normalize()` registers what it writes, but this path
             # tells it not to write and then writes the manifest itself -- so
             # every delivery normalized by the POLL path got a manifest and no
-            # registry row. Observed on a cold load: 198 landed objects, 157
-            # ingested, 0 rows. Not a correctness failure -- `deliveries.
-            # reconcile()` is the authority and the nightly
-            # `registry_reconcile` task closes it -- but it left the inline
-            # path covering only deliveries that arrived through a triggered
-            # DAG run, which is the smaller half, and `coverage()` reporting a
-            # lag that nothing had actually failed to do.
+            # registry row. Observed on a cold load: 198 landed, 157 ingested,
+            # 0 rows. Not a correctness failure -- `deliveries.reconcile()` is
+            # the authority -- but it left the inline path covering only the
+            # smaller half, and `coverage()` reporting a lag nothing had
+            # actually failed to do.
             manifest = normalize(feed, key, write=False)
             mkey = write_manifest(feed, manifest)
             _register(feed, manifest, mkey)

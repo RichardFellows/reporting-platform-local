@@ -78,10 +78,9 @@ def _summary(fd) -> dict[str, Any]:
     there with nothing red. The console names the missing pieces.
     """
     dag_id = f"ingest_{fd.name}"
-    # Airflow being down must not take the feed list down with it. Registering
-    # a feed, scaffolding it and landing sample data all work with the
-    # scheduler stopped, and the console is the natural place to be while
-    # waiting for it to come back -- so an unreachable Airflow degrades this to
+    # Airflow being down must not take the feed list down with it.
+    # Registering a feed, scaffolding it and landing sample data all work with
+    # the scheduler stopped, so an unreachable Airflow degrades this to
     # "unknown" and is reported once, in the header, rather than turning every
     # feed read into a 502.
     try:
@@ -96,25 +95,22 @@ def _summary(fd) -> dict[str, Any]:
         "filename_pattern": fd.filename_pattern,
         "business_key": list(fd.business_key),
         "columns": list(fd.columns),
-        # Stored overrides first, inference only as the fallback. This USED to
-        # be a bare `infer_types(fd.columns)`, which meant the endpoint the
-        # edit form is populated from re-guessed every type on every read --
-        # so a type the user chose was shown back to them as whatever the
-        # column name suggested, and `readTypes()` then posted that guess
-        # back. The choice survived exactly one scaffold call. See
-        # Feed.column_types in common/context.py for what that cost.
+        # Stored overrides first, inference only as the fallback. This used to
+        # be a bare `infer_types(fd.columns)`, so the endpoint the edit form is
+        # populated from re-guessed every type on every read -- a type the user
+        # chose was shown back as whatever the column name suggested, and
+        # `readTypes()` posted that guess back. See Feed.column_types.
         "column_types": scaffold.resolve_types(fd),
         # THE SAME BUG column_types had, in five more fields. The form reads
-        # `f?.delimiter ?? ","`, `f?.file_encoding ?? "utf-8"` and so on, so a
-        # key missing here is not invisible -- the form shows the DEFAULT, and
-        # posts it back. One edit of a pipe-delimited latin-1 feed through the
-        # console silently rewrote it to comma/utf-8 and dropped its
-        # `source_columns`; the ingest then lands one column holding the whole
-        # row, and the renamed columns land NULL. Demonstrated before fixing.
+        # `f?.delimiter ?? ","` and so on, so a key missing here is not
+        # invisible -- the form shows the DEFAULT and posts it back. One edit
+        # of a pipe-delimited latin-1 feed silently rewrote it to comma/utf-8
+        # and dropped its `source_columns`; the ingest then lands one column
+        # holding the whole row. Demonstrated before fixing.
         #
-        # `_block` only writes a key that differs from what is inherited,
-        # which is what made it silent: the feed's own `delimiter: "|"` was
-        # REMOVED rather than changed, leaving a diff that reads as tidying up.
+        # `_block` only writes a key that differs from what is inherited, which
+        # is what made it silent: the feed's own `delimiter: "|"` was REMOVED
+        # rather than changed, leaving a diff that reads as tidying up.
         "delimiter": fd.delimiter,
         "quote_char": fd.quote_char,
         "header": fd.header,
@@ -123,21 +119,20 @@ def _summary(fd) -> dict[str, Any]:
         "expected_min_rows": fd.expected_min_rows,
         "cadence": fd.cadence,
         "delivery_expected": fd.delivery_expected,
-        # REQ-201 and REQ-600. Both are plain scalars on the feed rather than
-        # blocks, but they are subject to the same rule as everything above:
-        # the form posts back what this endpoint gave it, so an omission here
-        # is a silent revert to the inherited value on the next save.
+        # REQ-201 and REQ-600. Plain scalars rather than blocks, but subject
+        # to the same rule as everything above: the form posts back what this
+        # endpoint gave it, so an omission here is a silent revert to the
+        # inherited value on the next save.
         "expected_by": fd.expected_by,
         "retention_class": fd.retention_class,
         "schema_drift": fd.schema_drift,
         "convention": fd.convention,
         "delivery": dict(fd.delivery or {}),
-        # EVERY BLOCK THE FORM CAN EDIT HAS TO COME BACK OUT OF HERE. The edit
-        # form populates itself from this endpoint and posts what it read, so
-        # a block omitted here is not merely invisible -- `readArrival()` sees
-        # an unchecked box, sends {}, and the next save DELETES the feed's
-        # arrival block from feeds.yml in a diff that looks deliberate. That
-        # is the same failure `column_types` had above, and it is caught by
+        # EVERY BLOCK THE FORM CAN EDIT HAS TO COME BACK OUT OF HERE. The form
+        # populates itself from this endpoint and posts what it read, so a
+        # block omitted here is not merely invisible -- `readArrival()` sees an
+        # unchecked box, sends {}, and the next save DELETES the feed's arrival
+        # block in a diff that looks deliberate. Caught by
         # tests/test_conform.py's serialiser round-trip.
         "arrival": dict(fd.arrival or {}),
         "raw_table": fd.raw_table,
@@ -157,13 +152,12 @@ def _summary(fd) -> dict[str, Any]:
 @app.get("/api/feeds")
 def api_feeds():
     # `conventions` rides along so the edit form can offer the defined ones as
-    # a closed list. A free-text field here would make a typo an invisible
-    # revert to `defaults:` -- the feed would load, and read its files with the
-    # wrong delimiter.
-    # `retention_classes` rides along for the same reason `conventions` does,
-    # and with a sharper edge: a class name feeds.yml carries but retention.yml
-    # does not declare is refused at LOAD, so a free-text field here would let
-    # the console write a feeds.yml the next Airflow parse will not read.
+    # a closed list: a free-text field would make a typo an invisible revert to
+    # `defaults:`, and the feed would read its files with the wrong delimiter.
+    # `retention_classes` rides along for the same reason with a sharper edge:
+    # a class feeds.yml carries but retention.yml does not declare is refused
+    # at LOAD, so free text would let the console write a feeds.yml the next
+    # Airflow parse will not read.
     return {"catalog": CATALOG,
             "conventions": sorted(conventions()),
             "retention_classes": sorted(retention_classes()),
@@ -188,8 +182,8 @@ def api_create_feed(payload: dict):
     spec = FeedSpec.from_payload(payload)
     # Reduce the form's full type map to just the genuine disagreements, and
     # PERSIST them: that is what makes the choice outlive this request. The
-    # scaffold below then builds from the same resolved map the generator will
-    # read later, rather than from a value only this call can see.
+    # scaffold then builds from the same resolved map the generator reads
+    # later, rather than from a value only this call can see.
     spec.column_types = scaffold.overrides_only(spec.columns, spec.column_types)
     registry.validate(spec, existing=set(feeds()))
     registry.add(spec)
@@ -378,10 +372,9 @@ def api_columns_from_header(payload: dict):
 
 # ------------------------------------------------------------------- sniff
 # docs/DELIVERY-SHAPES.md step 5: propose a feed's whole shape from a real
-# delivered file (delimiter, encoding, per-column TYPES read from real
-# values rather than guessed from names, business-key candidates, and for a
-# zip, its member layout) rather than just a header row. See
-# reporting_platform/ingest/sniff.py and DECISIONS.md#the-sniffer.
+# delivered file (delimiter, encoding, per-column TYPES read from real values
+# rather than guessed from names, business-key candidates, and for a zip its
+# member layout). See ingest/sniff.py and DECISIONS.md#the-sniffer.
 def _sniff_or_400(filename: str, data: bytes) -> dict:
     from reporting_platform.ingest import sniff
 
@@ -549,11 +542,10 @@ def api_generate(name: str, payload: dict | None = None):
     p = payload or {}
     from datetime import date as _date
     # types= is NOT optional here, and leaving it off was the bug. Without it
-    # `sampledata.generate` falls back to `infer_types(feed.columns)` and
-    # re-guesses from the column name -- so a column the prepared model
-    # safe_casts to DECIMAL got a non-numeric sample value, landed 100% NULL,
-    # and the build passed because safe_cast is meant to null and nothing
-    # tested it. Same resolved map the scaffold used.
+    # `sampledata.generate` re-guesses from the column name -- so a column the
+    # prepared model safe_casts to DECIMAL got a non-numeric sample value,
+    # landed 100% NULL, and the build passed because safe_cast is meant to null
+    # and nothing tested it. Same resolved map the scaffold used.
     return sampledata.generate(
         fd,
         days=int(p.get("days") or 3),
@@ -626,14 +618,13 @@ def api_ingest(name: str, payload: dict | None = None):
     # processed as soon as it is received, so the unit of work is a delivery,
     # not a batch -- and it surprises anyone who has just landed a week of
     # backfill and pressed a button once. `all_pending` triggers one run per
-    # outstanding object instead, which `max_active_runs=1` then drains in
-    # order.
+    # outstanding object instead, which `max_active_runs=1` drains in order.
     #
-    # It has to resolve the pending set itself (a Spark call, see
-    # feeddata.pending) rather than triggering a run per LANDED object: with
-    # an explicit object_key the DAG ingests what it is given without checking
-    # whether that file is already in raw, so a run per landed object would
-    # re-ingest the history as new _file_versions.
+    # It resolves the pending set itself (a Spark call, see feeddata.pending)
+    # rather than triggering a run per LANDED object: with an explicit
+    # object_key the DAG ingests what it is given without checking whether that
+    # file is already in raw, so a run per landed object would re-ingest the
+    # history as new _file_versions.
     if payload.get("all_pending"):
         keys = feeddata.pending(fd)
         runs = [orchestration.trigger(dag_id, conf={"object_key": k},
@@ -652,7 +643,7 @@ def api_ingest(name: str, payload: dict | None = None):
             "run_ids": [run["dag_run_id"]], "unpaused": unpaused,
             # Not an error: a run may legitimately be in flight. But under
             # max_active_runs=1 it is also the reason a new run sits queued
-            # forever, so the console shows it instead of leaving it to be
+            # forever, so the console shows it rather than leaving it to be
             # discovered.
             "runs_already_in_flight": stale}
 

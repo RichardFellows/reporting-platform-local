@@ -1,30 +1,26 @@
 """Read-only DuckDB session against the published lakehouse.
 
 WHAT THIS IS FOR. Analyst and developer queries against `main` -- "what does
-this table actually contain", "do these numbers reconcile", "what landed
-yesterday" -- without starting a SparkSession for it. DuckDB answers those in
-about a second where Spark takes tens of them, and it reads the same Iceberg
-tables through the same catalog.
+this table actually contain", "do these numbers reconcile" -- without starting
+a SparkSession. DuckDB answers those in about a second where Spark takes tens,
+and it reads the same Iceberg tables through the same catalog.
 
 WHAT IT IS NOT FOR, and why this is a script rather than a dbt target. It
-cannot build anything, and that is deliberate three times over:
+cannot build anything, deliberately three times over:
 
   * DuckDB can only ever address the catalog's DEFAULT BRANCH. The Nessie ref
     travels in the Iceberg REST request prefix, DuckDB takes that prefix from
-    the catalog's /v1/config response, and its ATTACH exposes no override. No
-    branch means no write-audit-publish, so a DuckDB build would write
-    straight to `main`.
-  * dbt-duckdb silently ignores `partition_by`, so anything it created would
-    be unpartitioned -- and `cob_date` partitioning is what makes
-    retention's expiry a metadata delete rather than a full rewrite.
+    /v1/config, and its ATTACH exposes no override. No branch means no
+    write-audit-publish, so a DuckDB build would write straight to `main`.
+  * dbt-duckdb silently ignores `partition_by`, so anything it created would be
+    unpartitioned -- and `cob_date` partitioning is what makes retention's
+    expiry a metadata delete rather than a full rewrite.
   * DuckDB refuses INSERT and UPDATE on a partitioned table by default, so it
-    cannot write to the tables the platform already has. Note DELETE is
-    allowed without the override: the destructive operation is the one needing
-    no opt-in.
+    cannot write to the tables the platform has. Note DELETE is allowed without
+    the override: the destructive operation is the one needing no opt-in.
 
-The attach is therefore READ_ONLY, which is verified rather than assumed --
-CREATE fails with "Cannot execute statement of type CREATE on database ...
-which is attached in read-only mode".
+The attach is therefore READ_ONLY, verified rather than assumed -- CREATE fails
+with "Cannot execute statement of type CREATE ... attached in read-only mode".
 
 It also speaks Iceberg REST at NESSIE_ICEBERG_URI, not the Nessie API at
 NESSIE_URI. DuckDB's iceberg extension cannot speak the latter; whatever

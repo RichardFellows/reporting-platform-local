@@ -2,64 +2,51 @@
 
 WHY THIS EXISTS. `landing/` has a CONTRACT: every object in it is correctly
 named and classified, so `Feed.parse_filename` answers for all of them and
-landing retention can date all of them. That contract is what keeps the rest
-of the platform simple -- one shape, one code path, no feed needing the whole
-pipeline taught a second way to find a COB date.
+landing retention can date all of them. That contract is what keeps the rest of
+the platform simple -- one shape, one code path.
 
-Real upstreams do not honour it. A legacy feed sends `positions.csv` every
-day with the date on a line inside `positions.ctl`. There are two ways to
-absorb that: teach `landing/` and everything downstream to cope with a
-dateless constant name, or make the delivery conformant AT THE DOOR. This
-module is the second, and the second is much cheaper -- it confines the
-irregularity to one stage instead of spreading it across seven modules.
+Real upstreams do not honour it: a legacy feed sends `positions.csv` every day
+with the date on a line inside `positions.ctl`. Either everything downstream
+learns to cope with a dateless constant name, or the delivery is made
+conformant AT THE DOOR. This module is the second, and it is much cheaper --
+the irregularity stays in one stage instead of spreading across seven modules.
 
-So: the inbox classifies, waits for the control file, verifies what the
-control file declares, derives the COB date, and promotes the delivery
-into `landing/` under the name the feed's own `filename_pattern` describes,
-with a metadata sibling recording what actually arrived.
+So: the inbox classifies, waits for the control file, verifies what it
+declares, derives the COB date, and promotes the delivery into `landing/`
+under the name the feed's own `filename_pattern` describes.
 
 **The rename cannot produce a name landing will not accept.**
 `common/filenames.render_filename` builds it FROM `filename_pattern` and feeds
-the result back through `parse_filename` before returning it. That makes the
-silent failure -- a renamed file that lands and is never ingested, with the
-feed reporting nothing pending forever -- structurally impossible rather than
-something a test has to remember.
+the result back through `parse_filename`, so the silent failure -- a renamed
+file that lands and is never ingested -- is structurally impossible.
 
 **THIS MODULE ESTABLISHES IDENTITY, NOT INTEGRITY.** Which source system,
-which feed, which COB date, which version -- everything needed to give
-the file its correct name and to know its prerequisites are present. It does
-NOT check the row count or the checksum. Those are `delivery.control`'s job,
-they run at ingest, and they run identically for a legacy delivery and for one
-an approved sender wrote straight into `landing/`. A second implementation on
-one of the two paths is exactly what would drift.
+feed, COB date and version -- everything needed to name the file. It does NOT
+check the row count or checksum: those are `delivery.control`'s job, run at
+ingest, identically for a legacy delivery and for one an approved sender wrote
+straight into `landing/`.
 
-That split is what makes the two failure modes different, and both are right:
+That split makes the two failure modes different, and both are right:
 
   * an IDENTITY failure -- no feed claims the name, or no COB date can be
-    found -- means the file CANNOT BE NAMED, so it cannot land at all. It goes
-    to `.rejected/`.
-  * an INTEGRITY failure -- wrong row count, wrong checksum -- has nothing to
-    do with naming. The delivery LANDS, because `landing/` is the evidence copy
-    and "the upstream sent us a truncated file on the 3rd" is precisely what it
-    exists to prove, and then the ingest refuses, abandons its Nessie branch
-    and leaves `main` untouched, exactly as `expected_min_rows` already does.
+    found -- means the file CANNOT BE NAMED, so it cannot land. It goes to
+    `.rejected/`.
+  * an INTEGRITY failure -- wrong row count or checksum -- has nothing to do
+    with naming. The delivery LANDS, because `landing/` is the evidence copy
+    and a truncated file is precisely what it exists to prove, and then the
+    ingest refuses and leaves `main` untouched.
 
-There is a third outcome, and it is neither: **an unchanged RESEND is a
-no-op.** A name already taken for a COB date used to be versioned to
-`_v2` on sight, which turned a retried transfer into a restatement the
-upstream never made -- see `DuplicateDelivery`. Sameness is decided on the
-bytes (md5), not on the name, and only against deliveries already landed for
-that same date.
+There is a third outcome: **an unchanged RESEND is a no-op.** A name already
+taken used to be versioned to `_v2` on sight, turning a retried transfer into
+a restatement the upstream never made. Sameness is decided on the bytes (md5),
+only against deliveries already landed for that date.
 
 **THE CONTROL FILE IS PROMOTED, NOT CONSUMED.** The delivery is the data file
-and its control file together, so both are renamed and written to `landing/`.
-That is what makes the process identical from landing onwards: whichever way a
-delivery arrived, `landing/` holds the same pair and `delivery.control` reads
-it the same way.
+and its control file together, so both are renamed into `landing/`. That is
+what makes the process identical from landing onwards.
 
 WHAT THIS DOES NOT DO: decide when a file is complete. That is the inbox
-watcher's stability check (`inbox.STABLE_POLLS`), which is about a file still
-being written. This module assumes the bytes it is handed are final.
+watcher's stability check (`inbox.STABLE_POLLS`).
 """
 from __future__ import annotations
 
@@ -297,22 +284,18 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
     which is what lets this be tested without S3 or a watcher.
 
     `taken` is the set of filenames already in this feed's landing prefix, and
-    it is how a RE-DELIVERY gets its version. A corrected file for a COB
-    date already landed must not overwrite the first one -- `landing/` is the
-    evidence copy, and the original is the evidence of what was originally
-    ingested. So the name is rendered with no version, and if that is taken,
-    with `_v2`, `_v3` and so on until it is not. Pass None to skip that (the
-    caller has no listing), which renders the unversioned name.
+    is how a RE-DELIVERY gets its version: a corrected file for a date already
+    landed must not overwrite the original, so the name is rendered
+    unversioned, then `_v2`, `_v3` until free. Pass None to skip that.
 
     `landed_md5` answers "what is the md5 of the delivery already landed under
-    this name", or None if that is not known. It is what tells a CORRECTED
-    file apart from an unchanged RESEND, which `taken` alone cannot: see
-    `_free_name` and `DuplicateDelivery`.
+    this name", or None if unknown. It is what tells a CORRECTED file apart
+    from an unchanged RESEND, which `taken` alone cannot.
 
     Raises `NotReady` if the control file is needed and absent,
     `DuplicateDelivery` if these exact bytes are already landed for this date,
-    and `ConformanceError` for an IDENTITY failure -- a delivery that cannot
-    be named. Content is not checked here at all; see the module docstring.
+    and `ConformanceError` for an IDENTITY failure. Content is not checked
+    here at all.
     """
     if not feed.needs_conforming:
         raise ValueError(
@@ -332,11 +315,10 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
     cob_date = declared.get("cob_date") \
         or feed.source_cob_date(data_filename)
     if cob_date is None:
-        # resolve_arrival_config guarantees one source exists, so reaching
-        # here means the configured source produced nothing -- which the
-        # readers above would already have raised on. Kept as a guard rather
-        # than an assert because it is the one value nothing downstream can
-        # do without, and without it the file cannot be named at all.
+        # resolve_arrival_config guarantees one source exists, so reaching here
+        # means the configured source produced nothing -- which the readers
+        # above would already have raised on. A guard rather than an assert
+        # because without it the file cannot be named at all.
         raise ConformanceError(
             f"{feed.name}: no COB date for {data_filename} -- neither "
             f"`arrival.source_pattern` nor the control file yielded one.")
@@ -378,8 +360,8 @@ def conform(feed: Feed, data_filename: str, content: bytes, *,
         "declared": {k: (v.isoformat() if isinstance(v, date) else v)
                      for k, v in declared.items()},
         # NO verbatim copy of the control file. An earlier draft embedded one,
-        # correctly, because the gate CONSUMED the control file and it reached
-        # landing no other way. It is promoted now -- byte-identical, under
+        # correctly, because the gate CONSUMED it and it reached landing no
+        # other way. It is promoted now -- byte-identical, under
         # `landing_control_filename` -- so a copy here would be a second
         # version of the same bytes with nothing keeping them in step.
     }
@@ -398,23 +380,19 @@ def _free_name(feed: Feed, cob_date: date, version: int | None,
     """The first landing name for this date that is not already used.
 
     A version the CONTROL FILE declared wins outright -- the sender said which
-    restatement this is, and second-guessing that would be worse than
-    obeying it. Otherwise the unversioned name is tried first, so an ordinary
-    single delivery is `FEED_20260801.csv` and not `FEED_20260801_v1.csv`.
+    restatement this is. Otherwise the unversioned name is tried first, so an
+    ordinary single delivery is `FEED_20260801.csv`.
 
     A NAME BEING TAKEN IS NOT ENOUGH TO VERSION IT. `taken` says a delivery
-    for this date landed; it does not say whether it is a DIFFERENT delivery.
-    Every candidate already in `taken` is compared against `md5` first, and an
-    equal one raises `DuplicateDelivery` rather than stepping past it -- see
-    that exception for what an undetected copy does to the raw history.
+    for this date landed; not whether it is a DIFFERENT delivery. Every
+    candidate in `taken` is compared against `md5` first, and an equal one
+    raises `DuplicateDelivery` rather than stepping past it.
 
-    `landed_md5` maps a landing filename to the md5 recorded for it, or None
-    when there is no record. **None means unknown, and unknown versions.**
-    That is the fail-open direction on purpose: `landing/` is the evidence
-    copy, so an unnecessary `_v2` costs an object, while suppressing a real
-    restatement loses the evidence that it was ever sent. Both arguments
-    absent (a caller with no listing) skips the comparison entirely, which is
-    the behaviour every caller had before this existed.
+    `landed_md5` maps a landing filename to its recorded md5, or None when
+    there is no record. **None means unknown, and unknown versions** -- the
+    fail-open direction on purpose: an unnecessary `_v2` costs an object,
+    while suppressing a real restatement loses the evidence it was sent. Both
+    arguments absent skips the comparison entirely.
     """
     def _refuse_if_identical(name: str) -> None:
         if md5 is None or landed_md5 is None:

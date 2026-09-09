@@ -1,41 +1,33 @@
 """Bring every raw table up to its feed's current column contract, in one pass.
 
 WHY THIS EXISTS, AND IT IS NOT A CONVENIENCE. `ensure_raw_schema` runs inside
-`ingest()`, on the branch, for the ONE feed being ingested -- which is the
-right place for it, because that is where a table is guaranteed to exist and
-where a schema change can be abandoned with the rest of a failed load. But it
-means the migration is LAZY: a feed that has not delivered since the columns
-were added still has the old schema.
+`ingest()`, on the branch, for the ONE feed being ingested -- the right place,
+because that is where a table is guaranteed to exist and where a schema change
+can be abandoned with a failed load. But it makes the migration LAZY: a feed
+that has not delivered since the columns were added still has the old schema.
 
-That is invisible until the next dbt build, and then it is not subtle. A build
-builds every prepared model, and every prepared model now selects
-`_delivery_id`; one feed ingesting migrates one raw table, so the first ingest
-after the change makes its own model work and leaves the others failing with
+That is invisible until the next dbt build, and then it is not subtle. Every
+prepared model selects `_delivery_id`, so the first ingest after the change
+makes its own model work and leaves the others failing with
+`[UNRESOLVED_COLUMN.WITH_SUGGESTION]` -- observed on three of four models,
+which is how this module came to exist.
 
-    [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with
-    name `_delivery_id` cannot be resolved.
-
--- observed, on three of four models, which is how this module came to exist.
-
-IT COVERS THE FEEDS' OWN COLUMNS TOO, not just the platform's provenance
-four, and that is the case it gets run for most. Adding a column to an
-existing feed -- an upstream extends its extract -- changes `feeds.yml` and
-the prepared model together, and the raw table in between has to be told. Run
-this after deploying that change and BEFORE the next ingest or build, in that
-order: config, migrate, build.
+IT COVERS THE FEEDS' OWN COLUMNS TOO, not just the provenance four, and that is
+what it gets run for most. Adding a column to an existing feed changes
+`feeds.yml` and the prepared model together, and the raw table in between has
+to be told. Run this after deploying that change and BEFORE the next ingest or
+build: config, migrate, build.
 
 A column a feed no longer declares is REPORTED AND NEVER DROPPED, here as in
-`ingest()`. See `plan_raw_schema` for why the two directions are not
-symmetrical.
+`ingest()`. See `plan_raw_schema` for why the two directions differ.
 
-Idempotent and safe to re-run: a table already carrying the columns is
-untouched and no commit is made for it. A feed whose raw table does not exist
-yet is skipped rather than created -- the first ingest creates it with the
-current schema anyway, and creating an empty table here would put a namespace
-and a table on `main` for a feed that has never delivered.
+Idempotent and safe to re-run. A feed whose raw table does not exist yet is
+skipped rather than created -- the first ingest creates it with the current
+schema anyway, and creating an empty table here would put a namespace and table
+on `main` for a feed that has never delivered.
 
-ON A BRANCH AND MERGED, like every other write. A schema change is a commit,
-and the one thing this must not do is put a half-finished migration on `main`.
+ON A BRANCH AND MERGED, like every other write: a schema change is a commit,
+and this must not put a half-finished migration on `main`.
 """
 from __future__ import annotations
 

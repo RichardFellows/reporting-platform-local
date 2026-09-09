@@ -1,45 +1,39 @@
 """Does every published pin still have the deliveries behind it? REQ-602.
 
-WHAT PHASE 1 BUILT AND WHY IT IS NOT ENOUGH.
+WHAT THE WINDOW CHECK CANNOT DO.
 `retention.check_reproducibility_window()` compares two numbers -- the landing
 window against the longest published-tag window -- and refuses the whole sweep
 if landing is shorter. That catches the CONFIGURATION that guarantees evidence
-loss, which was the live defect, and it is cheap enough to run before every
-delete. What it structurally cannot catch is one delivery going missing inside
-an otherwise coherent window: a landing object deleted by hand, a sweep that
-ran against a shorter window last month, an upload that was never actually
-made. The numbers still agree; the evidence is still gone.
+loss and is cheap enough to run before every delete. What it structurally
+cannot catch is one delivery going missing inside an otherwise coherent window:
+a landing object deleted by hand, a sweep that ran against a shorter window
+last month, an upload never actually made. The numbers still agree; the
+evidence is still gone.
 
-So this is the other half, and it is per delivery rather than per window. For
-each live published tag it takes the COB date the tag names, asks the
-registry which deliveries were received for that date, and checks that each
-one's landing object is still there. A pin whose inputs cannot be produced is
-reported as unbacked whether or not the arithmetic in retention.yml is sound.
+So this is the other half, per delivery rather than per window. For each live
+published tag it takes the COB date the tag names, asks the registry which
+deliveries were received for that date, and checks each one's landing object is
+still there.
 
 WHY THE REGISTRY AND NOT LANDING DIRECTLY. Listing landing for a date would
-answer "is there anything there", not "is everything there that arrived". The
-difference is exactly the registry's job: it is the record of what was
-received, and comparing it against what still exists is the only way to see a
-gap. That also makes this a check on the registry itself -- a delivery
-registered and then deleted from landing is what it is looking for, and the
-two cannot both be wrong in the same direction without somebody having tried.
+answer "is there anything there", not "is everything there that arrived". That
+difference is exactly the registry's job. It also makes this a check on the
+registry itself -- a delivery registered and then deleted from landing is what
+it is looking for.
 
 TWO WAYS THE INPUT SET IS RESOLVED, and the difference is REQ-400 arriving.
 
-  * EXACT, where the tag has a run record. A published run now enumerates the
-    deliveries it read -- taken off the tables it built, not declared -- so
-    the check asks the registry about exactly those and nothing else.
+  * EXACT, where the tag has a run record. A published run enumerates the
+    deliveries it read -- taken off the tables it built, not declared -- so the
+    check asks the registry about exactly those.
   * APPROXIMATE, where it does not. A tag cut before run records existed
-    carries only a COB date, and the best available answer is "every
-    delivery received for that date". That is generous in one direction only:
-    a published run reads more than one COB date (reference data from
-    earlier dates, a month-end window), so it can MISS a delivery the run
-    depended on. It cannot raise a false alarm, because everything it checks
-    genuinely was received for that date.
+    carries only a COB date, and the best answer is "every delivery received
+    for that date". Generous in one direction only: a published run reads more
+    than one COB date, so it can MISS a delivery the run depended on. It cannot
+    raise a false alarm.
 
-Each tag's result says which of the two it got, because a green from the
-second kind means less than a green from the first and a report that did not
-distinguish them would overstate itself.
+Each tag's result says which of the two it got, because a green from the second
+kind means less than a green from the first.
 """
 from __future__ import annotations
 
@@ -95,9 +89,9 @@ def check(tag_inputs: dict[str, dict]) -> dict:
                 if r.get("source_object") and r["source_object"] not in present]
         # A delivery a RUN named that the registry cannot describe. Only
         # possible on the run path -- `run_input` carries no foreign key, on
-        # purpose -- and it is a finding rather than an impossibility: the run
-        # read it, so it existed, and the registry not knowing it means the
-        # registry has lost something or was never reconciled.
+        # purpose -- and a finding rather than an impossibility: the run read
+        # it, so it existed, and the registry not knowing it means the registry
+        # has lost something or was never reconciled.
         unregistered = [f"{r['feed']}/{r['delivery_id']}" for r in mine
                         if r.get("registered") is False]
         per_tag[tag] = {
@@ -107,11 +101,10 @@ def check(tag_inputs: dict[str, dict]) -> dict:
             "missing": sorted(r["source_object"] for r in gone),
             "unregistered": sorted(unregistered),
             # NO INPUT AT ALL for a pinned tag. Reported apart from a missing
-            # object because the two have different causes: an empty result
-            # usually means the registry has not been reconciled since the
-            # date was ingested, and a missing object means the evidence
-            # really is gone. Both are worth seeing; only one is an emergency,
-            # and guessing which would make the check useless.
+            # object because the causes differ: an empty result usually means
+            # the registry has not been reconciled since the date was ingested,
+            # a missing object means the evidence really is gone. Both are
+            # worth seeing; only one is an emergency.
             "unbacked": not mine,
         }
 

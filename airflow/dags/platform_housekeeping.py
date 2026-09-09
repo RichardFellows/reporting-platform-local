@@ -14,23 +14,21 @@ ORDER IS THE POINT. See docs/MAINTENANCE.md and docs/RETENTION.md.
         -> sweep orphan table prefixes
 
 Expiring snapshots before expiring tags reclaims nothing while appearing to
-succeed. Note also that identification and removal are two different steps a
-deferral window apart: the sweep records what is collectable, and
-a later run deletes it. So reclamation is lagged by design, and `storage_report`
-cannot assert that bytes fell tonight — see its docstring.
+succeed. Identification and removal are also two steps a deferral window
+apart, so reclamation is lagged by design and `storage_report` cannot assert
+that bytes fell tonight.
 
 CONCURRENCY: every task here that touches table files holds the SAME
 `lakehouse_write` pool as ingest and the dbt builds. That one shared slot is
-what prevents `remove_orphan_files` running underneath an in-flight write, which
-corrupts the table. It must stay ONE pool -- a second one-slot pool does not
-exclude anything. See docs/DECISIONS.md#one-shared-write-pool
+what prevents `remove_orphan_files` running underneath an in-flight write,
+which corrupts the table. It must stay ONE pool -- a second one-slot pool does
+not exclude anything. See docs/DECISIONS.md#one-shared-write-pool
 
 Strictly, only `remove_orphan_files` corrupts on a concurrent write; compaction
 and snapshot expiry are safe under Iceberg's optimistic concurrency. Splitting
-just the orphan sweep into its own task would block far less, but it means
-restructuring retention.run()'s ordering and is only correct if that
-concurrency claim holds in this exact Iceberg/Nessie setup -- untested. Do it
-only if maintenance is observed to actually delay arrivals.
+just the orphan sweep out would block far less, but it means restructuring
+retention.run()'s ordering and is only correct if that concurrency claim holds
+in this exact Iceberg/Nessie setup -- untested.
 """
 from __future__ import annotations
 
@@ -135,31 +133,25 @@ def platform_housekeeping():
 
         AFTER THE MAINTENANCE CHAIN, and that ordering is the whole test.
         `maintain` rewrites data files; `enforce_retention` then expires
-        published tags, expires COB dates out of the tables, runs Nessie
-        GC and executes the deferred deletes an earlier sweep queued. Every one
-        of those can break a pin while leaving a catalog that looks healthy,
-        and none of them announces it. Running the check first would exercise
-        yesterday's state and pass on the night the damage was done.
+        published tags and COB dates, runs Nessie GC and executes the deferred
+        deletes an earlier sweep queued. Every one can break a pin while
+        leaving a catalog that looks healthy. Running the check first would
+        exercise yesterday's state and pass on the night the damage was done.
 
         FAILS THE RUN, unlike `completeness_check` beside it, and the
         difference is what the red means. A completeness gap is an upstream
-        missing a Tuesday — real, but not the platform's own doing, and a red
+        missing a Tuesday -- real, but not the platform's own doing, and a red
         run there would be indistinguishable to the watchdog from housekeeping
         being down. A pin that no longer resolves IS the platform destroying
-        its own evidence, in the step that just ran, and it is unrecoverable:
-        every further night makes it worse and less diagnosable.
+        its own evidence, in the step that just ran, and it is unrecoverable.
 
         `not_yet_meaningful` DOES NOT FAIL, and it is no longer an age. The
         check selects the oldest pin holding a data file `main` no longer
-        references, because a pin whose every file `main` still keeps alive
-        would read successfully whether pinning worked or not; when no scanned
-        pin holds one, there is nothing here worth reading and a green would be
-        a check whose window does not contain the thing it describes. This used
-        to be approximated by the pin being older than `recent_partition_days`,
-        which is backwards — compaction is scoped to the RECENT partitions, so
-        a pin ages out of that window rather than into it, and the gate would
-        have opened on a fixed date and reported green on files identical to
-        `main`'s. See monitoring/reproducibility.py.
+        references, because a pin whose every file `main` keeps alive would
+        read successfully whether pinning worked or not. This used to be
+        approximated by the pin being older than `recent_partition_days`,
+        which is backwards -- compaction is scoped to the RECENT partitions,
+        so a pin ages out of that window rather than into it.
         """
         import logging
 
@@ -225,30 +217,27 @@ def platform_housekeeping():
         """Register every delivery object storage holds that has no row yet.
 
         NO SPARK, so it runs in the task process rather than through
-        `scripts/_spark_task.py` -- boto3, json and psycopg2 only, the same
-        reason `normalize` is an ordinary task in the ingest DAGs.
+        `scripts/_spark_task.py` -- boto3, json and psycopg2 only.
 
         BEFORE the evidence check below and after retention, and both halves
-        of that matter. After, because the landing sweep may have removed
-        deliveries and this must describe what is left; before, because a
-        delivery with no registry row looks to the evidence check exactly like
-        a pinned date whose evidence is gone.
+        matter. After, because the landing sweep may have removed deliveries
+        and this must describe what is left; before, because a delivery with no
+        registry row looks to the evidence check exactly like a pinned date
+        whose evidence is gone.
 
         Ingest already registers each delivery inline as it normalizes it, so
         on an ordinary night this finds nothing. It exists for the nights it
         does: a registry write that failed while Postgres was restarting, or a
-        file an upstream agent pushed straight into the bucket while nothing
-        of ours was running.
+        file an upstream agent pushed straight into the bucket.
 
         `dry_run` NARROWS THIS TASK, IT DOES NOT SKIP IT, and the distinction
         is which side effect matters. Registry rows are an index: the write is
         an upsert, nothing that deletes reads it, and skipping the poll is
-        precisely what the rule above forbids. Manifest objects are different
-        -- they are the input to the `ready/` sweep two tasks back, so a "dry"
-        run that creates one changes what the real run does. Observed: a run
-        triggered with `{"dry_run": true}` wrote 116 manifests and forecast a
-        sweep of 42 that then removed 157. So a dry run reconciles from the
-        manifests that exist and reports how many it would have made.
+        what the rule above forbids. Manifest objects are different -- they are
+        the input to the `ready/` sweep two tasks back, so a "dry" run that
+        creates one changes what the real run does. Observed: a run triggered
+        with `{"dry_run": true}` wrote 116 manifests and forecast a sweep of 42
+        that then removed 157.
         """
         import logging
 
@@ -271,25 +260,23 @@ def platform_housekeeping():
 
         The per-delivery half of the interlock.
         `retention.check_reproducibility_window` compares two windows and
-        refuses the sweep if they disagree; that runs first, inside retention,
-        and cannot see a single delivery missing inside a coherent window.
-        This can, because the registry says what was received and object
-        storage says what is left.
+        refuses the sweep if they disagree; that runs first and cannot see a
+        single delivery missing inside a coherent window. This can, because the
+        registry says what was received and object storage says what is left.
 
         FAILS THE RUN when a pinned delivery's landing object is gone, for the
-        same reason `reproducibility_check` fails: it is the platform having
-        destroyed its own evidence, and it does not get better by itself.
+        same reason `reproducibility_check` fails: the platform has destroyed
+        its own evidence, and it does not get better by itself.
 
         Resolves each pin's input set from its RUN RECORD where there is one
-        (exact -- the deliveries that run actually read) and from the tag's
-        COB date where there is not (approximate, and generous only in
-        the direction of missing something). The counts are logged separately.
+        (exact) and from the tag's COB date where there is not (approximate,
+        and generous only in the direction of missing something). The counts
+        are logged separately.
 
         WARNS, and does not fail, when a pinned tag has no registered
-        deliveries at all. That is what an unreconciled registry
-        looks like -- indistinguishable from the real thing on the evidence
-        available here -- and failing the chain on it would make the first
-        red the one everybody learns to ignore.
+        deliveries at all. That is what an unreconciled registry looks like --
+        indistinguishable from the real thing on the evidence available here --
+        and failing on it would make the first red the one everybody ignores.
         """
         import logging
 
@@ -322,10 +309,10 @@ def platform_housekeeping():
             return report
         # EXACT vs APPROXIMATE is worth saying out loud every night: a green
         # from a tag resolved through its run record means the deliveries that
-        # run actually read; a green from a tag resolved by COB date
-        # means the deliveries that happened to arrive that day. The second is
-        # weaker, and a log line that did not distinguish them would let the
-        # weaker one pass for the stronger.
+        # run actually read; a green from a tag resolved by COB date means the
+        # deliveries that happened to arrive that day. The second is weaker,
+        # and a log line that did not distinguish them would let it pass for
+        # the stronger.
         log.info("evidence: %d delivery(ies) behind %d pinned tag(s), all "
                  "still landed (%d exact from run records, %d approximated "
                  "from the tag's COB date)",
@@ -418,31 +405,26 @@ def platform_housekeeping():
         WHAT THIS CAN AND CANNOT ASSERT ON. The obvious tripwire -- "dates
         expired but no files deleted" -- was wired to the per-table
         `files_deleted` counter, which `apply_table_retention` only ever sets
-        from `expire_snapshots`, and it was established that
-        `expire_snapshots` can never run under Nessie (`gc.enabled=false`), so
-        that counter is permanently absent and the assertion was unsatisfiable
-        by construction: every real run failed the moment any date expired
-.
+        from `expire_snapshots`, which can never run under Nessie
+        (`gc.enabled=false`). So that counter is permanently absent and the
+        assertion was unsatisfiable by construction: every real run failed the
+        moment any date expired.
 
         Reclamation here comes from three catalog-wide steps, not per-table
         ones: Nessie GC's sweep, the deferred-delete pass that executes what
         earlier sweeps recorded, and the orphan-prefix sweep.
 
-        WHAT D4 CHANGED, AND WHAT IT DID NOT. Deferred deletes are automated
-        now, so "expired dates, zero bytes reclaimed" is no longer the
-        permanent state it was. It is still not a failure condition, and
-        asserting on it would repeat that defect's mistake in a new costume:
-        reclamation is deliberately LAGGED by `deferred_delete_after_hours`,
-        so tonight's run deletes what a sweep several nights ago identified.
-        A night on which nothing had become collectable back then reclaims
-        nothing tonight, correctly.
+        Deferred deletes are automated now, so "expired dates, zero bytes
+        reclaimed" is no longer the permanent state it was. It is still not a
+        failure condition, and asserting on it would repeat that defect's
+        mistake in a new costume: reclamation is deliberately LAGGED by
+        `deferred_delete_after_hours`, so tonight's run deletes what a sweep
+        several nights ago identified.
 
-        The satisfiable assertions are about the machinery, not the bytes:
-        GC must have swept, and the deferred-delete pass must have run without
-        error. Whether reclamation is actually keeping up is a question about
-        a backlog over time, which is the watchdog's `deferred_backlog` check
-        -- it can see files sitting past their window, which is the thing that
-        genuinely means nothing is being reclaimed.
+        The satisfiable assertions are about the machinery, not the bytes: GC
+        must have swept, and the deferred-delete pass must have run without
+        error. Whether reclamation is keeping up is a question about a backlog
+        over time, which is the watchdog's `deferred_backlog` check.
         """
         import logging
 
@@ -562,9 +544,9 @@ def platform_housekeeping():
     retained >> reproducibility_check()
     # Same reasoning, different question: reproducibility asks whether the
     # TABLES can still be read at the pin, this asks whether the DELIVERIES
-    # behind it are still in landing. Both have to observe the state the
-    # retention chain left, and the registry has to be current before the
-    # second one can tell "evidence gone" from "never recorded".
+    # behind it are still in landing. Both observe the state the retention
+    # chain left, and the registry must be current before the second can tell
+    # "evidence gone" from "never recorded".
     retained >> registry_reconcile() >> evidence_check()
     # No dependency on the chain above, on purpose: a data gap must not block
     # reclamation, and reclamation failing must not hide a data gap. The

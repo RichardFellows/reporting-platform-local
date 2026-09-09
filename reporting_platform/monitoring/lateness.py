@@ -1,48 +1,37 @@
 """Deliveries that arrived, but after the time they were promised. REQ-201.
 
 THE ONE LATENESS CONCEPT. Two config keys that pretended to be this --
-`arrival_timeout_hours` and `arrival_poke_seconds` -- were deleted in phase 0
-for being settings nothing read, and one of them had already been mistaken for
-a mechanism once. `Feed.expected_by` is the replacement and it is deliberately
-a WALL-CLOCK TIME rather than a duration: what an upstream actually commits to
-is "by 07:00", and a duration needs an origin event that a delivery arriving by
-PutObject does not have.
+`arrival_timeout_hours` and `arrival_poke_seconds` -- were deleted for being
+settings nothing read, and one had already been mistaken for a mechanism.
+`Feed.expected_by` is the replacement and is deliberately a WALL-CLOCK TIME
+rather than a duration: an upstream commits to "by 07:00", and a duration needs
+an origin event that a delivery arriving by PutObject does not have.
 
 THIS IS NOT THE COMPLETENESS CHECK AND MUST NOT BECOME IT. `completeness.py`
-asks which COB dates a feed is MISSING. This asks, of the deliveries that
-did arrive, which arrived late. A date with no delivery at all is a gap, not an
-infinitely late delivery, and reporting it here as well would double-report
-every outage -- so a date with nothing registered is simply not judged. The two
-checks are deliberately separate for the same reason evidence and
-reproducibility are: a green from one means something different from a green
-from the other.
+asks which COB dates a feed is MISSING; this asks which of the deliveries that
+did arrive were late. A date with no delivery is a gap, not an infinitely late
+delivery, and reporting it here too would double-report every outage.
 
 NO SPARK. The arrival time is `registry.delivery.received_at` -- the landing
-object's LastModified, the same value the manifest carries -- so this is
-psycopg2 and nothing else and runs in the task process directly.
+object's LastModified -- so this is psycopg2 and nothing else, and runs in the
+task process directly.
 
-THE DEADLINE IS `expected_by` ON THE DAY AFTER THE COB DATE, and the
-offset is fixed rather than configurable. A delivery describes a COB date,
-so that date has to have ENDED before the extract can be taken: a position file
-as at Tuesday is produced after Tuesday's close and lands on Wednesday morning.
-Fixing it at +1 day rather than adding a second key is a choice in the
-FORGIVING direction -- a reference snapshot that legitimately arrives the same
-day is judged against a later deadline than it needed, so this check can
-under-report lateness and cannot invent it. That is the same direction
-`completeness.py` argues for at length: a monitor that cries wolf is a monitor
-somebody switches off, and this one is new.
+THE DEADLINE IS `expected_by` ON THE DAY AFTER THE COB DATE, fixed rather than
+configurable. A delivery describes a COB date, so that date must have ENDED
+before the extract can be taken. Fixing it at +1 rather than adding a second
+key is a choice in the FORGIVING direction -- a reference snapshot that
+legitimately arrives the same day is judged against a later deadline than it
+needed, so this check can under-report lateness and cannot invent it.
 
 A BACKFILL IS REPORTED AS ONE EVENT. If every late date for a feed arrived on
 the same calendar day, that is one bulk load and the log says so instead of
 listing ten missed deadlines. The finding is not suppressed -- `total_late` and
-`--fail-on-late` are unchanged -- because a backfill of dates that were due
-weeks ago genuinely IS late; what changes is that a human reading the log is
-told what happened rather than left to notice that ten timestamps are equal.
-The seeded stack is exactly this case and is what it was written against.
+`--fail-on-late` are unchanged -- because a backfill of dates due weeks ago
+genuinely IS late; what changes is that a human is told what happened.
 
-WHAT IT CANNOT SEE, said plainly: a delivery that is late and has not yet
-arrived. It has no row, so there is nothing to be late. That is the gap check's
-question up to a point and the watchdog's beyond it.
+WHAT IT CANNOT SEE: a delivery that is late and has not yet arrived. It has no
+row, so there is nothing to be late. That is the gap check's question up to a
+point and the watchdog's beyond it.
 """
 from __future__ import annotations
 
@@ -103,12 +92,12 @@ def run(lookback: int | None = None) -> dict:
                 report["skipped_feeds"].append(name)
                 continue
 
-            # The last `lookback` COB dates this feed actually has, so a
-            # feed that has never delivered is not judged against dates it was
-            # never party to. FIRST arrival per date: a `_v2` correction
-            # landing days later is a re-delivery, not the original being
-            # late, and judging the newest would report every corrected date
-            # as a missed deadline.
+            # The last `lookback` COB dates this feed actually has, so a feed
+            # that has never delivered is not judged against dates it was never
+            # party to. FIRST arrival per date: a `_v2` correction landing days
+            # later is a re-delivery, not the original being late, and judging
+            # the newest would report every corrected date as a missed
+            # deadline.
             cur.execute(
                 "SELECT cob_date, MIN(received_at) AS first_arrival, "
                 "       COUNT(*) AS deliveries "
@@ -131,21 +120,18 @@ def run(lookback: int | None = None) -> dict:
                     })
             # A BULK LOAD IS ONE EVENT, NOT N MISSED DEADLINES. If every late
             # date for this feed arrived on the SAME calendar day, what
-            # happened was one backfill -- a seed, a migration, a re-delivery
-            # of history after an outage -- and reporting it as ten separate
-            # findings buries whatever else the check found. This is a
-            # derivation, not a threshold: one distinct arrival day across
-            # more than one COB date IS a bulk load, by definition.
+            # happened was one backfill, and reporting it as ten separate
+            # findings buries whatever else the check found. A derivation, not
+            # a threshold: one distinct arrival day across more than one COB
+            # date IS a bulk load, by definition.
             #
             # The finding is DESCRIBED differently, not suppressed. `late` and
-            # `total_late` are untouched, so `--fail-on-late` still fails and
-            # nothing has been quietly forgiven -- only the log line changes,
-            # which is the thing a human actually reads.
+            # `total_late` are untouched, so `--fail-on-late` still fails --
+            # only the log line changes.
             #
             # This is what the seeded stack looks like: `generate_feeds.py`
-            # writes every historical COB date at once, ~17 days behind
-            # the current date, so all four feeds report every date late with
-            # one arrival timestamp. Verified there before it was written.
+            # writes every historical COB date at once, so all four feeds
+            # report every date late with one arrival timestamp.
             arrival_days = {x["arrived"][:10] for x in late}
             bulk = is_bulk_load(late)
             entry = {"feed": name, "expected_by": fd.expected_by,

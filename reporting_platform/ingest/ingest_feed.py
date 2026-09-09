@@ -96,25 +96,22 @@ def ensure_raw_namespace(spark, fd) -> None:
 
 
 # PROVENANCE COLUMNS, added together and listed once (REQ-101, REQ-303,
-# REQ-304). Every one of them answers a question about the DELIVERY the row
-# came from rather than about the row:
+# REQ-304). Each answers a question about the DELIVERY the row came from
+# rather than about the row:
 #
 #   _delivery_id     which delivery, joinable to `registry.delivery` on
-#                    (feed, delivery_id). Not the same as `_source_file`,
-#                    which is the PART -- for an archive those differ, and
+#                    (feed, delivery_id). Not `_source_file`, which is the
+#                    PART -- for an archive those differ, and
 #                    `already_ingested` depends on `_source_file` staying the
 #                    part, so the delivery needed a column of its own.
-#   _received_at     when it arrived, which is not `_ingest_ts`. A delivery
-#                    landed on Friday and ingested on Monday has two different
-#                    and both interesting timestamps.
-#   _schema_version  the declared column contract it was read against, so a
-#                    value can be traced to the column list in force when it
-#                    landed. See `Feed.schema_version`.
+#   _received_at     when it arrived, which is not `_ingest_ts`: a delivery
+#                    landed Friday and ingested Monday has two timestamps.
+#   _schema_version  the declared column contract it was read against.
 #   _source_system   which upstream, without a join to config that moves.
 #
-# Four at once rather than one now and three at the next requirement: an
-# `ALTER TABLE ... ADD COLUMNS` is cheap in Iceberg but it is still a commit
-# on every raw table, and prepared has to be edited to carry each of them.
+# Four at once rather than one per requirement: `ALTER TABLE ... ADD COLUMNS`
+# is cheap in Iceberg but still a commit on every raw table, and prepared has
+# to be edited to carry each of them.
 _PROVENANCE_COLUMNS = (
     ("_delivery_id", "STRING"),
     ("_received_at", "TIMESTAMP"),
@@ -168,33 +165,28 @@ def plan_raw_schema(fd, have) -> dict[str, list]:
 
     `have` is the table's columns as (name, type) pairs, exactly what
     `DataFrame.dtypes` gives. Everything this migration turns on is decided
-    here, out of `feeds.yml` alone, so it is testable without a stack --
-    tests/test_raw_schema.py. `ensure_raw_schema` below is the part that
-    needs Spark and does no deciding.
+    here, out of `feeds.yml` alone, so it is testable without a stack.
 
     THE TWO DIRECTIONS ARE NOT SYMMETRICAL, and that is the whole design:
 
       add       a column `feeds.yml` declares that the table does not have.
-                APPLIED, automatically, on the branch. An upstream extending
-                its extract is the ordinary event in the life of a feed --
-                far more common than a new feed -- and it must not need a
-                migration somebody remembers to hand-write.
+                APPLIED automatically, on the branch. An upstream extending
+                its extract is the ordinary event in the life of a feed and
+                must not need a hand-written migration.
 
       orphaned  a column the table has that `feeds.yml` no longer declares.
                 NEVER APPLIED. Dropping it would delete history to satisfy a
-                config edit, and a rename in `feeds.yml` is indistinguishable
-                from a drop plus an add -- so the destructive reading of an
-                ambiguous edit is the one this refuses to take. Reported, and
-                filled with NULL on the way in so the append still resolves.
+                config edit, and a rename is indistinguishable from a drop
+                plus an add -- so the destructive reading of an ambiguous edit
+                is the one this refuses. Reported, and filled with NULL so the
+                append still resolves.
 
     WHICH IS WHICH IS DERIVED, NOT LISTED, by the same rule
-    `lineage/columns.py:ingest_columns` already uses: a raw table is the
-    feed's declared columns plus the platform's own, the platform's all begin
-    with `_`, so a column that is neither is one `feeds.yml` used to declare.
-    A second list of ingest's own columns here would be exactly the drift
-    this repo keeps refusing -- and because there is only the one rule, an
-    orphan here is the same column that
-    `python -m reporting_platform.lineage --columns` reports as `unresolved`.
+    `lineage/columns.py:ingest_columns` uses: a raw table is the feed's
+    declared columns plus the platform's own, the platform's all begin with
+    `_`, so a column that is neither is one `feeds.yml` used to declare. An
+    orphan here is the same column `lineage --columns` reports as
+    `unresolved`.
     """
     present = {name.lower() for name, _ in have}
     declared = [(c, "STRING") for c in fd.columns]
@@ -214,44 +206,39 @@ def ensure_raw_schema(spark, table: str, fd) -> dict[str, list]:
     `_PROVENANCE_COLUMNS` -- reaches new tables only; every raw table already
     in the catalog would keep the old schema forever.
 
-    THIS USED TO COVER THE PROVENANCE COLUMNS AND NOTHING ELSE, which left
-    the common case unhandled. Declaring a new column on an existing feed
-    passed every check in this module -- the file has it, the contract has it,
-    drift is empty -- and then failed inside `df.writeTo().append()`, on every
-    delivery for that feed from then on, with
+    THIS USED TO COVER THE PROVENANCE COLUMNS AND NOTHING ELSE, which left the
+    common case unhandled. Declaring a new column on an existing feed passed
+    every check in this module -- the file has it, the contract has it, drift
+    is empty -- and then failed inside `df.writeTo().append()` on every
+    delivery from then on, with
+    `[INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS]`.
 
-        [INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS] Cannot write to
-        `lakehouse`.`raw`.`ref_rating`, the reason is too many data columns
-
-    -- observed, which is how this came to cover them. Note what that error
-    says and does not say: an ARITY mismatch, naming neither the column nor
-    `feeds.yml`. The append checks the COUNT first and only then resolves BY
-    NAME (verified: a same-arity frame written in reversed column order reads
-    back correctly), which is what makes the NULL fill for an orphan below
-    safe to append at the end of the frame.
+    Note what that error says and does not say: an ARITY mismatch, naming
+    neither the column nor `feeds.yml`. The append checks the COUNT first and
+    only then resolves BY NAME (verified: a same-arity frame written in
+    reversed column order reads back correctly), which is what makes the NULL
+    fill for an orphan safe to append at the end of the frame.
 
     ADDED, NOT BACKFILLED, like the provenance columns before them. Iceberg
-    adds a column as metadata -- no data files are touched -- so rows ingested
-    before this read NULL. That is the honest answer for a column the upstream
-    genuinely was not sending, and where a delivery DID carry it undeclared
-    the value is not lost either: it is in `_extra_columns`, which is what
-    would make a backfill possible later without making it one now.
+    adds a column as metadata -- no data files are touched -- so earlier rows
+    read NULL. That is the honest answer for a column the upstream was not
+    sending, and where a delivery DID carry it undeclared the value is in
+    `_extra_columns`.
 
     For a PROVENANCE column that has a consequence worth restating: an as-of
-    query cannot use `_delivery_id` to reach back past the change and must
-    fall back to `_source_file`. The alternative was rewriting every partition
-    of every raw table -- new data files under live published tags,
-    interacting with snapshot expiry and the pins retention keeps.
+    query cannot use `_delivery_id` to reach past the change and must fall back
+    to `_source_file`. The alternative was rewriting every partition of every
+    raw table -- new data files under live published tags, interacting with
+    snapshot expiry and the pins retention keeps.
 
     Reads the current column list rather than relying on `ADD COLUMNS IF NOT
     EXISTS`, which Iceberg's Spark extensions do not accept: an unconditional
-    ADD of an existing column fails the whole statement, and this runs on
-    every ingest.
+    ADD of an existing column fails the whole statement, and this runs on every
+    ingest.
 
-    New columns land at the END of the table's schema rather than in declared
-    order. Nothing reads raw positionally -- the append resolves by name and
-    every model selects by name -- so reordering them would be a commit on
-    every raw table to change a `DESCRIBE`.
+    New columns land at the END of the schema rather than in declared order.
+    Nothing reads raw positionally, so reordering would be a commit on every
+    raw table to change a `DESCRIBE`.
     """
     plan = plan_raw_schema(fd, spark.sql(f"SELECT * FROM {table} LIMIT 0").dtypes)
     if plan["add"]:
@@ -368,15 +355,13 @@ def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
     log.info("main has no commits yet; bootstrapping directly (one-time)")
     # REUSE THE CALLER'S SESSION IF THERE IS ONE, and never stop what we did
     # not start. This unconditionally built its own session and called
-    # spark.stop() in a finally -- which stops the whole SparkContext, not just
-    # this handle, so it silently killed the shared session that
-    # `_ingest_chunk` had passed into ingest(). Every subsequent read failed
-    # with a Py4JJavaError on the next spark.read.csv.
+    # spark.stop() in a finally -- which stops the whole SparkContext, so it
+    # silently killed the shared session `_ingest_chunk` had passed into
+    # ingest(), and every subsequent read failed with a Py4JJavaError.
     #
     # It only fires when `main` has no commits, so a warm stack never reaches
     # it: the failure appeared exactly once, on the first ingest of a cold
-    # rebuild, which is the one path a session-reuse change most needed to be
-    # tested against.
+    # rebuild.
     owns = spark is None
     if owns:
         spark = spark_session(f"bootstrap-main-{fd.name}", ref="main")
@@ -476,19 +461,17 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     if owns_session:
         spark = spark_session(f"ingest-{fd.name}-{run_id}", ref="main")
 
-    # ON MAIN, AND BEFORE THE BRANCH IS CUT. A namespace cannot be created on a
-    # branch: Nessie's `@branch` suffix applies to a TABLE identifier, and
+    # ON MAIN, AND BEFORE THE BRANCH IS CUT. A namespace cannot be created on
+    # a branch: Nessie's `@branch` suffix applies to a TABLE identifier, and
     # using it on a namespace does not fail -- it creates a namespace literally
     # named "`raw_x@ingest/...`" on main. Verified against the live catalog.
     #
     # So the namespace must exist on main first and the branch inherits it.
-    # Creating it after the branch was cut is what broke the first ingest into
-    # a new raw_<source> namespace:
-    #   NoSuchNamespaceException: Namespace does not exist: raw
-    # -- CREATE NAMESPACE landed on main while CREATE TABLE addressed the
-    # branch, cut a moment earlier. It hides for as long as the namespace
-    # already exists, which on a warm stack it always does; it appears on a
-    # catalog where it does not, which is where it matters most.
+    # Creating it after the branch was cut broke the first ingest into a new
+    # raw_<source> namespace with `NoSuchNamespaceException: raw` -- CREATE
+    # NAMESPACE landed on main while CREATE TABLE addressed the branch. It
+    # hides for as long as the namespace already exists, which on a warm stack
+    # it always does.
     ensure_raw_namespace(spark, fd)
 
     branch = branch_name("ingest", fd.name, bdate, run_id)
@@ -499,8 +482,8 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     try:
         ensure_raw_table(spark, fd, raw_at_branch)
         # ON THE BRANCH, like the CREATE above: a schema change is a commit,
-        # and a commit against `main` outside the merge is exactly what
-        # write-audit-publish exists to prevent. If the ingest then fails, the
+        # and a commit against `main` outside the merge is what
+        # write-audit-publish exists to prevent. If the ingest then fails the
         # branch is abandoned and the column was never added to main either.
         schema = ensure_raw_schema(spark, raw_at_branch, fd)
         version = next_file_version(spark, fd, bdate, raw_at_branch)
@@ -508,10 +491,8 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # ONE DATAFRAME PER PART, each tagged with its OWN object key, then
         # unioned. `_source_file` must be the object the rows actually came
         # from -- `already_ingested` matches on it, so writing the manifest's
-        # key here would make every delivery look un-ingested forever and
-        # re-ingest on the next pass. With `kind: file` there is exactly one
-        # part and it is the landing key, which is what this column has always
-        # held.
+        # key here would make every delivery look un-ingested forever. With
+        # `kind: file` there is exactly one part and it is the landing key.
         frames, drift = [], {"missing_columns": [], "extra_columns": []}
         for part in parts:
             part_df = read_landing(spark, manifest["format"],
@@ -526,19 +507,16 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         for extra in frames[1:]:
             df = df.unionByName(extra)
 
-        # `schema_drift: fail` was documented in feeds.yml and listed in the
-        # documented as "the fail branch is unexecuted code". It was worse than
-        # unexecuted: NOTHING read fd.schema_drift anywhere in the codebase,
-        # so setting it to `fail` was silently identical to `warn` and a feed
-        # configured to abort on drift would have loaded regardless
-        #.
+        # `schema_drift: fail` was documented in feeds.yml and read by
+        # NOTHING: setting it to `fail` was silently identical to `warn`, so a
+        # feed configured to abort on drift loaded regardless.
         #
-        # It fires on extra AND missing columns. An extra column is the
-        # obvious case, but a missing declared column is the quieter one:
+        # It fires on extra AND missing columns. An extra column is the obvious
+        # case; a missing declared column is the quieter one, because
         # reconcile_schema fills it with nulls, so the load succeeds and the
         # column reads as "no value" rather than "never arrived" from then on.
-        # A typo here would silently mean "warn", which is exactly how this
-        # setting managed to do nothing for so long. Reject anything unknown.
+        # A typo here would silently mean "warn", which is how this setting
+        # managed to do nothing for so long. Reject anything unknown.
         if fd.schema_drift not in ("warn", "fail"):
             raise ValueError(
                 f"{fd.name}: schema_drift must be 'warn' or 'fail', got "
@@ -562,10 +540,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
               .withColumn("_batch_id", F.lit(run_id))
               # Provenance, from the MANIFEST and the feed's declared
               # contract, not from the filename. `received_at` is the
-              # delivery's arrival time -- the landing object's LastModified
-              # -- and is null only for the hand-built manifest of the
-              # `--cob-date` escape hatch, which has no landed object to
-              # take it from.
+              # delivery's arrival time -- the landing object's LastModified --
+              # and is null only for the hand-built manifest of the
+              # `--cob-date` escape hatch, which has no landed object.
               .withColumn("_delivery_id", F.lit(manifest["delivery_id"]))
               .withColumn("_received_at",
                           F.lit(manifest.get("received_at")).cast("timestamp"))
@@ -576,9 +553,8 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # A column the table still has and `feeds.yml` no longer declares.
         # `writeTo().append()` resolves BY NAME and wants a value for every
         # column the table has, so an orphan has to be written -- and NULL is
-        # the true one: the contract this delivery was read against did not
-        # ask for it. Dropping the column instead would delete history to
-        # satisfy a config edit. See plan_raw_schema.
+        # the true one: the contract this delivery was read against did not ask
+        # for it. Dropping it would delete history to satisfy a config edit.
         for orphan, dtype in schema["orphaned"]:
             df = df.withColumn(orphan, F.lit(None).cast(dtype))
 
@@ -591,10 +567,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             )
 
         # The EXACT count next to the floor above. expected_min_rows catches a
-        # truncated file; a control file states what the sender actually
-        # counted, so this is an equality check, not another floor. Only a
-        # feed with `delivery.control.row_count` and a control file that
-        # matched it has one -- see ingest/normalize.py.
+        # truncated file; a control file states what the sender counted, so
+        # this is an equality check, not another floor. Only a feed with
+        # `delivery.control.row_count` and a matching control file has one.
         declared = manifest.get("declared_row_count")
         if declared is not None and row_count != declared:
             raise ValueError(
@@ -604,17 +579,15 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             )
 
         # The checksum, next to the count. It catches what the count cannot: a
-        # delivery truncated or re-encoded in transit that still happens to
-        # hold the right NUMBER of rows. Hashed from the parts as landed,
-        # which for a delivery the inbox promoted is byte-identical to what
-        # the upstream sent -- the gate renames, it never rewrites.
+        # delivery truncated or re-encoded in transit that still holds the
+        # right NUMBER of rows. Hashed from the parts as landed, which for a
+        # delivery the inbox promoted is byte-identical to what the upstream
+        # sent -- the gate renames, it never rewrites.
         #
         # THIS RUNS FOR EVERY DELIVERY, whichever way it arrived. That is the
         # point of checking here rather than at the door: an approved sender
-        # writing straight into landing/ gets exactly the same verification as
-        # a legacy feed coming through the inbox, and there is one
-        # implementation of it. See
-        # docs/DECISIONS.md#the-inbox-is-the-conformance-gate
+        # gets the same verification as a legacy feed, from one implementation.
+        # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
         declared_md5 = manifest.get("declared_md5")
         if declared_md5 is not None:
             actual_md5 = _parts_md5(manifest)
@@ -645,19 +618,19 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             "branch": branch,
             # The object the ROWS came from, which is what `_source_file`
             # holds and what every existing caller prints. For `kind: file`
-            # that is the landing key, exactly as before -- not the manifest
-            # key that may have been passed in.
+            # that is the landing key -- not the manifest key that may have
+            # been passed in.
             "source_file": parts[0]["object_key"],
             "manifest": (object_key if object_key != parts[0]["object_key"]
                          else None),
             "parts": len(parts),
             "delivery_id": manifest["delivery_id"],
             "schema_version": fd.schema_version,
-            # What this ingest did to the TABLE, which is a different event
-            # from what it found in the FILE (`missing_columns` /
-            # `extra_columns` below). A contract change shows up here on the
-            # first delivery after the deploy and never again; file drift
-            # shows up per delivery.
+            # What this ingest did to the TABLE, a different event from what
+            # it found in the FILE (`missing_columns` / `extra_columns`
+            # below). A contract change shows up here on the first delivery
+            # after the deploy and never again; file drift shows up per
+            # delivery.
             "columns_added": schema["added"],
             "columns_orphaned": [name for name, _ in schema["orphaned"]],
             "asset_uri": fd.asset_uri,

@@ -79,14 +79,13 @@ BLOCK_ORDER = ["name", "description", "source_system", "convention",
 # Keys only written when they differ from what the feed would INHERIT, because
 # a block repeating an inherited value is noise in the diff. The four format
 # keys are here rather than absent because a pipe-delimited or latin-1 feed is
-# ordinary, and the alternative was hand-editing feeds.yml after every
-# console-created feed.
+# ordinary.
 #
 # THESE VALUES ARE THE FALLBACK, NOT THE ANSWER. What a feed actually inherits
 # is `defaults:` overlaid with its convention, which only feeds.yml knows --
-# see `_inherited()` below. This map supplies the two keys that have no entry
-# in `defaults:` at all (`cadence`, `delivery_expected`, which default in the Feed
-# dataclass) and covers the case where feeds.yml cannot be read.
+# see `_inherited()` below. This map supplies the keys with no entry in
+# `defaults:` at all (`cadence`, `delivery_expected`) and covers the case where
+# feeds.yml cannot be read.
 OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "delivery_expected": True,
                          "schema_drift": "warn", "delimiter": ",",
                          "quote_char": '"', "header": True,
@@ -141,40 +140,38 @@ class FeedSpec:
     # -- so this is empty on most feeds and omitted from their blocks.
     expected_by: str = ""
     # REQ-600/601. The evidence obligation this feed's landing and quarantine
-    # objects are under. A `<select>` in the form rather than free text,
-    # populated from what retention.yml declares, because an unrecognised class
-    # is refused at LOAD and the form must not be able to write one.
+    # objects are under. A `<select>` rather than free text, populated from
+    # what retention.yml declares, because an unrecognised class is refused at
+    # LOAD and the form must not be able to write one.
     retention_class: str = "standard"
     # The `conventions:` entry this feed inherits from, or "" to stand alone.
     # Every key the convention supplies is then omitted from the feed's own
     # block, so the convention stays the single place that value is written.
     convention: str = ""
     # How a landed object becomes units of work -- absent/empty means
-    # `kind: file`, one object, one delivery. Validated with the SAME
-    # function feeds.yml load does (context.resolve_delivery_config), not a
-    # second copy of the rules: an archive/control-gated feed created here
-    # must fail in the form on exactly what would otherwise fail silently at
-    # the next Airflow parse. See docs/DECISIONS.md#archive-normalizer and
-    # #control-file-gate.
+    # `kind: file`, one object, one delivery. Validated with the SAME function
+    # feeds.yml load does (context.resolve_delivery_config), so a feed created
+    # here fails in the form on exactly what would otherwise fail silently at
+    # the next Airflow parse.
+    # See docs/DECISIONS.md#archive-normalizer and #control-file-gate.
     delivery: dict[str, Any] = field(default_factory=dict)
     # How the delivery arrives in the INBOX when it is not already conformant
     # -- absent/empty means the upstream writes a correctly named file to
-    # landing/ directly, which is every feed here today. Validated with the
-    # SAME function feeds.yml load does (context.resolve_arrival_config).
+    # landing/ directly. Validated with the SAME function feeds.yml load does
+    # (context.resolve_arrival_config).
     # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
     arrival: dict[str, Any] = field(default_factory=dict)
     # How to READ the file. All four default to the `defaults:` block and are
     # written only when they differ -- see OPTIONAL_WITH_DEFAULT. They reach
-    # Spark's reader unchanged (ingest_feed.py), so a wrong delimiter lands one
-    # column holding the whole row rather than failing.
+    # Spark's reader unchanged, so a wrong delimiter lands one column holding
+    # the whole row rather than failing.
     delimiter: str = ","
     quote_char: str = '"'
     header: bool = True
     file_encoding: str = "utf-8"
-    # Sparse: ONLY the columns whose type disagrees with what infer_type()
-    # guesses. The caller reduces it (scaffold.overrides_only) before handing
-    # it over, so this module stays ignorant of how a type is guessed -- it
-    # writes what it is told and nothing else.
+    # Sparse: ONLY the columns whose type disagrees with infer_type()'s guess.
+    # The caller reduces it (scaffold.overrides_only) before handing it over,
+    # so this module stays ignorant of how a type is guessed.
     column_types: dict[str, str] = field(default_factory=dict)
     # Platform name -> the name in the FILE, for the columns that differ.
     # Sparse, like column_types. See docs/DECISIONS.md#source-column-names
@@ -243,9 +240,9 @@ def _arrival_from_payload(raw: Any) -> dict[str, Any]:
         if c:
             out["control"] = c
     # An `arrival:` block with only a control block and no source_pattern is
-    # meaningless -- nothing would ever match it -- and returning {} for it
-    # means a form whose arrival fields are present but unused produces a feed
-    # with no arrival block at all, rather than one that validates as broken.
+    # meaningless -- nothing would match it -- and returning {} means a form
+    # whose arrival fields are present but unused produces a feed with no
+    # arrival block, rather than one that validates as broken.
     return out if source_pattern else {}
 
 
@@ -265,10 +262,9 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
         return {}
     out: dict[str, Any] = {}
     kind = str(raw.get("kind") or "").strip()
-    # "file" is the implicit default (resolve_delivery_config treats an
-    # absent `kind` the same way) -- writing it explicitly for the ordinary
-    # case would put `delivery: {kind: file}` in every feed the form
-    # creates, noise the four original feeds' blocks have never carried.
+    # "file" is the implicit default (resolve_delivery_config treats an absent
+    # `kind` the same way) -- writing it explicitly would put
+    # `delivery: {kind: file}` in every feed the form creates.
     if kind and kind != "file":
         out["kind"] = kind
     member_pattern = str(raw.get("member_pattern") or "").strip()
@@ -345,9 +341,8 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
     if spec.convention:
         # Checked here as well as at load, because the two failures are not
         # the same one. context.effective_defaults() raises when feeds.yml is
-        # already wrong, which takes the whole platform down at import; this
-        # catches a typo on its way IN, while it is still a message next to a
-        # form field.
+        # already wrong, taking the platform down at import; this catches a
+        # typo on its way IN, while it is still a message next to a form field.
         from reporting_platform.common import context
 
         try:
@@ -377,9 +372,8 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
                     "below; the inbox renames it on the way in")
 
     if spec.arrival:
-        # THE SAME FUNCTION feeds.yml load calls -- see the delivery block
-        # below for why that matters. `filename_pattern` is passed because
-        # the gate's whole job is producing a name that pattern accepts, so a
+        # THE SAME FUNCTION feeds.yml load calls. `filename_pattern` is passed
+        # because the gate's job is producing a name that pattern accepts, so a
         # landing pattern with no date to write into is an arrival error too,
         # and saying so here names which of the two patterns is wrong.
         from reporting_platform.common import context
@@ -393,12 +387,10 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
     if spec.delivery:
         # THE SAME FUNCTION feeds.yml load calls, not a second copy of the
         # rules -- an archive/control feed created here fails in the form on
-        # exactly what would otherwise fail silently at the next Airflow
-        # parse (an unknown kind falls through to the pass-through
-        # normalizer and ingests a zip as one column of binary rubbish).
-        # `feed_name` in the message is spec.name, which may still be
-        # invalid at this point (checked above) -- resolve_delivery_config
-        # does not care, it only reads it for the message.
+        # exactly what would otherwise fail silently at the next Airflow parse
+        # (an unknown kind falls through to the pass-through normalizer and
+        # ingests a zip as one column of binary rubbish). `feed_name` in the
+        # message is spec.name, which may still be invalid at this point.
         from reporting_platform.common import context
 
         try:
@@ -467,8 +459,7 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         errors["schema_drift"] = "must be 'warn' or 'fail'"
 
     # BOTH VALIDATED WITH THE PLATFORM'S OWN FUNCTIONS, not a second copy of
-    # the rules -- the same discipline `delivery:` and `arrival:` already
-    # follow here. A form that accepted `7am` or a class retention.yml does not
+    # the rules. A form that accepted `7am` or a class retention.yml does not
     # declare would write a feeds.yml the next Airflow parse refuses to load,
     # and the console's whole point is that its diff is one you can merge.
     from reporting_platform.common.context import (
@@ -611,10 +602,9 @@ def _block(spec: FeedSpec) -> CommentedMap:
         value = getattr(spec, key)
         # Omit ANY key whose value is exactly what the feed would inherit --
         # not just the OPTIONAL_WITH_DEFAULT subset. A convention may supply
-        # `source_system` or `expected_min_rows` as readily as `delimiter`,
-        # and the narrower rule wrote those back into every feed block on the
-        # first save, pinning them where the convention could no longer change
-        # them.
+        # `source_system` or `expected_min_rows` as readily as `delimiter`, and
+        # the narrower rule wrote those into every feed block on the first
+        # save, pinning them where the convention could no longer change them.
         #
         # Safe for the identity keys because `defaults:` cannot supply them:
         # `name`, `description`, `filename_pattern`, `business_key` and
@@ -653,9 +643,8 @@ def _block(spec: FeedSpec) -> CommentedMap:
         elif key == "columns":
             # Mixed list: a bare name where the file header is already usable,
             # `{name: source}` where it is not. Most columns need no mapping,
-            # and a uniform mapping form would double the length of every feed
-            # block to say nothing.
-            # See docs/DECISIONS.md#source-column-names
+            # and a uniform mapping form would double every feed block's length
+            # to say nothing. See docs/DECISIONS.md#source-column-names
             seq = CommentedSeq()
             for col in value:
                 source = spec.source_columns.get(col)
@@ -708,11 +697,10 @@ def _write(doc, y: YAML) -> None:
     if "feeds:" not in text:
         raise RuntimeError("refusing to write a feeds.yml with no `feeds:` key")
     # Exactly one trailing newline. `add` puts a blank line before the block it
-    # appends, and ruamel attaches that to the PREVIOUS item's trailing
-    # comment -- so removing the last feed leaves the blank line behind, and
-    # deleting a feed you had just added did not restore the file. Harmless in
-    # YAML terms and pure noise in a diff, which for a file whose diff is the
-    # deliverable is the part that matters.
+    # appends, and ruamel attaches that to the PREVIOUS item's trailing comment
+    # -- so removing the last feed leaves the blank line behind, and deleting a
+    # feed you had just added did not restore the file. Pure noise in a diff,
+    # which for a file whose diff is the deliverable is what matters.
     text = text.rstrip() + "\n"
     FEEDS_YML.write_text(text, encoding="utf-8")
 
@@ -721,9 +709,8 @@ def add(spec: FeedSpec) -> None:
     doc, y = read_raw()
     doc["feeds"].append(_block(spec))
     # Blank line before the new block, matching how the hand-written ones are
-    # separated. Cosmetic, but this file is read far more often than it is
-    # written, and a console-added feed should not be identifiable by its
-    # spacing.
+    # separated. Cosmetic, but this file is read far more often than written,
+    # and a console-added feed should not be identifiable by its spacing.
     try:
         doc["feeds"].yaml_set_comment_before_after_key(
             len(doc["feeds"]) - 1, before="\n")

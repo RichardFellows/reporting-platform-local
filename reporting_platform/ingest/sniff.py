@@ -1,40 +1,31 @@
 """Propose a feed's format, columns and types from a real delivered file.
 
-Step 5 of docs/DELIVERY-SHAPES.md: a normalizer running in PROPOSE MODE.
-Give it a real delivery and it suggests delimiter, quote, header, encoding,
+Step 5 of docs/DELIVERY-SHAPES.md: a normalizer running in PROPOSE MODE. Give
+it a real delivery and it suggests delimiter, quote, header, encoding,
 per-column types and business-key candidates -- a starting point for the
 console form, never a value written without a human looking at it.
 
-USES DUCKDB'S sniff_csv() rather than hand-rolled frequency analysis: it is
-a real, tested CSV sniffer, and `scripts/duckdb_console.py` already depends
-on DuckDB being installed, so this adds no new dependency. `sniff_delivery`
-takes ANY path a duckdb connection can read -- a local temp file or an
-`s3://...` URI. The console-facing entry points (`sniff_bytes`,
-`sniff_archive`) always sniff a LOCAL temp file, fetching the delivery's
-bytes with the same boto3 client `ingest/arrival.py` already uses rather
-than through DuckDB's own S3 support -- simpler, and it needs no
-`REPORTING_DUCKDB_S3_SECRET` or Iceberg attach for something that is just
-reading one object. A bare `duckdb.connect()` is enough; nothing here
-requires `scripts.duckdb_console.connect()`.
+USES DUCKDB'S sniff_csv() rather than hand-rolled frequency analysis: it is a
+real, tested CSV sniffer, and `scripts/duckdb_console.py` already depends on
+DuckDB, so this adds no new dependency. `sniff_delivery` takes any path a
+duckdb connection can read. The console-facing entry points always sniff a
+LOCAL temp file, fetching the bytes with the same boto3 client
+`ingest/arrival.py` uses rather than through DuckDB's S3 support -- simpler,
+and it needs no Iceberg attach for something that is just reading one object.
 
-What sniff_csv does NOT do, verified against a real duckdb 1.5.5 rather than
-assumed:
+What sniff_csv does NOT do, verified against a real duckdb 1.5.5:
 
 * It does not know this platform's `column_types` vocabulary. Its `Columns`
   field carries duckdb's OWN SQL type names -- BIGINT, DOUBLE, VARCHAR --
-  which are NOT Arrow's (`int64`/`float64`/`utf8`). DUCKDB_TYPE_MAP below
-  translates.
-* It does not detect encoding. It assumes UTF-8 (silently stripping a UTF-8
-  BOM) and raises a clear, catchable error on anything else -- see
-  `_sniff_with_encoding`.
+  which are NOT Arrow's. DUCKDB_TYPE_MAP below translates.
+* It does not detect encoding. It assumes UTF-8 (silently stripping a BOM) and
+  raises a clear, catchable error on anything else.
 * It has no notion of a business key. `candidate_keys` is a uniqueness scan
-  layered on top, reusing sniff_csv's own `Prompt` -- a ready-to-run
-  `read_csv(...)` call -- rather than re-deriving delimiter/quote escaping
-  by hand.
+  layered on top, reusing sniff_csv's own `Prompt` rather than re-deriving
+  delimiter/quote escaping by hand.
 * "Not applicable" comes back as the LITERAL STRING `"(empty)"`, not `""` --
   checked, not assumed, after a first draft's `row["Quote"] or DEFAULT`
-  silently failed to catch it (a non-empty string is truthy). See
-  `_or_default`.
+  silently failed to catch it. See `_or_default`.
 """
 from __future__ import annotations
 
@@ -44,23 +35,19 @@ import re
 from reporting_platform.ui.registry import platform_names
 from reporting_platform.ui.scaffold import COLUMN_TYPES
 
-# duckdb's SQL type name (the part before any `(...)` parameters -- so a
-# future duckdb version returning `DECIMAL(18,2)` still matches `DECIMAL`) ->
-# this platform's column_types vocabulary (ui/scaffold.py:COLUMN_TYPES).
+# duckdb's SQL type name (the part before any `(...)` parameters, so a future
+# duckdb returning `DECIMAL(18,2)` still matches `DECIMAL`) -> this platform's
+# column_types vocabulary (ui/scaffold.py:COLUMN_TYPES).
 #
 # Checked against a real duckdb 1.5.5, not assumed: a decimal-looking column
 # ("100.50") comes back as plain DOUBLE, never a parametrised DECIMAL, and an
-# integer overflowing BIGINT's range falls back to DOUBLE too rather than
-# HUGEINT. The base-name strip handles a parametrised type anyway, since
-# nothing here depends on duckdb continuing to prefer DOUBLE.
+# integer overflowing BIGINT falls back to DOUBLE rather than HUGEINT.
 #
-# Deliberately NOT listed, falling back to "string" via `platform_type`:
-# TIME, TIMESTAMP (and TIMESTAMPTZ), INTERVAL, BLOB, UUID. Every one of them
-# has no platform cast to land in -- `dbt/macros/engine.sql`'s `parse_date`
-# only parses a DATE-shaped string, there is no `parse_timestamp` -- and
-# "string" is the safe direction: a TRY_CAST-free passthrough, never a value
-# the platform would silently mis-cast or truncate (forcing a TIMESTAMP into
-# `date` would drop the time of day with no error raised anywhere).
+# Deliberately NOT listed, falling back to "string" via `platform_type`: TIME,
+# TIMESTAMP(TZ), INTERVAL, BLOB, UUID. None has a platform cast to land in --
+# `engine.sql`'s `parse_date` only parses a DATE-shaped string -- and "string"
+# is the safe direction: forcing a TIMESTAMP into `date` would drop the time of
+# day with no error raised anywhere.
 DUCKDB_TYPE_MAP = {
     "TINYINT": "integer", "SMALLINT": "integer", "INTEGER": "integer",
     "BIGINT": "integer", "HUGEINT": "integer",
@@ -113,30 +100,23 @@ def _row(con, sql: str) -> dict:
 # --------------------------------------------------------------- encoding
 # Tried in order once a BOM does not settle it. sniff_csv rejects a byte
 # sequence invalid for the encoding it is told to assume, and EVERY encoding
-# here can genuinely fail -- checked against a real duckdb, not assumed.
+# here can genuinely fail -- checked against a real duckdb.
 #
-# ORDER IS NOT ARBITRARY, and getting it backwards makes one of the two
-# entries dead code. duckdb's `latin-1` rejects the C1 control range
-# (0x80-0x9F) that ordinary ISO-8859-1 would accept; `cp1252` accepts that
-# ENTIRE range except five undefined slots. Checked byte-by-byte against a
-# real duckdb: every byte latin-1 accepts, cp1252 also accepts, plus 27 more
-# -- so with cp1252 tried first, latin-1 can never be the one that succeeds.
-# latin-1 goes first instead: plain Western-European text with no smart
-# quotes or em-dashes is genuinely ISO-8859-1, and calling it that is a more
-# accurate label than the Windows-specific one. `cp1252` is what is actually
-# tried LAST here, because it is the one that accepts the widest range of
-# anything in this list -- which is why `sniff_delivery` reports it as
-# low-confidence rather than presenting it with the same weight as a clean
-# UTF-8 read.
+# ORDER IS NOT ARBITRARY, and reversing it makes one entry dead code. duckdb's
+# `latin-1` rejects the C1 control range (0x80-0x9F) that `cp1252` accepts
+# except for five undefined slots. Checked byte-by-byte: every byte latin-1
+# accepts, cp1252 also accepts, plus 27 more -- so with cp1252 first, latin-1
+# could never succeed. latin-1 goes first because plain Western-European text
+# is genuinely ISO-8859-1 and that is the more accurate label; cp1252 is tried
+# LAST as the widest-accepting, which is why `sniff_delivery` reports it as
+# low-confidence.
 #
-# `utf-16` IS NOT HERE, and that absence was earned, not an oversight: a
-# first draft included it and `sniff_csv(..., encoding='utf-16')` on plain
-# ASCII/latin-1 bytes does NOT raise -- checked -- it reinterprets byte-pairs
-# as UTF-16 code units and "succeeds" with a single garbled column, which is
-# worse than useless as a fallback: it "succeeds" before anything else in
-# this list ever gets a turn, reporting HIGH confidence for mojibake. UTF-16
-# has no reliable signature in the bytes themselves without a BOM, so it is
-# only ever tried when `_bom_encoding` finds one -- see `_sniff_with_encoding`.
+# `utf-16` IS NOT HERE, and that absence was earned: `sniff_csv(...,
+# encoding='utf-16')` on plain ASCII/latin-1 bytes does NOT raise -- it
+# reinterprets byte-pairs as UTF-16 code units and "succeeds" with a single
+# garbled column, before anything else gets a turn, reporting HIGH confidence
+# for mojibake. Without a BOM UTF-16 has no reliable signature, so it is only
+# tried when `_bom_encoding` finds one.
 ENCODING_FALLBACKS = ["utf-8", "latin-1", "cp1252"]
 
 
@@ -395,16 +375,15 @@ def propose_feed(filename: str, data: bytes) -> dict:
     proposal["filename_has_date"] = dated is not None
 
     # A PLAIN FILE WITH NO DATE IN ITS NAME IS ONBOARDABLE, and the proposal
-    # has to say how or the console dead-ends: `derive_pattern` returns None,
-    # the form requires a cob_date group, and there is no obvious way to
-    # say "this one arrives through the inbox and gets renamed". So propose
-    # the arrival shape -- the source pattern is the name as sent, escaped,
-    # and the landing pattern is left for the operator, who is the only one
-    # who knows what this feed should be called.
+    # has to say how or the console dead-ends: `derive_pattern` returns None
+    # and the form requires a cob_date group. So propose the arrival shape --
+    # the source pattern is the name as sent, escaped, and the landing pattern
+    # is left for the operator, who is the only one who knows what this feed
+    # should be called.
     #
     # Only for a plain file. An archive with no date on the container is a
-    # different gap (`cob_date_from: member`, still NOT BUILT), and the
-    # inbox gate does not unpack archives.
+    # different gap (`cob_date_from: member`, still NOT BUILT), and the inbox
+    # gate does not unpack archives.
     if dated is None and not filename.lower().endswith(".zip"):
         proposal["arrival_source_pattern"] = re.escape(filename)
     if filename.lower().endswith(".zip"):
