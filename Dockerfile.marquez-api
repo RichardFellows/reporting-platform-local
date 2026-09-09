@@ -1,0 +1,53 @@
+# Marquez API on UBI, built FROM SOURCE. See docs/DECISIONS.md#marquez-on-ubi
+#
+# Upstream `marquezproject/marquez` is eclipse-temurin on Ubuntu 24.04, and
+# nothing in it is Ubuntu-specific: the whole application is one shaded jar,
+# `marquez.dev.yml` and a twelve-line entrypoint, all three built from the
+# source tree fetched below. The gradle build is the only route to a runnable
+# artifact -- Maven Central stops at 0.50.0 and publishes a THIN jar, which a
+# Dropwizard `server` command cannot start.
+ARG MARQUEZ_VERSION=0.51.1
+
+# --------------------------------------------------------------------- build
+# The JDK image, not the runtime one: gradle needs javac, and gradle.properties
+# opens jdk.compiler internals to it.
+FROM registry.access.redhat.com/ubi8/openjdk-17:1.23 AS build
+ARG MARQUEZ_VERSION
+# The base image runs as uid 185 with no write access outside its home.
+USER root
+WORKDIR /src
+
+# The release tarball rather than a clone: the builder has curl and tar and no
+# git, matching how Dockerfile.spark and Dockerfile.airflow fetch their jars.
+# gzip is NOT in this base -- tar is, so the failure is `gzip: Cannot exec`
+# from tar's grandchild and says nothing about the missing package.
+RUN microdnf install -y gzip \
+    && microdnf clean all
+RUN curl -fsSL "https://github.com/MarquezProject/marquez/archive/refs/tags/${MARQUEZ_VERSION}.tar.gz" \
+    | tar xz --strip-components=1
+
+# `clients/java` is in the build because `api` depends on it; `web` is not,
+# it is a separate image. --no-daemon: nothing here outlives the layer.
+RUN ./gradlew --no-daemon --console=plain clean :api:shadowJar
+
+# ------------------------------------------------------------------- runtime
+FROM registry.access.redhat.com/ubi8/openjdk-17-runtime:1.23
+ARG MARQUEZ_VERSION
+USER root
+WORKDIR /usr/src/app
+
+# Upstream's own entrypoint and config, unmodified: it resolves MARQUEZ_CONFIG,
+# adds -Duser.timezone=UTC and -Dlog4j2.formatMsgNoLookups=true, then globs
+# `marquez-*.jar`, which is why the jar keeps its versioned name. marquez.dev.yml
+# reads POSTGRES_HOST, MARQUEZ_PORT, SEARCH_ENABLED and friends from the
+# environment -- docker-compose.yml sets them and says why.
+COPY --from=build /src/api/build/libs/marquez-api-${MARQUEZ_VERSION}.jar ./
+COPY --from=build /src/marquez.dev.yml ./marquez.dev.yml
+COPY --from=build /src/docker/entrypoint.sh ./entrypoint.sh
+RUN chmod 0755 entrypoint.sh
+
+# Back to the base image's unprivileged user; every file above is read-only to
+# it, which is all the server needs.
+USER 185
+EXPOSE 5000 5001
+ENTRYPOINT ["/usr/src/app/entrypoint.sh"]

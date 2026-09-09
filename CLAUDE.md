@@ -357,6 +357,12 @@ How the datasets, columns and classes are actually derived is in
   explicitly under Airflow's constraints is the cosmos trap exactly. Env is
   read at process start, so enabling it needs the airflow containers
   **recreated**.
+- **Both Marquez images are BUILT HERE on UBI, from Marquez's own source** —
+  `Dockerfile.marquez-api`, `Dockerfile.marquez-web`; upstream ships Ubuntu and
+  Alpine. `MARQUEZ_VERSION` is the RELEASE TAG the builders fetch, so the first
+  `--profile lineage up` after changing it builds (gradle + npm, with egress)
+  rather than pulls. Nothing else about the deployment changed.
+  (`#marquez-on-ubi`)
 - **It is not an authority, and not the record of what a run published.**
   Lineage is derived from the dbt project by `context.model_refs()` — the SAME
   walker `feeds_behind_report()` sizes retention windows with, so a second
