@@ -4,7 +4,8 @@
 through the platform: `seed/` → landing → `raw` → `prepared` → `reporting`.
 
 It is a front end for `docs/ADDING-A-FEED.md` and the run sequence at the end
-of it. Read that document first: this console does exactly what it describes
+of it, plus one view that is neither: **Arrivals**, which is what became of
+every file the platform was offered. Read that document first: this console does exactly what it describes
 and nothing else, and every trap it warns about is a validation message or a
 label here.
 
@@ -415,6 +416,106 @@ covering it and it grows untended. The dbt source entry, test block and
 `PREPARED_TABLES` entry are left for you, because each lives in a file with
 other feeds' content in it.
 
+## Arrivals
+
+**Arrivals** in the sidebar, and an **Arrivals** tab on every feed. The journey
+of one file: `inbox/` → `landing/` → the declared checks → the ingest run that
+followed.
+
+This is the part of the platform the console could not previously see. A file
+was dropped into `inbox/` and the next thing anybody saw was either a raw table
+with more rows in it or nothing at all — and *did it arrive*, *was it
+recognised*, *did its control file agree with it* and *did an ingest start*
+were four different places to look: a container's log, a Postgres table, an
+object prefix and Airflow's UI. Only the first of them said anything at all
+about a file that never got past the door.
+
+**Nothing on these pages is a record of its own.** There is no arrivals table
+and no status column; every value is read from something that already holds it
+— `registry.delivery`, `registry.rejection`, the inbox folder through the
+gate's own `route()`, and Airflow. See
+[DECISIONS.md#the-arrivals-view-is-a-join-not-a-record](DECISIONS.md#the-arrivals-view-is-a-join-not-a-record).
+
+### In the inbox now
+
+Everything sitting in `inbox/`, each labelled with what `inbox.route()` makes
+of it — the gate's own function, so a file shown here as claimed by nobody is
+a file the next sweep will quarantine:
+
+| | |
+|---|---|
+| `conformant` | already named the way `landing/` requires — uploaded under its own name, no rename and no control file needed |
+| `gated` | the name the upstream sends: it goes through the conformance gate and is promoted under a name `filename_pattern` describes |
+| `control` | a control file. It names no COB date of its own, so it is held until the delivery it describes arrives |
+| `unroutable` / `ambiguous` | nothing claims the name, or more than one feed does. The next sweep quarantines it |
+
+A file listed here has **not** necessarily been seen yet: the watcher wants two
+consecutive polls with an unchanged size and mtime before it touches anything,
+so a file written seconds ago is *meant* to still be sitting there. The
+modified time is what tells that apart from a file nobody is coming for — which
+is why an age is shown rather than a spinner that would be a guess.
+
+### What arrived
+
+Accepted and refused deliveries in **one list**, newest first. Keeping them
+apart is how a console comes to show a morning that received something
+unreadable as a morning that received nothing.
+
+**A gated delivery has two filenames and they are different strings.** Both are
+shown, upstream's first: it is the only one the upstream will ever know, so a
+page showing only the landed name makes the delivery unfindable by the name
+anyone would search for.
+
+### Declared checks, and what they do and do not say
+
+`arrival.control` carries what the file must be NAMED; `delivery.control`
+carries `row_count` and `md5`, checked **at ingest**, for every delivery
+however it arrived. The column shows what was declared, and the two halves are
+deliberately different kinds of answer:
+
+- **The checksum is answerable here.** `md5 matches` compares what the control
+  file declared against what the landed object hashes to — the same comparison
+  `ingest_feed` makes, on the same bytes, because every feed that can carry a
+  `delivery.control` block is single-part by construction. A multi-part
+  delivery reads `not comparable` rather than being guessed at.
+- **The row count is not.** Nothing counts rows without reading the file, and
+  that is a Spark job. The declared number is shown and the **Ingest** column
+  beside it is the verdict: a mismatch fails that task and leaves the Nessie
+  branch for inspection.
+
+Neither is a claim that the check has been *made*. A delivery can sit in
+landing for days with a checksum that agrees perfectly and never be ingested.
+`md5 matches` says the two recorded values agree; the ingest run says whether
+anything acted on it.
+
+### The ingest column
+
+A run is matched to a delivery by the object key it was told to ingest — from
+its `conf` when the inbox or this console triggered it, and from
+`resolve_arrival`'s XCom for a run that resolved its own. Two states are worth
+reading carefully:
+
+- **`no run recorded`** is not `not ingested`. Airflow trims its run history
+  and the registry does not, so the older half of this list will always outlive
+  the runs that ingested it. Whether the rows actually reached raw is derived
+  from `_source_file` and costs a Spark job to ask — this page does not guess
+  at it.
+- **`no ingest DAG`** means Airflow has no `ingest_<feed>`: the feed is gone
+  from `feeds.yml`, or has not been parsed yet. The deliveries are still
+  listed, which is what an index over object storage is for.
+
+### Where a refused delivery went
+
+Quarantined rows carry the rejection **class** — `unroutable`, `ambiguous`,
+`identity` or `member` — and the reason as prose. An **integrity** failure is
+deliberately not among them: a delivery whose row count or checksum disagrees
+**lands** and fails at ingest, because landing is the evidence copy and a bad
+delivery is what it exists to prove.
+
+**Unclaimed deliveries** is a different page for a different job: it reads
+`inbox/.rejected/` as an onboarding queue and offers to sniff a file into a new
+feed. Arrivals reads `registry.rejection`, which is the durable record.
+
 ## When Airflow is down
 
 The console still works: registering, scaffolding, uploading and landing need
@@ -445,6 +546,8 @@ reporting_platform/ui/
   sampledata.py     generate a delivery from the definition itself
   feedtest.py       `dbt build` for one feed, on a throwaway branch, never merged
   jobs.py           background jobs + streamed logs for the long ones
+  arrivals.py       the arrivals view -- a join over the registry, the
+                    inbox folder and Airflow. Writes nothing
   orchestration.py  Airflow REST client
   static/index.html the whole front end, no build step
 ```
