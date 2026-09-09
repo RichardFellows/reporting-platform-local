@@ -1,32 +1,29 @@
 """Landing-prefix retention: the evidence copy, kept for a flat number of years.
 
-WHAT THIS IS AND WHY IT IS NOT THE TABLE RULE.
+WHAT THIS IS AND WHY IT IS NOT THE TABLE RULE. `landing/` holds an immutable
+copy of every CSV every feed has ever delivered -- the answer to "what did the
+file we actually received say?", normally asked after a restatement, about a
+COB date the table layers have long since expired. So this sweep keeps
+**everything** for `keep_years` and then removes it, rather than sampling by
+the "10 business days plus 80 month-ends" keep-set the tables use. Superseded
+re-deliveries are kept too, because the interesting question is usually about
+the first one.
 
-`landing/` holds an immutable copy of every CSV every feed has ever delivered.
-It is the answer to "what did the file we actually received say?" — a question
-normally asked after a restatement, about a COB date the table layers have
-long since expired. So this sweep keeps **everything** for `keep_years` and
-then removes it, rather than sampling by the "10 business days plus 80
-month-ends" keep-set the tables use. Superseded re-deliveries are kept too:
-`TRADE_20260813.csv` and `TRADE_20260813_v2.csv` both survive their ten
-years, because the interesting question is usually about the first one.
+That is a policy decision, not an implementation detail: it costs the cheapest
+bytes in the estate to preserve the only non-reconstructable artefact the
+platform holds.
 
-That is a policy decision, not an implementation detail. It costs the cheapest
-bytes in the estate (flat CSV on object storage) to preserve the only
-non-reconstructable artefact the platform holds.
+THIS DID NOT USED TO EXIST. `retention.yml` carried a `landing:` block with
+four keys, `docs/RETENTION.md` described its behaviour in the present tense,
+and no code read any of it -- so the landing prefix grew without bound and "we
+keep every delivery forever" was being decided by omission.
 
-UNTIL SESSION 5 THIS DID NOT EXIST. `retention.yml` carried a `landing:` block
-with four keys, `docs/RETENTION.md` described its behaviour in the present
-tense, and no code read any of it — so the landing prefix grew without bound
-and "we keep every delivery forever" was being decided by omission.
-
-AGE MEANS COB DATE, NOT UPLOAD TIME. A file re-delivered late carries an
-old COB date and a recent `LastModified`; the data in it is still ten
-years old and the retention question is about the data. Parsing also means a
-key whose name this platform does not recognise is never deleted — see
-`_expiry` below, where that is a deliberate skip rather than a fallback to
-object age. Deleting something we cannot identify is not a risk worth taking
-against a prefix whose entire purpose is evidence.
+AGE MEANS COB DATE, NOT UPLOAD TIME. A file re-delivered late carries an old
+COB date and a recent `LastModified`; the data in it is still ten years old and
+the retention question is about the data. Parsing also means a key whose name
+this platform does not recognise is never deleted -- a deliberate skip rather
+than a fallback to object age. Deleting something we cannot identify is not a
+risk worth taking against a prefix whose entire purpose is evidence.
 """
 from __future__ import annotations
 
@@ -75,25 +72,21 @@ def keep_years(feed: Feed | None = None) -> int:
     PER FEED SINCE RETENTION CLASSES (REQ-600/601). `feed.retention_class`
     names the obligation and retention.yml gives it a window; a feed in the
     default `standard` class resolves to exactly the `landing.keep_years` this
-    function used to return for everything, so nothing moved for an existing
-    feed. `None` asks for that prefix default, which is what a caller with no
-    feed in hand -- the CLI banner, a test -- actually wants.
+    used to return for everything. `None` asks for the prefix default, which is
+    what a caller with no feed in hand wants.
 
     THE INTERLOCK IS NOW PER FEED TOO, and it had to move with the window.
-    `find_pending` computes the retention keep-set from the COB dates it
-    can see in LANDING, per feed, from that feed's own prefix -- precisely so a
-    date expired from the table is recognised as expired rather than
-    re-ingested. That only works while a feed's landing prefix still holds
-    every date its raw table might hold. Left global, this check would have
-    compared the DEFAULT class against the raw window and gone quiet about
-    exactly the feed a short class was applied to: a guard whose window no
-    longer contains the thing it describes.
+    `find_pending` computes the retention keep-set from the COB dates it can
+    see in LANDING, per feed, precisely so a date expired from the table is
+    recognised as expired rather than re-ingested. That only works while a
+    feed's landing prefix still holds every date its raw table might. Left
+    global, this check would have compared the DEFAULT class against the raw
+    window and gone quiet about exactly the feed a short class was applied to.
 
-    Warn rather than refuse: unlike the GC cutoff interlock, the failure is
+    Warn rather than refuse: unlike the GC cutoff interlock the failure is
     gradual and recoverable, and an operator deliberately shortening a class in
-    a sandbox should not be blocked. The published-tag interlock in
-    `retention.check_reproducibility_window` is the one that refuses, and it is
-    per feed for the same reason.
+    a sandbox should not be blocked.
+    `retention.check_reproducibility_window` is the one that refuses.
     """
     years = (class_keep_years("landing", feed.retention_class) if feed
              else int(retention_policy("landing")["keep_years"]))
@@ -120,22 +113,19 @@ def _cob_date(feed: Feed, filename: str,
     A DELIVERY dates from its own name -- `parse_filename`, unchanged.
 
     A METADATA sibling is named `<delivery>.meta.json`, so its date is inside
-    its own name and needs no lookup. That is why the suffix convention was
-    chosen over a parallel prefix: an orphaned metadata object still expires
-    rather than accumulating forever.
+    its own name. That is why the suffix convention was chosen over a parallel
+    prefix: an orphaned metadata object still expires rather than accumulating.
 
     A CONTROL file cannot do either. `TRADE_20260801.ctl` matches no
-    `filename_pattern` -- it is not a delivery -- and stripping a suffix does
-    not help, because the data file is `TRADE_20260801.csv` and the extension
-    is not guessable. It is dated from the SIBLING it gates: the delivery in
-    the same prefix whose stem its `delivery.control.pattern` matches. Found
-    with no extra S3 call, because the sweep has already listed the prefix.
+    `filename_pattern`, and stripping a suffix does not help because the data
+    file is `TRADE_20260801.csv` and the extension is not guessable. It is
+    dated from the SIBLING it gates: the delivery in the same prefix whose stem
+    its `delivery.control.pattern` matches, found with no extra S3 call.
 
     Searching the control filename for an 8-digit run would be simpler and is
     deliberately not done: this function authorises DELETION from the evidence
-    copy, and a name with two 8-digit runs would pick the wrong one. No
-    sibling means None, which means keep -- the same "never delete on a guess"
-    rule the rest of this module follows.
+    copy, and a name with two 8-digit runs would pick the wrong one. No sibling
+    means None, which means keep.
     """
     if conform.is_metadata_key(filename):
         filename = conform.delivery_of_metadata(filename)

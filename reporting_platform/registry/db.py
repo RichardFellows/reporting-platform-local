@@ -1,28 +1,22 @@
 """The delivery registry's transactional store: Postgres, in the `platform` DB.
 
 WHY POSTGRES AND NOT ICEBERG. The registry needs one thing Iceberg cannot give
-it cheaply: a serialising authority. `sequence_no` is the order in which this
-platform saw deliveries, and an order allocated by `MAX(...)+1` over a table
-several writers append to is the same read-then-write `next_file_version` has
--- correct today only because the `lakehouse_write` pool has one slot, which is
-exactly what the concurrency work intends to change. A database sequence is
-serialised by the database, at any pool size.
-
-The `platform` database has existed since the first compose file and nothing
-has ever connected to it. This is its first user, which is why a connection
-helper is new surface rather than an import.
+cheaply: a serialising authority. `sequence_no` is the order this platform saw
+deliveries in, and an order allocated by `MAX(...)+1` over a table several
+writers append to is the same read-then-write `next_file_version` has --
+correct today only because the `lakehouse_write` pool has one slot, which is
+exactly what the concurrency work intends to change.
 
 WHY THIS IS NOT THE `stg` LOAD-CONTROL TABLE. That is the trap this platform
 refuses by name -- see `arrival.already_ingested` -- and the difference is not
-the technology, it is what the table is allowed to say:
+the technology but what the table may say:
 
-  * The registry records OBSERVATIONS about deliveries: what arrived, when,
-    how big, what it hashed to, what it was called upstream. Every one of
-    them is a fact about an object that already exists in `landing/`.
-  * It records NO VERDICTS. There is no `ingested`, no `superseded`, no
-    `status`. Whether a delivery reached the raw table stays derived from the
-    raw table's own `_source_file`, where it cannot drift; whether a delivery
-    supersedes another stays `dedupe_rank`'s answer, computed at read time.
+  * The registry records OBSERVATIONS about deliveries: what arrived, when, how
+    big, what it hashed to, what it was called upstream. Each is a fact about
+    an object that already exists in `landing/`.
+  * It records NO VERDICTS. No `ingested`, no `superseded`, no `status`.
+    Whether a delivery reached raw stays derived from `_source_file`; whether
+    it supersedes another stays `dedupe_rank`'s answer, computed at read time.
 
 So every row here is reconstructible from object storage, and
 `deliveries.reconcile()` is the function that does it. A registry that could
@@ -30,35 +24,26 @@ not be rebuilt would be a second source of truth; one that can is an index.
 
 WHAT A REBUILD DOES NOT PRESERVE: the exact integers in `sequence_no`. Rebuilt
 rows are inserted in `received_at` order, so the ORDER is reproduced and the
-values are not. Nothing may key on the value -- `_delivery_id` on the raw
-table references `(feed, delivery_id)`, which is the landing filename and is
-stable.
+values are not. Nothing may key on the value.
 
-RUNS, VERSIONS, SUBMISSIONS AND AS-AT TRANSITIONS ARE THE EXCEPTION, and it is
-the only one.
-Everything above is an observation about an object that exists in storage, so
-it can be recomputed from storage. A RUN is not: it is an event that happened
-once, at a time, from a particular commit of the code, and no object anywhere
-records that it happened. Neither is the version number a report was published
-under, nor the fact that somebody submitted it, nor that somebody locked or
-reopened an as-at date -- REQ-500's lifecycle is a sequence of human acts, and
-`registry.as_at_transition` is the only place any of them is written down.
+RUNS, VERSIONS, SUBMISSIONS AND AS-AT TRANSITIONS ARE THE EXCEPTION, and the
+only one. A RUN is not an observation about an object: it is an event that
+happened once, from a particular commit, and no object records that it
+happened. Neither is the version a report was published under, nor that
+somebody submitted it, nor that somebody locked or reopened an as-at date --
+REQ-500's lifecycle is a sequence of human acts.
 
-So these tables are the first rows in this database that a rebuild cannot
-reconstruct, and two things follow that are easy to get wrong:
+Two things follow that are easy to get wrong:
 
-  * `run_input` carries NO FOREIGN KEY to `delivery`. It looks like it should
-    -- it names (feed, delivery_id) -- but a foreign key would let a registry
-    rebuild (drop, reconcile) CASCADE run history away, destroying the only
-    copy of something to protect the integrity of a table that has a second
-    copy in object storage. Exactly the wrong way round. The join still works;
-    it is simply not enforced, and `monitoring/evidence.py` treats a delivery
-    it cannot find as a finding rather than as an impossibility.
-  * A run legitimately HAS A STATUS, where a delivery does not. That is not
-    the boundary being relaxed: a delivery's status would be a verdict about
-    something already true (was it ingested, was it superseded), derivable and
-    therefore driftable. A run's status is the record of how the run ended,
-    which nothing else knows and nothing can derive.
+  * `run_input` carries NO FOREIGN KEY to `delivery`. It looks like it should,
+    but a foreign key would let a registry rebuild CASCADE run history away --
+    destroying the only copy of something to protect a table that has a second
+    copy in object storage. `monitoring/evidence.py` treats a delivery it
+    cannot find as a finding rather than an impossibility.
+  * A run legitimately HAS A STATUS, where a delivery does not. A delivery's
+    status would be a verdict about something already true, derivable and
+    therefore driftable. A run's status is how the run ended, which nothing
+    else knows and nothing can derive.
 """
 from __future__ import annotations
 
@@ -400,16 +385,15 @@ CREATE TABLE IF NOT EXISTS registry.submission_item (
 
 # COLUMNS ADDED TO A TABLE THAT ALREADY EXISTS, which `SCHEMA` above cannot do.
 # `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table -- it does
-# not reconcile its columns -- so every column added after a database was first
+# not reconcile columns -- so every column added after a database was first
 # created has to arrive here or it silently never appears. The failure mode is
-# the bad one: `ensure_schema` succeeds, and the INSERT naming the new column
+# the bad one: `ensure_schema` succeeds and the INSERT naming the new column
 # fails later, in a task, at publish time.
 #
 # `ADD COLUMN IF NOT EXISTS` makes each statement idempotent, so this runs on
-# every connection like the schema does. Additive only -- a column that needs
-# dropping or retyping is a real migration and does not belong in a startup
-# path. This is the same lazy, idempotent shape `ensure_raw_schema()` uses one
-# layer down, for the same reason.
+# every connection like the schema does. Additive only -- a column needing a
+# drop or retype is a real migration. Same lazy, idempotent shape
+# `ensure_raw_schema()` uses one layer down.
 MIGRATIONS = """
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_project_ref         TEXT;
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_change_ref   TEXT;
@@ -444,8 +428,8 @@ def ensure_schema(conn=None) -> None:
         # identical CREATE: both see the table absent, both insert into
         # pg_type, and the loser raises a unique violation on
         # pg_type_typname_nsp_index rather than the DuplicateTable that
-        # IF NOT EXISTS swallows. Two containers starting together is exactly
-        # that race. The retry finds the table present and does nothing.
+        # IF NOT EXISTS swallows. Two containers starting together is that
+        # race. The retry finds the table present and does nothing.
         conn.rollback()
         log.info("registry schema was created concurrently; re-checking")
         with conn.cursor() as cur:

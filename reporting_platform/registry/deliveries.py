@@ -2,37 +2,34 @@
 
 ONE PROJECTION, TWO CALLERS. `observations()` turns (feed, manifest, sidecar,
 md5) into a row and touches nothing -- no S3, no database -- which is what
-makes it testable without the stack and what keeps the two write paths from
+makes it testable without the stack and keeps the two write paths from
 drifting:
 
   * `normalize.normalize()` registers a delivery the moment it produces a
-    manifest for it. Best-effort: a registry write that fails is logged and
-    counted, never fatal. `landing/` is the evidence and the raw table is the
-    ledger; this is an index over both, and taking ingestion down to protect
-    an index would be the wrong way round.
+    manifest. Best-effort: a registry write that fails is logged and counted,
+    never fatal. `landing/` is the evidence and the raw table is the ledger;
+    this is an index over both, and taking ingestion down to protect an index
+    would be the wrong way round.
   * `reconcile()` walks object storage and registers everything missing. This
-    is the authority, and it is the same rule `arrival.py` already states for
-    arrival detection: *events are an optimisation, the poll is the
-    correctness guarantee.*
+    is the authority, and it is the rule `arrival.py` already states: *events
+    are an optimisation, the poll is the correctness guarantee.*
 
 Because the second path exists and is the same code, "rebuildable from object
 storage" is true by construction rather than by a second implementation that
-would rot. `coverage()` is the check that says whether it is still true.
+would rot. `coverage()` says whether it is still true.
 
-WHERE THE md5 COMES FROM, AND WHY IT IS NOT COMPUTED TWICE. A landing object
-is immutable, so its hash is measured once and never again. Three sources, in
-this order:
+WHERE THE md5 COMES FROM, AND WHY IT IS NOT COMPUTED TWICE. A landing object is
+immutable, so its hash is measured once. Three sources, in this order:
 
   1. The `.meta.json` sidecar, when the delivery came through the inbox gate.
-     Measured at the door on the bytes the upstream sent.
   2. The object's ETag. MinIO and S3 both return the content md5 as the ETag
      for a single-part upload, so the ordinary case costs nothing beyond the
      listing already in hand. Verified against this stack's MinIO.
   3. Reading the object and hashing it -- only for a multipart upload, whose
-     ETag ends in `-<partcount>` and is a hash of hashes, not of the content.
+     ETag ends in `-<partcount>` and is a hash of hashes.
 
-A row already registered is never re-hashed at all: `register()` leaves
-`md5`, `bytes` and `sequence_no` alone on conflict.
+A row already registered is never re-hashed: `register()` leaves `md5`, `bytes`
+and `sequence_no` alone on conflict.
 """
 from __future__ import annotations
 
@@ -122,10 +119,10 @@ def observations(feed: Feed, manifest: dict[str, Any],
         # WHERE IT CAME FROM, as far back as anything recorded. For a gated
         # delivery that is the name in the inbox; for a direct one the landing
         # object is the earliest thing that exists, and saying so is more
-        # honest than leaving the column null and implying it is unknown.
-        # `bucket` is passed in rather than read here so this stays pure --
-        # and it is not optional: `source_object` is a KEY, so the bucket has
-        # to come from somewhere or the URI names a bucket called "landing".
+        # honest than a null implying it is unknown. `bucket` is passed in
+        # rather than read here so this stays pure -- and it is not optional:
+        # `source_object` is a KEY, so without it the URI names a bucket
+        # called "landing".
         "origin_uri": (f"inbox:{sidecar['source_filename']}"
                        if sidecar.get("source_filename")
                        else f"s3://{bucket}/{manifest['source_object']}"),
@@ -148,14 +145,13 @@ _COLUMNS = ("feed", "delivery_id", "source_system", "cob_date",
             "declared_row_count", "declared_md5", "producer_run_id")
 
 # On conflict, update only what is a pure function of the delivery's own
-# objects. NOT `sequence_no` (the arrival order does not change because the
-# row was seen again), NOT `first_seen_at`, NOT `md5` or `bytes` (the object
-# is immutable, so re-measuring it can only introduce disagreement), and NOT
-# `received_at` (the landing object's LastModified, which likewise does not
-# move). What CAN legitimately change is what config says about the delivery
-# -- a corrected `source_columns` map changes `schema_version`, a control file
-# arriving late gives it a `control_object` -- and a re-registration is how
-# that is picked up.
+# objects. NOT `sequence_no` (arrival order does not change because the row was
+# seen again), NOT `first_seen_at`, NOT `md5` or `bytes` (the object is
+# immutable, so re-measuring can only introduce disagreement), and NOT
+# `received_at`. What CAN legitimately change is what config says about the
+# delivery -- a corrected `source_columns` map changes `schema_version`, a late
+# control file gives it a `control_object` -- and a re-registration picks that
+# up.
 _UPDATABLE = ("manifest_key", "normalizer", "schema_version", "control_object",
               "declared_row_count", "declared_md5", "producer_run_id",
               "origin", "origin_uri", "source_filename", "source_container")

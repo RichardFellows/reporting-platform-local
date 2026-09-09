@@ -44,16 +44,16 @@ QUARANTINE_PREFIX = "quarantine"
 #
 #   unroutable  no feed claims this filename
 #   ambiguous   more than one feed claims it -- rejected, never guessed
-#   identity    a feed claims it and it cannot be NAMED for landing: no
-#               COB date, an unparsable control file, a declared version
-#               that will not render
+#   identity    a feed claims it and it cannot be NAMED for landing: no COB
+#               date, an unparsable control file, a version that will not
+#               render
 #   member      an archive member that could not be conformed, where the
 #               container itself was fine
 #
 # An INTEGRITY failure is deliberately not in this list. A delivery whose row
 # count or checksum does not match LANDS and fails at ingest -- landing is the
-# evidence copy and a bad delivery is exactly what it exists to prove -- so it
-# is never quarantined. See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
+# evidence copy -- so it is never quarantined.
+# See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
 REASON_CLASSES = ("unroutable", "ambiguous", "identity", "member")
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")

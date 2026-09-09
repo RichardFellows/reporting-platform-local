@@ -1,48 +1,38 @@
 """External watchdog for platform housekeeping.
 
-WHY THIS EXISTS, AND WHY IT IS NOT AN AIRFLOW TASK.
+WHY THIS EXISTS, AND WHY IT IS NOT AN AIRFLOW TASK. `storage_report` is the
+tripwire for reclamation not happening -- and it is a task *inside*
+`platform_housekeeping`, the DAG whose absence it would need to detect. A
+monitor inside the thing it monitors cannot report that thing being down.
+Pause the DAG, break its import, leave a stale run wedging
+`max_active_runs=1`, and the tripwire never fires.
 
-`storage_report` is the tripwire for reclamation not happening -- and it is a
-task *inside* `platform_housekeeping`, the DAG whose absence it would need to
-detect. A monitor inside the thing it monitors cannot report that thing being
-down. Pause the DAG, break its import, leave a stale run wedging
-`max_active_runs=1`, and the tripwire simply never fires. Nothing complains,
-because the thing that would complain is the thing that stopped.
-
-That is not hypothetical here. A storage leak that stranded
-table directories permanently -- went unnoticed for exactly this reason, and
-the stale working branches found on first inspection existed because
-housekeeping had never run at all and nothing said so.
+Not hypothetical here: a storage leak that stranded table directories went
+unnoticed for exactly this reason, and the stale working branches found on
+first inspection existed because housekeeping had never run at all.
 
 So this process depends on **none** of Airflow's runtime. It reads:
 
-  * the Airflow *metadata database* directly (Postgres), which is the source of
-    truth for run state and stays up when the scheduler does not;
+  * the Airflow *metadata database* directly (Postgres), the source of truth
+    for run state, which stays up when the scheduler does not;
   * Nessie's REST API, for reference counts;
   * the object store, for warehouse size.
 
 If the scheduler is dead, runs stop appearing and the freshness check fires. If
-the DAG is paused or deleted, that is read straight off the `dag` table and
-fires immediately. If the *database* is unreachable, that is itself an alert --
-silence is never treated as health.
+the DAG is paused or deleted, that is read off the `dag` table. If the database
+is unreachable, that is itself an alert -- silence is never treated as health.
 
-Deliberately not using Airflow's REST API: it requires the webserver, which is
-another Airflow process that can be down for reasons unrelated to scheduling,
-and its absence would then be indistinguishable from a real outage.
+Deliberately not Airflow's REST API: it requires the webserver, another
+process that can be down for unrelated reasons, whose absence would then be
+indistinguishable from a real outage. Deliberately not importing `airflow` at
+all -- it runs in the same image for convenience but in its own container, and
+importing the library would reintroduce the coupling this exists to remove.
 
-Deliberately not importing `airflow` at all. This runs in the same image for
-convenience -- it is the image with the code and the drivers -- but in its own
-container, started by its own compose service that does not depend on any
-Airflow service. Importing the library would reintroduce the coupling this
-exists to remove.
-
-ALERTING. On a laptop the "alert channel" is the process exit code and stderr:
-non-zero means at least one ALERT-severity finding. In OpenShift this is the
-shape a CronJob or a Prometheus textfile exporter wants -- see
-docs/OPENSHIFT-MAPPING.md. It writes each evaluation to a JSONL history file so
-warehouse-size trend can be read across runs; a single sample cannot show a
-trend, and the flatlining storage graph docs/MAINTENANCE.md warns about is
-precisely a trend failure.
+ALERTING. On a laptop the alert channel is the exit code and stderr: non-zero
+means at least one ALERT-severity finding. It writes each evaluation to a JSONL
+history file so warehouse-size trend can be read across runs; a single sample
+cannot show a trend, and a flatlining storage graph is precisely a trend
+failure.
 
 Usage:
     python -m reporting_platform.monitoring.watchdog             # one evaluation
@@ -81,7 +71,7 @@ STALE_RUN_HOURS = float(os.environ.get("REPORTING_WATCHDOG_STALE_RUN_HOURS", "6"
 # How long the warehouse may sit at exactly the same byte count before that is
 # worth remarking on. MUST exceed the reclamation cadence -- housekeeping is
 # nightly, so anything under 24h flags a healthy platform between runs, which
-# is precisely the bug this constant exists to prevent recurring.
+# is the bug this constant exists to prevent recurring.
 FLAT_WAREHOUSE_HOURS = float(
     os.environ.get("REPORTING_WATCHDOG_FLAT_HOURS", "36"))
 
@@ -138,19 +128,16 @@ def check_orchestrator(now: datetime) -> tuple[list[Finding], dict]:
                     "SELECT is_paused, is_active FROM dag WHERE dag_id = %s",
                     (WATCHED_DAG,))
             except psycopg2.errors.UndefinedTable:
-                # THE STACK IS STILL COMING UP. This container deliberately has
-                # no depends_on airflow-init -- a monitor that shares the
-                # lifecycle of the thing it monitors cannot report that thing
-                # being down -- so on a cold start it wins the race against
-                # `airflow db migrate` and there is no `dag` table to read yet.
+                # THE STACK IS STILL COMING UP. This container deliberately
+                # has no depends_on airflow-init -- a monitor sharing the
+                # lifecycle of what it monitors cannot report that thing being
+                # down -- so on a cold start it wins the race against
+                # `airflow db migrate` and there is no `dag` table yet.
                 #
                 # That is not "housekeeping is broken", and calling it an ALERT
-                # meant every single fresh clone opened with a red watchdog
-                # before anything had had a chance to go wrong. A monitor that
-                # cries wolf on first boot is a monitor people learn to skip,
-                # which costs more than the check is worth. WARN, with a
-                # message that says which of the two it is; it clears on the
-                # next pass once airflow-init has finished.
+                # opened every fresh clone with a red watchdog. A monitor that
+                # cries wolf on first boot is one people learn to skip. WARN,
+                # saying which of the two it is; it clears on the next pass.
                 return [Finding(
                     "metadata_db", WARN,
                     "the Airflow metadata schema does not exist yet — "
@@ -210,21 +197,17 @@ def check_orchestrator(now: datetime) -> tuple[list[Finding], dict]:
                         age_hours=round(age_h, 2)))
 
             # A run stuck non-terminal holds max_active_runs=1 and makes the
-            # scheduler spin on it, starving every other DAG. That failure
-            # mode has bitten this stack repeatedly (CLAUDE.md), and from
-            # inside Airflow it looks like nothing happening at all.
-            # COALESCE, and it is the whole point of this query. A run that
-            # never started has start_date NULL, and "queued with start=None"
-            # is precisely the symptom CLAUDE.md tells you to look for -- so
-            # keying on start_date alone made the check blind to the exact
-            # failure it exists for. Worse, `ORDER BY start_date` sorts NULLs
-            # last in Postgres, so such a run was not even the row examined
-            # unless it was the only one, and when it was, `start_date is
-            # None` skipped the check in silence.
+            # scheduler spin on it, starving every other DAG. From inside
+            # Airflow it looks like nothing happening at all.
             #
-            # queued_at is when the scheduler put it in the queue, which is
-            # the right clock for a run that never got further; execution_date
-            # is a last resort and is NOT NULL by schema.
+            # COALESCE is the whole point of this query. A run that never
+            # started has start_date NULL, and "queued with start=None" is
+            # precisely the symptom to look for -- so keying on start_date
+            # alone made the check blind to the exact failure it exists for.
+            # Worse, `ORDER BY start_date` sorts NULLs last in Postgres, so
+            # such a run was not even the row examined unless it was the only
+            # one. queued_at is the right clock for a run that never got
+            # further; execution_date is a last resort and is NOT NULL.
             cur.execute(
                 "SELECT run_id, "
                 "       COALESCE(start_date, queued_at, execution_date) "
@@ -468,17 +451,15 @@ def check_deferred_backlog(
             except psycopg2.errors.UndefinedTable:
                 # `nessie_gc` is created empty by scripts/init-postgres.sql;
                 # the TABLES in it are created by the nessie-gc tool the first
-                # time housekeeping runs. So on any stack where housekeeping
-                # has never run, these tables are legitimately absent and the
-                # honest answer is "nothing has been deferred yet" -- not an
-                # alert. This fired on every fresh clone.
+                # time housekeeping runs. So where housekeeping has never run
+                # these tables are legitimately absent and the honest answer is
+                # "nothing has been deferred yet" -- not an alert. This fired
+                # on every fresh clone.
                 #
                 # But absent tables AFTER a successful housekeeping run is a
                 # real fault: the GC step did not do what the DAG says it did.
-                # So the same missing table is a fact or an alert depending on
-                # whether anything should have created it yet, which is exactly
-                # the distinction the rest of this check is built around --
-                # eligible is not the same as overdue.
+                # The same missing table is a fact or an alert depending on
+                # whether anything should have created it yet.
                 if last_success_at is None:
                     return [], {"deferred_backlog":
                                 "n/a (GC has never run; no tables yet)"}
@@ -578,11 +559,10 @@ def evaluate(history_path: str = HISTORY_PATH) -> dict:
                   lambda: check_warehouse(history, now),
                   # ORDER MATTERS, and the lambda is what makes it work:
                   # `facts` is read when this is CALLED, after
-                  # check_orchestrator has already put last_success_at in it.
-                  # check_deferred_backlog needs to know whether a
-                  # housekeeping run has completed since files became
-                  # eligible -- without that it cannot tell "the pass failed"
-                  # from "the pass has not run yet".
+                  # check_orchestrator has put last_success_at in it.
+                  # check_deferred_backlog needs to know whether a housekeeping
+                  # run has completed since files became eligible -- without
+                  # that it cannot tell "the pass failed" from "not run yet".
                   lambda: check_deferred_backlog(
                       now, facts.get("last_success_at"))):
         # One check failing outright must not hide the others. A watchdog that

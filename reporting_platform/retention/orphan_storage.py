@@ -1,38 +1,32 @@
 """Reclaim table directories that no Nessie reference points at.
 
-THE GAP THIS FILLS. Two mechanisms are supposed to reclaim
-storage, and neither can touch this case:
+THE GAP THIS FILLS. Two mechanisms are supposed to reclaim storage, and
+neither can touch this case:
 
-  * **Nessie GC** identifies live content by walking live references, then for
-    each content in that live set deletes files which are not live. A table
-    whose content entry existed ONLY on a branch that has since been deleted is
-    in no live reference, so it never enters the live set and its files are
-    never visited. GC cannot collect what it never enumerates.
+  * **Nessie GC** identifies live content by walking live references, then
+    deletes files not live for each content in that set. A table whose content
+    entry existed ONLY on a branch since deleted is in no live reference, so it
+    never enters the live set. GC cannot collect what it never enumerates.
   * **`remove_orphan_files`** would catch exactly this by diffing the object
     store against table metadata -- but it is disabled under Nessie by
-    `gc.enabled=false`, and rightly so: files are shared across
-    references and no single table pointer knows what another branch needs.
+    `gc.enabled=false`, and rightly so: files are shared across references.
 
 So a failed build whose branch is later swept by `clean_working_branches`
 leaves its entire table output in object storage permanently. That is
 unbounded, and invisible to `storage_report`, which only checks that expiry
-produced deletions -- not that the warehouse holds prefixes nothing points at.
+produced deletions.
 
 WHAT THIS DOES. Resolve the set of table locations live across *every*
-reference (branches and tags), list the table-level prefixes actually present
-in the warehouse, and delete those in neither -- subject to an age floor.
+reference (branches and tags), list the table-level prefixes present in the
+warehouse, and delete those in neither -- subject to an age floor.
 
 TWO SAFETY PROPERTIES, both deliberate:
 
-  * **Age floor.** A prefix whose newest object is younger than
-    `min_age_days` is never touched, because it may belong to a write that is
-    still in flight. Same reasoning and the same floor as
-    `remove_orphan_files`; it also absorbs clock skew between the writer and
-    the object store.
+  * **Age floor.** A prefix whose newest object is younger than `min_age_days`
+    is never touched, because it may belong to a write still in flight. Same
+    reasoning and floor as `remove_orphan_files`; it also absorbs clock skew.
   * **Every reference, not just main.** Reading only `main` would delete the
-    working output of every open build branch. The set must be the union
-    across all references, which is precisely the reasoning that makes Nessie
-    GC the right owner of the file lifecycle in the first place.
+    working output of every open build branch.
 
 ORDERING TRAP. Deleting a branch *before* GC runs guarantees its files can
 never be collected by GC -- which is how the stranded directories appeared.

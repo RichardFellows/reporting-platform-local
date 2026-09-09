@@ -74,19 +74,15 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
 
     # THE SCOPE COLUMN IS A PROPERTY OF THE TABLE, NOT OF THE LAYER. run()
     # derives it from the layer -- right for every snapshot table, wrong for an
-    # SCD2 dimension, which holds one row per VERSION and has no cob_date
-    # at all. Iceberg rejects the whole call:
-    #   Cannot parse predicates in where option: cob_date >= date "..."
-    # and a failed action fails the maintenance task, which takes the entire
-    # nightly chain down with it -- retention, GC and reclamation included. It
-    # had never fired because no prepared table had ever reached `main`.
-    # Same shape as the sort_order intersection below: ask the table.
+    # SCD2 dimension, which holds one row per VERSION and has no cob_date at
+    # all. Iceberg rejects the whole call with "Cannot parse predicates in
+    # where option", and a failed action takes the entire nightly chain down
+    # with it. It had never fired because no prepared table had reached `main`.
     #
     # `effective_from` is the version clock retention.is_scd2() already keys
-    # on. It is deliberately NOT the partition column (`effective_from_month`
-    # is), so it bounds the work without pruning partitions -- acceptable on a
-    # dimension of this size, and reclaiming the row-level delete files an SCD2
-    # expiry leaves behind is rewrite_deletes' job, not this one.
+    # on. Deliberately NOT the partition column (`effective_from_month` is), so
+    # it bounds the work without pruning partitions -- acceptable on a
+    # dimension of this size.
     scope = next((c for c in (date_column, "effective_from")
                   if c.lower() in present), None)
     if scope is None:
@@ -114,11 +110,11 @@ def compact(spark, table: str, layer_cfg: dict, defaults: dict,
         # (per counterparty) and `exposure_by_country` (aggregated, so
         # `counterparty_id` does not exist on it). Iceberg binds every sort
         # field against the table schema up front and throws
-        #   ValidationException: Cannot find field 'counterparty_id' in struct
-        # which aborted the whole maintenance run at the first such table
-        #. Intersect the configured order with the columns
-        # that actually exist, and fall back to binpack if none survive --
-        # a layer-wide sort key is a preference, not a schema guarantee.
+        # "ValidationException: Cannot find field", which aborted the whole
+        # maintenance run at the first such table. Intersect the configured
+        # order with the columns that actually exist, and fall back to binpack
+        # if none survive -- a layer-wide sort key is a preference, not a
+        # schema guarantee.
         wanted = [c.strip() for c in layer_cfg["sort_order"].split(",") if c.strip()]
         usable = [c for c in wanted if c.split()[0].strip('"`').lower() in present]
         dropped = [c for c in wanted if c not in usable]
@@ -163,9 +159,9 @@ def decide(metrics: dict, thresholds: dict) -> list[str]:
     actions = []
     # Gate on total_files, NOT on the truthiness of avg_file_size_mb. That
     # value is rounded to 2dp, so any table averaging under ~5 KB per file
-    # reports 0.0 -- which is falsy, and which silently skipped compaction on
-    # exactly the most fragmented tables. An empty table reports 0 too, and
-    # only that case should opt out.
+    # reports 0.0 -- falsy, silently skipping compaction on exactly the most
+    # fragmented tables. An empty table reports 0 too, and only that case
+    # should opt out.
     has_files = metrics["total_files"] > 0
     if has_files and (
             metrics["max_files_per_partition"] > thresholds["compact_when_files_per_partition_gt"]

@@ -3,35 +3,30 @@
 WHY THIS IS NOT DERIVED FROM THE dbt PROJECT, when the edges are. The dbt
 schema YAML documents the columns somebody wrote a TEST or a description for:
 `_sources.yml` names two columns of `raw.fo_trade` and the table has twenty.
-Emitting that as the schema would not be an incomplete answer, it would be a
-WRONG one -- a reader seeing eight of twenty-four columns in Marquez has no
-way to know the list is partial, and would reasonably conclude the other
-sixteen do not exist. Empty is honest; partial is not. So the columns come
-from the table.
+Emitting that would not be an incomplete answer but a WRONG one -- a reader
+seeing eight of twenty-four columns in Marquez has no way to know the list is
+partial. Empty is honest; partial is not. So the columns come from the table.
 
-READ THROUGH DuckDB, which is the platform's established no-Spark read path
-(`scripts/duckdb_console.py`): `DESCRIBE` against the Iceberg REST catalog,
-measured at 0.59s for all eleven tables plus 0.31s to attach. Spark here would
-mean a JVM in the task process, which is the one thing
+READ THROUGH DuckDB, the platform's established no-Spark read path: `DESCRIBE`
+against the Iceberg REST catalog, measured at 0.59s for all eleven tables plus
+0.31s to attach. Spark here would mean a JVM in the task process, which
 docs/DECISIONS.md#spark-in-a-subprocess forbids.
 
 IT IS THE PUBLISHED SCHEMA, AND THAT IS THE RIGHT ONE. DuckDB can only address
 the catalog's default branch, so what Marquez is told is the shape of the table
-on `main` -- what a reader can actually query -- and not what the branch this
-run is building might merge in a minute. A table that has never been published
-has no schema here and gets none: it appears after the first run that merges
-it, which is also when it becomes true. Marquez is a consumer; it reports what
-exists.
+on `main` -- what a reader can actually query -- not what the branch this run
+is building might merge in a minute. A table never published has no schema here
+and gets none.
 
 A LANDING PREFIX IS NOT A TABLE, and its columns are the ones in the FILE --
 `Feed.source_column()`, the upstream's own names, before ingest renames them.
 So the graph shows the rename this platform performs: `Trade Id` at landing,
-`trade_id` from raw onward. See CLAUDE.md on source column names.
+`trade_id` from raw onward.
 
 TOTAL, AND CACHED PER PROCESS. Every path returns "no columns" rather than
-raising: this runs inside an OpenLineage extractor, where the cost of an
-exception is the DATASETS of whatever was being extracted, so a catalog that
-is briefly unreachable must cost the schema and never the edge.
+raising: this runs inside an OpenLineage extractor, where an exception costs
+the DATASETS of whatever was being extracted, so a catalog that is briefly
+unreachable must cost the schema and never the edge.
 """
 from __future__ import annotations
 

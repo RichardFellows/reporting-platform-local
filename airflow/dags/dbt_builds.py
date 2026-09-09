@@ -219,11 +219,10 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
         max_active_runs=1,
         default_args=DEFAULT_ARGS,
         tags=["reporting-platform", "dbt", "cosmos", purpose],
-        # REQ-405. The change this build is being made under -- a Jira key, a
-        # change number, whatever the process uses. Carried onto the Nessie
-        # merge commit and onto the run record, so "why did this figure
-        # change" has an answer in the catalog rather than only in somebody's
-        # inbox. Empty for a scheduled build, which is the honest answer:
+        # REQ-405. The change this build is made under -- a Jira key, a change
+        # number, whatever the process uses. Carried onto the Nessie merge
+        # commit and the run record, so "why did this figure change" has an
+        # answer in the catalog. Empty for a scheduled build, which is honest:
         # nothing authorised it beyond the schedule.
         params={"change_ref": ""},
     )
@@ -235,10 +234,9 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             from reporting_platform.common.context import Nessie
 
             # Slugify rather than slice. `run_id[-24:]` cut mid-token and
-            # produced branch names like `-08-21T101555.6748970000` and tags
-            # like `published/2026-08-20/l__2026-08-21T1002500000` -- the "l__"
-            # being the tail of "dataset_triggered__". Unreadable, and it
-            # discards exactly the part that identifies the run.
+            # produced branch names like `-08-21T101555.6748970000` -- the
+            # "l__" in tags being the tail of "dataset_triggered__".
+            # Unreadable, and it discards the part identifying the run.
             raw = context["run_id"]
             run_id = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-")[:40]
             branch = f"build/{purpose}/{pendulum.now('UTC'):%Y-%m-%d}/{run_id}"
@@ -273,13 +271,11 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
 
             # BEFORE the run row and before any model builds. In a controlled
             # environment this RAISES, and failing here is the point: the
-            # project on disk is not the one the pipeline deployed, so
-            # anything published from it would be attributed to a commit that
-            # did not produce it. Outside those environments it returns a
-            # description and the build proceeds -- `dev` diverges by design,
-            # because the feed console writes models into the project there.
-            # NOT inside the try below: this refusal must not be swallowed as
-            # a best-effort registry failure.
+            # project on disk is not the one the pipeline deployed, so anything
+            # published from it would be attributed to a commit that did not
+            # produce it. Elsewhere it returns a description and the build
+            # proceeds -- `dev` diverges by design. NOT inside the try below:
+            # this refusal must not be swallowed as a best-effort failure.
             drift = check_project_drift()
             if drift:
                 logging.getLogger("airflow.task").warning(
@@ -299,13 +295,12 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                     "could not open the run record for %s: %s", run_id,
                     f"{type(exc).__name__}: {exc}")
 
-        # THE POOL, because this task now runs Spark. It did not before: it was
-        # a Nessie merge and nothing else. Reading the input set off the branch
-        # is one more Spark application, and standalone mode hands out every
-        # free core and holds them until the session stops -- so a publish
-        # outside the pool would contend with the next build's model tasks for
-        # exactly the reason `lakehouse_write` exists. Safe to take here: every
-        # rendered dbt task upstream has finished and released its slot.
+        # THE POOL, because this task now runs Spark -- it did not before,
+        # when it was a Nessie merge and nothing else. Reading the input set
+        # off the branch is one more Spark application, and standalone mode
+        # holds every free core until the session stops, so a publish outside
+        # the pool would contend with the next build's model tasks. Safe to
+        # take here: every rendered dbt task upstream has released its slot.
         @task(outlets=[outlet], pool="lakehouse_write")
         def publish(branch: str, **context) -> dict:
             """Merge the audited branch into main, and RECORD THE PUBLICATION.
@@ -354,12 +349,12 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                 inputs = _spark_run("run-inputs", branch)
                 cob_date = inputs.get("max_cob_date")
                 if inputs.get("unreadable"):
-                    # NOT fatal, and deliberately so: the tables are audited
-                    # and correct, and refusing to publish them because their
+                    # NOT fatal, deliberately: the tables are audited and
+                    # correct, and refusing to publish them because their
                     # provenance could not be enumerated would take the
                     # platform down to protect a record of it. Loud, though --
-                    # this is the state the _prepared.yml migration guard
-                    # exists to make impossible.
+                    # this is what the _prepared.yml migration guard exists to
+                    # make impossible.
                     log.error("run %s: input set INCOMPLETE -- %s", run_id,
                               inputs["unreadable"])
                 runs.record_inputs(
@@ -370,17 +365,16 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                           f"{type(exc).__name__}: {exc}")
 
             # 1b. THE AS-AT LIFECYCLE GATE, and it must be HERE -- after the
-            # input set (which is what makes the as-at date knowable) and
-            # BEFORE the merge. Placed with the versioning below it would fire
-            # after `main` had already moved, so the refusal would be a
-            # complaint about a publication that had happened. Refusing here
-            # fails the task with main untouched and the branch retained by
-            # keep_failed_branch, which is write-audit-publish doing its job.
+            # input set (which makes the as-at date knowable) and BEFORE the
+            # merge. Placed with the versioning below it would fire after
+            # `main` had already moved, so the refusal would complain about a
+            # publication that had happened. Refusing here fails the task with
+            # main untouched and the branch retained by keep_failed_branch.
             #
             # REQ-500/502. A LifecycleRefused is deliberately NOT caught: it is
-            # the one error in this task that must stop the publication. Every
-            # other failure here is best-effort because the tables are audited
-            # and correct; this one says the tables must not become main's.
+            # the one error here that must stop the publication. Every other
+            # failure is best-effort because the tables are audited and
+            # correct; this one says they must not become main's.
             carried_forward: list[dict] = []
             if purpose == "reporting" and cob_date:
                 from datetime import date as _date
@@ -430,15 +424,14 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                     try:
                         version = runs.allocate_version(report, as_at, run_id, tag)
                     except Exception as exc:                    # noqa: BLE001
-                        # NOT fatal -- the merge has already happened and the
-                        # tag is cut, so the publication is real whether or not
-                        # it was numbered. But a tag with no version row is an
+                        # NOT fatal -- the merge has happened and the tag is
+                        # cut, so the publication is real whether or not it was
+                        # numbered. But a tag with no version row is an
                         # inconsistency somebody has to explain later, so it is
-                        # carried onto the run record rather than living only
-                        # in a task log. Observed once, for real: the allocator
-                        # used SELECT ... FOR UPDATE over an aggregate, which
-                        # Postgres refuses, and nothing found out until the
-                        # first reporting build published.
+                        # carried onto the run record. Observed once: the
+                        # allocator used SELECT ... FOR UPDATE over an
+                        # aggregate, which Postgres refuses, and nothing found
+                        # out until the first reporting build published.
                         detail = f"{type(exc).__name__}: {exc}"
                         log.error("could not allocate a version for %s %s: %s",
                                   report, as_at, detail)

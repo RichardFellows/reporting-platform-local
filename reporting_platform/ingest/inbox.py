@@ -1,66 +1,52 @@
 """Watch a host folder and ingest whatever is dropped into it.
 
 Drop `TRADE_20260901.csv` into `inbox/` and it lands in
-`landing/fo_trade/TRADE_20260901.csv`, the ingest DAG runs, and the file moves to
-`inbox/.processed/trade/`. No console, no MinIO UI, no CLI.
-
-That is what the upstream will actually do: write a file to a directory. The
-console's upload button (docs/FEED-UI.md) is for a person with a file in their
-hand; this is for the twenty files that arrive overnight.
+`landing/fo_trade/TRADE_20260901.csv`, the ingest DAG runs, and the file moves
+to `inbox/.processed/trade/`. That is what an upstream actually does: write a
+file to a directory. The console's upload button is for a person with a file
+in their hand; this is for the twenty that arrive overnight.
 
 POLLED, NOT inotify, AND THAT IS DELIBERATE. Filesystem events do not cross a
 Docker Desktop bind mount on Windows or macOS -- the host writes the file, the
-container is never told, and a watcher built on `watchdog`/inotify sits there
-reporting itself healthy while nothing happens.
-See docs/DECISIONS.md#inbox-is-polled. Polling costs a directory
-listing every few seconds and works the same on every host, which for a folder
-that receives a handful of files a day is the right trade.
+container is never told, and a watcher built on inotify sits there reporting
+itself healthy while nothing happens.
+See docs/DECISIONS.md#inbox-is-polled.
 
-FOUR THINGS IT DOES THAT A NAIVE LOOP WOULD NOT, each of which is the
-difference between a watcher you can leave running and one you cannot:
+FOUR THINGS IT DOES THAT A NAIVE LOOP WOULD NOT:
 
-**It waits for the file to stop changing.** A file appears in a directory the
-moment it is created, not when it is finished. Uploading a half-written CSV
-gives you a short file that ingests cleanly -- `expected_min_rows` is the only
-thing between that and a silently truncated delivery. A file is considered
-ready when its size and mtime are unchanged across two consecutive polls.
+**It waits for the file to stop changing.** A file appears when it is created,
+not when it is finished; a half-written CSV ingests cleanly and
+`expected_min_rows` is the only thing between that and a silent truncation.
+Ready means size and mtime unchanged across two consecutive polls.
 
 **It routes by the feeds' own filename patterns**, so no configuration here
-repeats what `feeds.yml` already says. A file matching no feed is moved to
-`.rejected/` rather than left in place, because a file that stays put is one
-the watcher retries forever, logging on every pass.
+repeats `feeds.yml`. A file matching no feed moves to `.rejected/` rather than
+being left for the watcher to retry forever.
 
-**A file matching MORE than one feed is rejected, not guessed.** Two feeds with
-overlapping patterns is a configuration error, and picking one arbitrarily
-would put a delivery in the wrong raw table -- which looks like data, not like
-an error.
+**A file matching MORE than one feed is rejected, not guessed.** Overlapping
+patterns are a configuration error, and picking one arbitrarily would put a
+delivery in the wrong raw table -- which looks like data, not an error.
 
-**It moves the file before triggering.** If the trigger fails, the file is
+**It moves the file before triggering.** If the trigger fails the file is
 already out of the way and recorded as landed, so the next pass does not
-re-upload it as a new `_file_version`. The DAG can be retriggered by hand; a
-duplicate ingest is much harder to undo.
+re-upload it as a new `_file_version`. A duplicate ingest is much harder to
+undo than a retrigger.
 
-AND IT IS THE CONFORMANCE GATE. `landing/` has a contract -- every object in
-it is correctly named and classified -- and a legacy upstream that sends
-`positions.csv` with the date inside `positions.ctl` does not satisfy it. For
-a feed with an `arrival:` block this watcher waits for the control file,
-verifies what it declares (row count, md5), derives the COB date, and
-promotes the delivery under the name `filename_pattern` describes, with a
-`.meta.json` sibling recording what actually arrived. A feed with no
-`arrival:` block is a conformant upstream: its file is uploaded under its own
-name, exactly as before.
+AND IT IS THE CONFORMANCE GATE. For a feed with an `arrival:` block this
+watcher waits for the control file, verifies what it declares, derives the COB
+date, and promotes the delivery under the name `filename_pattern` describes,
+with a `.meta.json` sibling. A feed with no `arrival:` block is a conformant
+upstream and its file is uploaded under its own name.
 
 **An unchanged file sent twice lands nothing.** The gate compares the bytes
-against what is already landed for that COB date and reports `duplicate`
--- nothing uploaded, nothing triggered, the inbox copy moved to
-`.processed/`. A conformant upstream gets this free by writing the same key
-twice; the gate had to be taught it, because its rename would otherwise turn
-the second copy into `_v2` and the raw table into a restatement that never
-happened. See `conform.DuplicateDelivery`.
+against what is already landed for that COB date and reports `duplicate`. A
+conformant upstream gets this free by writing the same key twice; the gate had
+to be taught it, because its rename would otherwise turn the second copy into
+`_v2` and the raw table into a restatement that never happened.
 
-That gate is why the two names in play are different strings and must stay
-so. `positions.csv` is what the upstream sends; `trs_position_20260801.csv`
-is what landing holds. `Feed.claims_source` answers the first,
+That gate is why the two names in play are different strings and must stay so:
+`positions.csv` is what the upstream sends, `trs_position_20260801.csv` is
+what landing holds. `Feed.claims_source` answers the first,
 `Feed.parse_filename` the second, and `ingest/conform.py` is the only thing
 that crosses between them.
 See docs/DECISIONS.md#the-inbox-is-the-conformance-gate.
@@ -338,11 +324,9 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
 
         # A LEGACY CONTROL FILE IS NOT PROMOTED ON ITS OWN. It is consumed at
         # the door as part of its data file's delivery, so it is left in place
-        # here and picked up when that data file is processed -- which may be
-        # this same pass (the loop is sorted, and `.csv` sorts before `.ctl`
-        # for the usual naming, so it is usually the NEXT pass) or a later one
-        # if the data file has not arrived yet. Its own arrival is what
-        # unblocks a data file that was waiting.
+        # here and picked up when that data file is processed -- usually the
+        # next pass, or a later one if the data file has not arrived yet. Its
+        # own arrival is what unblocks a data file that was waiting.
         #
         # A CONFORMANT feed's control file is different: it belongs in landing,
         # where `delivery.control` gates the delivery, so it falls through to
@@ -457,10 +441,10 @@ def _promote(feed: Feed, path: Path,
         return None
     except conform.DuplicateDelivery as exc:
         # NOT a rejection. The delivery is already landed and already
-        # ingested; there is nothing to write and nothing to trigger. The
-        # inbox copy still moves to `.processed/`, where `_move` timestamps a
-        # colliding name, so the resend itself remains on disk as evidence it
-        # happened -- it is simply not evidence of a new delivery.
+        # ingested; there is nothing to write and nothing to trigger. The inbox
+        # copy still moves to `.processed/`, where `_move` timestamps a
+        # colliding name, so the resend stays on disk as evidence it happened
+        # -- it is simply not evidence of a new delivery.
         log.info("%s", exc)
         _move(path, PROCESSED, feed.name)
         if control_path is not None and control_path.exists():
@@ -471,10 +455,10 @@ def _promote(feed: Feed, path: Path,
                 "landed_as": exc.landing_filename, "reason": str(exc)}
     except conform.ConformanceError as exc:
         # AN IDENTITY FAILURE, and the only kind that can happen here. The
-        # delivery cannot be NAMED -- no COB date, or a pattern no
-        # concrete filename can be built from -- so there is no landing key to
-        # write it to and no amount of waiting fixes it. Content failures are
-        # not checked here at all: they land and the ingest refuses.
+        # delivery cannot be NAMED -- no COB date, or a pattern no concrete
+        # filename can be built from -- so there is no landing key to write it
+        # to and no amount of waiting fixes it. Content failures are not
+        # checked here at all: they land and the ingest refuses.
         log.warning("rejecting %s: %s", path.name, exc)
         _quarantine(feed, path, "identity", str(exc))
         _move(path, REJECTED)
@@ -586,8 +570,8 @@ def _promote_archive(feed: Feed, path: Path,
             # THE MEMBER'S OWN BYTES, not the container's. The container is
             # never landed -- the members are the deliveries -- so quarantining
             # the zip would keep the nineteen good members alongside the one
-            # bad one and make the evidence harder to read, not easier. The
-            # container is named in the reason instead.
+            # bad one and make the evidence harder to read. The container is
+            # named in the reason instead.
             from reporting_platform.registry.rejections import quarantine_quietly
             quarantine_quietly(
                 feed, f"{path.name}!{member_name}", member_bytes,

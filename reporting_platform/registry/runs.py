@@ -2,32 +2,27 @@
 
 THIS IS THE PART OF THE REGISTRY THAT CANNOT BE REBUILT. `deliveries.py` is an
 index over objects that exist in storage, so `reconcile()` can reconstruct
-every row of it from `landing/`. Nothing in this module can be reconstructed
-from anything: that a build ran at 03:14, from that commit of the code, merged
-that hash and published version 3 of a report is an EVENT, and the only record
-of it is the one written while it happened. `registry/db.py`'s header says what
-follows from that -- no foreign key from `run_input` to `delivery`, and a
-mutable status on a run where a delivery may not have one.
+every row of it. Nothing in this module can be reconstructed from anything:
+that a build ran at 03:14, from that commit, merged that hash and published
+version 3 of a report is an EVENT, and the only record of it is the one written
+while it happened. `registry/db.py`'s header says what follows -- no foreign
+key from `run_input` to `delivery`, and a mutable status on a run where a
+delivery may not have one.
 
-THE INPUT SET IS DERIVED, NOT DECLARED. A run does not say which deliveries
-are behind it; it is asked, after it has built them, by selecting the distinct
+THE INPUT SET IS DERIVED, NOT DECLARED. A run does not say which deliveries are
+behind it; it is asked, after it has built them, by selecting the distinct
 `delivery_id` out of the prepared models on its own branch. Precisely: the
-deliveries whose rows are PRESENT in what it published, which for an SCD2
-model is narrower than the deliveries it scanned -- see
-`registry/inputs.py`. That column is
-`delivery_ref()` -- `_delivery_id` where the row has one, the basename of
-`_source_file` where it predates provenance -- so the answer reaches back past
-the provenance change rather than stopping at it. A declared input set would be
-a second statement of something the rows already carry, and the two would
-disagree the first time a model changed which sources it reads.
+deliveries whose rows are PRESENT in what it published, which for an SCD2 model
+is narrower than what it scanned -- see `registry/inputs.py`. That column is
+`delivery_ref()`, so the answer reaches back past the provenance change rather
+than stopping at it. A declared input set would be a second statement of
+something the rows already carry.
 
 WHY THE PREPARED LAYER AND NOT THE REPORTING ONE. Both would answer, but only
 prepared knows WHICH FEED a delivery belongs to: a prepared model is one feed
-by the platform's naming rule (model filename == table name == feed name, see
-docs/DECISIONS.md#table-naming-no-layer-prefix), where a reporting model joins
-several and keeps no column saying which delivery came from where. The
-reporting layer's input set is its prepared tables' input set, so asking
-prepared is both exact and more informative.
+by the platform's naming rule, where a reporting model joins several and keeps
+no column saying which delivery came from where. The reporting layer's input
+set is its prepared tables' input set.
 """
 from __future__ import annotations
 
@@ -156,25 +151,20 @@ def allocate_version(report: str, as_at_date: date, run_id: str,
 
     ALLOCATED UNDER A TRANSACTION-SCOPED ADVISORY LOCK, so two publications of
     the same report and date cannot both read the same maximum and both write
-    it. That read-then-write is what `sequence_no` avoided by being a
-    BIGSERIAL, and a plain sequence will not do here because the number
-    restarts per (report, as-at date) rather than running globally.
+    it. A plain sequence will not do, because the number restarts per (report,
+    as-at date) rather than running globally.
 
-    IT WAS `SELECT MAX(...) ... FOR UPDATE`, WHICH POSTGRES REFUSES:
-
-        FeatureNotSupported: FOR UPDATE is not allowed with aggregate functions
-
-    -- and the refusal only appeared when a publication actually reached this
-    code, which is the first time a reporting build published. The row lock
-    was the wrong instrument anyway: there is no row to lock until the first
-    version of a report exists, so it could not have serialised the case that
-    matters. `pg_advisory_xact_lock` locks the (report, date) PAIR whether or
-    not a row exists yet, and is released when the transaction ends however it
-    ends. The primary key stays as the backstop.
+    IT WAS `SELECT MAX(...) ... FOR UPDATE`, WHICH POSTGRES REFUSES with
+    "FOR UPDATE is not allowed with aggregate functions" -- and the refusal
+    only appeared when a publication actually reached this code, on the first
+    reporting build that published. The row lock was the wrong instrument
+    anyway: there is no row to lock until the first version exists, so it could
+    not have serialised the case that matters. `pg_advisory_xact_lock` locks
+    the (report, date) PAIR whether or not a row exists yet. The primary key
+    stays as the backstop.
 
     Idempotent on the TAG: republishing the same tag returns the version it
-    already has rather than minting a second one, because a retried publish
-    task is the same publication.
+    already has, because a retried publish task is the same publication.
     """
     with db.connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT version_no FROM registry.report_version WHERE tag = %s",

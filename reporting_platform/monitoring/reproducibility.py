@@ -1,73 +1,56 @@
 """Can a published run still be reproduced? REQ-702.
 
 WHY A TEST AND NOT A COMMENT. Everything that makes a published run
-reproducible is a *pin* — `record_publication` cuts
-`published/<report>/<cob_date>/<run_id>` against main, and retention keeps
-that tag for `references.published_tags`. Nothing about that arrangement
-announces its own failure. A tag deleted too early, a GC cutoff that collected
-a file the tag still referenced, a maintenance step that rewrote data and then
-expired the snapshot the tag pointed at: every one of those leaves a catalog
-that looks healthy and a pin that no longer resolves, and the first person to
-find out is whoever was asked to reproduce a figure from three years ago.
+reproducible is a *pin* -- `record_publication` cuts
+`published/<report>/<cob_date>/<run_id>`, and retention keeps that tag for
+`references.published_tags`. Nothing about that announces its own failure. A
+tag deleted too early, a GC cutoff that collected a file the tag referenced, a
+maintenance step that expired the snapshot it pointed at: each leaves a catalog
+that looks healthy and a pin that no longer resolves, and the first to find out
+is whoever was asked to reproduce a figure from three years ago.
 
-So the pin is EXERCISED, on a schedule, against the real catalog: the
-reference is resolved, the metadata the commit pointed at is opened, and every
-data file that metadata names is confirmed to still be an object. Both halves
-are needed and `check_tag` says why -- a `SELECT COUNT(*)` at the tag is
-answered out of Iceberg's own manifests and returns the published number
-happily from a table whose parquet files have been deleted, which is measured
-there rather than assumed here.
+So the pin is EXERCISED against the real catalog: the reference is resolved,
+the metadata opened, and every data file it names confirmed to still be an
+object. Both halves are needed -- a `SELECT COUNT(*)` at the tag is answered
+out of Iceberg's own manifests and returns the published number happily from a
+table whose parquet files have been deleted. `check_tag` measures that.
 
-WHICH PIN IS WORTH READING, AND WHY IT IS NOT AN AGE. A tag whose files are
-the ones `main` is still using would resolve even if pinning did not work at
-all: every file it names is kept alive by `main`, so nothing about the read is
-evidence. What makes the read mean something is the pin holding at least one
-data file `main` no longer references — a file nothing but the tag keeps alive,
-and therefore a file a too-eager collector would take.
+WHICH PIN IS WORTH READING, AND WHY IT IS NOT AN AGE. A tag whose files are the
+ones `main` still uses would resolve even if pinning did not work at all. What
+makes the read mean something is the pin holding at least one data file `main`
+no longer references -- a file a too-eager collector would take.
 
-This used to be approximated by AGE, on the stated grounds that "`maintain.py`
-compacts partitions older than `recent_partition_days`, which rewrites their
-data files". That is backwards in two ways, and the second is the one that
-bites. `compact()` scopes its rewrite to `date_column >= today −
-recent_partition_days`, so it only ever touches the RECENT partitions and a pin
-ages OUT of the compaction window rather than into it. And compaction is not
-even the mechanism that produces the divergence here: expiring a COB date
-is a metadata-level partition delete, so `main` stops referencing that date's
-files while every pin goes on referencing them. On a catalog whose newest
-COB date is older than the compaction window — which is every catalog
-between deliveries — the age gate opens on a fixed date and reports GREEN on
-a pin that is still byte-identical to `main`. That is the meaningless green the
-gate was written to prevent, arriving on a timer.
+This used to be approximated by AGE, on the grounds that compaction rewrites
+old partitions. That is backwards twice over. `compact()` scopes its rewrite to
+the RECENT partitions, so a pin ages OUT of the window rather than into it. And
+compaction is not the mechanism that produces the divergence: expiring a COB
+date is a metadata-level partition delete, so `main` stops referencing that
+date's files while every pin goes on referencing them. On a catalog whose
+newest COB date is older than the compaction window -- every catalog between
+deliveries -- the age gate opened on a fixed date and reported GREEN on a pin
+still byte-identical to `main`.
 
-So the question is asked directly instead: `divergence_scan()` compares each
-pin's current-snapshot data-file set against `main`'s and selects the oldest
-pin that holds a file `main` has dropped. Below that, the report is
-`not_yet_meaningful` rather than a pass, because a green there is worse than
-no result.
+So the question is asked directly: `divergence_scan()` compares each pin's
+data-file set against `main`'s and selects the oldest pin holding a file `main`
+has dropped. Below that the report is `not_yet_meaningful` rather than a pass,
+because a green there is worse than no result.
 
-WHAT IT COSTS, MEASURED. One Spark session addresses every reference: Nessie's
-Iceberg catalog accepts `catalog.namespace.`table@ref`.files`, so the scan is
-NOT a session per pin. Against the live stack, 11 managed tables: 6.9s for
-`main`'s baseline, then ~1.0s per pin, all inside one session. The scan stops
-at the first pin that diverges and is capped at `MAX_PINS_SCANNED` distinct
-commits, so the cost is bounded by the cap and not by how many reports have
-ever been published. `check_tag` still opens its own session at the tag rather
-than reading `table@tag` from the scan's session — it costs a second JVM start
-a night, and it buys the check exercising the same resolution path a human
-reproduction uses, which is the thing REQ-702 actually claims.
+WHAT IT COSTS, MEASURED. One Spark session addresses every reference --
+Nessie's catalog accepts `catalog.namespace.`table@ref`.files`, so this is NOT
+a session per pin. Against the live stack, 11 managed tables: 6.9s for `main`'s
+baseline, then ~1.0s per pin. The scan stops at the first divergent pin and is
+capped at `MAX_PINS_SCANNED`. `check_tag` still opens its own session at the
+tag, which buys it exercising the same resolution path a human reproduction
+uses.
 
-WHAT THIS CANNOT TELL YOU. That the numbers are the same as those published —
-it asserts the tables are READABLE at the pin and reports their row counts, not
-that they match a report nobody has recorded yet. Comparing against what was
-actually published needs the run record: which deliveries, which code, which
-report version. Until that exists this is a liveness check on the pin, which is
-the failure mode that actually occurs and the one that is silent.
+WHAT THIS CANNOT TELL YOU: that the numbers match those published. It asserts
+the tables are READABLE at the pin and reports row counts. Comparing against
+what was published needs the run record.
 
-Nor does a capped `not_yet_meaningful` mean NO pin diverges. It means none of
-the `pins_scanned` oldest ones does. A newer pin can diverge while an older one
-does not — compaction rewrites recent partitions, which only a recent pin
-references — so the scan is bounded in the direction of missing a young pin,
-never of passing an old one. The report names how many it looked at.
+Nor does a capped `not_yet_meaningful` mean NO pin diverges -- only that none
+of the `pins_scanned` oldest ones does. A newer pin can diverge while an older
+one does not, so the scan is bounded in the direction of missing a young pin,
+never of passing an old one.
 """
 from __future__ import annotations
 
@@ -83,13 +66,12 @@ from reporting_platform.common.context import (
 
 log = logging.getLogger("reproducibility")
 
-# How many DISTINCT pin commits the divergence scan will look at before giving
-# up and reporting `not_yet_meaningful`. A bound is needed because the tag
-# count grows without limit -- one per report per published COB date --
-# while the scan is oldest-first and stops at its first hit, so on any catalog
-# where retention has actually run it stops at 1. The cap only bites on a
-# catalog that has never removed a file, which is precisely the state in which
-# there is nothing meaningful to read anyway.
+# How many DISTINCT pin commits the divergence scan looks at before giving up
+# and reporting `not_yet_meaningful`. Bounded because the tag count grows
+# without limit -- one per report per published COB date -- while the scan is
+# oldest-first and stops at its first hit, so wherever retention has run it
+# stops at 1. The cap only bites on a catalog that has never removed a file,
+# which is precisely where there is nothing meaningful to read anyway.
 MAX_PINS_SCANNED = 25
 
 

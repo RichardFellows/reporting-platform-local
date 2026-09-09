@@ -1,52 +1,43 @@
 """The as-at date lifecycle: what may still be published, and on whose say-so.
 
-REQ-500..503. One state machine per (report, as-at date), and it is keyed on
-exactly that pair because that is what a version number is keyed on
-(`registry.report_version`, decision 5). A lifecycle keyed on the run would
-move when an unrelated report was rebuilt; one keyed on a submission family
-would move when a sibling was restated. The same argument, one layer up.
+REQ-500..503. One state machine per (report, as-at date), keyed on exactly that
+pair because that is what a version number is keyed on. A lifecycle keyed on
+the run would move when an unrelated report was rebuilt; one keyed on a
+submission family would move when a sibling was restated.
 
 THE REPORT IS A dbt EXPOSURE, derived by `context.reports()` -- not a new list
-of reports that would disagree with that one the first time a model moved. So
-is the restatement policy (`meta: restatement:`) and so is the owner
-(`owner: name:`), which means the lifecycle adds NO new registry of reports.
+that would disagree with that one the first time a model moved. So is the
+restatement policy (`meta: restatement:`) and the owner (`owner: name:`), so
+the lifecycle adds NO new registry of reports.
 
-  open       no row. An as-at date nobody has locked, which is the ordinary
-             state and the one that costs nothing to be in.
+  open       no row. An as-at date nobody has locked -- the ordinary state.
   locked     closed to routine republication. A publish whose input set for
              that date has MOVED is refused; one that has not is allowed, so
              an unrelated rebuild of a locked date is not an incident.
   submitted  a version was sent somewhere. Everything `locked` means, plus a
-             stronger reopening requirement. Written by `record_submission`,
-             so submitting is not a second thing to remember.
+             stronger reopening requirement. Written by `record_submission`.
   reopened   somebody deliberately reopened it. The next publish is allowed
              and takes the next version number.
 
-WHAT THIS PLATFORM CAN AND CANNOT ENFORCE, stated rather than implied. There
-is no identity provider here: nothing can verify that the person who typed
-`--actor jane` is Jane, and a module claiming to enforce authority would be
-theatre of exactly the kind this repo keeps regretting. What it CAN do:
+WHAT THIS PLATFORM CAN AND CANNOT ENFORCE. There is no identity provider here:
+nothing can verify that whoever typed `--actor jane` is Jane, and a module
+claiming to enforce authority would be theatre. What it CAN do:
 
   * refuse any transition that does not name an ACTOR and a REASON, so the
     record is never "somebody unlocked this at some point";
   * require, when reopening a SUBMITTED date, an `approved_by` matching the
-    report's declared owner -- and that is a real check, because the owner
-    comes from the exposure and cannot be supplied by the person reopening.
+    report's declared owner -- a real check, because the owner comes from the
+    exposure and cannot be supplied by the person reopening.
 
-That is open decision 3, settled: authority is RECORDED and checked against
-the project's own declaration, not enforced against an identity the platform
-does not have. It is deliberately settled alongside REQ-501's named owner,
-because both answer "who is told, and who may act", and `report_owner()` is
-the single derivation behind both.
+Authority is RECORDED and checked against the project's own declaration, not
+enforced against an identity the platform does not have.
 
 WHERE THE GATE RUNS, and it is not where it looks like it should. The publish
 task merges the audited branch into `main` and only THEN cuts tags and
-allocates versions. A lifecycle check sitting with the versioning would fire
-after `main` had already moved -- the publication would have happened and the
-refusal would be a complaint about it. So `check_publishable()` is called
-between reading the input set (which is where the as-at date first becomes
-known) and the merge. A refusal there fails the task with `main` untouched and
-the branch retained, which is write-audit-publish doing precisely its job.
+allocates versions, so a check sitting with the versioning would fire after
+`main` had moved. `check_publishable()` is called between reading the input set
+(where the as-at date first becomes known) and the merge. A refusal there fails
+the task with `main` untouched and the branch retained.
 """
 from __future__ import annotations
 
@@ -239,34 +230,30 @@ def inputs_changed(report: str, as_at_date: date,
     """Whether `candidate` differs from the input set of the version in force.
 
     THE COMPARISON IS RESTRICTED TO DELIVERIES FOR THIS AS-AT DATE. A run's
-    input set spans every COB date its tables hold, so comparing the sets
-    whole would report a change on every ordinary daily build -- the newest
-    date's deliveries are new by definition. What the lifecycle asks is
-    narrower and is the question REQ-502 actually poses: has what we published
+    input set spans every COB date its tables hold, so comparing the sets whole
+    would report a change on every ordinary daily build. What the lifecycle
+    asks is narrower and is the question REQ-502 poses: has what we published
     FOR THIS DATE moved?
 
-    The COB date comes from `registry.delivery`, joined without a foreign
-    key (see registry/db.py) -- so a delivery the registry has never seen is
+    The COB date comes from `registry.delivery`, joined without a foreign key
+    (see registry/db.py) -- so a delivery the registry has never seen is
     reported as `unregistered` rather than silently dropped from both sides,
     where it would look like agreement.
 
     `unregistered` MEANS UNKNOWN TO THE REGISTRY, NOT "FOR ANOTHER DATE", and
     the difference is most of the input set. A run's inputs are what it
     PUBLISHED: `ref_counterparty` is SCD2, so one reporting build reads ten of
-    its forty deliveries and thirty-odd deliveries for other COB dates are
-    in `candidate` perfectly legitimately. Verified on this stack against a
-    real 126-delivery input set, where 85 of the 126 are for other dates -- an
-    earlier version of this function called all 85 `unregistered`, which is a
-    diagnostic that would send somebody to look for a registry gap that is not
-    there. They are counted as `off_date` instead, which is context rather than
-    a finding. See registry/inputs.py for why the input set is shaped this way.
+    its forty deliveries and thirty-odd for other COB dates are in `candidate`
+    perfectly legitimately. Verified against a real 126-delivery input set
+    where 85 are for other dates -- an earlier version called all 85
+    `unregistered`, sending somebody to look for a registry gap that is not
+    there. They are counted as `off_date` instead.
 
-    AN `unregistered` DELIVERY DOES NOT FLIP `changed`, and that is a choice.
-    It cannot be attributed to a COB date, so it cannot be said to have
-    moved this date's input set; blocking a publication on it would refuse
-    exactly when the registry is behind, which is the moment it is least
-    useful to. It is reported instead, and `deliveries.reconcile()` is what
-    resolves it.
+    AN `unregistered` DELIVERY DOES NOT FLIP `changed`. It cannot be attributed
+    to a COB date, so it cannot be said to have moved this date's input set;
+    blocking a publication on it would refuse exactly when the registry is
+    behind, which is when it is least useful. It is reported instead, and
+    `deliveries.reconcile()` is what resolves it.
 
     Returns `{"changed": bool, ...}` with the sets, so a refusal can say what
     moved rather than that something did.

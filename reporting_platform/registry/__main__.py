@@ -60,8 +60,8 @@ def main(argv=None) -> int:
     sub.add_parser("schema", help="create the registry schema if absent")
 
     # FOR THE DEPLOYMENT PIPELINE as much as for an operator. The pipeline
-    # bakes `dbt_project_digest` into the deployment as DBT_PROJECT_DIGEST, and
-    # every run recomputes it and compares -- so the two sides have to be ONE
+    # bakes `dbt_project_digest` in as DBT_PROJECT_DIGEST and every run
+    # recomputes and compares it, so the two sides have to be ONE
     # implementation. Printing it here rather than documenting the algorithm is
     # what keeps them from being two that agree until one is changed.
     sub.add_parser("provenance",
@@ -172,11 +172,10 @@ def main(argv=None) -> int:
             # message names what to do next, and a stack trace would bury it.
             #
             # ValueError is here because the most likely refusal of all is a
-            # MISTYPED REPORT NAME, and that one comes from `context.report()`
-            # rather than from the state machine -- verified live, where it
-            # printed forty lines of traceback ending in a message that
-            # already listed the two valid names. The refusals are the same
-            # kind of thing whichever layer noticed.
+            # MISTYPED REPORT NAME, which comes from `context.report()` rather
+            # than the state machine -- verified live, where it printed forty
+            # lines of traceback ending in a message that already listed the
+            # two valid names.
             print(str(exc), file=sys.stderr)
             return 2
         print(json.dumps(out, indent=2, default=str))
