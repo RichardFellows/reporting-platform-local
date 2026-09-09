@@ -358,6 +358,74 @@ def coverage(feed: Feed) -> dict[str, Any]:
             "manifest_expired": len(rows - manifests)}
 
 
+# ------------------------------------------------------------------ reading
+# THE ARRIVALS READS. What `deliveries_on` and `deliveries_by_id` are for a
+# date and for a run's input set, these are for "what has arrived lately" --
+# the question the feed console's arrivals view asks. They live here rather
+# than in the console because a read of the registry is the registry's shape
+# to state, and a SELECT written in `ui/` would be the second place that knows
+# what a delivery row holds.
+_ARRIVAL_COLUMNS = (
+    "feed, delivery_id, sequence_no, source_system, cob_date, received_at, "
+    "first_seen_at, source_object, manifest_key, normalizer, bytes, md5, "
+    "schema_version, origin, origin_uri, source_filename, source_container, "
+    "control_object, declared_row_count, declared_md5, producer_run_id")
+
+
+def recent(limit: int = 50, feed: str | None = None) -> list[dict[str, Any]]:
+    """The most recent deliveries, newest first, with their part count.
+
+    ORDERED BY `received_at`, NOT `first_seen_at`. The delivery's own arrival
+    time is what "recent" means to somebody asking what has arrived; the
+    registry's clock is when it got round to writing the row, so a reconcile
+    back-filling a year of history in one pass would order that year by the
+    minute it ran and put 2019 at the top. `sequence_no` breaks the tie, which
+    for two deliveries with the same LastModified is registration order.
+
+    The part count comes back rather than the parts: a list of 200 deliveries
+    that each carried their members would be mostly archive members, and the
+    one caller that wants them (`by_id`) is looking at one delivery.
+    """
+    sql = (f"SELECT {_ARRIVAL_COLUMNS}, "
+           "  (SELECT count(*) FROM registry.delivery_part p "
+           "    WHERE p.feed = d.feed AND p.delivery_id = d.delivery_id) "
+           "  AS parts "
+           "FROM registry.delivery d")
+    args: list[Any] = []
+    if feed:
+        sql += " WHERE feed = %s"
+        args.append(feed)
+    sql += " ORDER BY received_at DESC, sequence_no DESC LIMIT %s"
+    args.append(limit)
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def by_id(feed: str, delivery_id: str) -> dict[str, Any] | None:
+    """One delivery and the objects that hold its rows, or None.
+
+    The parts are the join back to raw: `_source_file` is the PART's key, so
+    this is what turns a row in the raw table into the delivery it arrived in.
+    """
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {_ARRIVAL_COLUMNS} FROM registry.delivery "
+                    "WHERE feed = %s AND delivery_id = %s",
+                    (feed, delivery_id))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        out = dict(zip([c[0] for c in cur.description], row))
+        cur.execute("SELECT part_no, object_key, bytes "
+                    "FROM registry.delivery_part "
+                    "WHERE feed = %s AND delivery_id = %s ORDER BY part_no",
+                    (feed, delivery_id))
+        out["parts"] = [{"part_no": r[0], "object_key": r[1], "bytes": r[2]}
+                        for r in cur.fetchall()]
+    return out
+
+
 def deliveries_on(cob_date: date, feed: str | None = None
                   ) -> list[dict[str, Any]]:
     """Every registered delivery for one COB date. Used by REQ-602."""

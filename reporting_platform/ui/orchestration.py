@@ -131,8 +131,41 @@ def recent_runs(dag_id: str, limit: int = 5) -> list[dict[str, Any]]:
         raise
     return [{"run_id": r["dag_run_id"], "state": r["state"],
              "start_date": r.get("start_date"), "end_date": r.get("end_date"),
-             "run_type": r.get("run_type")}
+             "run_type": r.get("run_type"),
+             # WHAT THE RUN WAS TOLD TO INGEST, and the note saying who told
+             # it. `run_type` is `manual` for everything here -- the inbox
+             # watcher, this console and a hand-typed `dags trigger` are all
+             # API triggers -- so the conf and the note are the only things
+             # that distinguish them. `arrivals._ingested_key` is what reads
+             # the conf; the note is shown as-is.
+             "conf": r.get("conf") or {},
+             "note": r.get("note")}
             for r in body.get("dag_runs", [])]
+
+
+def xcom(dag_id: str, run_id: str, task_id: str,
+         key: str = "return_value") -> Any:
+    """One task's XCom value, as Airflow's API renders it.
+
+    RETURNED AS A PYTHON REPR, NOT AS JSON, and the caller has to deal with
+    that: Airflow 2.10 serialises the value with `str()` unless the deploy
+    opts into `AIRFLOW__API__ENABLE_XCOM_DESERIALIZE_SUPPORT`, which loads
+    arbitrary pickled objects into the webserver and is off here for good
+    reason. So `{'object_key': 'landing/...'}` comes back as that string,
+    quotes and all. See `arrivals._ingested_key`, which parses it with
+    `literal_eval`.
+
+    A task that has not run, or was skipped, has no XCom entry: 404 is the
+    ordinary case and comes back as None rather than as an error.
+    """
+    try:
+        body = _req("GET", f"/dags/{dag_id}/dagRuns/{run_id}"
+                           f"/taskInstances/{task_id}/xcomEntries/{key}")
+    except AirflowError as exc:
+        if "404" in str(exc):
+            return None
+        raise
+    return body.get("value")
 
 
 def stale_non_terminal(dag_id: str) -> list[str]:

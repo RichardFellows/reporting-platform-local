@@ -212,7 +212,15 @@ The procedures are `docs/ADDING-A-FEED.md` (five files, no DAG edit),
   re-guesses from the column name and a `decimal` gets a string `safe_cast`
   silently nulls.
 - **The feed console (`reporting_platform/ui`, <http://localhost:8082>) writes
-  those five files from a form** and drives land → ingest → build. It is a
+  those five files from a form** and drives land → ingest → build. Its
+  **Arrivals** page (`ui/arrivals.py`) is the one view that is neither: what
+  became of every file offered, joined per request from `registry.delivery`,
+  `registry.rejection`, `inbox.route()` and Airflow, and **written nowhere** —
+  an arrivals table would hold verdicts the platform derives and could not be
+  rebuilt. A declared **md5** is comparable there (same bytes ingest hashes);
+  a declared **row_count** is not, and says `at_ingest`. `no run recorded`
+  means Airflow trimmed its history, never "not ingested".
+  (`#the-arrivals-view-is-a-join-not-a-record`) It is a
   front end for that procedure, not a second source of truth: the change is an
   ordinary reviewable diff, checked with `dbt parse` (~5s, no Spark). Its
   one-feed build **never merges**, on purpose — publication belongs to the
@@ -490,6 +498,10 @@ docker compose exec -T inbox python -m reporting_platform.ingest.inbox --dry-run
 
 # feed console -- add/edit a feed, land it, ingest it, watch the builds
 docker compose up -d feed-ui     # http://localhost:8082
+# what became of every file offered: classification, declared checks, the
+# ingest run. A join, written nowhere -- no stack state to reset.
+curl -s 'http://localhost:8082/api/arrivals?limit=20'
+curl -s http://localhost:8082/api/inbox     # what is at the door, and how it routes
 
 # read-only query console against published `main`
 docker compose exec -T airflow python -m scripts.duckdb_console --tables

@@ -4235,3 +4235,124 @@ migrated one converge.
 - A retry under a newer deployment **overwrites** the deployment fields — the
   version that produced the publication is the one recorded — while the
   per-run `change_ref` is preserved.
+
+
+## the-arrivals-view-is-a-join-not-a-record
+
+The feed console could see every stage of the platform except the first one. A
+file was dropped into `inbox/`, and the next thing anybody saw was either a raw
+table with more rows in it or nothing at all. Four questions — *did it arrive*,
+*was it recognised*, *did its control file agree with it*, *did an ingest
+start* — were four different places to look: the inbox container's log, a
+Postgres table, an object prefix and Airflow's UI. Only the first of them said
+anything at all about a file that never got past the door, and it said it in a
+log line that scrolls away.
+
+**The obvious implementation is a table, and it would have been the wrong
+one.** One row per arriving file, updated as it moves — classified, landed,
+checked, ingested — is what every load-control system in this problem space
+has, and `registry/db.py` already argues at length against exactly that shape:
+the delivery registry is an INDEX, not a ledger, it holds no verdicts, and it is
+rebuildable from object storage by the same code that writes it. An arrivals
+table would break both halves. It could not be rebuilt — "this file was
+classified as unroutable at 06:12" is an event, not an observation about stored
+bytes — and it would hold `ingested`/`checked` verdicts that the platform
+deliberately derives, from `_source_file` and from `dedupe_rank`. The first
+time it disagreed with the raw table, the raw table would be right and the
+console would be the thing people had been reading.
+
+So the view is a **join over what already records each leg**, computed per
+request and written nowhere:
+
+| leg | already recorded by |
+|---|---|
+| at the door, and what claims it | `inbox/` itself, through the gate's own `route()` |
+| refused, and which class of refusal | `registry.rejection` |
+| accepted, under what name, out of what | `registry.delivery` |
+| what its control file declared | `declared_row_count`, `declared_md5` on that row |
+| what ran next | Airflow, by the object key the run was told to ingest |
+
+Nothing new is derived; the console reads five things and puts them on one
+line. That is also why it degrades in pieces rather than as a whole: Airflow
+being down costs the last column and nothing else.
+
+### The two checks are different kinds of answer
+
+`delivery.control` declares two facts and the console can honestly answer only
+one of them.
+
+**The checksum is answerable.** `declared_md5` is what the control file said;
+`md5` on the same row is what the landed object hashes to, measured once when
+the delivery was registered. `ingest_feed._parts_md5` hashes the same bytes —
+every feed that can carry a `delivery.control` block is single-part by
+construction, since `kind: archive` is refused a control block at load — so
+comparing them is the same comparison ingest makes rather than an approximation
+of it. A multi-part delivery with a declared checksum reports `not_comparable`
+rather than a guess: the combination cannot arise today, and inventing an
+answer for it is how it would be wrong the day it does.
+
+**The row count is not.** Nothing counts rows without reading the file, and
+reading the file is a Spark job. So the declared number is shown with the
+verdict `at_ingest`, and the ingest run sits in the next column: a mismatch
+fails that task, so the run's state *is* the verdict.
+
+And neither is a claim that the check has been *made*. A delivery can sit in
+landing for days with a checksum that agrees perfectly and never be ingested.
+`ok` says the two recorded values match; the run beside it says whether
+anything acted on that.
+
+### `no run recorded` is not `not ingested`
+
+The one label on these pages that would be believed and wrong. Airflow trims
+its own run history and the registry does not, so the older half of any
+arrivals list will outlive the runs that ingested it — and whether the rows
+reached raw is derived from `_source_file`, which costs a Spark job to ask on a
+page that is redrawn on every refresh (the same reasoning that keeps
+`/api/feeds/<name>/state` Spark-free). The column reports the state of a RUN
+and says so. `no ingest DAG` is kept separate for the same reason: a feed
+removed from `feeds.yml` keeps every delivery it ever made, which is the point
+of an index over object storage, and reading that as "nothing ever ingested
+this" sends somebody looking for a lost run.
+
+### A run is matched by the key it was told to ingest
+
+One rule, read wherever it ended up. A run triggered by the inbox watcher or by
+the console carries the key in `dag_run.conf`, because both have it in hand; a
+run triggered with no conf resolves its own delivery and the key it chose is in
+`resolve_arrival`'s XCom. The cheap one is tried first and the second call is
+made only for the runs the first cannot answer. Airflow 2.10's XCom endpoint
+returns the value as a Python **repr**, not as JSON — `{'object_key': '…'}`,
+quotes and all — unless the deploy opts into
+`AIRFLOW__API__ENABLE_XCOM_DESERIALIZE_SUPPORT`, which loads arbitrary pickled
+objects into the webserver and is off here for good reason. So it is parsed
+with `literal_eval`, and anything that will not parse yields no key at all: a
+run that cannot be placed is shown as an ingest of the feed naming no delivery,
+which is exactly what is known about it. Attaching it to a delivery on a guess
+is how a page reports another delivery's failure as this one's.
+
+### `origin` records whether the GATE promoted it, not which door it came through
+
+The label that reads wrong until you know what it means. A conformant file
+dropped into `inbox/` is uploaded under its own name and needs no gate, so it
+is registered `direct` — identical to one an approved sender PUT straight into
+the bucket, because that is what `origin` is a statement about. The console
+therefore labels the two "renamed by the gate" and "own name" rather than
+"inbox" and "direct", and shows the pill only for the gated case: `direct` is
+every feed with no `arrival:` block, and a pill saying so on all fifty rows is
+fifty repetitions of the default dressed up as information.
+
+### Verified
+
+- A file dropped into `inbox/` landed, triggered `ingest_fo_trade`, and
+  appeared on the page with that run's state — matched by the `object_key` in
+  the conf the watcher set.
+- A file matching no pattern was quarantined, wrote a `registry.rejection` row
+  and appeared in the same list with class `unroutable` and `not triggered`.
+- The XCom endpoint's repr encoding was read off the running Airflow 2.10
+  before `_ingested_key` was written against it.
+- A gated delivery (two names), a checksum mismatch and a checksum match were
+  rendered from rows inserted into the registry for the purpose and removed
+  afterwards; the mismatch reads `md5 MISMATCH` and the counts agree with the
+  rows on screen.
+- `trs_position`, a feed no longer in `feeds.yml`, still lists its deliveries
+  and reports `no ingest DAG` rather than 404ing on the config.

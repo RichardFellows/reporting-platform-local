@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from reporting_platform.common.context import (CATALOG, conventions, feeds,
                                                retention_classes)
-from . import (dbt_check, feeddata, feedtest, jobs, orchestration,
+from . import (arrivals, dbt_check, feeddata, feedtest, jobs, orchestration,
                registry, sampledata, scaffold)
 from .registry import FeedSpec, FeedValidationError
 
@@ -646,6 +646,46 @@ def api_ingest(name: str, payload: dict | None = None):
             # forever, so the console shows it rather than leaving it to be
             # discovered.
             "runs_already_in_flight": stale}
+
+
+# ------------------------------------------------------------------ arrivals
+# What arrived, what the gate made of it and what ran next. Every one of these
+# is a read of something that already records it -- see ui/arrivals.py: the
+# console does not write an arrivals record and must not start.
+@app.get("/api/arrivals")
+def api_arrivals(limit: int = 50, feed: str | None = None):
+    """Accepted and refused arrivals in one list, newest first.
+
+    There is no flag for skipping the Airflow half. `with_runs` already
+    degrades to `available: false` per feed when the scheduler cannot be
+    asked, so a switch for it would be a setting nothing ever reads -- and the
+    registry half, which is the page's substance, renders either way.
+    """
+    if feed:
+        _feed_or_404(feed)
+    return arrivals.with_runs(max(1, min(int(limit), 500)), feed)
+
+
+@app.get("/api/arrivals/{feed}/{delivery_id}")
+def api_arrival(feed: str, delivery_id: str):
+    """One delivery: its identity, its parts, its checks and its ingest runs.
+
+    NOT `_feed_or_404` on the way in. The registry outlives `feeds.yml` -- a
+    feed removed from config keeps every delivery it ever made, which is the
+    point of an index over object storage -- and 404ing on the config would
+    hide exactly the history somebody is looking for.
+    """
+    row = arrivals.detail(feed, delivery_id)
+    if row is None:
+        raise HTTPException(404, f"no delivery {delivery_id} for feed {feed}")
+    return row
+
+
+@app.get("/api/inbox")
+def api_inbox():
+    """What is sitting in the inbox right now, classified by the gate's own
+    `route()`, plus what recently went through it."""
+    return arrivals.inbox_state()
 
 
 @app.post("/api/builds/{layer}")

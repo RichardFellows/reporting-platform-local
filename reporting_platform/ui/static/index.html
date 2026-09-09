@@ -106,6 +106,7 @@
 <main>
   <aside>
     <button class="newbtn" id="new-feed">+ New feed</button>
+    <button class="newbtn" id="arrivals-btn">Arrivals</button>
     <button class="newbtn" id="unclaimed-btn">Unclaimed deliveries</button>
     <div id="feed-list"></div>
   </aside>
@@ -214,6 +215,7 @@ function renderDetail(f) {
   for (const [key, label, render] of [
     ["details", "Details", paneDetails],
     ["data", "Data", paneData],
+    ["arrivals", "Arrivals", paneArrivals],
     ["run", "Run", paneRun],
   ]) {
     const btn = el("button", {class: STATE.tab === key ? "active" : "",
@@ -1201,6 +1203,458 @@ async function sniffUnclaimed(filename, btn) {
   });
 }
 
+// ------------------------------------------------------------------ arrivals
+// THE JOURNEY OF ONE FILE: inbox -> landing -> checks -> ingest run. Every
+// value here is read from something that already records that leg of it (the
+// delivery registry, the rejection registry, the inbox folder, Airflow) --
+// see reporting_platform/ui/arrivals.py. Nothing on these pages is written
+// anywhere, and nothing here decides anything.
+
+const ts = (iso) => (iso || "").replace("T", " ").slice(0, 19) || "—";
+const short = (s, n=44) => !s ? "" : s.length <= n ? s : s.slice(0, n - 1) + "…";
+
+// What the ORIGIN column means, spelled out, because the honest label is not
+// the obvious one. `origin` is the registry's, and it records whether the
+// CONFORMANCE GATE promoted the delivery -- not whether a human used the
+// inbox. A conformant file dropped into `inbox/` is uploaded under its own
+// name and needs no gate, so it lands as `direct`, exactly like one an
+// approved sender PUT into the bucket. Calling that "not from the inbox"
+// would be wrong; calling it "landed under its own name" is what happened.
+const ORIGIN = {
+  inbox: ["renamed by the gate",
+          "promoted by the conformance gate: landed under a name " +
+          "filename_pattern describes, with its control file and a metadata " +
+          "sibling beside it"],
+  direct: ["own name",
+           "landed under the name it was sent with — by an approved sender " +
+           "writing straight into landing/, or dropped into the inbox already " +
+           "conformant, which needs no gate. `origin` records whether the " +
+           "GATE promoted it, not which door it came through."],
+};
+
+function outcomePill(a) {
+  if (a.kind === "rejection")
+    return el("span", {class: "pill bad", title: a.reason || ""},
+              "quarantined · " + (a.reason_class || "refused"));
+  return el("span", {class: "pill ok"}, "landed");
+}
+
+// The integrity pair, and they are two different kinds of answer -- see
+// arrivals.checks(). The checksum is comparable here (declared against what
+// the landed object hashes to); the row count is not, because only Spark
+// counts rows, so the DECLARED number is shown and the ingest run beside it
+// is the verdict.
+function checkPills(a) {
+  const c = a.checks;
+  if (!c) return el("span", {class: "muted"}, "—");
+  const out = el("span", {class: "row", style: "gap:5px"});
+  const rc = c.row_count || {};
+  if (rc.verdict === "at_ingest")
+    out.append(el("span", {class: "pill", title:
+      "the control file declared " + rc.declared + " rows. Nothing counts " +
+      "rows without reading the file, so ingest is what compares them -- and " +
+      "fails the run on a mismatch. The ingest column is the verdict."},
+      "rows: " + rc.declared + " declared"));
+  const m = c.md5 || {};
+  if (m.verdict === "ok")
+    out.append(el("span", {class: "pill ok", title:
+      "declared " + m.declared + "\nlanded   " + m.landed +
+      "\n\nThe same comparison ingest makes, on the same recorded bytes. It " +
+      "does not say an ingest has run."}, "md5 matches"));
+  else if (m.verdict === "mismatch")
+    out.append(el("span", {class: "pill bad", title:
+      "declared " + m.declared + "\nlanded   " + m.landed +
+      "\n\nThe file is not the file the sender checksummed. Ingest refuses " +
+      "this delivery."}, "md5 MISMATCH"));
+  else if (m.verdict === "not_comparable")
+    out.append(el("span", {class: "pill warn", title:
+      "a multi-part delivery with a declared checksum -- ingest hashes the " +
+      "parts in order, which is not what the registry recorded for the " +
+      "container."}, "md5 not comparable"));
+  if (!out.childNodes.length)
+    out.append(el("span", {class: "muted", title:
+      "this feed's deliveries carry no control file, so nothing was declared " +
+      "to check against. expected_min_rows still applies at ingest."},
+      "nothing declared"));
+  return out;
+}
+
+// A delivery Airflow no longer has a run for reads "no run recorded", never
+// "not ingested". Airflow trims its own history and the registry does not, so
+// the older half of this list will always outlive the runs that ingested it --
+// and whether the rows reached raw is derived from `_source_file`, which costs
+// a Spark job to ask. The state shown is the state of a RUN.
+function ingestPill(a) {
+  const g = a.ingest;
+  if (a.kind === "rejection")
+    return el("span", {class: "muted", title:
+      "a refused delivery never reaches landing, so no ingest is triggered " +
+      "for it. The bytes are in quarantine/ and the row in " +
+      "registry.rejection."}, "not triggered");
+  if (!g) return el("span", {class: "muted"}, "—");
+  if (!g.available)
+    return el("span", {class: "pill warn"}, "airflow unreachable");
+  if (!g.runs.length)
+    return el("span", {class: "muted", title:
+      g.dag_known === false
+        ? "Airflow has no DAG " + g.dag_id + " -- the feed is gone from " +
+          "feeds.yml, or has not been parsed yet. The delivery is still in " +
+          "the registry, which is what an index over object storage is for."
+        : "no run of " + g.dag_id + " names this delivery. Airflow trims its " +
+          "run history; the registry does not, so this is expected for an " +
+          "older delivery and is not a claim that it was never ingested."},
+      g.dag_known === false ? "no ingest DAG" : "no run recorded");
+  const r = g.runs[0];
+  return el("span", {class: "pill " + stateClass(r.state),
+                     title: r.run_id + (r.note ? "\n" + r.note : "") +
+                            "\nstarted " + ts(r.start_date) +
+                            (g.runs.length > 1
+                              ? "\n\n" + g.runs.length + " runs name this " +
+                                "delivery; the newest is shown."
+                              : "")}, r.state || "—");
+}
+
+async function showArrivals() {
+  STATE.selected = null;
+  loadFeeds();
+  const d = $("#detail");
+  d.textContent = "";
+  d.append(
+    el("h2", {}, "Arrivals"),
+    el("div", {class: "sub"},
+      "Every file this platform was offered, accepted or refused, newest " +
+      "first — what it was called, which feed claimed it, what its control " +
+      "file declared, and which ingest run followed. Assembled from the " +
+      "delivery registry, the rejection registry, the inbox folder and " +
+      "Airflow; nothing on this page is a record of its own."));
+  const inbox = el("div", {style: "margin-top:16px"});
+  const body = el("div");
+  d.append(inbox, body);
+  renderInbox(inbox);
+  renderArrivals(body, {});
+}
+
+// What is at the door RIGHT NOW, classified by `inbox.route()` -- the gate's
+// own function, so a file shown here as claimed by nobody is a file the next
+// sweep will quarantine. That is the question this answers that nothing else
+// did: a name nobody has onboarded looks exactly like a name about to be
+// picked up, right until it is not.
+async function renderInbox(target) {
+  target.textContent = "";
+  let s;
+  try { s = await api("/api/inbox"); }
+  catch (err) {
+    target.append(el("div", {class: "note warn"}, "inbox: " + err.message));
+    return;
+  }
+  target.append(el("h3", {}, "In the inbox now"));
+  if (!s.present) {
+    target.append(el("div", {class: "note warn"},
+      "No inbox directory at " + s.path + "."));
+    return;
+  }
+  if (!s.waiting.length) {
+    target.append(el("div", {class: "note"},
+      "Nothing waiting in " + s.path + ". " +
+      (s.processed.length
+        ? "Last through the gate: " + s.processed[0].filename + " (" +
+          s.processed[0].feed + ", " + ts(s.processed[0].processed_at) + ")."
+        : "")));
+  } else {
+    const t = el("table");
+    t.append(el("thead", {}, el("tr", {}, [
+      el("th", {}, "File"), el("th", {}, "Modified"), el("th", {}, "Size"),
+      el("th", {}, "Claimed by"), el("th", {}, "How")])));
+    const tb = el("tbody");
+    for (const w of s.waiting) {
+      const cls = {conformant: "ok", gated: "ok", control: "warn",
+                   unroutable: "bad", ambiguous: "bad"}[w.classification] || "";
+      tb.append(el("tr", {}, [
+        el("td", {class: "mono"}, w.filename),
+        el("td", {class: "muted"}, ts(w.modified_at)),
+        el("td", {class: "muted"}, (w.bytes ?? 0) + " B"),
+        el("td", {}, w.feed || el("span", {class: "muted"}, "nobody")),
+        el("td", {}, el("span", {class: "pill " + cls,
+                                 title: w.reason || ""}, w.classification)),
+      ]));
+    }
+    t.append(tb);
+    target.append(el("div", {class: "scroll"}, t));
+    target.append(el("div", {class: "note"},
+      "A file here has not necessarily been seen yet: the watcher wants " +
+      s.stable_polls + " consecutive polls with an unchanged size and mtime " +
+      "before it touches anything, so a file written seconds ago is meant to " +
+      "still be sitting there. " +
+      "conformant = already named the way landing requires · " +
+      "gated = the upstream's own name, renamed by the gate · " +
+      "control = a control file, held until its data file arrives · " +
+      "unroutable/ambiguous = the next sweep quarantines it."));
+  }
+}
+
+// One renderer, two callers: the Arrivals page and the per-feed Arrivals tab.
+// `opts.feed` narrows it; everything else is identical, because a feed's
+// arrivals and every feed's arrivals are the same question asked with a
+// different filter and would drift if they were two tables.
+async function renderArrivals(target, opts) {
+  target.textContent = "";
+  const controls = el("div", {class: "row", style: "margin:16px 0 8px"});
+  const summary = el("div", {class: "row", style: "gap:6px;margin-bottom:8px"});
+  // Taller than the shared .scroll cap: this table IS the page rather than a
+  // panel on one, and 340px shows nine rows of a list whose header says fifty.
+  const box = el("div", {class: "scroll", style: "max-height:62vh"});
+  const limit = el("select", {}, [25, 50, 100, 250].map(v =>
+    el("option", {value: v, selected: v === 50 ? "" : null}, v + " rows")));
+  const refresh = el("button", {class: "act"}, "Refresh");
+  controls.append(el("div", {}, [el("label", {}, "Show"), limit]), refresh);
+  target.append(el("h3", {}, opts.feed ? "Arrivals for this feed" : "What arrived"),
+                controls, summary, box);
+
+  const draw = async () => {
+    box.textContent = "";
+    box.append(el("div", {class: "empty"}, "Loading…"));
+    let data;
+    try {
+      data = await api("/api/arrivals?limit=" + limit.value +
+                       (opts.feed ? "&feed=" + encodeURIComponent(opts.feed) : ""));
+    } catch (err) {
+      box.textContent = "";
+      box.append(el("div", {class: "note warn"}, err.message));
+      return;
+    }
+    summary.textContent = "";
+    const c = data.counts || {};
+    summary.append(
+      el("span", {class: "pill" + (c.landed ? " ok" : "")}, c.landed + " landed"),
+      el("span", {class: "pill" + (c.quarantined ? " bad" : "")},
+         c.quarantined + " quarantined"),
+      el("span", {class: "pill" + (c.md5_mismatch ? " bad" : "")},
+         c.md5_mismatch + " checksum mismatch"),
+      el("span", {class: "muted", style: "margin-left:6px"},
+         c.declared + " of " + c.landed + " arrived with a checksum to check"));
+    box.textContent = "";
+    if (!data.arrivals.length) {
+      box.append(el("div", {class: "empty"},
+        "Nothing recorded yet. Drop a file into ./inbox, or use the Data tab."));
+      return;
+    }
+    const t = el("table");
+    t.append(el("thead", {}, el("tr", {}, [
+      el("th", {}, "Arrived"), el("th", {}, "File"),
+      ...(opts.feed ? [] : [el("th", {}, "Feed")]),
+      el("th", {}, "Outcome"), el("th", {}, "COB"),
+      el("th", {}, "Declared checks"), el("th", {}, "Ingest")])));
+    const tb = el("tbody");
+    for (const a of data.arrivals) {
+      const name = el("span", {class: "mono", title: a.source_name || ""},
+                      short(a.source_name));
+      const fileCell = el("td", {}, [name]);
+      // TWO FILENAMES AND THEY ARE DIFFERENT STRINGS for a gated delivery.
+      // The upstream will only ever know the first one, so showing only the
+      // landed name makes a delivery unfindable by what it was called.
+      if (a.renamed)
+        fileCell.append(el("div", {class: "sub mono", style: "font-size:11.5px",
+                                   title: a.delivery_id},
+                           "→ " + short(a.delivery_id)));
+      if (a.source_container)
+        fileCell.append(el("div", {class: "sub", style: "font-size:11.5px"},
+                           "from " + short(a.source_container, 34)));
+      const cells = [
+        el("td", {class: "muted", title: "first seen by the registry " +
+                                          ts(a.first_seen_at)}, ts(a.at)),
+        fileCell,
+        ...(opts.feed ? [] : [el("td", {}, a.feed
+              || el("span", {class: "muted", title:
+                    "nothing claimed this name, which is a rejection the " +
+                    "registry can still describe -- and the commonest one."},
+                    "unclaimed"))]),
+        // The origin pill appears only for a delivery the GATE promoted.
+        // `direct` is the overwhelming majority -- every feed with no
+        // `arrival:` block -- and a pill saying so on all fifty rows is fifty
+        // repetitions of the default dressed up as information. The renamed
+        // pair under the filename is where a gated delivery already shows
+        // itself; this names the mechanism. Both origins are spelled out on
+        // the delivery's own page.
+        el("td", {}, [outcomePill(a), " ",
+                      a.origin === "inbox"
+                        ? el("span", {class: "pill", title: ORIGIN.inbox[1]},
+                             ORIGIN.inbox[0])
+                        : ""]),
+        el("td", {class: "muted"}, a.cob_date || "—"),
+        el("td", {}, checkPills(a)),
+        el("td", {}, ingestPill(a)),
+      ];
+      const tr = el("tr", {}, cells);
+      if (a.kind === "delivery") {
+        tr.style.cursor = "pointer";
+        tr.title = "open this delivery";
+        tr.addEventListener("click", () => showArrival(a.feed, a.delivery_id));
+      }
+      tb.append(tr);
+    }
+    t.append(tb);
+    box.append(t);
+  };
+  limit.addEventListener("change", draw);
+  refresh.addEventListener("click", (e) => withBusy(e.target, draw));
+  await draw();
+}
+
+// One delivery, end to end. Opened from a row above; `back` returns to
+// wherever it was opened from, because the per-feed tab and the global page
+// are both legitimate places to have come from.
+async function showArrival(feed, deliveryId) {
+  const from = STATE.selected;
+  const fromTab = STATE.tab;
+  const d = $("#detail");
+  d.textContent = "";
+  d.append(el("div", {class: "empty"}, "Loading…"));
+  let a;
+  try { a = await api(`/api/arrivals/${encodeURIComponent(feed)}/` +
+                      encodeURIComponent(deliveryId)); }
+  catch (err) {
+    d.textContent = "";
+    d.append(el("div", {class: "note warn"}, err.message));
+    return;
+  }
+  d.textContent = "";
+  const back = el("button", {class: "act", onclick: () => {
+    if (from) selectFeed(from, fromTab); else showArrivals();
+  }}, "← Back");
+  d.append(el("div", {class: "row"}, back),
+           el("h2", {style: "margin-top:12px"}, a.delivery_id),
+           el("div", {class: "sub"},
+              a.feed + " · " + (a.source_system || "") + " · COB " + a.cob_date));
+
+  const kv = (rows) => {
+    const t = el("table");
+    const tb = el("tbody");
+    for (const [k, v, help] of rows) {
+      if (v === null || v === undefined || v === "") continue;
+      tb.append(el("tr", {}, [
+        el("td", {class: "muted", style: "width:200px"}, k),
+        el("td", {}, [el("span", {class: "mono"}, String(v)),
+                      help ? el("div", {class: "sub", style: "font-size:11.5px"},
+                               help) : ""]),
+      ]));
+    }
+    t.append(tb);
+    return t;
+  };
+
+  d.append(el("h3", {}, "Identity"), kv([
+    ["what the upstream called it", a.source_name,
+     a.renamed ? "different from the landed name: this delivery was renamed " +
+                 "by the conformance gate, and the upstream knows only this one"
+               : null],
+    ["landed as", a.delivery_id],
+    ["container", a.source_container,
+     a.source_container ? "unpacked at the gate; the container itself is " +
+                          "never landed" : null],
+    ["how it got in", (ORIGIN[a.origin] || [a.origin])[0],
+     (ORIGIN[a.origin] || ["", ""])[1]],
+    ["control file", a.checks.control_object,
+     "promoted into landing beside the delivery, never consumed -- which is " +
+     "what lets the same verification run whichever way the delivery arrived"],
+    ["arrived", ts(a.at)],
+    ["first seen by the registry", ts(a.first_seen_at),
+     "the gap between the two is how far behind the registry was running"],
+    ["origin", a.origin_uri],
+    ["schema version", a.schema_version,
+     "the declared column contract this delivery was read against -- not the " +
+     "shape of the file"],
+    ["producer run", a.producer_run_id],
+  ]));
+
+  d.append(el("h3", {}, "Declared checks"), el("div", {}, checkPills(a)));
+  d.append(el("div", {class: "note"},
+    "THE INBOX ESTABLISHES IDENTITY; INGESTION VERIFIES INTEGRITY. " +
+    (a.checks.control_object
+      ? "The control file is promoted into landing beside the delivery, not " +
+        "consumed, so the same verification runs whichever way the delivery " +
+        "arrived: " + a.checks.control_object
+      : "This delivery declared nothing to check against — no control file. " +
+        "expected_min_rows still applies at ingest, and schema drift is " +
+        "still reported.")));
+
+  d.append(el("h3", {}, "The objects holding the rows"), kv([
+    ["landing object", a.source_object, "the evidence copy"],
+    ["manifest", a.manifest_key,
+     "ready/ is the work queue and a days-long cache; landing keeps the " +
+     "delivery for years, so a manifest that has expired is the designed " +
+     "steady state, not a fault"],
+    ["bytes", a.bytes],
+  ]));
+  if (a.part_objects && a.part_objects.length) {
+    const t = el("table");
+    t.append(el("thead", {}, el("tr", {}, [
+      el("th", {}, "part"), el("th", {}, "object"), el("th", {}, "bytes")])));
+    const tb = el("tbody");
+    for (const p of a.part_objects)
+      tb.append(el("tr", {}, [el("td", {class: "muted"}, p.part_no),
+                              el("td", {class: "mono"}, p.object_key),
+                              el("td", {class: "muted"}, p.bytes ?? "—")]));
+    t.append(tb);
+    d.append(t, el("div", {class: "sub", style: "margin-top:6px"},
+      "`_source_file` in the raw table is the PART's key, so these are what " +
+      "join a raw row back to this delivery."));
+  }
+
+  d.append(el("h3", {}, "Ingest"));
+  const g = a.ingest || {};
+  if (!g.available)
+    d.append(el("div", {class: "note warn"},
+      "Airflow could not be asked. " + (g.error || "")));
+  else if (!g.runs.length)
+    d.append(el("div", {class: "note"}, g.dag_known === false
+      ? "Airflow has no DAG " + g.dag_id + ". The feed is gone from " +
+        "feeds.yml or has not been parsed yet — the delivery is still here, " +
+        "which is what an index over object storage is for."
+      : "No run of " + g.dag_id + " names this delivery. Airflow trims its " +
+        "run history and the registry does not, so an older delivery having " +
+        "no run here is expected. Whether its rows are in raw is derived " +
+        "from `_source_file` and costs a Spark job to ask — this page does " +
+        "not guess at it."));
+  else {
+    const t = el("table");
+    t.append(el("thead", {}, el("tr", {}, [
+      el("th", {}, g.dag_id), el("th", {}, "state"), el("th", {}, "started"),
+      el("th", {}, "ended"), el("th", {}, "triggered with")])));
+    const tb = el("tbody");
+    for (const r of g.runs)
+      tb.append(el("tr", {}, [
+        el("td", {class: "mono"}, r.run_id),
+        el("td", {}, el("span", {class: "pill " + stateClass(r.state)}, r.state)),
+        el("td", {class: "muted"}, ts(r.start_date)),
+        el("td", {class: "muted"}, ts(r.end_date)),
+        el("td", {class: "muted"}, r.note || (r.conf && r.conf.object_key
+          ? "object_key" : "resolved its own")),
+      ]));
+    t.append(tb);
+    d.append(t, el("div", {class: "sub", style: "margin-top:6px"},
+      "A run is matched to this delivery by the object key it was told to " +
+      "ingest — from its conf, or from `resolve_arrival`'s XCom for a run " +
+      "that chose its own. A failed run left its Nessie branch for " +
+      "inspection and never touched main."));
+  }
+}
+
+// -------------------------------------------------------------- arrivals tab
+// The same table, narrowed to one feed. It sits between Data (what you can
+// send) and Run (what you can start) because that is where it sits in time:
+// this is what actually turned up.
+function paneArrivals(pane, f) {
+  pane.append(el("div", {class: "note"},
+    "What this feed was sent, what the gate made of each file, and which " +
+    "ingest run followed. A refused delivery appears here too — it is " +
+    "evidence exactly as much as an accepted one, and leaving it out would " +
+    "show a morning that received something unreadable as a morning that " +
+    "received nothing."));
+  const body = el("div");
+  pane.append(body);
+  renderArrivals(body, {feed: f.name});
+}
+
 function renderValidation(target, v) {
   if (!v) return;
   const old = target.querySelector(".validation");
@@ -1736,6 +2190,7 @@ async function health() {
     }
   }).catch(() => { /* the hardcoded defaults stand */ });
   $("#new-feed").addEventListener("click", () => newFeed());
+  $("#arrivals-btn").addEventListener("click", showArrivals);
   $("#unclaimed-btn").addEventListener("click", showUnclaimed);
   await loadFeeds();
   health();
