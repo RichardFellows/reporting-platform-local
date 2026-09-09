@@ -3634,6 +3634,89 @@ for the web front end.** Search is a nice-to-have; lineage is the point.
   skipped task above, and nothing else.
 
 
+## marquez-on-ubi
+
+Both Marquez images are BUILT HERE, from Marquez's own source, on Red Hat UBI
+bases — `Dockerfile.marquez-api` and `Dockerfile.marquez-web`. Upstream ships
+`marquezproject/marquez` on eclipse-temurin/Ubuntu 24.04 and
+`marquezproject/marquez-web` on node:18-alpine, and neither base is permitted
+in this estate. Everything else about the deployment is unchanged: same
+version, same `marquez.dev.yml`, same entrypoints, same ports, same
+`SEARCH_ENABLED=false`.
+
+**From source, not copied out of the upstream image.** Lifting the artifacts
+with a `COPY --from=marquezproject/marquez:0.51.1` stage would have been a
+two-line change and produces byte-identical output, but it still pulls the
+image the policy exists to keep out — it moves the base out of the running
+container without removing it from the build. Maven Central is not an
+alternative either: `io.github.marquezproject:marquez-api` stops at 0.50.0 and
+publishes a THIN jar, which `server marquez.dev.yml` cannot start.
+
+So the API image runs Marquez's own `:api:shadowJar` in a
+`ubi8/openjdk-17` builder and ships the result on `ubi8/openjdk-17-runtime`.
+The whole upstream image was three files — the shaded jar, `marquez.dev.yml`
+and a twelve-line `entrypoint.sh` — and all three come out of the same source
+tree, so the runtime image is those three files and nothing else. The
+entrypoint is upstream's, unmodified: it globs `marquez-*.jar`, which is why
+the jar keeps its versioned name.
+
+### The web image is a bundle and two packages, not a build tree
+
+`marquezproject/marquez-web` is 1.36 GB, of which 702 MB is `node_modules` and
+40 MB is the bundle it built. At runtime the application is `node
+setupProxy.js`: an Express server for `dist/`, proxying `/api/v1` and
+`/api/v2beta` to the API. So `npm run build` happens in a `ubi8/nodejs-18`
+builder and the runtime stage on `ubi8/nodejs-18-minimal` gets the bundle,
+`setupProxy.js`, the entrypoint and a separately-resolved two-package
+`node_modules`.
+
+**Both of those packages are pinned, and one of them is load-bearing.**
+`http-proxy-middleware` must stay 2.x: 3.x removed the
+`createProxyMiddleware(path, options)` form `setupProxy.js` calls, and the
+failure is a 404 at request time rather than anything at startup. `express` is
+pinned at the 4.19.2 upstream resolved because `setupProxy.js` requires it and
+`web/package.json` never declared it — it arrives transitively through
+`webpack-dev-server`, which is a build-time dependency that does not ship here.
+
+### Two things the UBI bases do not have
+
+- **No gzip in `ubi8/openjdk-17`.** `tar` is there, so `curl | tar xz` fails
+  with `gzip: Cannot exec: No such file or directory` from tar's grandchild and
+  a `curl: (23) Failed writing body` — neither of which names a missing
+  package. One `microdnf install -y gzip`. The node builder has it already.
+- **No `npm ci`.** `web/package.json` carries a `file:./libs/graph`
+  dependency; upstream's own Dockerfile uses `npm install` and so does this
+  one.
+
+### Verified
+
+Both images built from the 0.51.1 tag and run against the live stack:
+
+- **API**: `ubi8/openjdk-17:1.23` builder, `ubi8/openjdk-17-runtime:1.23`
+  runtime, RHEL 8.10, OpenJDK 17.0.20.1. **613 MB against upstream's 895 MB**,
+  and the runtime image holds the same three files upstream's did — the jar is
+  49,457,974 bytes against 49,465,199, the difference being manifest build
+  metadata. Healthy on the second 6s poll; `/healthcheck` reports
+  `postgresql: healthy`; Jetty up in 4.1s; runs as the base image's uid 185.
+- **Web**: `ubi8/nodejs-18:1` builder, `ubi8/nodejs-18-minimal:1` runtime.
+  **346 MB against upstream's 1.36 GB.** `dist/` is file-for-file the same
+  sixteen names upstream shipped; `bundle.js` serves 11,107,168 bytes; the
+  proxy logs `[HPM] Proxy created: /api/v1 -> http://marquez-api:5000/` and
+  `/api/v1/namespaces` through :13000 returns the API's answer. Runs as uid
+  1001, everything it reads owned root and world-readable, so an arbitrary
+  assigned uid works the way OpenShift needs.
+- **Round trip**: a `COMPLETE` RunEvent POSTed to `/api/v1/lineage` returned
+  201, created the job and both dataset namespaces, and came back out of
+  `/api/v1/lineage?nodeId=dataset:...` as a three-node graph. Deleted again
+  afterwards, so it is not in the graph anyone reads.
+- First `docker compose --profile lineage up -d marquez-api marquez-web` after
+  a clone or a `MARQUEZ_VERSION` change **builds** rather than pulls: the
+  gradle build fetches its own distribution and dependencies, and `npm
+  install` resolves the full web tree, so it needs egress to
+  github.com, services.gradle.org, Maven Central and the npm registry — in the
+  cluster, whatever mirrors front them.
+
+
 ## lineage-is-derived-from-the-dbt-project
 
 The export above emitted a job per task and **no datasets at all** — 41

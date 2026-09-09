@@ -1,0 +1,57 @@
+# Marquez web UI on UBI, built FROM SOURCE. See docs/DECISIONS.md#marquez-on-ubi
+#
+# Upstream `marquezproject/marquez-web` is node:18-alpine carrying its whole
+# build tree -- 702 MB of node_modules for an application that at runtime is
+# `node setupProxy.js`: an Express server for the webpack bundle in `dist/`,
+# proxying /api/v1 and /api/v2beta to marquez-api. So the build tree stays in
+# the builder stage and only the bundle and its two runtime packages ship.
+ARG MARQUEZ_VERSION=0.51.1
+
+# --------------------------------------------------------------------- build
+FROM registry.access.redhat.com/ubi8/nodejs-18:1 AS build
+ARG MARQUEZ_VERSION
+USER root
+WORKDIR /src
+
+# Only `web/` from the tarball -- the api tree is a separate image.
+RUN curl -fsSL "https://github.com/MarquezProject/marquez/archive/refs/tags/${MARQUEZ_VERSION}.tar.gz" \
+    | tar xz --strip-components=2 "marquez-${MARQUEZ_VERSION}/web"
+
+# `npm install`, as upstream does, NOT `npm ci`: package.json carries a
+# `file:./libs/graph` dependency that a lockfile install resolves differently.
+RUN npm install --no-audit --no-fund \
+    && npm run build
+
+# The runtime dependency set, resolved separately so the 702 MB build tree is
+# not what gets copied forward. Both are pinned to what upstream's image
+# actually resolved, and http-proxy-middleware 2.x IS LOAD-BEARING: 3.x dropped
+# the `createProxyMiddleware(path, options)` form setupProxy.js calls, and the
+# failure is at request time, not at start. express is pinned here because
+# setupProxy.js requires it and package.json never declared it -- upstream gets
+# it transitively through webpack-dev-server.
+ARG EXPRESS_VERSION=4.19.2
+ARG HTTP_PROXY_MIDDLEWARE_VERSION=2.0.6
+RUN mkdir -p /runtime \
+    && cd /runtime \
+    && npm install --no-audit --no-fund --omit=dev \
+         "express@${EXPRESS_VERSION}" \
+         "http-proxy-middleware@${HTTP_PROXY_MIDDLEWARE_VERSION}"
+
+# ------------------------------------------------------------------- runtime
+# -minimal: node with no build toolchain, since nothing is compiled here.
+FROM registry.access.redhat.com/ubi8/nodejs-18-minimal:1
+USER root
+WORKDIR /usr/src/app
+
+# setupProxy.js exits 1 unless MARQUEZ_HOST, MARQUEZ_PORT and WEB_PORT are all
+# set; docker-compose.yml sets them and says so. It serves __dirname + '/dist',
+# so the two must stay siblings.
+COPY --from=build /runtime/node_modules ./node_modules
+COPY --from=build /src/dist ./dist
+COPY --from=build /src/setupProxy.js ./setupProxy.js
+COPY --from=build /src/docker/entrypoint.sh ./entrypoint.sh
+RUN chmod 0755 entrypoint.sh
+
+USER 1001
+EXPOSE 3000
+ENTRYPOINT ["/usr/src/app/entrypoint.sh"]
