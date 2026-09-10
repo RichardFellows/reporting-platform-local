@@ -161,13 +161,21 @@ override, and with it a real `raw.fo_trade` went 400 → 403 rows on a branch
 with the `_cob_date` partitioning intact. So this is not limited to an
 append-only *unpartitioned* silver layer.
 
-**The override you need for INSERT is what breaks UPDATE.** With it off,
-UPDATE is cleanly refused. With it on, UPDATE reaches an internal error that
-**invalidates the whole DuckDB database** — every subsequent statement on that
-connection returns `FATAL Error: … database has been invalidated`. In an
+**The override you need for INSERT is what breaks a bare UPDATE.** With it
+off, UPDATE is cleanly refused. With it on, UPDATE reaches an internal error
+that **invalidates the whole DuckDB database** — every subsequent statement on
+that connection returns `FATAL Error: … database has been invalidated`. In an
 Airflow task that is the process gone mid-write, with the branch left
 half-written. Recoverable, since the branch is throwaway, but the failure is a
 crash rather than a rollback.
+
+**`MERGE INTO`, however, works — including on the partitioned table.** That
+matters more than the line above, because `MERGE` is what dbt's `merge`
+incremental strategy emits and a bare `UPDATE` is not. Measured against the
+real Spark-created `raw.fo_trade` on a branch with the override on: the merge
+applied, one row changed on the branch, `main` still read zero. So the broken
+operation is narrower than "updating a partitioned table" — it is the bare
+`UPDATE` statement specifically.
 
 **DELETE needs no opt-in on a partitioned table, and never did.** The
 destructive operation is the one with no guard — already noted in
@@ -193,6 +201,118 @@ beside the nightly — the second merge fails and its work must be re-run on a
 rebased branch. That is a real design constraint on this pattern, not a
 DuckDB one: the platform's Spark path has it too, and serialises through the
 `lakehouse_write` pool for exactly this reason.
+
+## Upstream: all of it is filed, and most of it is already fixed
+
+Searched after the fact, which is the wrong order but the more useful one —
+everything above was measured first, so the issues below are corroboration
+rather than something taken on trust.
+
+**The seam is a filed bug, fixed a month before this was written.**
+
+> [duckdb/duckdb-iceberg#1145](https://github.com/duckdb/duckdb-iceberg/issues/1145)
+> — *REST catalog: `uri` override from /v1/config is ignored; prefix appended
+> to ATTACH ENDPOINT breaks Nessie branch-scoped endpoints*. Opened
+> 2026-07-05, closed COMPLETED 2026-07-26.
+
+Its body describes what Phase 2 above describes: the doubled path, the 404,
+the silently empty catalog, and the same workaround — *"Reaching another
+branch currently requires an external path-rewriting proxy."*
+
+> **Fixed by [duckdb/duckdb-iceberg#1230](https://github.com/duckdb/duckdb-iceberg/pull/1230)
+> — "Honor REST catalog URI overrides"**, merged 2026-07-26.
+
+The diff is visible in `src/catalog/rest/iceberg_catalog.cpp`. On `main`,
+`base_uri` is taken from `overrides["uri"]` and `GetBaseUrl()` uses it; on
+`v1.5-variegata`, `uri` is still `attach_options_p.endpoint` and `SetHost(uri)`
+uses that. The bug is in source, on the shipping branch.
+
+**Which is exactly why this estate still reproduces it.** The extension here is
+`45163a28` (2026-07-09, `core`), 17 days older than the fix. Forcing the
+nightly (`FORCE INSTALL iceberg FROM core_nightly`) gives `6561bfca` — byte
+identical to the head of `v1.5-variegata`, because the nightly for DuckDB
+1.5.x is built from the 1.5 maintenance branch. The branch attach was re-tested
+on it without the proxy and was still empty. **None of the relevant fixes are
+on that branch:**
+
+| fix | merged to | on `v1.5-variegata`? |
+|---|---|---|
+| [#1230](https://github.com/duckdb/duckdb-iceberg/pull/1230) honor `uri` overrides | `main`, 2026-07-26 | no |
+| [#1150](https://github.com/duckdb/duckdb-iceberg/pull/1150) re-enable `target-file-size-bytes` for partitioned inserts ([#1057](https://github.com/duckdb/duckdb-iceberg/issues/1057)) | `main`, 2026-07-06 | no |
+| [#1232](https://github.com/duckdb/duckdb-iceberg/pull/1232) parse the catalog `prefix` once | `main`, 2026-07-26 | no |
+
+So **the proxy and the file-size override are both version artefacts, not
+architectural limits.** They are what this release line requires, not what the
+approach requires.
+
+**Branches will not become a first-class feature, though.**
+
+> [duckdb/duckdb-iceberg#1252](https://github.com/duckdb/duckdb-iceberg/issues/1252)
+> — *[FEATURE] Support for Iceberg branches and tags* (open)
+
+The maintainer is explicit: *"read support should be trivial, but write
+support isn't something I'm willing to commit to yet"*, and *"I'm not
+implementing nessie-specific endpoints … They require these parameters to be
+passed to the REST endpoint in a way that doesn't conform to the spec."* So
+expect no `REF`/`BRANCH` attach option. Branch access works only as a side
+effect of spec-conformant URI handling — which is what #1230 restores.
+
+Also open, and separate:
+[#375](https://github.com/duckdb/duckdb-iceberg/issues/375) (an older Nessie
+ATTACH failure about URL-encoding the `|`, which #1145's author explicitly
+distinguishes from the doubled-path bug) and
+[#784](https://github.com/duckdb/duckdb-iceberg/issues/784) (*Support Create
+or replace table* — the third finding in the constraints table above).
+
+## Could the dbt project use this?
+
+Asked separately, measured the same way. The branch problem is no longer the
+obstacle; three others are.
+
+**What clears.** dbt-duckdb's `Attachment` accepts `type` plus arbitrary
+`options`, so `TYPE ICEBERG / ENDPOINT / AUTHORIZATION_TYPE` all fit in
+`profiles.yml`, and the endpoint could carry `{{ var('nessie_ref') }}` exactly
+as the Spark profile carries `spark.sql.catalog.lakehouse.ref`. `MERGE INTO`
+works on the real partitioned tables, so `incremental_strategy: merge` — the
+default on every model here — is not the blocker. `DELETE` works, so
+`delete+insert` is a fallback; dbt-duckdb ships both materializations. And
+`pip install --dry-run dbt-duckdb` moves exactly one package: no
+cosmos-style dependency trap.
+
+**What blocks.**
+
+1. **`partition_by` is silently dropped.** dbt-duckdb handles it only in the
+   `external` materialization; `table.sql` and `incremental.sql` never read
+   it ([dbt-duckdb#581](https://github.com/duckdb/dbt-duckdb/issues/581) is
+   the DuckLake equivalent). Every prepared and reporting table would come out
+   unpartitioned, with a green build — and `docs/RETENTION.md` depends on
+   `cob_date` leading the spec so expiry is a metadata delete rather than a
+   full rewrite. The *engine* is not the problem: DuckDB-Iceberg accepts
+   `CREATE TABLE … PARTITIONED BY`. This is an adapter gap.
+2. **`dbt run` hangs for minutes with an Iceberg catalog attached** —
+   [dbt-duckdb#640](https://github.com/duckdb/dbt-duckdb/issues/640). The
+   `information_schema.tables` listing dbt runs on every invocation took 90+
+   seconds against a populated catalog for that reporter, whose users
+   abandoned the integration over it. Not measured here; the catalog in this
+   estate has one table.
+3. **Six Spark-only constructs in `dbt/macros/engine.sql`, reaching every
+   model**: `sha2`, `date_sub`, `trunc(date,'MM')`, `element_at`,
+   `TO_DATE(col, fmt)` and the backtick quoting from `ident()`. All six fail
+   on DuckDB; `TRY_CAST`, `CAST(… AS STRING)`, `INTERVAL n DAY` and the window
+   functions are fine. Mechanical to fix — but `engine.sql`'s own header
+   records that its DuckDB branches were deleted because "an untested promise
+   in this repo is a liability rather than optionality", so putting them back
+   re-opens that decision and needs a test that actually runs.
+
+Two more, both already filed against dbt-duckdb:
+[#754](https://github.com/duckdb/dbt-duckdb/issues/754) — `generate_schema_name`
+prefixes `target.schema` onto custom schemas for an attached Iceberg REST
+catalog, which is precisely what `dbt/macros/naming.sql` overrides for the
+Spark path (fix in [#755](https://github.com/duckdb/dbt-duckdb/pull/755)) —
+and the CTAS handling in
+[#747](https://github.com/duckdb/dbt-duckdb/pull/747) /
+[#725](https://github.com/duckdb/dbt-duckdb/pull/725), the latter written
+around the same `CREATE OR REPLACE` gap found above.
 
 ## Verdict
 
@@ -221,9 +341,15 @@ a DuckDB reader attached to that branch could run the cheap assertions in
 seconds. That needs the branch to be *readable*, which is the same seam, but
 read-only removes constraints 2 and 3 entirely.
 
-Worth revisiting when DuckDB's iceberg extension either honours the `uri`
-override or exposes a prefix option — at that point the proxy disappears and
-this becomes a one-line change to `duckdb_console.connect()`.
+**That revisit already has a date on it.** This section originally ended
+"worth revisiting when DuckDB's iceberg extension either honours the `uri`
+override or exposes a prefix option". It honours it on `main` as of
+2026-07-26; it is the 1.5 release line that does not. So the next step is not
+to design around the proxy but to re-run `constraints.py` against an extension
+built from `main` (or the first release that carries #1230) and see how much of
+the list above simply disappears. If both #1230 and #1150 hold, what is left is
+dbt-duckdb's, not DuckDB's — and `dbt-duckdb#640` is then the one that would
+actually stop you.
 
 ## Files
 
@@ -237,3 +363,9 @@ this becomes a one-line change to `duckdb_console.connect()`.
 Nothing here is wired into the platform. The spike creates a `wap_poc`
 namespace and `spike/duckdb-wap/*.parquet` under the lakehouse bucket, and
 removes neither — `cleanup.py` does.
+
+**Version boundary.** Everything measured here is DuckDB 1.5.5 with iceberg
+extension `45163a28` (`core`), and `6561bfca` (`core_nightly`, the head of
+`v1.5-variegata`) behaves identically. Re-measure before trusting any of it on
+a build that carries
+[#1230](https://github.com/duckdb/duckdb-iceberg/pull/1230).

@@ -19,6 +19,13 @@ cannot build anything, deliberately three times over:
     bridge worth owning is `spike/duckdb-wap/` (measured, with the request
     trace). No branch means no write-audit-publish, so a DuckDB build here
     would write straight to `main`.
+
+    THIS IS A VERSION BOUNDARY, NOT A DESIGN. Upstream fixed it in
+    duckdb/duckdb-iceberg#1230 ("Honor REST catalog URI overrides", merged
+    2026-07-26), which is on `main` and NOT on the `v1.5-variegata` release
+    branch DuckDB 1.5.x loads -- the `core` extension here is `45163a28` and
+    even `core_nightly` is the same 1.5 line. Re-measure when the extension
+    moves; the constraint above may simply be gone.
   * dbt-duckdb silently ignores `partition_by`, so anything it created would be
     unpartitioned -- and `cob_date` partitioning is what makes retention's
     expiry a metadata delete rather than a full rewrite.
@@ -28,8 +35,12 @@ cannot build anything, deliberately three times over:
     `INTERNAL Error: IcebergDelete multi_file_list is NULL`, which invalidates
     the whole database: every later statement on that connection returns a
     FATAL error. Note DELETE is allowed with or without the override: the
-    destructive operation is the one needing no opt-in. Measured on DuckDB
-    1.5.5 -- see `spike/duckdb-wap/README.md`.
+    destructive operation is the one needing no opt-in. `MERGE INTO` works on
+    a partitioned table with the override, which is what dbt's `merge`
+    strategy emits -- it is the bare UPDATE that breaks. Measured on DuckDB
+    1.5.5; the file-size refusal is also fixed on the extension's `main` and
+    not on the 1.5 line (duckdb/duckdb-iceberg#1150). See
+    `spike/duckdb-wap/README.md`.
 
 The attach is therefore READ_ONLY, verified rather than assumed -- CREATE fails
 with "Cannot execute statement of type CREATE ... attached in read-only mode".
