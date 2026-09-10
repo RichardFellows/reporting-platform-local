@@ -261,3 +261,74 @@ def test_an_upstream_name_is_labelled_gated():
 
 def test_a_name_nobody_claims_is_unroutable():
     assert _classify("whatever.txt") == "unroutable"
+
+
+# ------------------------------------------------- how far back to ask Airflow
+def test_the_run_limit_scales_with_the_rows_on_the_page():
+    """A FIXED LIMIT MAKES `no run recorded` A LIE.
+
+    The page size is the reader's choice and the row selector offers 250. A
+    delivery whose run is older than the newest N matches nothing and renders
+    as the one state this module promises means "Airflow trimmed its
+    history", never "not ingested".
+    """
+    a = _arrivals()
+    assert a._run_limit(100) > 100
+    assert a._run_limit(250) >= 250 or a._run_limit(250) == a.RUN_LIMIT_CEILING
+
+
+def test_the_run_limit_has_a_floor_and_a_ceiling():
+    """A floor because one row on screen still wants its re-run history; a
+    ceiling because this is an HTTP call to a scheduler, not a query.
+    """
+    a = _arrivals()
+    assert a._run_limit(0) == a.RUN_LIMIT_FLOOR
+    assert a._run_limit(1) == a.RUN_LIMIT_FLOOR
+    assert a._run_limit(10_000) == a.RUN_LIMIT_CEILING
+
+
+def test_the_run_limit_leaves_room_for_re_runs():
+    """One run per row would push the oldest rows off the end as soon as any
+    delivery had been ingested twice -- which is exactly the history somebody
+    reading this page is looking for.
+    """
+    a = _arrivals()
+    assert a._run_limit(40) >= 80
+
+
+# ------------------------------------------------------------- the timestamps
+def test_a_timestamp_is_normalised_to_utc_not_merely_formatted():
+    """`recent()` merges two queries and sorts the result LEXICALLY, which is
+    chronological only while every string carries the same offset. psycopg2
+    renders a TIMESTAMPTZ in the server's timezone, which `registry/db.py`
+    never sets.
+    """
+    from datetime import datetime, timedelta, timezone as tz
+    a = _arrivals()
+    east = tz(timedelta(hours=10))
+    assert a._stamp(datetime(2026, 8, 4, 6, 0, tzinfo=east)) == \
+        "2026-08-03T20:00:00+00:00"
+
+
+def test_two_offsets_sort_chronologically_once_stamped():
+    """The DST case, which is the one that actually reaches this: two rows
+    hours apart whose raw ISO strings compare the wrong way round.
+    """
+    from datetime import datetime, timedelta, timezone as tz
+    a = _arrivals()
+    earlier = datetime(2026, 8, 4, 6, 0, tzinfo=tz(timedelta(hours=10)))
+    later = datetime(2026, 8, 3, 21, 0, tzinfo=tz(timedelta(hours=0)))
+    assert earlier.isoformat() > later.isoformat()          # the raw strings lie
+    assert a._stamp(earlier) < a._stamp(later)              # stamped, they do not
+
+
+def test_a_naive_or_absent_timestamp_is_left_alone():
+    """Every column feeding this is NOT NULL, so `None` is defence against a
+    row from a future schema rather than an expected case -- and it must not
+    raise.
+    """
+    from datetime import datetime
+    a = _arrivals()
+    assert a._stamp(None) is None
+    assert a._stamp("2026-08-03T20:00:00+00:00") == "2026-08-03T20:00:00+00:00"
+    assert a._stamp(datetime(2026, 8, 3, 20, 0)) == "2026-08-03T20:00:00"

@@ -14,7 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 
-from tests.support import REPO, config_dir
+from tests.support import DAGS, REPO, config_dir
 
 
 def _context():
@@ -160,10 +160,10 @@ def test_the_run_key_is_derived_from_the_branch_and_carries_the_purpose():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "_dbt_builds_probe", REPO / "airflow" / "dags" / "dbt_builds.py")
+        "_dbt_builds_probe", DAGS / "dbt_builds.py")
     # The module imports cosmos and airflow, which the test environment does
     # not have, so the helper is read out of the source rather than imported.
-    source = (REPO / "airflow" / "dags" / "dbt_builds.py").read_text()
+    source = (DAGS / "dbt_builds.py").read_text()
     body = source[source.index("def _run_key("):]
     body = body[:body.index("\ndef ", 1)]
     ns: dict = {}

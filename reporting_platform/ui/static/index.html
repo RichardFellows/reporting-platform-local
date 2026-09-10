@@ -2069,6 +2069,16 @@ function watchJob(target, jobId) {
   const log = el("pre", {class: "log"});
   target.append(head, log);
   let since = 0;
+  // Only one build runs at a time, so a job nobody can stop blocks the next
+  // one for the life of the container. The server kills a job at its deadline
+  // anyway; this is the same escape hatch for somebody already watching the
+  // log and able to see it is stuck.
+  const stop = el("button", {class: "act", onclick: async (e) => {
+    await withBusy(e.target, async () => {
+      try { await api(`/api/jobs/${jobId}`, {method: "DELETE"}); }
+      catch (err) { head.append(el("div", {class: "sub"}, err.message)); }
+    });
+  }}, "Cancel");
   const tick = async () => {
     let j;
     try { j = await api(`/api/jobs/${jobId}?since=${since}`); }
@@ -2083,6 +2093,15 @@ function watchJob(target, jobId) {
     head.textContent = "";
     head.append(el("span", {class: "pill " + stateClass(j.status)}, j.status),
                 " ", el("code", {}, j.label));
+    if (j.status === "running") head.append(" ", stop);
+    // A killed build and a build whose tests failed are both `failed`, and
+    // they mean opposite things about the feed.
+    if (j.stopped)
+      head.append(el("div", {class: "sub", style: "margin-top:6px"},
+        j.stopped === "timeout"
+          ? "Stopped: it passed the job deadline without finishing. This says "
+            + "nothing about the feed — look at whether Spark or Nessie is stuck."
+          : "Cancelled on request. This says nothing about the feed."));
     if (j.result && j.result.branch)
       head.append(el("div", {class: "sub", style: "margin-top:6px"},
         j.status === "failed"

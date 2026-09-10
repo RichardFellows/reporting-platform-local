@@ -206,7 +206,7 @@ the notes in this table before moving one.
 | **dbt-spark** | **1.8.0** (`[PyHive]`) | `Dockerfile.airflow` | The only dbt adapter installed — see below. |
 | **astronomer-cosmos** | **1.15.1** | `Dockerfile.airflow` | Renders the dbt project into Airflow tasks. Installed `--no-deps`, and that is **not** an optimisation: installing it under Airflow's constraint file downgrades `typing_extensions` 4.16 -> 4.12, and dbt's `mashumaro` needs `evaluate_forward_ref` from 4.13+, so **every dbt invocation dies at import** — in dbt, not in cosmos, and not until something runs dbt. The image build now runs `dbt --version` as a smoke check so that can never ship silently again. |
 | **DuckDB** | **1.5.5** | `Dockerfile.airflow` | For `scripts/duckdb_console.py` only. 1.1.3's iceberg extension has no catalog `ATTACH` at all and fails with `Binder Error: Unrecognized storage type "ICEBERG"`. |
-| **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `dbt/profiles.yml`, `reporting_platform/common/context.py` | S3A filesystem for reading landing CSVs. Deliberately **not** baked into `Dockerfile.spark`: the driver resolves it via `spark.jars.packages` and ships it to the executors, so there is one place the version is set. |
+| **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `dbt/profiles.yml`, `reporting_platform/common/spark.py` | S3A filesystem for reading landing CSVs. Deliberately **not** baked into `Dockerfile.spark`: the driver resolves it via `spark.jars.packages` and ships it to the executors, so there is one place the version is set. |
 
 **There is no `dbt-duckdb`, on purpose.** Spark is the only build engine —
 a build has to land on a Nessie branch and only the Spark path can address one

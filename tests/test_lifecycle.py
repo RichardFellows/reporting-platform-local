@@ -21,11 +21,11 @@ from __future__ import annotations
 import pathlib
 from datetime import date
 
-from tests.support import config_dir
+from tests.support import DAGS, config_dir
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 LIFECYCLE = REPO / "reporting_platform" / "registry" / "lifecycle.py"
-DBT_BUILDS = REPO / "airflow" / "dags" / "dbt_builds.py"
+DBT_BUILDS = DAGS / "dbt_builds.py"
 
 
 def _ctx():

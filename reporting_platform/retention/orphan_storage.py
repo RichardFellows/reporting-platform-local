@@ -20,13 +20,22 @@ WHAT THIS DOES. Resolve the set of table locations live across *every*
 reference (branches and tags), list the table-level prefixes present in the
 warehouse, and delete those in neither -- subject to an age floor.
 
-TWO SAFETY PROPERTIES, both deliberate:
+THREE SAFETY PROPERTIES, all deliberate:
 
   * **Age floor.** A prefix whose newest object is younger than `min_age_days`
     is never touched, because it may belong to a write still in flight. Same
     reasoning and floor as `remove_orphan_files`; it also absorbs clock skew.
   * **Every reference, not just main.** Reading only `main` would delete the
     working output of every open build branch.
+  * **A COMPLETE LIVE SET, OR NOTHING.** This sweep's input is a set of things
+    NOT to delete, so every gap in it is a deletion. A Nessie that is down,
+    slow or answering 401 therefore reads as "nothing is live" and the sweep
+    would delete the entire warehouse -- unattended, from the nightly chain.
+    So an unreadable reference REFUSES the sweep rather than shrinking the
+    keep-set, and an empty live set refuses too: a warehouse holding objects
+    while the catalog claims no tables is not a state to act destructively on.
+    Only a 404 is tolerated, because a ref that vanished mid-sweep really has
+    taken its tables with it. See docs/DECISIONS.md#an-incomplete-keep-set-refuses
 
 ORDERING TRAP. Deleting a branch *before* GC runs guarantees its files can
 never be collected by GC -- which is how the stranded directories appeared.
@@ -69,18 +78,58 @@ def _warehouse() -> tuple[str, str]:
     return bucket, prefix.strip("/")
 
 
+class IncompleteLiveSet(RuntimeError):
+    """The set of live prefixes could not be established in full.
+
+    Raised rather than returned, because the caller of `live_table_prefixes`
+    is about to delete everything NOT in the answer: a short set and a
+    complete one are the same type and read the same way, and the difference
+    between them is the whole warehouse.
+    """
+
+
+def _ref_is_gone(exc: Exception) -> bool:
+    """Did this reference 404, as opposed to being unreadable?
+
+    A branch deleted between `list_references` and `list_entries` is benign --
+    its tables genuinely have no live reference now, which is exactly what this
+    sweep exists to reclaim. Every other failure (connection refused, 401, 500,
+    a read timeout) means the ref may hold live tables we simply did not see.
+    """
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) == 404
+
+
 def live_table_prefixes(nessie: Nessie | None = None) -> set[str]:
-    """Table prefixes referenced by ANY branch or tag."""
+    """Table prefixes referenced by ANY branch or tag.
+
+    Raises `IncompleteLiveSet` if any reference could not be read. See this
+    module's third safety property: a partial keep-set is a deletion order.
+    """
     nessie = nessie or Nessie()
     live: set[str] = set()
-    for ref in nessie.list_references():
+    unreadable: list[str] = []
+    try:
+        references = nessie.list_references()
+    except Exception as e:
+        # The same refusal as an unreadable ref, and the commoner one: a
+        # Nessie that is down fails HERE, and an empty reference list would
+        # otherwise mean "nothing is live" -- i.e. delete the warehouse.
+        raise IncompleteLiveSet(
+            f"could not list the catalog's references, so nothing is known "
+            f"to be live: {str(e)[:200]}") from e
+    for ref in references:
         name = ref.get("name")
         if not name:
             continue
         try:
             entries = nessie.list_entries(name)
-        except Exception as e:                      # a ref can vanish mid-sweep
-            log.warning("could not read entries for %s: %s", name, str(e)[:120])
+        except Exception as e:
+            if _ref_is_gone(e):                     # a ref can vanish mid-sweep
+                log.warning("reference %s vanished mid-sweep", name)
+                continue
+            log.error("could not read entries for %s: %s", name, str(e)[:120])
+            unreadable.append(f"{name}: {str(e)[:120]}")
             continue
         for e in entries:
             content = e.get("content") or {}
@@ -90,22 +139,33 @@ def live_table_prefixes(nessie: Nessie | None = None) -> set[str]:
             m = _METADATA_RE.match(loc)
             if m:
                 live.add(m.group("prefix").strip("/"))
+    if unreadable:
+        raise IncompleteLiveSet(
+            "could not read %d of the catalog's references, so the live set is "
+            "incomplete and anything missing from it would be deleted: %s"
+            % (len(unreadable), "; ".join(unreadable[:5])))
     return live
 
 
 def warehouse_table_prefixes() -> dict[str, dict]:
     """Table-level prefixes present in object storage, with size and newest mtime."""
     bucket, root = _warehouse()
+    # root / namespace / table_uuid / ... -- and the ROOT IS CONFIGURABLE, so
+    # its depth is derived, never assumed. `_METADATA_RE` captures the whole
+    # root into a live prefix; a hardcoded depth of 3 against a nested root
+    # (`s3a://bucket/a/warehouse`) yields `a/warehouse/<namespace>`, which can
+    # never equal a live prefix -- so every namespace reads as an orphan.
+    root_parts = [p for p in root.split("/") if p]
+    depth = len(root_parts) + 2
     s3 = _client()
     found: dict[str, dict] = {}
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=f"{root}/"):
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{root}/" if root else ""):
         for obj in page.get("Contents", []):
             parts = obj["Key"].split("/")
-            # root / namespace / table_uuid / ...
-            if len(parts) < 4:
+            if len(parts) <= depth:
                 continue
-            prefix = "/".join(parts[:3])
+            prefix = "/".join(parts[:depth])
             rec = found.setdefault(prefix, {"objects": 0, "bytes": 0, "newest": None})
             rec["objects"] += 1
             rec["bytes"] += obj["Size"]
@@ -122,8 +182,24 @@ def sweep_orphan_prefixes(dry_run: bool = True) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=min_age)
 
     nessie = Nessie()
-    live = live_table_prefixes(nessie)
+    try:
+        live = live_table_prefixes(nessie)
+    except IncompleteLiveSet as e:
+        log.error("REFUSING the orphan sweep: %s", e)
+        return {"refused": str(e), "orphans": [], "dry_run": dry_run}
     present = warehouse_table_prefixes()
+
+    if present and not live:
+        # Not a crash and not an empty warehouse: the catalog answered, and
+        # answered that it holds no tables at all, while object storage holds
+        # some. Every prefix would qualify. Refuse and say so.
+        msg = ("no live table prefixes across any reference, but %d prefixes "
+               "are present in the warehouse -- every one of them would be "
+               "deleted. Refusing: check the catalog before sweeping."
+               % len(present))
+        log.error("REFUSING the orphan sweep: %s", msg)
+        return {"refused": msg, "orphans": [], "warehouse_prefixes": len(present),
+                "dry_run": dry_run}
 
     orphans, too_new = [], []
     for prefix, rec in sorted(present.items()):
@@ -171,15 +247,18 @@ def sweep_orphan_prefixes(dry_run: bool = True) -> dict:
 def main(argv=None) -> int:
     import argparse
     import json
-    import sys
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--dry-run", action="store_true", default=False,
                    help="report what would be deleted, change nothing")
     a = p.parse_args(argv)
-    print(json.dumps(sweep_orphan_prefixes(dry_run=a.dry_run), indent=2, default=str))
-    return 0
+    report = sweep_orphan_prefixes(dry_run=a.dry_run)
+    print(json.dumps(report, indent=2, default=str))
+    # A REFUSAL IS NOT A SUCCESS. Nothing was deleted, but nothing was checked
+    # either, and this runs unattended often enough that a zero exit would be
+    # read as "no orphans".
+    return 1 if report.get("refused") else 0
 
 
 if __name__ == "__main__":

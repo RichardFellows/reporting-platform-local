@@ -34,6 +34,11 @@ to run something for the first time, expect it to fail and read what it says.
 - **A check whose window does not contain the thing it describes** will either
   never fire or never stop. Match the window to the cadence of whatever clears
   it.
+- **A subject it could not READ is not a subject that is EMPTY**, and the two
+  are the same value. Reporting the first as the second is how a monitor goes
+  green on a table nobody opened and a sweep treats "nothing is live" as
+  "delete everything". Say which one it was.
+  (`#an-incomplete-keep-set-refuses`)
 
 ## Environment
 
@@ -67,9 +72,15 @@ to run something for the first time, expect it to fail and read what it says.
   `DBT_TARGET`): only the Spark path can address a Nessie branch. DuckDB is a
   read-only query tool (`scripts/duckdb_console.py`).
   (`#duckdb-is-not-an-engine`)
+- **`spark_session()` is in `common/spark.py` and `Nessie` in
+  `common/nessie.py`**, both RE-EXPORTED from `common/context.py` — every
+  existing import still works, and reading `feeds.yml` no longer drags an
+  engine and an HTTP client in with it. `CONFIG_DIR`/`CATALOG`/`ENV` are in
+  `common/settings.py`, which is what lets `spark.py` name the catalog without
+  importing `context`.
 - **Every Spark job runs on the cluster, never `local[*]`.** `SPARK_MASTER` is
   read in two places that must not diverge — `spark_session()` in
-  `common/context.py` and `spark.master` in `dbt/profiles.yml`;
+  `common/spark.py` and `spark.master` in `dbt/profiles.yml`;
   `spark_session()` refuses a `local` master rather than run in the Airflow
   container with the cluster idle. Each app caps at 2 cores/2g or standalone
   mode holds every free core until the session stops and the next job waits
@@ -224,7 +235,11 @@ The procedures are `docs/ADDING-A-FEED.md` (five files, no DAG edit),
   front end for that procedure, not a second source of truth: the change is an
   ordinary reviewable diff, checked with `dbt parse` (~5s, no Spark). Its
   one-feed build **never merges**, on purpose — publication belongs to the
-  Airflow builds, not a button labelled "test". Because it edits config a
+  Airflow builds, not a button labelled "test". That build is EXCLUSIVE, so it
+  must be able to end: `jobs.stream` kills its subprocess at
+  `FEED_UI_JOB_TIMEOUT` (default 3600s) and `DELETE /api/jobs/<id>` cancels
+  one, both by PROCESS GROUP — dbt spawns spark-submit spawns a JVM, and
+  signalling the direct child alone orphans the part holding the cores. Because it edits config a
   running Airflow is reading, `feeds()` and `_load()` are cached on **mtime**:
   a plain `@lru_cache` there means a new feed never reaches the DAG
   processor.
@@ -325,6 +340,18 @@ them.
 
 - **Retention and GC delete data. `dry_run` first, always.** GC defers its
   deletes by design; the deferred-delete pass is the deliberate second step.
+- **THE ORPHAN SWEEP'S INPUT IS A KEEP-SET, so a short answer is a deletion
+  order.** `orphan_storage` deletes every warehouse prefix not live on some
+  reference: a Nessie that is down therefore used to read as "nothing is
+  live". An unreadable reference (anything but a 404) now REFUSES the sweep,
+  an empty live set against a non-empty warehouse refuses too, and a refusal
+  exits non-zero — nothing deleted is not the same as nothing to delete. The
+  prefix depth is derived from `REPORTING_WAREHOUSE`, never assumed, or a
+  nested root makes every namespace an orphan.
+  (`#an-incomplete-keep-set-refuses`)
+- **The completeness check has THREE answers, not two**: `no data` (empty
+  table), `no table` (`TABLE_OR_VIEW_NOT_FOUND` — a feed that has never
+  delivered), `unreadable` (anything else, and it fails `--fail-on-gap`).
 - **A dry run may write to the index; it may not write anything a later step
   reads to decide what to delete.** `registry_reconcile` ignored `dry_run` and
   `deliveries.reconcile()` normalizes first, so `{"dry_run": true}` wrote 116

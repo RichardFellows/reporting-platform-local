@@ -41,7 +41,14 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(HERE.parent))
     passed, failed = 0, []
 
+    from tests import support
+
     for name in modules(argv):
+        # BEFORE THE IMPORT, not after it: a module that calls `config_dir()`
+        # at import time would otherwise start from whatever its predecessor
+        # left in the environment and in `sys.modules`, and the suite would
+        # depend on the order `modules()` happens to return.
+        support.reset()
         mod = importlib.import_module(f"tests.{name}")
         for attr in sorted(vars(mod)):
             if not attr.startswith("test_"):

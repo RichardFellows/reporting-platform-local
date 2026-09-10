@@ -580,6 +580,27 @@ def api_jobs():
     return {"running": running.snapshot(since=running.produced) if running else None}
 
 
+@app.delete("/api/jobs/{job_id}")
+def api_cancel_job(job_id: str):
+    """Stop a running job's subprocess.
+
+    THE ESCAPE HATCH FROM AN EXCLUSIVE SLOT. A build is refused while one is
+    running (see `jobs`), so a job that will never finish on its own -- a dbt
+    run blocked on the `lakehouse_write` pool, a Nessie call that never
+    answers -- would otherwise hold the console until the container is
+    restarted. The deadline in `jobs.stream` is the unattended version of
+    this; this is the one for somebody watching the log.
+    """
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"no such job: {job_id}")
+    # False means there was nothing to signal -- the job had already finished
+    # between the click and the request, which is not an error and not a
+    # cancellation either. Say which happened rather than implying a kill.
+    return {"job_id": job_id, "cancelled": jobs.cancel(job_id),
+            "status": job.status}
+
+
 # ------------------------------------------------------------ orchestration
 @app.get("/api/airflow/health")
 def api_airflow_health():

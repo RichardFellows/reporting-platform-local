@@ -354,9 +354,19 @@ def platform_housekeeping():
                     "feed %s (%s) is missing %d period(s) that other feeds "
                     "delivered on: %s", f["feed"], f.get("cadence"),
                     len(f["missing"]), ", ".join(f["missing"]))
-        if report.get("total_missing") and context["params"].get("fail_on_gap"):
+        # A FEED THAT COULD NOT BE READ IS NOT A FEED WITH NO GAPS. It carries
+        # no missing periods, so the loop above says nothing about it and
+        # `total_missing` counts nothing for it: without this the check goes
+        # green on a table it never opened.
+        unreadable = report.get("unreadable_feeds") or []
+        for name in unreadable:
+            log.error("feed %s was NOT CHECKED: its raw table could not be "
+                      "read, so nothing here describes its completeness", name)
+        if (report.get("total_missing") or unreadable) \
+                and context["params"].get("fail_on_gap"):
             raise AirflowException(
-                f"{report['total_missing']} COB date(s) are missing; "
+                f"{report.get('total_missing', 0)} COB date(s) are missing and "
+                f"{len(unreadable)} feed(s) could not be read; "
                 "see the per-feed detail above")
         return report
 

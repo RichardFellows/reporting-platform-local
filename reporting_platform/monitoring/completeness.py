@@ -35,6 +35,20 @@ spot is undocumented is worse than no monitor:
     visibility: such a feed that stops for a month is invisible here.
   * Anything outside a feed's own observed range: dates before its first
     delivery are not gaps, they are history it does not have.
+
+A TABLE IT COULD NOT READ IS NOT A TABLE WITH NO DATA. The two answers look
+identical from here -- an empty set of observed dates -- and reporting the
+first as the second turns a broken monitor into a passing one: no gaps, no
+`--fail-on-gap`, nothing on screen but a feed that has "no data". So a read
+failure is carried through as its own status and fails the check.
+
+THREE ANSWERS, NOT TWO, and the third is why this does not simply fail on
+every error. A feed declared in `feeds.yml` that has never delivered has no
+raw table at all, and Spark says so precisely (`TABLE_OR_VIEW_NOT_FOUND`).
+That is an ordinary state of a new feed, not a broken monitor: reported as
+`no table`, counted as neither a gap nor a failure. Anything else -- a
+catalog that will not answer, a branch that is gone, a permissions error --
+is `unreadable`, and that one fails.
 """
 from __future__ import annotations
 
@@ -65,12 +79,21 @@ def observed_dates(spark, table: str) -> set[date]:
 
 
 def find_gaps(per_feed: dict[str, set[date]], lookback: int,
-              cadence: dict[str, str] | None = None) -> dict:
+              cadence: dict[str, str] | None = None,
+              unreadable: dict[str, str] | None = None,
+              absent: dict[str, str] | None = None) -> dict:
     """Dates each feed is missing that other feeds prove were business days.
 
     Split out from the Spark reads so the interesting logic can be exercised
     without a cluster -- the calendar inference is the part with edge cases,
     and it should not need thirty seconds of JVM start-up to test.
+
+    `unreadable` maps a feed to why its raw table could not be read, and
+    `absent` to why it has no raw table at all -- two different answers, and
+    only the first is a defect (see the module header). Neither contributes
+    anything to the inferred calendar: an unread feed is not evidence that a
+    date was a business day, and treating it as one would let a broken read
+    move the window every other feed is judged against.
     """
     calendar = sorted(set().union(*per_feed.values())) if per_feed else []
     # Bound to the most recent `lookback` COB dates. Note this counts
@@ -79,8 +102,17 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
     window = set(calendar[-lookback:]) if lookback else set(calendar)
 
     cadence = cadence or {}
+    unreadable = unreadable or {}
+    absent = absent or {}
     report: dict = {"cob_dates_in_window": len(window),
                     "lookback_business_days": lookback, "feeds": []}
+    for name, why in sorted(unreadable.items()):
+        report["feeds"].append(
+            {"feed": name, "status": "unreadable", "error": why,
+             "missing": []})
+    for name, why in sorted(absent.items()):
+        report["feeds"].append(
+            {"feed": name, "status": "no table", "error": why, "missing": []})
     for name, dates in sorted(per_feed.items()):
         if not dates:
             report["feeds"].append(
@@ -119,6 +151,13 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
             "missing": missing,
         })
     report["total_missing"] = sum(len(f["missing"]) for f in report["feeds"])
+    # Named separately as well as flagged per feed, because this is the number
+    # that decides whether the check ANSWERED, and `total_missing: 0` beside
+    # it would otherwise read as a pass.
+    report["unreadable_feeds"] = sorted(unreadable)
+    # Reported beside it and NOT counted with it: a feed that has never
+    # delivered is not a broken check.
+    report["feeds_without_a_table"] = sorted(absent)
     return report
 
 
@@ -128,6 +167,8 @@ def run(lookback: int | None = None) -> dict:
         lookback = retention_policy("raw").get("keep_business_days", 10)
 
     checked, skipped, cadence = {}, [], {}
+    unreadable: dict[str, str] = {}
+    absent: dict[str, str] = {}
     spark = spark_session("completeness", ref="main")
     try:
         for name, fd in feeds().items():
@@ -141,13 +182,30 @@ def run(lookback: int | None = None) -> dict:
             try:
                 checked[name] = observed_dates(spark, fd.raw_table)
             except Exception as exc:
-                log.warning("cannot read %s: %s", fd.raw_table, str(exc)[:200])
-                checked[name] = set()
+                # NOT `checked[name] = set()`. That is the answer for a table
+                # that exists and is empty, and this one is "we do not know" --
+                # which `find_gaps` would render as `no data`, contribute 0 to
+                # `total_missing`, and pass.
+                #
+                # Spark names the one benign case exactly, so it is matched on
+                # the ERROR CLASS rather than guessed at from the prose; an
+                # error class that changes falls through to `unreadable`,
+                # which is the conservative direction.
+                why = str(exc)[:200]
+                if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+                    log.info("%s has no raw table yet", fd.raw_table)
+                    absent[name] = why
+                else:
+                    log.error("cannot read %s: %s", fd.raw_table, why)
+                    unreadable[name] = why
     finally:
         spark.stop()
 
-    report = find_gaps(checked, lookback, cadence)
+    report = find_gaps(checked, lookback, cadence, unreadable, absent)
     report["skipped_feeds"] = skipped
+    for name in report["unreadable_feeds"]:
+        log.error("feed %s was NOT CHECKED: its raw table could not be read. "
+                  "This report says nothing about its completeness.", name)
     for f in report["feeds"]:
         if f["missing"]:
             log.warning("feed %s (%s) is missing %d period(s) other feeds "
@@ -164,11 +222,17 @@ def main(argv=None) -> int:
                    help="COB dates to check back over "
                         "(default: raw layer's keep_business_days)")
     p.add_argument("--fail-on-gap", action="store_true",
-                   help="exit non-zero if any gap is found")
+                   help="exit non-zero if any gap is found, or if any feed's "
+                        "raw table could not be read")
     a = p.parse_args(argv)
     report = run(a.lookback)
     print(json.dumps(report, indent=2, default=str))
-    return 1 if (a.fail_on_gap and report["total_missing"]) else 0
+    # A feed that could not be READ fails this too. The check's promise is
+    # that it looked; a green exit for a feed it never managed to look at is
+    # the failure this whole module exists to prevent, one level up.
+    if a.fail_on_gap and (report["total_missing"] or report["unreadable_feeds"]):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

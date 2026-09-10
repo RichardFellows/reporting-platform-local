@@ -339,7 +339,7 @@ This is set in exactly two places, and they must not diverge:
 
 | Path | Where the master is set |
 |---|---|
-| Python (ingest, retention, maintenance, completeness, arrival checks) | `spark_session()` in `reporting_platform/common/context.py`, from `SPARK_MASTER` |
+| Python (ingest, retention, maintenance, completeness, arrival checks) | `spark_session()` in `reporting_platform/common/spark.py`, from `SPARK_MASTER` |
 | dbt builds | `spark.master` in `dbt/profiles.yml` (`spark_local`), from the same `SPARK_MASTER` |
 
 Three consequences worth knowing before changing any of it:
@@ -352,7 +352,7 @@ Three consequences worth knowing before changing any of it:
 - **The driver ships the jars.** `Dockerfile.spark` bakes the Iceberg and
   Nessie runtimes into the executors, but `spark.jars.packages` jars are
   served from the driver to every executor, so what the executors load is what
-  the driver resolved. That is why the package list in `context.py` and
+  the driver resolved. That is why the package list in `common/spark.py` and
   `profiles.yml` must stay at `Dockerfile.spark`'s versions, and why
   `hadoop-aws` — which the Spark image does *not* bake — reaches the executors
   at all.

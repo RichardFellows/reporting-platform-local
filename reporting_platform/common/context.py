@@ -1,15 +1,24 @@
-"""Shared platform context: config loading, Spark session, Nessie helpers.
+"""Shared platform context: config, feeds, reports, retention and identity.
 
 Everything environment-varying is read from config + env here, so no DAG or
 job module contains an endpoint, a credential or a policy value.
+
+TWO CLIENTS USED TO LIVE HERE AND NOW DO NOT: `spark_session` is in
+`common/spark.py` and `Nessie` is in `common/nessie.py`. They are RE-EXPORTED
+below, so `from reporting_platform.common.context import spark_session` still
+works and no call site changed -- but a reader of `feeds.yml` no longer drags
+an engine and an HTTP client into view, and the config half can be exercised
+without either. `CONFIG_DIR`/`CATALOG`/`ENV` moved to `common/settings.py` for
+the same reason: `spark.py` needs the catalog name, and importing this module
+to get it would put the split back.
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import uuid
-from urllib.parse import quote as _urlquote
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from functools import lru_cache
@@ -18,13 +27,27 @@ from typing import Any
 
 import yaml
 
-CONFIG_DIR = Path(os.environ.get("REPORTING_CONFIG_DIR", "/opt/platform/reporting_platform/config"))
-CATALOG = os.environ.get("REPORTING_CATALOG", "lakehouse")
-ENV = os.environ.get("REPORTING_ENV", "local")
+# Re-exported, not merely imported: these names are part of this module's
+# published surface and dozens of call sites read them from here.
+from reporting_platform.common.nessie import Nessie          # noqa: F401
+from reporting_platform.common.settings import (CATALOG,     # noqa: F401
+                                                CONFIG_DIR, ENV)
+from reporting_platform.common.spark import spark_session    # noqa: F401
 
 
 # --------------------------------------------------------------------- config
-@lru_cache(maxsize=None)
+# EVERY CACHE BELOW IS KEYED ON AN MTIME, SO IT IS BOUNDED OR IT LEAKS. Only
+# the current mtime of each file is ever asked for again; every earlier one is
+# a dead key holding a fully parsed config -- or, for `_feeds_at`, a whole
+# `Feed` object graph. `maxsize=None` never evicts them, and the process that
+# rewrites these files at run time is the feed console, which is long-lived,
+# as is Airflow's DAG file processor reading them. A handful of entries is
+# enough for every file to hit on its current mtime with room for a
+# mid-edit read; the rest is what we are declining to keep.
+_CONFIG_CACHE = 16
+
+
+@lru_cache(maxsize=_CONFIG_CACHE)
 def _load_at(name: str, mtime_ns: int) -> dict[str, Any]:
     """Parse a config file. Cached on (name, mtime) rather than name alone."""
     with open(CONFIG_DIR / name) as fh:
@@ -1088,7 +1111,7 @@ def effective_defaults(convention: str = "",
     return {**(cfg.get("defaults") or {}), **(known.get(convention) or {})}
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=_CONFIG_CACHE)
 def _conventions_at(mtime_ns: int) -> dict[str, dict[str, Any]]:
     return resolve_conventions(_load("feeds.yml"))
 
@@ -1098,7 +1121,7 @@ def conventions() -> dict[str, dict[str, Any]]:
     return _conventions_at((CONFIG_DIR / "feeds.yml").stat().st_mtime_ns)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=_CONFIG_CACHE)
 def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
     cfg = _load("feeds.yml")
     known = resolve_conventions(cfg)
@@ -1160,7 +1183,7 @@ DBT_MODELS_DIR = Path(os.environ.get("DBT_PROJECT_DIR", "/opt/platform/dbt")) / 
 _ALIAS = re.compile(r"\balias\s*=")
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=_CONFIG_CACHE)
 def _models_at(layer: str, mtime_ns: int) -> tuple[str, ...]:
     names = []
     for path in sorted((DBT_MODELS_DIR / layer).glob("*.sql")):
@@ -1228,7 +1251,7 @@ def managed_tables() -> list[tuple[str, str]]:
 _EXPOSURE_LAYERS = ("reporting",)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=_CONFIG_CACHE)
 def _reports_at(mtime_ns: int) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for layer in _EXPOSURE_LAYERS:
@@ -1640,10 +1663,7 @@ def tag_retention_years(report: str | None = None) -> int:
 
     years = _years(per_report[report], f"per_report[{report!r}]")
     if years < default:
-        # Local import to match the rest of this module: context.py has no
-        # module-level logger, and adding one here would be the only caller.
-        import logging as _logging
-        _logging.getLogger("retention").warning(
+        logging.getLogger("retention").warning(
             "published tag retention for report %r is %d years, shorter than "
             "default_keep_years (%d). Pins for that report expire first; this "
             "is the direction that loses evidence permanently.",
@@ -1908,308 +1928,3 @@ def dbt_manifest_ref() -> str:
     project = Path(os.environ.get("DBT_PROJECT_DIR", "/opt/platform/dbt"))
     return _tree_digest([project / "models", project / "macros",
                          project / "tests"], (".sql", ".yml"))
-
-
-# ---------------------------------------------------------------------- spark
-def spark_session(app_name: str, ref: str = "main"):
-    """Build a Spark session bound to the Nessie catalog at a given ref.
-
-    `ref` is the Nessie branch. Ingest and dbt builds run on a working branch;
-    maintenance and snapshot expiry run on main.
-
-    THE SESSION IS A CLIENT OF THE STANDALONE CLUSTER, never local[*]. The
-    caller's process is the driver; every task runs in an executor on
-    `spark-worker`. See the `master` handling below for why there is no
-    local fallback.
-    """
-    from pyspark.sql import SparkSession
-
-    endpoint = os.environ.get("S3_ENDPOINT", "http://minio:9000")
-    warehouse = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
-    nessie_uri = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")
-
-    # No local[*] fallback, deliberately: running in-container is a config
-    # error that LOOKS like success. The default below matches
-    # docker-compose.yml so a bare `python -m ...` still works.
-    # See docs/DECISIONS.md#spark-master-no-local-fallback
-    master = os.environ.get("SPARK_MASTER") or "spark://spark-master:7077"
-    if master.startswith("local"):
-        raise RuntimeError(
-            f"SPARK_MASTER is {master!r}. This platform runs every Spark job on "
-            f"the spark-master/spark-worker cluster; an in-process local session "
-            f"silently bypasses it. Point SPARK_MASTER at the cluster "
-            f"(spark://spark-master:7077)."
-        )
-
-    # `pyspark` here is the pip-installed runtime baked into
-    # Dockerfile.airflow, and it is the DRIVER. It has NONE of the
-    # Iceberg/Nessie/S3A jars Dockerfile.spark curls into the workers'
-    # /opt/spark/jars, so it must resolve every one via Ivy or the first
-    # Iceberg SQL statement fails with ClassNotFoundException.
-    #
-    # Keep this list even though the executors bake most of it in:
-    # spark.jars.packages ships the DRIVER's jars to every executor, so what
-    # the executors load is what is resolved here -- which is why these
-    # versions must stay equal to Dockerfile.spark's, and how hadoop-aws (not
-    # baked) reaches them at all. Versions come from the environment, set once
-    # in docker-compose.yml from .env, so this and dbt/profiles.yml cannot
-    # drift. The defaults repeat theirs, for a process started outside
-    # compose.
-    iceberg = os.environ.get("ICEBERG_VERSION", "1.6.1")
-    nessie_ext = os.environ.get("NESSIE_SPARK_EXT_VERSION", "0.99.0")
-    packages = ",".join([
-        f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{iceberg}",
-        f"org.apache.iceberg:iceberg-aws-bundle:{iceberg}",
-        "org.projectnessie.nessie-integrations:"
-        f"nessie-spark-extensions-3.5_2.12:{nessie_ext}",
-        # Needed separately from iceberg-aws-bundle: reading landing CSVs via
-        # spark.read.csv("s3a://...") goes through Hadoop's S3A connector, not
-        # Iceberg's own S3FileIO, and Spark's binaries don't bundle it.
-        "org.apache.hadoop:hadoop-aws:3.3.4",
-        "com.amazonaws:aws-java-sdk-bundle:1.12.262",
-    ])
-
-    builder = (
-        SparkSession.builder.appName(app_name)
-        .master(master)
-        .config("spark.jars.packages", packages)
-        # The driver does no task work, so it needs far less heap than a
-        # local[*] session would -- but not the 1g default, which is tight once
-        # Iceberg/Nessie/aws-sdk-bundle classes are loaded and exercised.
-        .config("spark.driver.memory", "2g")
-        .config("spark.driver.maxResultSize", "1g")
-        # spark.driver.host is left at its default: Spark advertises this
-        # container's hostname and Docker's embedded DNS resolves it from
-        # spark-worker, so executors can call back. Verified live.
-        #
-        # CAP THE APP so one job cannot take the whole cluster. Standalone mode
-        # grants an application every free core by default and holds them until
-        # it stops; two overlapping jobs would leave the second waiting forever
-        # rather than failing. The `lakehouse_write` pool already serialises the
-        # WRITERS -- this is what keeps read-only jobs outside that pool from
-        # colliding. Sized against SPARK_WORKER_CORES/SPARK_WORKER_MEMORY:
-        # three concurrent applications fit.
-        .config("spark.cores.max", os.environ.get("SPARK_APP_CORES", "2"))
-        .config("spark.executor.cores", os.environ.get("SPARK_APP_CORES", "2"))
-        .config("spark.executor.memory", os.environ.get("SPARK_APP_MEMORY", "2g"))
-        .config(
-            # ORDER MATTERS. Each extension injects a parser wrapping the
-            # previous one, so the LAST listed ends up outermost. Iceberg's
-            # `rewrite_data_files(strategy => 'sort', sort_order => ...)`
-            # checks `parser instanceof ExtendedParser`; with Nessie last it
-            # fails with "Cannot parse order: parser is not an Iceberg
-            # ExtendedParser", which broke maintenance on every
-            # prepared/reporting table. Nessie first, Iceberg last.
-            "spark.sql.extensions",
-            "org.projectnessie.spark.extensions.NessieSparkSessionExtensions,"
-            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-        )
-        .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
-        .config(f"spark.sql.catalog.{CATALOG}.catalog-impl",
-                "org.apache.iceberg.nessie.NessieCatalog")
-        .config(f"spark.sql.catalog.{CATALOG}.uri", nessie_uri)
-        .config(f"spark.sql.catalog.{CATALOG}.ref", ref)
-        .config(f"spark.sql.catalog.{CATALOG}.authentication.type", "NONE")
-        .config(f"spark.sql.catalog.{CATALOG}.warehouse", warehouse)
-        .config(f"spark.sql.catalog.{CATALOG}.io-impl",
-                "org.apache.iceberg.aws.s3.S3FileIO")
-        .config(f"spark.sql.catalog.{CATALOG}.s3.endpoint", endpoint)
-        .config(f"spark.sql.catalog.{CATALOG}.s3.path-style-access", "true")
-        .config("spark.hadoop.fs.s3a.endpoint", endpoint)
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        .config("spark.sql.session.timeZone", "UTC")
-    )
-    return builder.getOrCreate()
-
-
-# --------------------------------------------------------------------- nessie
-class Nessie:
-    """Thin wrapper over Nessie's REST API.
-
-    Deliberately REST rather than the Spark SQL extensions for branch
-    management, so branch lifecycle can be driven from Airflow tasks that do
-    not need a Spark session (cheaper pods, faster failure).
-    """
-
-    def __init__(self, uri: str | None = None):
-        self.uri = (uri or os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")).rstrip("/")
-
-    def _req(self, method: str, path: str, **kwargs):
-        import requests
-
-        r = requests.request(method, f"{self.uri}{path}", timeout=30, **kwargs)
-        if not r.ok:
-            # requests' default raise_for_status() drops the response body,
-            # which is where Nessie puts the useful part (status/reason/
-            # message/errorCode) -- surface it instead of "404 Client Error".
-            raise requests.exceptions.HTTPError(
-                f"{r.status_code} {r.reason} for url {r.url}: {r.text}", response=r
-            )
-        return r.json() if r.content else {}
-
-    def get_reference(self, name: str) -> dict[str, Any]:
-        return self._req("GET", f"/trees/{_urlquote(name, safe='')}")
-
-    def create_branch(self, name: str, from_ref: str = "main",
-                      exist_ok: bool = False) -> dict[str, Any]:
-        """POST /v2/trees?name=<new>&type=BRANCH
-
-        Per Nessie's v2 REST spec (confirmed against the live server's
-        /nessie-openapi/openapi.yaml), the new reference's name/type are
-        QUERY params, and the JSON body is the SOURCE reference being
-        branched from (not the new branch) -- i.e. {type, name, hash} of
-        `from_ref`. Getting this backwards produces a 404
-        "Named reference '<new-name>' not found", since the server tries to
-        resolve the body's name as the existing source ref.
-        """
-        if exist_ok:
-            # Retries must not be poisoned by their own previous attempt. A
-            # failed build deliberately leaves its branch behind for inspection
-            # (see dbt_builds.keep_failed_branch), so re-running hits 409
-            # "already exists" and can NEVER succeed -- which made `retries`
-            # actively harmful. Reusing the branch is right: same run_id, so
-            # the same logical build.
-            try:
-                existing = self.get_reference(name)
-                log_msg = f"branch {name} already exists; reusing it"
-                import logging as _logging
-                _logging.getLogger("nessie").info(log_msg)
-                return existing
-            except Exception:
-                pass
-        src = self.get_reference(from_ref)["reference"]
-        return self._req(
-            "POST",
-            "/trees",
-            params={"name": name, "type": "BRANCH"},
-            json={"type": src["type"], "name": src["name"], "hash": src["hash"]},
-        )
-
-    def merge(self, from_branch: str, into: str = "main",
-              message: str | None = None,
-              properties: dict[str, str] | None = None) -> dict[str, Any]:
-        """POST /v2/trees/{branch}@{expectedHash}/history/merge
-
-        v2 has no separate `expectedHash` body field -- the target's expected
-        HEAD is pinned via `name@hash` in the path, and the server rejects an
-        unpinned merge. This only works once `into` has a real commit: pinning
-        at Nessie's sentinel "no ancestor" hash fails with "No common ancestor
-        in parents of ...". Callers run a one-time bootstrap commit first (see
-        `_bootstrap_main_if_empty` in ingest_feed.py).
-
-        `message` and `properties` become the merge commit's CommitMeta, sent
-        only when there is something to say.
-
-        READING THEM BACK, the properties are under **`allProperties`**, not
-        `properties` -- v2 returns them multi-valued, `{"change_ref":
-        ["RPT-1421"]}`. Looking for `properties` finds nothing and reads like
-        the server having dropped them.
-        """
-        src = self.get_reference(from_branch)["reference"]
-        tgt = self.get_reference(into)["reference"]
-        body: dict[str, Any] = {"fromRefName": from_branch,
-                                "fromHash": src["hash"]}
-        if message or properties:
-            # REQ-405. The merge commit is the only place a publication can
-            # say WHY it happened in the catalog itself, and it carried nothing
-            # at all: Nessie synthesises "Merge <hash> into main".
-            # `properties` is a free-form string map on Nessie's CommitMeta, so
-            # the change reference is queryable rather than only greppable.
-            meta: dict[str, Any] = {}
-            if message:
-                meta["message"] = message
-            if properties:
-                meta["properties"] = {k: str(v) for k, v in properties.items()
-                                      if v is not None}
-            body["commitMeta"] = meta
-        return self._req(
-            "POST",
-            f"/trees/{_urlquote(into, safe='')}@{tgt['hash']}/history/merge",
-            json=body,
-        )
-
-    def list_entries(self, ref: str = "main") -> list[dict[str, Any]]:
-        """Every content entry on a ref -- tables and namespaces.
-
-        Paginated: Nessie answers with `hasMore` and a `token`, and a caller
-        that ignores them silently sees only the first page. On a warehouse
-        this size that is one page, which is exactly why it would go unnoticed
-        until it was not.
-
-        This is the cheap way to ask what the catalog holds. The alternative,
-        `SHOW TABLES`, costs a SparkSession -- about 22 seconds -- and the
-        watchdog runs every five minutes and imports no Spark at all.
-        """
-        entries: list[dict[str, Any]] = []
-        params: dict[str, Any] = {}
-        while True:
-            page = self._req("GET", f"/trees/{_urlquote(ref, safe='')}/entries",
-                             params=params).json()
-            entries.extend(page.get("entries", []))
-            if not page.get("hasMore"):
-                return entries
-            params = {"pageToken": page["token"]}
-
-    def create_tag(self, name: str, from_ref: str = "main") -> dict[str, Any]:
-        src = self.get_reference(from_ref)["reference"]
-        return self._req(
-            "POST",
-            "/trees",
-            params={"name": name, "type": "TAG"},
-            json={"type": src["type"], "name": src["name"], "hash": src["hash"]},
-        )
-
-    def delete_reference(self, name: str) -> None:
-        """DELETE /v2/trees/{name}@{hash}?type=...
-
-        Like merge, the expected hash rides in the path (`name@hash`), not
-        as a query param -- an `expectedHash` query param is silently
-        ignored by the server.
-        """
-        ref = self.get_reference(name)["reference"]
-        self._req("DELETE", f"/trees/{_urlquote(name, safe='')}@{ref['hash']}",
-                  params={"type": ref["type"]})
-
-    def list_entries(self, ref: str) -> list[dict[str, Any]]:
-        """Every content entry on `ref`, with the content payload inlined.
-
-        `content=true` is what makes `metadataLocation` available, which is the
-        only way to learn where a table's files actually live. Without it you
-        get names and ids and no way to map a table to object storage.
-        """
-        out, token = [], None
-        enc = _urlquote(ref, safe="")
-        while True:
-            params: dict[str, Any] = {"content": "true"}
-            if token:
-                params["page-token"] = token
-            page = self._req("GET", f"/trees/{enc}/entries", params=params)
-            out.extend(page.get("entries", []))
-            token = page.get("token")
-            if not token:
-                break
-        return out
-
-    def list_references(self, prefix: str = "",
-                        fetch_all: bool = False) -> list[dict[str, Any]]:
-        """List references, optionally with their commit metadata.
-
-        `fetch_all=True` adds `fetch=ALL`, which is what makes each reference
-        carry a `metadata.commitMetaOfHEAD.commitTime`. WITHOUT it the server
-        returns only type/name/hash -- no metadata key at all. Any caller that
-        wants to reason about a branch's age must pass it, or every age check
-        silently sees `None` and treats every branch as arbitrarily old.
-        Costs an extra lookup per reference server-side, so it is opt-in.
-        """
-        out, token = [], None
-        while True:
-            params: dict[str, Any] = {"fetch": "ALL"} if fetch_all else {}
-            if token:
-                params["page-token"] = token
-            page = self._req("GET", "/trees", params=params)
-            out.extend(page.get("references", []))
-            token = page.get("token")
-            if not token:
-                break
-        return [r for r in out if r["name"].startswith(prefix)]
