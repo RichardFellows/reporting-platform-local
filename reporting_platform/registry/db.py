@@ -196,6 +196,10 @@ CREATE TABLE IF NOT EXISTS registry.rejection (
 
 CREATE INDEX IF NOT EXISTS rejection_feed_time
     ON registry.rejection (feed, rejected_at);
+-- `rejections.recent` orders by arrival, not by refusal, so that the arrivals
+-- view can merge it with `deliveries.recent` on one field. Its own index.
+CREATE INDEX IF NOT EXISTS rejection_feed_received
+    ON registry.rejection (feed, received_at);
 -- ------------------------------------------------------------------- runs
 -- REQ-400/REQ-401. One row per BUILD RUN that reached the point of writing
 -- something: which branch it built on, what it merged, which code and which

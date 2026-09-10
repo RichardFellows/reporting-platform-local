@@ -588,7 +588,13 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # point of checking here rather than at the door: an approved sender
         # gets the same verification as a legacy feed, from one implementation.
         # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
-        declared_md5 = manifest.get("declared_md5")
+        # Lower-cased on BOTH sides. `normalize._declared` already does this
+        # when it writes the manifest, but hex case is a property of the
+        # sender's file and not of our reader: an older manifest still in
+        # `ready/`, or one written by hand, would fail here on a checksum that
+        # matches, and the message this raises sends the reader looking for
+        # corruption that did not happen.
+        declared_md5 = (manifest.get("declared_md5") or "").strip().lower() or None
         if declared_md5 is not None:
             actual_md5 = _parts_md5(manifest)
             if actual_md5 != declared_md5:

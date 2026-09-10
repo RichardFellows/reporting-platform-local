@@ -34,7 +34,7 @@ finding, not pedantry.
 | `NESSIE_SERVER_VERSION` | the Nessie server image tag and the `nessie-gc` jar |
 
 `ICEBERG_VERSION` has to be identical in three places — `Dockerfile.spark`, and
-*both* drivers (`spark_session()` in `common/context.py`, `spark.jars.packages`
+*both* drivers (`spark_session()` in `common/spark.py`, `spark.jars.packages`
 in `dbt/profiles.yml`) — because every process that submits work here runs a
 pip-installed pyspark with no jars of its own. `spark.jars.packages` ships the
 driver's jars to every executor, so what the executors load is what the driver
@@ -326,7 +326,7 @@ secret — see [airflow-2-not-3](#airflow-2-not-3).
 
 Every Spark job runs on the `spark-master`/`spark-worker` cluster, never
 `local[*]`. The master comes from `SPARK_MASTER` in two places that must not
-diverge: `spark_session()` in `common/context.py` and `spark.master` in
+diverge: `spark_session()` in `common/spark.py` and `spark.master` in
 `dbt/profiles.yml`. `spark_session()` refuses a `local` master rather than
 quietly running the pipeline inside the Airflow container with the cluster idle.
 
@@ -341,7 +341,7 @@ job on this platform is a *client* of this cluster — ingest, dbt builds,
 maintenance, retention, arrival checks, completeness — and a standalone
 application holds its cores from its first job until the session stops.
 
-Each application caps itself at 2 cores / 2g (`spark.cores.max` in `context.py`
+Each application caps itself at 2 cores / 2g (`spark.cores.max` in `common/spark.py`
 and `dbt/profiles.yml`), so 6 cores / 6g leaves room for three concurrent: the
 one `lakehouse_write` slot plus the read-only jobs outside that pool. Without
 the cap, standalone mode grants every free core until the session stops and the
@@ -1398,7 +1398,7 @@ with no implementation behind them.
 
 **Unbuilt values raise "NOT BUILT", not "unknown".** A typo and a missing
 feature are different problems with different fixes, so
-`context.NOT_BUILT` (`common/context.py:214`) lists them by name and
+`context.NOT_BUILT` (`common/context.py:346`) lists them by name and
 `resolve_delivery_config` checks that table before the `allowed` one. Folding
 them into one error would make a real gap look like a fixable spelling
 mistake, and it would only be caught by someone reading the source rather than
@@ -2247,7 +2247,7 @@ The next bucket-wide sweep would not be so lucky.
 ### Nothing needs them, and that was checked rather than assumed
 
 Iceberg writes through `S3FileIO` (`spark.sql.catalog.lakehouse.io-impl`,
-set identically in `common/context.py` and `dbt/profiles.yml`), which PUTs
+set identically in `common/spark.py` and `dbt/profiles.yml`), which PUTs
 keys directly and has no notion of a parent directory. The only S3A use is
 `spark.read.csv("s3a://...")` READING a landing object that already exists.
 
@@ -4356,3 +4356,104 @@ fifty repetitions of the default dressed up as information.
   rows on screen.
 - `trs_position`, a feed no longer in `feeds.yml`, still lists its deliveries
   and reports `no ingest DAG` rather than 404ing on the config.
+
+## an-incomplete-keep-set-refuses
+
+`retention/orphan_storage.py` deletes a warehouse prefix that no Nessie
+reference points at. Its input is not a list of things to delete — it is a set
+of things **not** to delete, and everything else goes. That inverts the usual
+relationship between an error and its blast radius: a query that fails and
+returns nothing normally does nothing, and here it deletes the warehouse.
+
+The sweep read every reference and, per reference, did this:
+
+```python
+try:
+    entries = nessie.list_entries(name)
+except Exception as e:                      # a ref can vanish mid-sweep
+    log.warning("could not read entries for %s: %s", name, str(e)[:120])
+    continue
+```
+
+The comment is right about the case it names and wrong about every other one.
+A branch deleted between `list_references` and `list_entries` really has taken
+its tables with it, and reclaiming them is the whole point of this module. But
+a Nessie that is down, restarting, rate-limiting or answering 401 fails the
+same way, and then `live` is `set()`, every prefix older than the three-day
+age floor qualifies, and the sweep deletes the entire Iceberg warehouse
+object-by-object — unattended, from step 6 of the nightly
+`platform_housekeeping` chain, with nothing louder than a `warning` per
+reference. `list_references()` failing outright was worse still: it raised out
+of a `try/except` in `retention.run` that exists to stop a sweep failure
+failing the chain, so the traceback landed in a report field.
+
+**So the live set is complete or the sweep does not run.** Three rules, and
+the second is the one that would not have occurred to anybody writing this
+the first time:
+
+- **A reference that could not be read refuses the whole answer.** Only a 404
+  is tolerated — that is the ref-vanished case, identified by status code
+  rather than by the shape of the message. Anything else raises
+  `IncompleteLiveSet`, which `sweep_orphan_prefixes` turns into a reported
+  refusal: no deletions, an `ERROR` line, and `refused` in the report.
+- **An empty live set against a non-empty warehouse refuses too.** Not every
+  short answer arrives as an exception. A catalog that answers cleanly and
+  says it holds no tables at all, while object storage holds some, is either a
+  catastrophe or a misconfiguration; "delete everything" is not the reading to
+  act on. An empty warehouse is still an ordinary no-op.
+- **A refusal exits non-zero.** Nothing was deleted, but nothing was checked
+  either, and a zero exit from an unattended sweep reads as "no orphans".
+
+The prefix depth had the same shape of bug from the other end.
+`warehouse_table_prefixes` took `"/".join(parts[:3])` while `_warehouse()`
+reads a configurable `REPORTING_WAREHOUSE`; `_METADATA_RE` captures the whole
+root into a live prefix, so with a nested root (`s3a://bucket/a/warehouse`)
+the two halves computed different strings, nothing ever matched, and every
+namespace read as an orphan. The depth is now derived from the root. The
+shipped `s3a://lakehouse/warehouse` happened to align, which is why it had
+never been seen.
+
+### The same shape in the monitor next door
+
+`monitoring/completeness.py` had the mirror image: it caught the Spark read of
+a feed's raw table, logged a warning, and recorded `set()` — which `find_gaps`
+renders as `{"status": "no data", "missing": []}`, contributing 0 to
+`total_missing` so that `--fail-on-gap` passes. A table nobody could open and
+a table with nothing in it are the same value, and the module goes to some
+length to enumerate its own blind spots without this one among them. A monitor
+that goes green on a table it never read is worse than no monitor.
+
+There are **three** answers, not two, and the third is why this does not
+simply fail on every error:
+
+| answer | what it means | counted |
+|---|---|---|
+| `no data` | the table exists and is empty | no |
+| `no table` | Spark said `TABLE_OR_VIEW_NOT_FOUND` — a feed declared in `feeds.yml` that has never delivered | no |
+| `unreadable` | anything else: catalog down, branch gone, permissions | **yes**, and it fails `--fail-on-gap` |
+
+Matched on the error CLASS rather than on the prose, and an error class that
+changes falls through to `unreadable` — the conservative direction. An unread
+feed also contributes nothing to the inferred calendar, in either state: it is
+not evidence that a date was a business day, and letting a broken read move
+the window would change the verdict for every other feed.
+
+### Verified
+
+- With `NESSIE_URI` pointed at a dead port, `python -m
+  reporting_platform.retention.orphan_storage` (not a dry run) printed
+  `refused: could not list the catalog's references…` and deleted nothing.
+  Before the change the same command raised out of `list_references`.
+- With a live Nessie and `list_entries` patched to raise a 500 for `main`
+  only, the sweep refused with `could not read 1 of the catalog's references`
+  and made no `delete_object` call — asserted by a guard client that raises if
+  one is attempted.
+- The shipped root still resolves: `live_prefixes: 1`, `warehouse_prefixes:
+  1`, `orphans: []` against the one table this environment holds, and the two
+  halves produce the identical string
+  `warehouse/raw/fo_trade_fb646d55-…`.
+- `python -m scripts._spark_task completeness` reported `ref_collateral`,
+  `ref_counterparty` and `ref_rating` as `no table` with
+  `unreadable_feeds: []` — three feeds that have never been ingested in this
+  environment, and that previously read as `no data` with a green
+  `--fail-on-gap`.

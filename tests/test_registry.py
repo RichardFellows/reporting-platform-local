@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from tests.support import config_dir, feeds_from, synthetic
+from tests.support import DAGS, config_dir, feeds_from, synthetic
 
 MANIFEST = {
     "manifest_version": 1,
@@ -384,7 +384,7 @@ def test_the_nightly_task_is_narrowed_by_dry_run_not_skipped():
     failure is a one-line `if p.get("dry_run"): return` somebody adds later.
     """
     from tests.support import REPO
-    src = (REPO / "airflow" / "dags" / "platform_housekeeping.py").read_text(
+    src = (DAGS / "platform_housekeeping.py").read_text(
         encoding="utf-8")
     body = src[src.index("def registry_reconcile"):src.index("def evidence_check")]
     assert "reconcile_all(normalize_first=not dry)" in body

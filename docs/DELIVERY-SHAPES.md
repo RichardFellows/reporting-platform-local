@@ -50,7 +50,7 @@ mechanism.
 **One landed object is one file, is one delivery, and its NAME carries the
 COB date.**
 
-`Feed.parse_filename` (`common/context.py:142`) does `re.fullmatch` on a
+`Feed.parse_filename` (`common/context.py:283`) does `re.fullmatch` on a
 filename and returns `(cob_date, version)`. It has **14 call sites across
 7 modules**, and they are not all the ones you would guess:
 

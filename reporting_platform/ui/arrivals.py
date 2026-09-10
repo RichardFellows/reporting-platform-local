@@ -46,7 +46,9 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from reporting_platform.registry import deliveries, rejections
@@ -58,6 +60,10 @@ log = logging.getLogger("ui.arrivals")
 # The task whose XCom names the delivery a run without conf resolved for
 # itself. See `_ingested_key`.
 RESOLVE_TASK = "resolve_arrival"
+
+# How many of a feed's ingest runs to ask Airflow for. See `_run_limit`.
+RUN_LIMIT_FLOOR = 15
+RUN_LIMIT_CEILING = 200
 
 
 # --------------------------------------------------------------- at the door
@@ -143,12 +149,22 @@ def inbox_state(processed_limit: int = 20) -> dict[str, Any]:
         for feed_dir in processed.iterdir():
             if not feed_dir.is_dir():
                 continue
-            for path in feed_dir.iterdir():
-                if ib._skip(path):
-                    continue
-                rows.append({"filename": path.name, "feed": feed_dir.name,
-                             "bytes": path.stat().st_size,
-                             "processed_at": _iso(path.stat().st_mtime)})
+            # `scandir`, and ONE stat per file: this walks everything every
+            # feed has ever processed to keep `processed_limit` of it, so the
+            # per-file cost is the whole cost. A DirEntry caches its stat,
+            # where two `path.stat()` calls are two syscalls.
+            with os.scandir(feed_dir) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if ib._skip(path):
+                        continue
+                    try:
+                        stat = entry.stat()
+                    except FileNotFoundError:   # swept while we were reading
+                        continue
+                    rows.append({"filename": entry.name, "feed": feed_dir.name,
+                                 "bytes": stat.st_size,
+                                 "processed_at": _iso(stat.st_mtime)})
         rows.sort(key=lambda r: r["processed_at"], reverse=True)
         out["processed"] = rows[:processed_limit]
     return out
@@ -277,7 +293,21 @@ def _refused(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _stamp(value: Any) -> str | None:
-    return value.isoformat() if hasattr(value, "isoformat") else value
+    """A registry timestamp as an ISO-8601 string, NORMALISED TO UTC.
+
+    Not merely formatted. `recent()` merges two queries and sorts the result
+    lexically, which is chronological only while every string carries the same
+    offset -- and psycopg2 renders a `TIMESTAMPTZ` in the SERVER's timezone,
+    which `registry/db.py` deliberately never sets. On a server that is not on
+    UTC, two rows either side of a DST change carry different offsets and the
+    merge puts them in the wrong order. Converting here fixes the sort and the
+    displayed value together, and there is nowhere else the two could diverge.
+    """
+    if not hasattr(value, "isoformat"):
+        return value
+    if getattr(value, "tzinfo", None) is not None:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
 
 
 def recent(limit: int = 50, feed: str | None = None) -> dict[str, Any]:
@@ -289,10 +319,13 @@ def recent(limit: int = 50, feed: str | None = None) -> dict[str, Any]:
     """
     rows = [_accepted(r) for r in deliveries.recent(limit, feed)]
     rows += [_refused(r) for r in rejections.recent(limit, feed)]
-    # `at` is an ISO string in UTC on both sides, so a lexical sort is a
-    # chronological one. A row with no timestamp sorts last rather than
-    # raising -- every column in the registry that feeds it is NOT NULL, so
-    # this is defence against a row from a future schema, not an expected case.
+    # `at` is an ISO string in UTC on both sides -- `_stamp` converts, it does
+    # not assume -- so a lexical sort is a chronological one. Both halves are
+    # also ORDERED ON THE SAME COLUMN the merge sorts by (see
+    # `rejections.recent`), or the top-N of one half would not be the top-N of
+    # the merge. A row with no timestamp sorts last rather than raising --
+    # every column in the registry that feeds it is NOT NULL, so this is
+    # defence against a row from a future schema, not an expected case.
     rows.sort(key=lambda r: r["at"] or "", reverse=True)
     # Trimmed BEFORE counting, so the summary describes the rows on screen.
     # Counting the merge would report four arrivals above a list of three, and
@@ -383,6 +416,26 @@ def ingest_runs(feed_name: str, limit: int = 15) -> dict[str, Any]:
             "runs": runs}
 
 
+def _run_limit(deliveries_on_page: int) -> int:
+    """How many ingest runs to fetch for a feed with this many rows on screen.
+
+    A FIXED LIMIT MAKES `no run recorded` A LIE. The page size is the reader's
+    choice (the row selector offers 250), and a delivery whose run is older
+    than the newest N matches nothing -- which renders as the one state this
+    module promises means "Airflow trimmed its history", never "not ingested".
+    So the ask is scaled to the rows actually being matched.
+
+    Doubled, because a delivery can have more than one run: a re-run after a
+    failure is exactly the history somebody reading this page is looking for,
+    and fetching one run per row would push the oldest rows back off the end.
+    Still a heuristic and still bounded -- `RUN_LIMIT_CEILING` is there
+    because this is one HTTP call to a scheduler, not a query -- but a row
+    beyond it now needs a genuinely long re-run history to be missed, rather
+    than merely being the sixteenth delivery.
+    """
+    return max(RUN_LIMIT_FLOOR, min(deliveries_on_page * 2, RUN_LIMIT_CEILING))
+
+
 def _matches(run: dict[str, Any], delivery: dict[str, Any]) -> bool:
     """Is this run an ingest of this delivery?
 
@@ -411,9 +464,12 @@ def with_runs(limit: int = 50, feed: str | None = None) -> dict[str, Any]:
     wrong way round for a list whose whole job is to grow.
     """
     out = recent(limit, feed)
-    wanted = {r["feed"] for r in out["arrivals"]
-              if r["kind"] == "delivery" and r["feed"]}
-    by_feed = {name: ingest_runs(name) for name in sorted(wanted)}
+    wanted: dict[str, int] = {}
+    for r in out["arrivals"]:
+        if r["kind"] == "delivery" and r["feed"]:
+            wanted[r["feed"]] = wanted.get(r["feed"], 0) + 1
+    by_feed = {name: ingest_runs(name, _run_limit(n))
+               for name, n in sorted(wanted.items())}
     for row in out["arrivals"]:
         if row["kind"] != "delivery":
             continue
@@ -441,7 +497,13 @@ def detail(feed_name: str, delivery_id: str) -> dict[str, Any] | None:
     out = _accepted(row)
     out["part_objects"] = row["parts"]
     out["origin_uri"] = row.get("origin_uri")
-    activity = ingest_runs(feed_name)
+    # The ceiling, not the floor: this is ONE delivery, asked about by name,
+    # and it is usually not a recent one -- somebody opening a detail page is
+    # looking into something. The default limit would answer `no run recorded`
+    # for any delivery older than the fifteenth. The cost is bounded by the
+    # runs that carry no conf, since `_ingested_key` reads the conf first and
+    # only falls back to XCom for the rest.
+    activity = ingest_runs(feed_name, RUN_LIMIT_CEILING)
     matched = [r for r in activity.get("runs", []) if _matches(r, row)]
     out["ingest"] = {"dag_id": activity.get("dag_id"),
                      "available": activity.get("available", False),

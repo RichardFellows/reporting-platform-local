@@ -150,6 +150,16 @@ def quarantine_quietly(feed: Feed | None, filename: str, content: bytes, *,
 
 
 def recent(limit: int = 50, feed: str | None = None) -> list[dict]:
+    """The most recent rejections, newest ARRIVAL first.
+
+    ORDERED BY `received_at`, LIKE `deliveries.recent`, because the one caller
+    that reads both (`ui/arrivals.recent`) merges them and re-sorts on that
+    field. Ordered on `rejected_at` instead, the two halves disagree about
+    what "recent" means: a file re-examined long after it arrived takes a slot
+    in this top-N and then sorts to the bottom of the merged page, displacing
+    an arrival that genuinely belonged on it. `rejected_at` breaks the tie,
+    which for a gate that refuses on sight is registration order.
+    """
     sql = ("SELECT quarantine_key, feed, source_filename, received_at, "
            "       rejected_at, reason_class, reason, bytes, md5 "
            "FROM registry.rejection")
@@ -157,7 +167,7 @@ def recent(limit: int = 50, feed: str | None = None) -> list[dict]:
     if feed:
         sql += " WHERE feed = %s"
         args.append(feed)
-    sql += " ORDER BY rejected_at DESC LIMIT %s"
+    sql += " ORDER BY received_at DESC, rejected_at DESC LIMIT %s"
     args.append(limit)
     with db.connect() as conn, conn.cursor() as cur:
         cur.execute(sql, args)

@@ -99,16 +99,30 @@ def _render_inner(inner: str, cob_date: date, version: int | None) -> str:
 
 
 def _closing_paren(s: str, start: int) -> int:
+    """Index of the `)` closing the group that opens at `start`.
+
+    THE ESCAPE SKIPS TWO CHARACTERS, not one. `\\(` is a literal parenthesis in
+    the filename, and skipping only the backslash leaves the paren itself to be
+    counted as structural -- so a balanced pattern either has its boundary
+    found at the wrong index (a wrong name, caught later by `render_filename`'s
+    round-trip check, reported as the pattern not matching its own output) or
+    is rejected outright as unbalanced. `_render_inner` already advances by two
+    for the same reason.
+    """
     depth = 0
-    for i in range(start, len(s)):
-        if s[i] == "\\":
+    i = start
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\":
+            i += 2
             continue
-        if s[i] == "(":
+        if ch == "(":
             depth += 1
-        elif s[i] == ")":
+        elif ch == ")":
             depth -= 1
             if depth == 0:
                 return i
+        i += 1
     raise FilenameError("unbalanced parentheses in filename_pattern")
 
 
