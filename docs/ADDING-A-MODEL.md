@@ -12,7 +12,21 @@ parse interval, with no restart and nothing to register.
 That is the same property `feeds.yml` gives the ingest DAGs, and it is the
 answer to "where do I wire this up?" — you don't.
 
+> **The commands below are PowerShell**, because that is what the Windows
+> stack this was built on uses. Only two constructs differ elsewhere: a
+> continuation is `` ` `` in PowerShell and `\` in bash, and capturing the
+> build branch is
+>
+> ```bash
+> branch=$(docker compose exec -T airflow python -m scripts._open_build_branch | tr -d '\r')
+> ```
+>
+> instead of `$branch = (...).Trim()`. `$branch` then reads the same in both.
+> On Windows, use Git Bash for anything with single-quoted JSON in it —
+> PowerShell mangles the quoting.
+
 ---
+
 
 ## Which layer
 

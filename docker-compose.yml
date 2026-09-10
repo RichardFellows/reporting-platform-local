@@ -43,7 +43,8 @@ x-airflow-common: &airflow-common
     args:
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.108.1}
   # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own
-  # `id -u`; `.env.example` says how and why.
+  # `id -u`; `.env.example` says how and why, and
+  # docs/DECISIONS.md#containers-run-as-the-host-uid says what breaks otherwise.
   #
   # Half the bind mounts here are READ-WRITE by design -- the feed console
   # writes feeds.yml, the dbt sources and a scaffolded model; the inbox

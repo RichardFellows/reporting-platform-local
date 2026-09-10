@@ -28,9 +28,9 @@ defaults:
   # worse one, because reconcile_schema fills it with nulls, so the load
   # succeeds and the column reads as "no value" rather than "never arrived".
   #
-  # Both branches have been exercised (
-  # until then nothing read this setting at all and 'fail' was silently
-  # identical to 'warn').
+  # Both branches have been exercised since this setting was first read:
+  # until then nothing read it at all and 'fail' was silently identical
+  # to 'warn'.
   schema_drift: warn
   # REQ-600/601. Which EVIDENCE OBLIGATION a feed's landing and quarantine
   # objects are under. Declared in retention.yml, which is also where the

@@ -36,7 +36,8 @@ That split makes the two failure modes different, and both are right:
     and a truncated file is precisely what it exists to prove, and then the
     ingest refuses and leaves `main` untouched.
 
-There is a third outcome: **an unchanged RESEND is a no-op.** A name already
+There is a third outcome: **an unchanged RESEND is a no-op**
+(docs/DECISIONS.md#an-unchanged-resend-is-a-no-op). A name already
 taken used to be versioned to `_v2` on sight, turning a retried transfer into
 a restatement the upstream never made. Sameness is decided on the bytes (md5),
 only against deliveries already landed for that date.

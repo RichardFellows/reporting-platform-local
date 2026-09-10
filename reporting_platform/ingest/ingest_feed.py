@@ -90,7 +90,8 @@ def ensure_raw_namespace(spark, fd) -> None:
     """Create the feed's raw namespace on `main`, idempotently.
 
     Separate from ensure_raw_table because it has to happen at a different
-    REFERENCE and a different moment -- see the call site in ingest().
+    REFERENCE and a different moment -- see the call site in ingest(), and
+    docs/DECISIONS.md#namespace-before-branch for why it is `main`.
     """
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{fd.raw_namespace}")
 

@@ -22,6 +22,156 @@ Read `CLAUDE.md` for the short version of the rules that bite most often, and
 
 ---
 
+## Contents
+
+98 entries. They are grouped here by subject; the file itself is in the order
+they were written, which is roughly the order they were learned. **Anchors are
+stable** — the code links to them by name — so if you rename one, grep for it
+first.
+
+If you arrived from a `# See docs/DECISIONS.md#…` comment, jump straight to the
+anchor; this page is for when you do not yet know what you are looking for.
+
+### Versions, images and the container estate
+
+| Anchor | The finding |
+|---|---|
+| [jar-versions](#jar-versions) | Three version values in `.env` reaching six consumers, and why the split is the finding rather than pedantry |
+| [spark-jars-prebaked](#spark-jars-prebaked) | The Spark image bakes its jars instead of resolving `--packages` at submit |
+| [nessie-gc-jar](#nessie-gc-jar) | There is no server-side GC endpoint; collecting content needs the CLI jar |
+| [nessie-iceberg-rest](#nessie-iceberg-rest) | Nessie serves an Iceberg REST catalog, and what that does and does not replace |
+| [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) | Nessie logs Elastic Common Schema field names, which is why its logs read oddly |
+| [airflow-2-not-3](#airflow-2-not-3) | **Airflow is 2.10.5 deliberately.** Under 3.0.2 no DAG run here could complete |
+| [airflow-provider-constraints](#airflow-provider-constraints) | Providers install under Airflow's constraint file so pip cannot drag a version quietly |
+| [airflow-api-auth](#airflow-api-auth) | `session` alone authenticates only a browser |
+| [image-permissions-layer](#image-permissions-layer) | The permissions layer is last in the Dockerfile because it changes least |
+| [containers-run-as-the-host-uid](#containers-run-as-the-host-uid) | `user: "${AIRFLOW_UID:-50000}:0"`, and what a bind mount does to ownership |
+| [minio-host-ports](#minio-host-ports) | The published MinIO ports are the host side only |
+| [no-folder-markers](#no-folder-markers) | `minio-init` creates the bucket and nothing else |
+| [marimo-not-jupyter](#marimo-not-jupyter) | Marimo notebooks *are* Python files, so they diff |
+| [notebook-service](#notebook-service) | The developer sandbox for "what is actually in these tables" |
+| [feed-ui-same-image](#feed-ui-same-image) | The console runs from the Airflow image because it imports the platform |
+| [watchdog-independent](#watchdog-independent) | **A monitor inside the thing it monitors cannot report that thing being down** |
+| [seed-clean](#seed-clean) | `seed_clean/` — the same history without the injected data-quality failures |
+
+### Spark: where it runs, and how it is kept from wedging
+
+| Anchor | The finding |
+|---|---|
+| [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
+| [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
+| [spark-worker-sizing](#spark-worker-sizing) | Cap each application, or standalone mode holds every free core until the session stops |
+| [spark-in-a-subprocess](#spark-in-a-subprocess) | The JVM keeps the task process alive; heartbeats stop; the scheduler zombie-reaps it |
+| [one-session-per-chunk](#one-session-per-chunk) | `ingest()` opens and stops its own session, in a `finally` |
+| [one-shared-write-pool](#one-shared-write-pool) | One `lakehouse_write` slot across everything that touches table files |
+| [log-tail-plus-head](#log-tail-plus-head) | Head *and* tail of a failed subprocess: a Java stack pushes the message off the front |
+| [branch-in-the-table-name](#branch-in-the-table-name) | The Nessie branch is named in the table reference |
+
+### dbt and the Cosmos-rendered builds
+
+| Anchor | The finding |
+|---|---|
+| [cosmos-no-deps](#cosmos-no-deps) | **`--no-deps` is not an optimisation.** Under Airflow's constraints, every dbt invocation dies at import |
+| [cosmos-rendered-builds](#cosmos-rendered-builds) | One task per model, rendered from the project — which is why adding a model needs no DAG edit |
+| [cosmos-load-bearing-settings](#cosmos-load-bearing-settings) | The four settings in `dbt_builds.py` you may not change casually |
+| [cosmos-packages](#cosmos-packages) | Packages install once, in `airflow-init`, not per task |
+| [cosmos-profile-config](#cosmos-profile-config) | One `ProfileConfig`, the committed `profiles.yml` |
+| [cosmos-emit-datasets](#cosmos-emit-datasets) | `emit_datasets=False`, or every model task gets a Dataset outlet |
+| [cosmos-exclude-exposures](#cosmos-exclude-exposures) | Exposures are documentation, not something to build |
+| [dbt-working-directories](#dbt-working-directories) | Three working directories outside the bind mount, or `dbt deps` hits `Permission denied` |
+| [dbt-packages-volume](#dbt-packages-volume) | Mounted one level **above** `dbt_packages`, because `dbt deps` rmtree's that directory |
+| [dbt-spark-session-mode](#dbt-spark-session-mode) | `method: session` and what it means for where the driver lives |
+| [dbt-target-guard](#dbt-target-guard) | A non-Spark target is refused **at import time** — it would write to the wrong branch and go green |
+| [duckdb-is-not-an-engine](#duckdb-is-not-an-engine) | Spark is the only build engine; DuckDB is a read-only query tool |
+| [raw-is-a-source](#raw-is-a-source) | `models/raw/` contains no models on purpose |
+| [no-unused-config-paths](#no-unused-config-paths) | No `seeds:` block, and why an unused config path is a trap |
+| [identifiers-in-macros](#identifiers-in-macros) | Which macros call `ident()`, and why that is a decision |
+| [airflow-init-four-things](#airflow-init-four-things) | Migrate, admin user, the pool, `dbt deps` — miss the last and two DAGs do not import |
+| [assets-are-or-not-and](#assets-are-or-not-and) | A bare schedule list is **AND**, which is almost never what you meant |
+| [retry-delay](#retry-delay) | Seconds, not the five minutes it used to be |
+
+### Arrival: the inbox, the gate, and the shapes a delivery comes in
+
+| Anchor | The finding |
+|---|---|
+| [the-inbox-is-the-conformance-gate](#the-inbox-is-the-conformance-gate) | **`landing/` has a contract**; everything that does not meet it goes through the gate |
+| [unpacking-happens-at-the-gate](#unpacking-happens-at-the-gate) | One zip in, N ordinary deliveries out; the container never lands |
+| [archive-normalizer](#archive-normalizer) | A dated container of undated members |
+| [control-file-gate](#control-file-gate) | A normalizer that will not emit a manifest until the control file agrees |
+| [control-file-formats](#control-file-formats) | HOW a control file is read (`format`) versus WHAT is read out of it (the fields) |
+| [the-sniffer](#the-sniffer) | Onboarding from a real file |
+| [console-delivery-support](#console-delivery-support) | Creating an archive- or control-gated feed through the form |
+| [inbox-is-polled](#inbox-is-polled) | Polling, not inotify — *events are an optimisation, the poll is the correctness guarantee* |
+| [an-unchanged-resend-is-a-no-op](#an-unchanged-resend-is-a-no-op) | A byte-identical redelivery used to land as `_v2` |
+| [no-arrival-timeout](#no-arrival-timeout) | Two config keys deleted for being settings nothing read |
+| [delivery-expected-not-completeness](#delivery-expected-not-completeness) | "Is a delivery expected on every COB date" is not "is this delivery complete" |
+| [ready-is-a-derived-index](#ready-is-a-derived-index) | **`ready/` is a derived index of `landing/`**, not a queue somebody fills |
+| [the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests) | 157 deleted, 157 remade, both logging success |
+| [namespace-before-branch](#namespace-before-branch) | The namespace is created against `main`, before the ingest branch exists |
+
+### Feeds, columns and the console
+
+| Anchor | The finding |
+|---|---|
+| [feed-names-carry-the-source](#feed-names-carry-the-source) | One string is the raw table, DAG id, prefix, source and model at once |
+| [feed-conventions](#feed-conventions) | `defaults → convention → feed`, and why there may be only one implementation of that merge |
+| [source-column-names](#source-column-names) | A column may be named differently in the file than in the platform |
+| [a-declared-column-migrates-itself](#a-declared-column-migrates-itself) | **The directions are not symmetrical**: declared columns are added, undeclared ones are never dropped |
+| [provenance-is-added-not-backfilled](#provenance-is-added-not-backfilled) | The migration is lazy, and one un-migrated feed fails *every* prepared model |
+| [supersession-is-declared-not-assumed](#supersession-is-declared-not-assumed) | The value is the refusal: a delta feed deduped as a snapshot loses keys silently |
+| [as-of-is-a-var-not-a-second-model](#as-of-is-a-var-not-a-second-model) | Same models, a dbt var, and a refusal to run incrementally |
+| [delivery-ref-is-the-fallback-with-the-prefix-stripped](#delivery-ref-is-the-fallback-with-the-prefix-stripped) | `_delivery_id` is a basename; `_source_file` is a key |
+| [generated-data-must-hold-still](#generated-data-must-hold-still) | Generated data is a function of (entity, epoch), not (entity, date) |
+| [resolve-types-is-authoritative](#resolve-types-is-authoritative) | One answer to "what type is this column?", or the generator and the model disagree |
+| [one-destructive-dialog](#one-destructive-dialog) | Feed deletion asks once |
+| [the-arrivals-view-is-a-join-not-a-record](#the-arrivals-view-is-a-join-not-a-record) | **Written nowhere** — an arrivals table would hold verdicts that could not be rebuilt |
+| [table-naming-no-layer-prefix](#table-naming-no-layer-prefix) | The namespace already says the layer |
+
+### The registry and the publication record
+
+| Anchor | The finding |
+|---|---|
+| [the-registry-records-observations-not-verdicts](#the-registry-records-observations-not-verdicts) | **No `ingested`, no `superseded`, no `status`** — the whole difference from the `stg` load-control tables |
+| [a-run-is-the-first-thing-the-registry-cannot-rebuild](#a-run-is-the-first-thing-the-registry-cannot-rebuild) | Which is why `run_input` has no foreign key and a run has a mutable status |
+| [version-is-per-report-and-as-at-date](#version-is-per-report-and-as-at-date) | Not per run, not per family |
+| [code-identity-is-a-digest-when-it-cannot-be-a-tag](#code-identity-is-a-digest-when-it-cannot-be-a-tag) | A value **and** a kind, never conflated |
+| [a-change-is-a-deployment-event-not-a-run-event](#a-change-is-a-deployment-event-not-a-run-event) | One ticket authorises a version; hundreds of runs inherit it |
+| [a-version-diff-is-inputs-and-code-not-data](#a-version-diff-is-inputs-and-code-not-data) | The set difference of two `run_input` sets |
+| [the-as-at-date-has-a-lifecycle](#the-as-at-date-has-a-lifecycle) | `open → locked → submitted`, where **`open` is the absence of a row** |
+| [quarantine-is-where-a-refused-delivery-goes](#quarantine-is-where-a-refused-delivery-goes) | The rejection date is in the key, because the file usually has no parsable name |
+| [catalog-reconciliation](#catalog-reconciliation) | What the catalog holds versus what the project declares |
+| [managed-tables-are-derived](#managed-tables-are-derived) | Derived from the dbt project, not listed |
+| [managed-tables-single-definition](#managed-tables-single-definition) | One definition, imported by both the DAG and the CLIs |
+
+### Retention, GC and reclamation
+
+| Anchor | The finding |
+|---|---|
+| [an-incomplete-keep-set-refuses](#an-incomplete-keep-set-refuses) | **A short answer is a deletion order.** Nothing deleted is not nothing to delete |
+| [published-tags-are-the-reproducibility-window](#published-tags-are-the-reproducibility-window) | A tag is **data** retention, sized in years, not by the table keep-set |
+| [an-ingest-is-not-a-publication](#an-ingest-is-not-a-publication) | They cut different tags, and conflating them kept ingests for ten years |
+| [retention-classes-name-the-obligation](#retention-classes-name-the-obligation) | The class is a feed property; the window is per-environment policy |
+| [the-evidence-interlock-is-two-halves](#the-evidence-interlock-is-two-halves) | A configuration check and a per-delivery check, neither sufficient alone |
+| [reproducibility-is-exercised-not-asserted](#reproducibility-is-exercised-not-asserted) | The pin is read against the real catalog |
+| [gc-lag-and-assertions](#gc-lag-and-assertions) | Identification and removal are two steps, a deferral window apart |
+| [a-dry-run-may-write-to-the-index-not-to-object-storage](#a-dry-run-may-write-to-the-index-not-to-object-storage) | `{"dry_run": true}` wrote 116 manifests and then mispredicted its own sweep |
+| [retention-partial-failure-report](#retention-partial-failure-report) | A half-applied run is the shape this chain actually produces |
+| [minio-per-object-delete](#minio-per-object-delete) | One object at a time, and why the faster batch call is not used |
+| [lateness-is-a-wall-clock-time-not-a-duration](#lateness-is-a-wall-clock-time-not-a-duration) | A duration needs an origin event that `PutObject` does not have |
+| [watchdog-wall-clock-window](#watchdog-wall-clock-window) | **Match the window to the cadence of whatever clears it** |
+| [watchdog-eligible-vs-overdue](#watchdog-eligible-vs-overdue) | Eligible is not overdue |
+
+### Lineage
+
+| Anchor | The finding |
+|---|---|
+| [openlineage-is-an-export-not-a-record](#openlineage-is-an-export-not-a-record) | Not an authority, and a skipped task shows as `RUNNING` forever |
+| [lineage-is-derived-from-the-dbt-project](#lineage-is-derived-from-the-dbt-project) | A job per task and **no datasets at all**, until the extractor was registered under the variable Airflow reads |
+| [a-column-with-no-source-says-so](#a-column-with-no-source-says-so) | 116 of 136 traced, and reporting only those makes a literal, a `count(*)` and a parser failure identical |
+| [marquez-on-ubi](#marquez-on-ubi) | Both images built here, from Marquez's own source |
+
+---
+
 ## jar-versions
 
 Three version values, in `.env`, reaching six consumers. The split is the

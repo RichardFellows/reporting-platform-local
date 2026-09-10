@@ -15,7 +15,21 @@ once.
 > describes and the diff it produces is meant to be reviewed as an ordinary
 > change.
 
+> **The commands below are PowerShell**, because that is what the Windows
+> stack this was built on uses. Only two constructs differ elsewhere: a
+> continuation is `` ` `` in PowerShell and `\` in bash, and capturing the
+> build branch is
+>
+> ```bash
+> branch=$(docker compose exec -T airflow python -m scripts._open_build_branch | tr -d '\r')
+> ```
+>
+> instead of `$branch = (...).Trim()`. `$branch` then reads the same in both.
+> On Windows, use Git Bash for anything with single-quoted JSON in it —
+> PowerShell mangles the quoting.
+
 ---
+
 
 ## 1. `reporting_platform/config/feeds.yml` — the registry
 
@@ -83,6 +97,34 @@ Optional, and worth a thought rather than a default:
 | `delivery.control:` | The delivery is gated on a control file landing beside it, and that file states the row count (`row_count`) or a checksum (`md5`). Checked at ingest for **every** delivery — one an approved sender wrote straight into landing, and one the inbox renamed and promoted — so there is one implementation of the check and the trusted path is not the less-verified one. A mismatch abandons the build branch and leaves `main` untouched. `format:` says how the file is READ — the default is a regex per field over its text, `kind: delimited` makes each field a column name of a `|`-or-whatever table, and both control blocks must declare the same one because they parse the same promoted bytes. See [DECISIONS.md#control-file-formats](DECISIONS.md#control-file-formats). |
 | `supersession:` | Only if a later delivery does **not** simply restate the whole population for its COB date. The one built mode is `full_snapshot`, which is the default and what every feed here does; `delta_append` and `correction` are refused at load with the reason. Set it explicitly on a feed whose shape you want stated rather than assumed — the failure it prevents is silent, because a delta feed deduped as a snapshot loses every key its newest file omits and the row counts still look plausible. See [DECISIONS.md#supersession-is-declared-not-assumed](DECISIONS.md#supersession-is-declared-not-assumed). |
 | `delivery:` | The delivery is a zip (`kind: archive`, plus `member_pattern`) rather than one plain CSV. See [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) for the shapes, and [DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) / [#control-file-gate](DECISIONS.md#control-file-gate) for what each key actually does. The console validates it with the exact function feeds.yml load does, so a typo here fails in the form rather than at the next Airflow parse. |
+
+### Inherited from `defaults:`, and when to override
+
+The keys above are the ones you *add*. These already have values from the
+`defaults:` block at the top of `feeds.yml`, and a feed block lists one only to
+disagree with it — or, better, a `convention:` does, since file format is a
+property of the source system far more often than of one feed.
+
+| Key | Default | Override when |
+|---|---|---|
+| `delimiter` | `","` | The upstream sends pipes, tabs or semicolons. **Never inherited by a control file** — `control.format` needs its own, because pipes read as commas is not an error, it is one column named by the whole header line. |
+| `quote_char` | `'"'` | The upstream quotes with something else, or nothing. |
+| `file_encoding` | `utf-8` | A mainframe extract in `cp1252` or `latin-1`. Getting this wrong does not fail — it lands mojibake. |
+| `header` | `true` | The file has no header row. `columns:` then carries the whole contract by position. |
+| `schema_drift` | `warn` | `fail` aborts the load on an extra **or** missing column, leaves the ingest branch for inspection, and never touches `main`. The default is usually right: a rejected file is a file nobody looks at. |
+| `landing_prefix` / `ready_prefix` / `raw_namespace` | `landing` / `ready` / `raw` | Effectively never. They exist so the paths have one definition, not so feeds vary. |
+
+`schema_drift: fail` fires on an extra column *and* on a missing declared one.
+The extra case is the obvious one; the missing case is quieter and arguably
+worse, because the schema reconcile fills it with nulls, so the load succeeds
+and the column reads as "no value" rather than "never arrived".
+
+The resolution order is `defaults → convention → feed`, shallow at each layer,
+and `context.effective_defaults()` is the **only** implementation of it. The
+console depends on that: `ui/registry._block` omits any key matching what the
+feed inherits, so a second copy of the merge would start pinning inherited
+values into feed blocks.
+([`DECISIONS.md#feed-conventions`](DECISIONS.md#feed-conventions))
 
 Verify before moving on:
 

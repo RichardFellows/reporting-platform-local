@@ -100,6 +100,38 @@ third copy of the data.
 A **normalize** stage sits between them, and `ready_prefix` joins
 `landing_prefix` in `feeds.yml` defaults (`config/feeds.yml:11`).
 
+There is a third prefix, and it has the *same* lifetime as the evidence copy
+for the same reason — a refused delivery is evidence of what the upstream sent:
+
+```mermaid
+flowchart LR
+  IN["inbox/<br/><i>the door</i>"]
+  G{"conformance<br/>gate"}
+  L["landing/&lt;feed&gt;/<br/><b>EVIDENCE</b><br/>years · byte-exact"]
+  Q["quarantine/<br/><b>REFUSED</b><br/>years · date in the key"]
+  R["ready/&lt;feed&gt;/<br/><b>CACHE</b><br/>days · rebuildable"]
+  RAW[("raw<br/>Iceberg")]
+  IN --> G
+  G -->|"identity OK"| L
+  G -->|"identity FAILS"| Q
+  L -->|"normalize"| R
+  R -->|"ingest<br/><i>integrity checked here</i>"| RAW
+  R -. "find_pending computes its keep-set<br/>from landing/, NOT from the manifests" .-> L
+```
+
+**The dotted arrow is the coupling that must not be undone.** `find_pending`
+derives what is outstanding from `landing/`, because `ready/` is a days-long
+cache and `landing/` is the only prefix holding every date. So the `ready:`
+window bounds the **derived parts, not the manifests** — a manifest whose
+landing object still exists is kept at any age. Bound the manifests instead and
+the sweep and the reconcile undo each other nightly: 157 deleted, 157 remade,
+both logging success.
+([`DECISIONS.md#the-ready-window-bounds-the-parts-not-the-manifests`](DECISIONS.md#the-ready-window-bounds-the-parts-not-the-manifests))
+
+An **identity** failure is quarantined; an **integrity** failure lands and
+fails at ingest. That asymmetry is deliberate: landing is the evidence copy,
+and a bad delivery is exactly what it exists to prove.
+
 ## The manifest
 
 Normalization writes one JSON manifest per delivery into `ready/<feed>/`:
