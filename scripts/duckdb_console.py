@@ -8,16 +8,28 @@ and it reads the same Iceberg tables through the same catalog.
 WHAT IT IS NOT FOR, and why this is a script rather than a dbt target. It
 cannot build anything, deliberately three times over:
 
-  * DuckDB can only ever address the catalog's DEFAULT BRANCH. The Nessie ref
-    travels in the Iceberg REST request prefix, DuckDB takes that prefix from
-    /v1/config, and its ATTACH exposes no override. No branch means no
-    write-audit-publish, so a DuckDB build would write straight to `main`.
+  * DuckDB cannot address a NON-DEFAULT BRANCH unaided, and fails at it
+    silently. The Nessie ref travels in the Iceberg REST request prefix;
+    DuckDB takes that prefix from /v1/config and then appends it to THE
+    ENDPOINT IT WAS GIVEN, so putting the ref in the endpoint path puts it in
+    the URL twice (`/iceberg/etl_x/v1/etl_x%7Cwarehouse/...`), which 404s --
+    and the 404 renders as an EMPTY CATALOG, not an error. ATTACH succeeds and
+    every table is missing. There is no PREFIX or WAREHOUSE option to override
+    it. A rewriting proxy in front of Nessie does bridge it; whether that is a
+    bridge worth owning is `spike/duckdb-wap/` (measured, with the request
+    trace). No branch means no write-audit-publish, so a DuckDB build here
+    would write straight to `main`.
   * dbt-duckdb silently ignores `partition_by`, so anything it created would be
     unpartitioned -- and `cob_date` partitioning is what makes retention's
     expiry a metadata delete rather than a full rewrite.
-  * DuckDB refuses INSERT and UPDATE on a partitioned table by default, so it
-    cannot write to the tables the platform has. Note DELETE is allowed without
-    the override: the destructive operation is the one needing no opt-in.
+  * DuckDB refuses INSERT and UPDATE on a partitioned table by DEFAULT. There
+    is an override (`ignore_target_file_size_for_partitioned_tables`) and with
+    it INSERT genuinely works -- but the same flag turns UPDATE's refusal into
+    `INTERNAL Error: IcebergDelete multi_file_list is NULL`, which invalidates
+    the whole database: every later statement on that connection returns a
+    FATAL error. Note DELETE is allowed with or without the override: the
+    destructive operation is the one needing no opt-in. Measured on DuckDB
+    1.5.5 -- see `spike/duckdb-wap/README.md`.
 
 The attach is therefore READ_ONLY, verified rather than assumed -- CREATE fails
 with "Cannot execute statement of type CREATE ... attached in read-only mode".
