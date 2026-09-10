@@ -198,9 +198,11 @@ the notes in this table before moving one.
 |---|---|---|---|
 | **Airflow** | **2.10.5** (python3.11) | `Dockerfile.airflow` | **Not 3.x, deliberately.** Under Airflow 3.0.2 no DAG run here could ever complete: tasks ran, logged, returned values and pushed xcom, and the scheduler never recorded them. Airflow 2's LocalExecutor writes the result straight to the metadata DB. |
 | **Spark** | **3.5.3** (Scala 2.12, JDK 11) | `Dockerfile.spark` | Must match the Iceberg and Nessie Spark runtimes below, which are published per Spark minor. `pyspark` in the Airflow image is pinned to the same 3.5.3. |
-| **Nessie** | **0.99.0** | `docker-compose.yml`, `Dockerfile.spark`, `Dockerfile.airflow` | Server, Spark extensions and the `nessie-gc` CLI jar must all be the same version. Serves REST API v2 (spec 2.2.0) and an Iceberg REST catalog. |
-| **Apache Iceberg** | **1.6.1** | `Dockerfile.spark`, `dbt/profiles.yml` | `iceberg-spark-runtime-3.5_2.12` and `iceberg-aws-bundle`. |
-| **Postgres** | **16** | `docker-compose.yml` | Backs both the Airflow metadata DB and the Nessie version store. Nessie is JDBC-backed rather than in-memory on purpose, so the local stack exercises the same version-store path as the cluster. |
+| **Nessie server** | **0.108.1** (`NESSIE_SERVER_VERSION`) | `.env` | Sets the server image **and** the `nessie-gc` jar, which must equal each other. Serves REST API v2 and an Iceberg REST catalog. It is allowed to be **newer** than the Spark extensions below, and here it is. |
+| **Nessie Spark extensions** | **0.99.0** (`NESSIE_SPARK_EXT_VERSION`) | `.env` | **Tracks Iceberg, not the server** — 0.103.3 ↔ Iceberg 1.8.1, 0.108.1 ↔ 1.11.0. Newer-than-your-Iceberg is the failing direction, which is why this trails the server. |
+| **Apache Iceberg** | **1.6.1** (`ICEBERG_VERSION`) | `.env` | `iceberg-spark-runtime-3.5_2.12` and `iceberg-aws-bundle`. Must be **identical** in the Spark image and in *both* drivers — `spark_session()` and `spark.jars.packages` in `dbt/profiles.yml` — because every submitting process runs a pip `pyspark` with no jars of its own. |
+| **Marquez** | **0.51.1** (`MARQUEZ_VERSION`) | `.env` | The OpenLineage consumer, off by default behind the `lineage` compose profile. **Both images are built here on UBI** from Marquez's own source (`Dockerfile.marquez-api`, `Dockerfile.marquez-web`) — upstream ships Ubuntu and Alpine. This is the *release tag the builders fetch*, so changing it triggers a gradle + npm build with egress, not a pull. |
+| **Postgres** | **16** | `docker-compose.yml` | Backs three databases: the Airflow metadata DB, the Nessie version store, and the `platform` database holding the delivery/run **registry**. Nessie is JDBC-backed rather than in-memory on purpose, so the local stack exercises the same version-store path as the cluster. |
 | **MinIO** | `RELEASE.2024-09-22T00-33-43Z` | `docker-compose.yml` | Stand-in for the on-prem S3-compatible store. `mc` is pinned separately for the bucket-init job. |
 | **dbt-core** | **1.8.7** | `Dockerfile.airflow` | Held back deliberately. It is what every DAG runs on and what has been validated; a bump needs a planned re-verification of both layers, not an opportunistic one. |
 | **dbt-spark** | **1.8.0** (`[PyHive]`) | `Dockerfile.airflow` | The only dbt adapter installed — see below. |
@@ -219,61 +221,155 @@ DuckDB itself stays as a **read-only query tool** for analysts and developers
 Two version rules worth stating separately, because breaking either is quiet
 rather than loud:
 
-- **Nessie server, Nessie Spark extensions and `nessie-gc.jar` move together.**
-  They are three artefacts of one release.
+- **There are THREE jar versions in `.env`, not one, and the split is the
+  finding.** Diverging them gives you a `NoSuchMethodError` on the first
+  write — never anything that says "version". `NESSIE_SERVER_VERSION` pairs
+  the server image with the `nessie-gc` jar; `NESSIE_SPARK_EXT_VERSION` pairs
+  the extensions with **Iceberg**; `ICEBERG_VERSION` must be identical in the
+  Spark image and both drivers. The server may be newer than the extensions,
+  and today it is. Full reasoning:
+  [DECISIONS.md#jar-versions](docs/DECISIONS.md#jar-versions).
 - **Iceberg and Spark minors are coupled.** `iceberg-spark-runtime-3.5_2.12`
   exists because Spark is 3.5 and Scala is 2.12; changing either means
   changing the artefact name, not just the version.
+- **`.env.example` holds a known-good set.** To see what is actually baked into
+  a running image rather than what is configured:
+
+  ```bash
+  docker compose exec spark-worker env | grep VERSION
+  ```
+
+```mermaid
+flowchart TB
+  subgraph env[".env — three values"]
+    IV["ICEBERG_VERSION<br/>1.6.1"]
+    NX["NESSIE_SPARK_EXT_VERSION<br/>0.99.0"]
+    NS["NESSIE_SERVER_VERSION<br/>0.108.1"]
+  end
+  IV ==> SI["Dockerfile.spark<br/><i>baked into executors</i>"]
+  IV ==> D1["common/spark.py<br/>spark_session()"]
+  IV ==> D2["dbt/profiles.yml<br/>spark.jars.packages"]
+  NX --> SI
+  NX --> D1
+  NX --> D2
+  NS --> SRV["nessie server image"]
+  NS --> GC["nessie-gc.jar<br/><i>Dockerfile.airflow</i>"]
+  IV -. "must match the pairing<br/>0.103.3 ↔ 1.8.1<br/>0.108.1 ↔ 1.11.0" .- NX
+  NX -. "server may be NEWER<br/>than the extensions" .- NS
+```
+
+**Read the diagram this way:** a thick arrow is *must be identical*. The two
+dotted lines are the pairings — Iceberg and the Spark extensions must be a
+matching release pair, and the server is allowed to run ahead of the
+extensions. Everything a *driver* resolves is shipped to the executors, which
+is why the same Iceberg version has to appear in three places: every
+submitting process runs a pip `pyspark` with no jars of its own.
 
 
 ## Documentation
 
+Read in this order: **QUICKSTART** to get it running, **ARCHITECTURE** for why
+it is shaped this way, then whichever procedure you need. `DECISIONS.md` is the
+reference the other documents and the code both point into — you go to it when
+something surprises you, not front to back.
+
+**Start here**
+
 | Document | Read it for |
 |---|---|
-| **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands. Start here.** |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, Nessie write-audit-publish, per-feed DAG topology, why Spark is the only build engine |
+| **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands.** |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | layer model, Nessie write-audit-publish, the registry, the as-at lifecycle, per-feed DAG topology, why Spark is the only build engine |
 | **[docs/PIPELINE.md](docs/PIPELINE.md)** | one delivered file end to end — inbox → landing → ready → raw → prepared → reporting, with the failure mode at every stage |
-| **[docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)** | the five files a new feed touches, in order, with a worked example |
-| **[docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md)** | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
-| **[docs/ADDING-A-COLUMN.md](docs/ADDING-A-COLUMN.md)** | adding a column to an existing feed — the commonest change of all, and the raw table is the part not in the git diff |
-| [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 -- the same five files through a form, plus land/ingest/build buttons |
-| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | all five steps built and live-verified, including creating an archive/control-gated feed through the console's own form |
-| [notebooks/explore.py](notebooks/explore.py) | marimo notebook on :8083 — query landing files and every Iceberg layer through one read-only DuckDB session |
+
+**Reference — the two documents everything else points into**
+
+| Document | Read it for |
+|---|---|
+| **[docs/DECISIONS.md](docs/DECISIONS.md)** | **why the code is shaped the way it is — 98 anchored entries, almost all of them learned by running the stack and reading what it actually said.** The code links here by anchor rather than repeating the reasoning; it has its own contents page at the top. |
+| [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | what every `REQ-nnn` cited in the code and tests actually requires, where it is implemented and what proves it |
+
+**Making a change**
+
+| Document | Read it for |
+|---|---|
+| [docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md) | the five files a new feed touches, in order, with a worked example |
+| [docs/ADDING-A-COLUMN.md](docs/ADDING-A-COLUMN.md) | adding a column to an existing feed — the commonest change of all, and the raw table is the part not in the git diff |
+| [docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md) | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
+| [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 — the same five files through a form, plus land/ingest/build buttons |
+| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | zips, control files and legacy filenames — the conformance gate, and how a feed that is not a plain daily CSV is declared |
+| [docs/DEV-PROCESS.md](docs/DEV-PROCESS.md) | ticket-to-prod path, why dbt and DAG changes carry different risk, the CAB digest gate |
+
+**Running it**
+
+| Document | Read it for |
+|---|---|
+| [docs/REGISTRY.md](docs/REGISTRY.md) | what was delivered, what was published, out of which inputs, under which code — and the as-at lifecycle that gates publication |
+| [docs/MONITORING.md](docs/MONITORING.md) | the six checks, what each one can and cannot see, and what a red one means |
 | [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
+| [docs/LINEAGE.md](docs/LINEAGE.md) | OpenLineage export and Marquez — opt-in, and why it is not an authority on what a run published |
 | [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | what changes on promotion, and the three things that genuinely differ |
-| [docs/DEV-PROCESS.md](docs/DEV-PROCESS.md) | ticket-to-prod path, why dbt and DAG changes carry different risk, the CAB digest gate |
-| [tests/README.md](tests/README.md) | the config-level tests -- `make test`, no stack needed, and why there is no pytest |
+
+**Also**
+
+| Document | Read it for |
+|---|---|
+| [notebooks/explore.py](notebooks/explore.py) | marimo notebook on :8083 — query landing files and every Iceberg layer through one read-only DuckDB session |
+| [tests/README.md](tests/README.md) | the config-level tests — `make test`, no stack needed, and why there is no pytest |
+| [spike/duckdb-wap/README.md](spike/duckdb-wap/README.md) | a closed spike: can DuckDB do write-audit-publish on a Nessie branch? Findings and the upstream bug it ran into. Kept because the answer is a constraint, not a preference. |
 
 ## Layout
 
 ```
-docker-compose.yml        MinIO, Nessie, Postgres, Spark, Airflow
-reporting_platform/            the platform library (NOT named `platform` — that
-  config/                 shadows a Python stdlib module)
-    feeds.yml             feed registry — adding a feed edits only this
-    retention.yml         retention policy, per environment
+docker-compose.yml        MinIO, Nessie, Postgres, Spark, Airflow, the feed
+                          console, the watchdog; Marquez behind a profile
+.env                      the three jar versions -- see Component versions
+reporting_platform/       the platform library (NOT named `platform` -- that
+                          shadows a Python stdlib module)
+  config/
+    feeds.yml             feed registry -- adding a feed edits only this
+    retention.yml         retention policy + classes, per environment
     maintenance.yml       maintenance thresholds
-  common/                 config loading, Spark session, Nessie REST client,
-                          COB-date keep-set calculation
-  ingest/                 arrival detection + CSV -> raw Iceberg
+  common/                 config loading and resolution, Spark session, Nessie
+                          REST client, COB-date keep-set calculation
+  ingest/                 the inbox conformance gate, normalize, CSV -> raw
+                          Iceberg, raw schema migration
+  registry/               Postgres `platform`: what was delivered, what was
+                          published, out of which inputs, and the as-at
+                          lifecycle. 16-subcommand CLI -- docs/REGISTRY.md
+  monitoring/             the six checks that run outside what they watch --
+                          gaps, lateness, evidence, reproducibility, watchdog
+  lineage/                OpenLineage export + column classification. Off by
+                          default -- docs/LINEAGE.md
+  retention/              branch/tag/row/snapshot/orphan expiry, in order,
+                          plus the landing, ready and quarantine sweeps
   maintenance/            metric-driven compaction, manifests, deletes
-  retention/              branch/tag/row/snapshot/orphan expiry, in order
+  ui/                     the feed console on :8082 -- form, scaffold, sample
+                          data, job runner, the Arrivals join
 airflow/dags/
   feed_ingest.py          one DAG per feed, generated from feeds.yml
   dbt_builds.py           asset-triggered prepared and reporting builds;
                           the dbt tasks inside them are rendered by Cosmos
-  platform_housekeeping.py  nightly maintenance then retention
-dbt/                      prepared + reporting models, tests, exposures
-docs/                     architecture, retention, maintenance, OpenShift
-                          mapping, dev process
+  platform_housekeeping.py  nightly maintenance, then retention, then the
+                          reproducibility check
+dbt/
+  models/                 raw sources, prepared, reporting, exposures
+  macros/                 engine.sql (engine-specific SQL, known_as_of,
+                          dedupe_rank, provenance), naming.sql (schema
+                          routing -- removing it moves every table reference)
+docs/                     see Documentation, above
 scripts/
   generate_feeds.py       sample feed generator
   land_feeds.py           landing helper
   bulk_ingest.py          ingest everything pending, in subprocess batches
   _ingest_chunk.py        one batch within a single JVM
+  _spark_task.py          the subprocess EVERY Spark job in an Airflow task
+                          goes through, or the JVM zombie-reaps the task
   _open_build_branch.py   open a throwaway Nessie build branch for a manual
                           write-audit-publish test
+  duckdb_console.py       read-only query tool against published `main`
+tests/                    config-level tests; no stack, no pytest
+spike/                    closed spikes, kept for their findings
 ```
 
 ---
@@ -813,10 +909,34 @@ make maintenance-metrics
 make retention-dry
 ```
 
-`make help` lists everything. **Needs GNU Make**, which a stock Windows box
-does not have; without it, run the walkthrough's `docker compose` commands
-directly — `make -n <target>` prints what a target would run, if you have make
-somewhere else to read it with.
+`make help` prints this same list from the Makefile itself:
+
+| Target | Does |
+|---|---|
+| `make env` | Create .env from the template |
+| `make up` | Start the whole local stack |
+| `make test` | Config-level tests (no stack needed, ~1s). See tests/README.md |
+| `make down` | Stop the stack, keep volumes |
+| `make nuke` | **Stop and destroy all data** — `down -v`, every volume gone |
+| `make seed` | Generate sample upstream CSVs into seed/ |
+| `make land` | Upload seed CSVs into the S3 landing prefix |
+| `make pools` | Re-create the write pool (airflow-init already did this) |
+| `make deps` | Re-install dbt packages (airflow-init already did this) |
+| `make build` | Full dbt build (run + test) -- on main, see note above |
+| `make prepared` | Build the prepared layer only -- on main, see note above |
+| `make reporting` | Build the reporting layer only -- on main, see note above |
+| `make lineage` | Generate and serve the dbt lineage docs |
+| `make retention-dry` | Show what retention WOULD expire, changing nothing |
+| `make retention` | Enforce retention for real |
+| `make maintenance-metrics` | Collect Iceberg health metrics without acting |
+| `make maintenance` | Run metric-driven maintenance |
+| `make console` | Start the feed console UI on http://localhost:8082 |
+| `make refs` | List Nessie branches and tags |
+
+**Needs GNU Make**, which a stock Windows box does not have; without it, run
+the walkthrough's `docker compose` commands directly — `make -n <target>`
+prints what a target would run, if you have make somewhere else to read it
+with.
 
 **This route does not touch Airflow.** It builds on `main` from the command
 line, which is convenient for a throwaway stack and is *not* the

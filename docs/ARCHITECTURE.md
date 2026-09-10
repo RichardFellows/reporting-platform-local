@@ -335,6 +335,30 @@ once, in `raw`, which this change does not touch.
 `dbt build`, a manual `python -m ...` in the Airflow container — is the
 **driver**; all task work happens in executors on `spark-worker`.
 
+```mermaid
+flowchart LR
+  T["Airflow task<br/><i>2.10 LocalExecutor</i>"]
+  SP["scripts/_spark_task.py<br/><b>child process</b>"]
+  DR["the DRIVER<br/><i>lives here</i>"]
+  M["spark-master"]
+  E1["executor<br/>2 cores / 2g"]
+  E2["executor"]
+  T -->|"subprocess"| SP
+  SP --> DR
+  DR -->|"SPARK_MASTER"| M
+  M --> E1
+  M --> E2
+  DR -. "ships spark.jars.packages<br/>(incl. hadoop-aws, which the<br/>Spark image does NOT bake)" .-> E1
+  DR -. .-> E2
+```
+
+**Why the subprocess is not optional:** the driver runs in-process, so the JVM
+and its py4j gateway keep non-daemon threads alive after the task callable
+returns. Heartbeats stop, and ~300s later the scheduler reaps the task as a
+zombie and marks it failed — with a task log that shows the work completing.
+This holds on a cluster too, because the *driver* is what lives in that
+process.
+
 This is set in exactly two places, and they must not diverge:
 
 | Path | Where the master is set |
@@ -450,6 +474,194 @@ and the DAG goes green.
 
 ---
 
+## The registry: what is recorded, and what stays derived
+
+A lakehouse can answer "what does the data say". It cannot, on its own, answer
+"did they send it", "which deliveries is this number built from", or "under
+whose authority was this published". Those are questions about **events**, and
+they live in a Postgres database called `platform`, under the schema
+`registry`.
+
+```mermaid
+flowchart LR
+  subgraph obs["Observations — rebuildable from object storage"]
+    D["delivery<br/><i>one row per delivery</i>"]
+    DP["delivery_part"]
+    RJ["rejection<br/><i>what was refused</i>"]
+  end
+  subgraph ev["Events — happened once, cannot be rebuilt"]
+    R["run"]
+    RI["run_input<br/><i>derived from the branch</i>"]
+    RV["report_version<br/><i>+ the tag that pins it</i>"]
+    SB["submission"]
+    AT["as_at_transition<br/><i>append-only</i>"]
+  end
+  S3[("landing/ · ready/<br/>quarantine/")] -. "reconcile()" .-> D
+  D --- DP
+  S3 -.-> RJ
+  R --> RI
+  R --> RV
+  RV --> SB
+  RV -.-> AT
+```
+
+**The dividing line is the whole design.** The left half is an *index over
+bytes that still exist*, so it is rebuildable by the same code that writes it —
+`deliveries.reconcile()` walks object storage and registers everything missing,
+and that path is the authority, not a repair tool. The right half records
+things that happened once: a run either executed or it did not, and no amount
+of reading storage will tell you afterwards.
+
+Three consequences follow, and each of them is a rule that fails quietly if you
+work against it:
+
+- **The delivery half records no verdicts.** There is no `ingested`, no
+  `superseded`, no `status`. Whether a delivery reached raw stays derived from
+  `_source_file` in the raw table; whether it supersedes another stays
+  `dedupe_rank`'s answer. This is the single difference from the legacy `stg`
+  load-control tables this platform replaces — those held a status that could
+  disagree with the data, and eventually did.
+- **`run_input` carries no foreign key to `delivery`.** A run is an event and a
+  delivery is an observation; a run may legitimately name an input whose
+  delivery row was rebuilt, renumbered, or not yet reconciled. The input set is
+  *derived* — read out of the prepared models on the branch, before the merge,
+  using the same `delivery_ref()` the rows themselves carry.
+- **A run has a mutable status. A delivery may not.** For the same reason.
+
+Postgres rather than Iceberg because `sequence_no` — the order in which the
+platform saw deliveries — needs a serialising authority. `MAX(…)+1` over a
+table several writers append to is a read-then-write, correct today only
+because the `lakehouse_write` pool has one slot, which is precisely what any
+concurrency work would change.
+
+The CLI is `python -m reporting_platform.registry`; [`REGISTRY.md`](REGISTRY.md)
+is the operator's guide to it, and
+[`DECISIONS.md#the-registry-records-observations-not-verdicts`](DECISIONS.md#the-registry-records-observations-not-verdicts)
+carries the reasoning.
+
+---
+
+## The as-at date has a lifecycle
+
+Publishing is not only a technical question. A `(report, as-at date)` pair
+moves through states that say whether it may still be republished, and on whose
+say-so.
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> open
+  open --> locked: lock (actor + reason)
+  open --> submitted: record_submission()
+  locked --> submitted: record_submission()
+  locked --> reopened: reopen (actor + reason)
+  submitted --> reopened: reopen + approved_by = the exposure owner
+  reopened --> locked: lock
+  reopened --> submitted: record_submission()
+  note right of open
+    NO ROW. `open` is the absence of a
+    transition, so nothing has to be
+    written to create an as-at date.
+  end note
+```
+
+| State | Means | What a publish onto it does |
+|---|---|---|
+| `open` | nobody has locked it — the ordinary state | proceeds |
+| `locked` | closed to routine republication | **refused if the input set for that date has moved**; allowed if it has not, so an unrelated rebuild is not an incident |
+| `submitted` | a version was sent somewhere | as `locked`, plus a stronger reopening requirement |
+| `reopened` | somebody deliberately reopened it | proceeds, and takes the next version number |
+
+Four things about this are load-bearing:
+
+**`open` is the absence of a row.** `registry.as_at_transition` is append-only
+and records *departures from the default*. Nothing has to be written to bring
+an as-at date into existence, which is why a date nobody has ever thought about
+behaves correctly.
+
+**The gate runs BEFORE the merge, and that is not where it looks like it should
+go.** The publish task merges the audited branch into `main` and only *then*
+cuts tags and allocates versions. A check sitting with the versioning would
+fire after `main` had already moved. `check_publishable()` is called between
+reading the input set — where the as-at date first becomes known — and the
+merge. A refusal fails the task with `main` untouched and the branch retained
+for inspection.
+
+**Authority is recorded and checked against the project's own declaration, not
+enforced.** There is no identity provider here; nothing can verify that whoever
+typed `--actor jane` is Jane, and a module claiming otherwise would be theatre.
+What it *can* do is refuse any transition that does not name an actor and a
+reason — so the record is never "somebody unlocked this at some point" — and
+require, when reopening a **submitted** date, an `approved_by` matching the
+report's owner. That last one is a real check, because the owner comes from the
+dbt exposure and cannot be supplied by the person doing the reopening.
+
+**Nothing branches on what kind of report it is.** A daily internal dashboard
+and a quarterly regulatory return travel the same path; the difference between
+them is the `restatement:` policy declared on the exposure, not a branch in the
+lifecycle code. `tests/test_lifecycle.py` greps for that, because a comment
+claiming it would not survive the first convenient special case.
+
+The report, its owner and its restatement policy are all **derived from the dbt
+exposure** by `context.reports()` — the lifecycle adds no second registry of
+reports that could disagree with the first.
+
+---
+
+## Lineage is an export, not an authority
+
+OpenLineage emission and Marquez are **off by default**, behind
+`OPENLINEAGE_DISABLED` and the `lineage` compose profile. When on, Airflow
+emits a lineage event per task and Marquez consumes it.
+
+```mermaid
+flowchart LR
+  P["dbt project<br/><i>models, refs, exposures</i>"]
+  W["context.model_refs()<br/><b>one walker</b>"]
+  L["lineage/<br/>graph + columns"]
+  RT["feeds_behind_report()<br/><i>sizes retention windows</i>"]
+  OL["OpenLineage events"]
+  M["Marquez"]
+  RG["registry.run_input<br/><b>the publication record</b>"]
+  P --> W
+  W --> L
+  W --> RT
+  L --> OL --> M
+  P -.->|"built on a branch"| RG
+  M -. "legitimately differs" .- RG
+```
+
+Two things this diagram is drawn to make obvious:
+
+**There is one graph walker, not two.** `context.model_refs()` derives the
+lineage graph *and* is what `feeds_behind_report()` uses to size per-feed
+retention windows. A second derivation that drifted from the first is exactly
+the failure this codebase keeps warning about, so `tests/test_lineage.py`
+asserts the two agree.
+
+**Marquez is not the record of what a run published.** `registry.run_input` is,
+and the two legitimately differ: an SCD2 dimension may contribute 10 of 40
+deliveries to a published figure while OpenLineage correctly reports all 40 as
+read. **Do not reconcile them** — they answer different questions.
+
+Three operational facts that are easy to lose an afternoon to:
+
+- **Env is read at process start**, so enabling lineage needs the Airflow
+  containers **recreated**, not restarted.
+- **The custom extractor registers under `AIRFLOW__OPENLINEAGE__EXTRACTORS`** —
+  *not* `__CUSTOM_EXTRACTORS`, which is read by nothing and warns about
+  nothing. Without it Airflow emits jobs and no datasets at all.
+- **A skipped task shows as `RUNNING` in Marquez forever.** Airflow 2.10's
+  listener spec has no skipped hook, and skipping is the ingest DAGs' idle
+  state. Airflow is the authority on what is running.
+
+The package may never refuse: nothing in it raises, because an export must not
+gain the power to stop the pipeline. `unresolved` columns are a defect that does
+not fail a build — the seam is CI, where `lineage --columns` exits 1 on any.
+[`LINEAGE.md`](LINEAGE.md) has the detail.
+
+---
+
 ## Component inventory
 
 | Component | Local | Purpose |
@@ -461,7 +673,10 @@ and the DAG goes green.
 | Transformation | dbt-core + dbt-spark | prepared + reporting |
 | Query (people) | DuckDB, read-only on `main` | `scripts/duckdb_console.py` — analyst and dev queries |
 | Serving | Postgres | stand-in for an enterprise RDBMS export target |
-| Metadata | dbt manifest + Nessie commit log | lineage, catalog |
+| **Registry** | **Postgres `platform`** | **what arrived, what was published, out of which inputs, under whose authority — see above** |
+| Metadata | dbt manifest + Nessie commit log | model graph, catalog, and the change ref on each merge commit |
+| Lineage (optional) | OpenLineage → Marquez, both built here on UBI | export only, off by default behind the `lineage` profile |
+| Monitoring | six checks, one of them in its own container | gaps, lateness, evidence, reproducibility, the watchdog, the orphan sweep's refusal |
 
 Airflow is **2.10.5 deliberately, not 3.x**. Under Airflow 3 no DAG run here
 could ever complete — tasks ran, logged, returned values and pushed xcom, and

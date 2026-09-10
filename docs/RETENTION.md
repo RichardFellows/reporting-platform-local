@@ -213,6 +213,35 @@ Three properties worth knowing:
 - **`keep_years` must also be ≥ the published-tag window of every report the
   feed is behind**, and *that* one refuses. See *The reproducibility window*.
 
+#### The four windows, and which of them constrain each other
+
+Four separate windows are in play, and three of the relationships between them
+are enforced. This is the picture worth having before changing any number:
+
+```mermaid
+flowchart TB
+  PT["<b>published tag window</b><br/>references.published_tags<br/><i>years — the reproducibility window</i>"]
+  LK["<b>landing keep_years</b><br/>per RETENTION CLASS<br/><i>the evidence copy</i>"]
+  RW["<b>raw layer window</b><br/>keep_month_ends / 12<br/><i>≈6.7y — what the tables serve</i>"]
+  RY["<b>ready window</b><br/><i>days — a cache</i>"]
+  PT -->|"landing must be ≥ this,<br/><b>per (report, feed)</b><br/>REFUSES the sweep"| LK
+  RW -->|"landing must be ≥ this<br/>WARNS only"| LK
+  LK -->|"find_pending derives<br/>its keep-set from here"| RY
+```
+
+**Only one of these refuses.** A landing window shorter than a pin it must
+honour aborts the sweep outright, because landing is the only copy of what the
+upstream sent and a pin outliving its evidence cannot be honoured. A landing
+window shorter than the *raw* window only warns: the failure is gradual — live
+month-ends start looking expired — and an operator shortening landing in a
+sandbox should not be blocked.
+
+**The pin interlock is per `(report, feed)`, not global.** `feeds_behind_report()`
+walks the exposure's `ref()` closure, so a feed behind no published report is
+bound by no pin — which is the point. Under the old global rule, no retention
+class could be shorter than the longest pin anywhere in the estate.
+`snapshot_tags` stays outside this entirely: an ingest is not a publication.
+
 #### Retention classes
 
 A feed's window is chosen by its **retention class**. The class is named in
