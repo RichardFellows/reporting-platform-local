@@ -441,6 +441,33 @@ How the datasets, columns and classes are actually derived is in
 
 ## Quick reference
 
+- **THE CONSOLE MAY NOT BE THE ONLY THING THAT VALIDATES A VALUE.** `cadence`,
+  `schema_drift`, `expected_min_rows`, `delimiter`, `quote_char` and
+  `file_encoding` were checked by `ui/registry.validate` and by NOTHING at
+  load — so the form refused what a hand edit or a merge could still write,
+  and `cadence: fortnightly` behaved as `daily` with nothing saying so. They
+  are `check_*` functions in `common/context.py` now, called from both, like
+  `parse_expected_by` and `check_retention_class` always were.
+  `tests/test_value_checks.py` asserts each from both sides.
+
+## CI
+
+- **`.github/workflows/config.yml` is the cheap tier and the only one that
+  exists**: `config check` + `python -m tests.run` on a bare runner, ~10s.
+  Its dependency set (pyyaml, ruamel.yaml, requests, duckdb) was DERIVED BY
+  RUNNING IT in a clean virtualenv, not read off the imports — `test_sniff`
+  imports duckdb at module level and its absence aborts the whole run with no
+  summary line.
+- **`lineage --columns` is NOT usable at that tier.** Without compiled SQL and
+  a catalog it reports 7 of 11 tables as `not derivable` and still **exits
+  0** — green on almost nothing. It needs a build first, or a
+  `--require-derivable`; the exit code does not yet distinguish "read it and
+  it was clean" from "could not read it", which is this file's own rule about
+  a subject it could not READ.
+- **Still ungated**: the image build (the cosmos `--no-deps` trap — the
+  Dockerfile's `dbt --version` smoke test IS the gate, it just never runs in
+  CI), `dbt parse`, DAG import, and the jar version triple.
+
 ```powershell
 # config-level tests: registry resolution + the console's write-back.
 # No stack, ~6s. Everything else is verified by running it. tests/README.md
