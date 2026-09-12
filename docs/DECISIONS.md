@@ -116,6 +116,8 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [feed-names-carry-the-source](#feed-names-carry-the-source) | One string is the raw table, DAG id, prefix, source and model at once |
 | [feed-conventions](#feed-conventions) | `defaults → convention → feed`, and why there may be only one implementation of that merge |
 | [the-registry-is-a-directory](#the-registry-is-a-directory) | One file per feed, and the cache key that makes it work |
+| [a-gate-that-cannot-fail](#a-gate-that-cannot-fail) | `lineage --columns` was green on seven tables it could not read |
+| [the-jar-versions-are-checked-by-a-test-now](#the-jar-versions-are-checked-by-a-test-now) | Five copies of one version, and what is actually checkable |
 | [source-column-names](#source-column-names) | A column may be named differently in the file than in the platform |
 | [a-declared-column-migrates-itself](#a-declared-column-migrates-itself) | **The directions are not symmetrical**: declared columns are added, undeclared ones are never dropped |
 | [provenance-is-added-not-backfilled](#provenance-is-added-not-backfilled) | The migration is lazy, and one un-migrated feed fails *every* prepared model |
@@ -1390,6 +1392,78 @@ So the namespace is created on `main` first and the branch inherits it. A
 namespace holds no data, and this is the same precedent the cold-start
 bootstrap already sets.
 
+
+## a-gate-that-cannot-fail
+
+`python -m reporting_platform.lineage --columns` is described in CLAUDE.md as
+THE CI seam: the lineage package may never raise, so `unresolved` has to be
+caught somewhere allowed to say no, and that CLI exits 1 on any. Measured on a
+runner with no stack:
+
+```
+raw.ref_rating: 5 columns  sourced=5
+prepared.fo_trade: not derivable (unbuilt or unpublished)
+... 7 of 11 tables ...
+unresolved: none          exit=0
+```
+
+Four tables classified, seven unreadable, **and it passed.** Column lineage
+needs the compiled SQL and the catalog, and the ordinary state of every model
+on an unbuilt checkout is that it has neither. So the seam the rest of the
+rules leaned on was structurally unable to go red at the only tier cheap
+enough to run on every push.
+
+**`unresolved` and `not derivable` are different facts and only one was a
+failure.** `unresolved` is a column the parser READ and could not trace -- a
+defect in the export. `not derivable` is a table it could not read at all.
+Reporting the second as a clean bill of health is precisely
+[an-incomplete-keep-set-refuses](#an-incomplete-keep-set-refuses) -- *a
+subject it could not READ is not a subject that is EMPTY, and the two are the
+same value* -- applied to the tool that enforces the rest of them.
+
+`--require-derivable` adds the second condition, and the derivable count now
+prints either way, because `unresolved: none` over four of eleven tables reads
+as a pass unless the other seven are counted next to it. The flag is for the
+post-build tier: at the config tier it correctly fails, which is why
+`.github/workflows/config.yml` runs `--columns` without it and says so.
+
+The flag alone, without `--columns`, is an argparse error rather than a silent
+no-op -- for the same reason `member_pattern` on a non-archive feed is
+refused: a setting that cannot apply must not look like one that did.
+
+## the-jar-versions-are-checked-by-a-test-now
+
+[jar-versions](#jar-versions) has been documented in CLAUDE.md, `.env.example`
+and here for as long as it has existed, and was checked by nothing.
+`common/spark.py` reads two of the three and interpolates them straight into
+`spark.jars.packages`; the failure is `NoSuchMethodError` on the first write,
+after the image builds and the stack comes up, naming no version.
+
+`tests/test_versions.py` pins what is actually checkable, which is not the
+same as what the rule says:
+
+- **`ICEBERG_VERSION` agrees across all five files that declare it** --
+  `.env.example`, `docker-compose.yml`, `Dockerfile.spark`,
+  `common/spark.py`'s fallback and `dbt/profiles.yml`'s. Five, because the
+  image bakes the jars in and both drivers resolve the coordinates again;
+  a bump touching four of five is the realistic mistake.
+- the extensions likewise, across five.
+- **`NESSIE_SERVER_VERSION` against the `nessie-gc` jar**, which
+  `docker-compose.yml`'s own comment says must be equal.
+- **the server may lead the extensions, not lag them.**
+- **the configured (Iceberg, extensions) pair is one somebody has run.**
+
+That last one is a hand-kept list, and deliberately: whether a given
+extensions build works with a given Iceberg is a property of what upstream
+compiled against, and nothing in this repo can compute it. Both entries come
+from `.env.example`'s own header -- the shipped pair and the "known-good
+fully-upgraded alternative" it documents. Adding one is a claim that somebody
+ran it, made once in one place rather than implied by whatever is in `.env`.
+
+A seventh test pairs the Quarkus JSON logging keys with the server version
+that honours them, because `.env.example` warns that pinning the server below
+0.104 leaves those keys behind as inert config that reads as working -- which
+is this repo's most-repeated failure shape and was, again, enforced by nothing.
 
 ## the-registry-is-a-directory
 

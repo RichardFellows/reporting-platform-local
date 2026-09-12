@@ -15,6 +15,21 @@ This is that somewhere: it exits 1 when any column of any managed table is
 DESCRIPTION of the pipeline the power to stop it. It needs the catalog and the
 compiled SQL, which the edge listing does not, so it is a flag rather than the
 default. See `columns.py` for why that division is deliberate.
+
+`--require-derivable` IS WHAT MAKES `--columns` A GATE RATHER THAN A REPORT.
+`unresolved: none` is true of a table whose columns were read and were clean,
+AND of one that could not be read at all -- and the second is the ordinary
+state of every model on a runner that has not built: no compiled SQL, no
+catalog, `not derivable`, exit 0. Measured on the shipped project with no
+stack: 4 of 11 tables classified, 7 not derivable, and it passed. A gate that
+cannot fail is worse than no gate, because it is reported as a tick.
+
+That is this repo's own rule -- a subject it could not READ is not a subject
+that is EMPTY, and reporting the first as the second is how a monitor goes
+green on a table nobody opened -- applied to the tool that enforces the rest
+of them. The flag says both counts out loud and refuses when anything was
+unreadable, which is what the post-build tier should run.
+See docs/DECISIONS.md#a-gate-that-cannot-fail
 """
 from __future__ import annotations
 
@@ -32,10 +47,16 @@ def main() -> int:
     parser.add_argument("--columns", action="store_true",
                         help="classify every column of every managed table; "
                              "exits 1 if any is unresolved")
+    parser.add_argument("--require-derivable", action="store_true",
+                        help="also exit 1 if any managed table could not be "
+                             "read at all -- needs a build, and is what makes "
+                             "--columns a gate rather than a report")
     args = parser.parse_args()
 
     if args.columns:
-        return _columns(args.json)
+        return _columns(args.json, args.require_derivable)
+    if args.require_derivable:
+        parser.error("--require-derivable only means anything with --columns")
 
     edges = graph.edges()
     if args.json:
@@ -51,8 +72,16 @@ def main() -> int:
     return 0
 
 
-def _columns(as_json: bool) -> int:
-    """Every managed table's columns, classified. Exit 1 on any defect."""
+def _columns(as_json: bool, require_derivable: bool = False) -> int:
+    """Every managed table's columns, classified.
+
+    TWO FAILURE CONDITIONS, AND THEY ARE DIFFERENT FACTS. `unresolved` is a
+    column the parser read and could not trace -- a defect in the export.
+    `not derivable` is a table it could not read at all, which on an unbuilt
+    checkout is every model and is not a defect. Only the first fails by
+    default; `--require-derivable` adds the second, for the tier that has
+    built and where a blind table means something is wrong.
+    """
     from reporting_platform.common.context import feeds, models_in
     from reporting_platform.lineage import columns
 
@@ -66,6 +95,7 @@ def _columns(as_json: bool) -> int:
     defects = {f"{name}.{column}": traced[column].detail
                for (_, name), traced in tables
                for column in columns.unresolved_columns(traced)}
+    blind = [name for (_, name), traced in tables if not traced]
 
     if as_json:
         print(json.dumps({
@@ -76,6 +106,10 @@ def _columns(as_json: bool) -> int:
                               for c, l in traced.items()}
                        for (_, name), traced in tables},
             "unresolved": defects,
+            # NAMED, not merely absent from `tables`. A consumer counting
+            # keys cannot otherwise tell a table with no defects from one
+            # nothing was known about.
+            "not_derivable": blind,
         }, indent=2))
     else:
         for (_, name), traced in tables:
@@ -104,8 +138,18 @@ def _columns(as_json: bool) -> int:
                 print(f"    {name}  -- {detail}")
         else:
             print("unresolved: none")
+        # ALWAYS, not only under the flag. "unresolved: none" over four of
+        # eleven tables reads as a clean bill of health unless the other
+        # seven are counted next to it.
+        print(f"derivable: {len(tables) - len(blind)} of {len(tables)} tables"
+              + (f" -- not derivable: {', '.join(blind)}" if blind else ""))
+        if blind and require_derivable:
+            print(f"REFUSING: {len(blind)} table(s) could not be read. That is "
+                  f"not the same answer as having no defects -- build the "
+                  f"project and publish it, or drop --require-derivable and "
+                  f"read this as the partial report it is.")
 
-    return 1 if defects else 0
+    return 1 if defects or (blind and require_derivable) else 0
 
 
 if __name__ == "__main__":
