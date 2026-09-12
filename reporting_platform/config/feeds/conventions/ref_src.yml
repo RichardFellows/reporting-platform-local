@@ -1,0 +1,14 @@
+# The three reference feeds are one delivery arrangement, not three.
+source_system: REF_SRC
+expected_min_rows: 10
+# REQ-201. The wall-clock time by which the upstream has agreed a delivery
+# will have ARRIVED. One arrangement, one time -- which is the case for
+# putting it on the convention rather than repeating it on three feeds
+# that would then drift apart.
+#
+# QUOTED, and it has to be. Unquoted, YAML 1.1 reads a time as SEXAGESIMAL
+# -- `7:30` is the integer 450. A LEADING ZERO happens to block pyyaml's
+# resolver, so `07:30` would survive unquoted and `9:30` would not, which
+# is worse than if it never worked: it would hold until the first hour
+# somebody did not pad. `parse_expected_by` refuses a non-string saying so.
+expected_by: "07:30"

@@ -56,16 +56,17 @@ def test_undefined_convention_is_an_error():
     """Silent fallback to `defaults:` would give a feed configured subtly
     wrong rather than one that does not exist.
 
-    ASSERTS ON THE FEED NAME, and that is the point of the assertion.
+    ASSERTS ON THE FEED, and that is the point of the assertion.
     `effective_defaults()` raises its own "convention is not defined" for the
     same input, so a looser check passes even with `_feeds_at`'s guard
     removed -- verified by removing it. Only the guard in `_feeds_at` knows
     which FEED named the missing convention, which is the half of the message
-    worth having when feeds.yml has forty blocks in it.
+    worth having when the registry holds forty of them. Since the split it
+    names the FILE, which is the same half and locates it as well.
     """
     msg = _raises('conventions:\n  ref: {delimiter: "|"}\n',
                   "    convention: rfe\n")
-    assert "feed 't_one'" in msg, msg
+    assert "t_one.yml" in msg, msg
     assert "not defined" in msg and "Available: ref" in msg, msg
 
 
@@ -87,10 +88,41 @@ def test_convention_may_not_set_name():
     assert "may not set 'name'" in msg, msg
 
 
-def test_conventions_do_not_chain():
+def test_a_convention_chains_with_parent_not_with_convention():
+    """`convention:` is how a FEED names one. A convention naming it would
+    record a name on the resolved Feed that had no effect -- so it stays an
+    error, and the message points at the key that does work."""
     msg = _raises('conventions:\n  a: {delimiter: "|"}\n  b: {convention: a}\n',
                   "    convention: b\n")
-    assert "may not set 'convention'" in msg and "do not chain" in msg, msg
+    assert "may not set 'convention'" in msg and "`parent:`" in msg, msg
+
+
+def test_a_convention_inherits_through_parent():
+    """defaults -> parent -> convention -> feed, shallow at every link."""
+    registry, _ = feeds_from(synthetic(
+        'conventions:\n'
+        '  base: {delimiter: "|", expected_min_rows: 5}\n'
+        '  eu: {parent: base, expected_min_rows: 9}\n',
+        "    convention: eu\n"))
+    fd = registry["t_one"]
+    assert fd.delimiter == "|", "not inherited through the parent"
+    assert fd.expected_min_rows == 9, "the nearer link did not win"
+
+
+def test_an_undefined_parent_is_an_error():
+    """Silent fallback to `_defaults.yml` would give a feed configured subtly
+    wrong rather than one that does not exist -- the same reason an undefined
+    convention on a feed is an error."""
+    msg = _raises('conventions:\n  a: {parent: nope, delimiter: "|"}\n',
+                  "    convention: a\n")
+    assert "parent: nope" in msg and "not defined" in msg, msg
+
+
+def test_a_convention_cycle_is_an_error():
+    """Otherwise a RecursionError naming nothing."""
+    msg = _raises('conventions:\n  a: {parent: b}\n  b: {parent: a}\n',
+                  "    convention: a\n")
+    assert "cycle" in msg, msg
 
 
 def test_conventions_section_must_be_a_mapping():

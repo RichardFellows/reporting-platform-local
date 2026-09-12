@@ -1,0 +1,27 @@
+name: ref_collateral
+convention: ref_src
+description: Collateral positions held against counterparty exposure, from the collateral management system.
+filename_pattern: 'COLLATERAL_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+business_key: [collateral_id]
+# BEHIND NO PUBLISHED REPORT. `feeds_behind_report` walks the exposures'
+# ref() closure and this feed is in neither report's lineage, so no
+# published figure is reproduced from its evidence and the published-tag
+# interlock does not bind it. `operational` is 7 years rather than 10 --
+# still above the raw layer's own window, which find_pending needs.
+#
+# THIS IS A POLICY STATEMENT, not a tuning knob: if a report ever ref()s
+# prepared.ref_collateral, check_reproducibility_window() will refuse the
+# nightly sweep until this is moved back to `standard`. That refusal is
+# the mechanism -- the class cannot silently outlive its correctness.
+retention_class: operational
+columns:
+  - collateral_id
+  - counterparty_id
+  - collateral_type
+  - market_value
+  - currency
+  - valuation_date
+  - haircut_pct
+  - is_eligible
+column_types:
+  haircut_pct: decimal

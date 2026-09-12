@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 
-from tests.support import config_dir, registry_on
+from tests.support import config_dir, feed_text, registry_on, registry_text
 
 # Keys the shipped `ref_src` convention supplies. None of these may appear in
 # the block of a feed that inherits them.
@@ -22,12 +22,6 @@ def _setup():
     registry = registry_on(d)
     from reporting_platform.common.context import feeds
     return d, registry, feeds
-
-
-def _block_of(text: str, name: str) -> str:
-    blk = text[text.index(f"- name: {name}"):]
-    end = blk.find("\n  - name:")
-    return blk if end == -1 else blk[:end]
 
 
 def _changed(before: str, after: str) -> list[str]:
@@ -45,10 +39,10 @@ def test_noop_save_pins_nothing():
     change to a key the convention supplies.
     """
     d, registry, feeds = _setup()
-    before = (d / "feeds.yml").read_text()
+    before = registry_text(d)
     for name in feeds():
         registry.update(registry.spec_from_feed(feeds()[name]))
-    after = (d / "feeds.yml").read_text()
+    after = registry_text(d)
     leaked = [l for l in _changed(before, after) if any(k in l for k in SUPPLIED)]
     assert not leaked, "convention-supplied keys leaked:\n" + "\n".join(leaked)
 
@@ -68,7 +62,7 @@ def test_new_feed_inherits_without_repeating():
         name="ref_newthing", description="A new reference feed.",
         filename_pattern=r'NEW_(?P<cob_date>\d{8})\.csv')
     registry.add(spec)
-    blk = _block_of((d / "feeds.yml").read_text(), "ref_newthing")
+    blk = feed_text(d, "ref_newthing")
     assert "convention: ref_src" in blk, blk
     for key in SUPPLIED:
         assert key not in blk, f"{key} was pinned into the new block:\n{blk}"
@@ -86,7 +80,7 @@ def test_clearing_a_convention_pins_what_it_supplied():
     cleared = dataclasses.replace(
         registry.spec_from_feed(feeds()["ref_counterparty"]), convention="")
     registry.update(cleared)
-    blk = _block_of((d / "feeds.yml").read_text(), "ref_counterparty")
+    blk = feed_text(d, "ref_counterparty")
     assert "convention:" not in blk, blk
     assert "source_system: REF_SRC" in blk, blk
     assert "expected_min_rows: 10" in blk, blk
@@ -101,13 +95,13 @@ def test_a_hand_written_supersession_block_survives_a_console_save():
     which is the mode whose whole purpose is to be stated rather than assumed.
     """
     d, registry, feeds = _setup()
-    path = d / "feeds.yml"
+    path = d / "feeds" / "fo_trade.yml"
     text = path.read_text()
-    # Hand-add the block the way somebody would, under the first feed.
-    marker = "  - name: fo_trade\n"
+    # Hand-add the block the way somebody would, under `name:`.
+    marker = "name: fo_trade\n"
     assert marker in text
     path.write_text(text.replace(
-        marker, marker + "    supersession:\n      mode: full_snapshot\n", 1))
+        marker, marker + "supersession:\n  mode: full_snapshot\n", 1))
 
     registry.update(registry.spec_from_feed(feeds()["fo_trade"]))
     after = path.read_text()

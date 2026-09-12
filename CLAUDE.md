@@ -206,8 +206,10 @@ The procedures are `docs/ADDING-A-FEED.md` (five files, no DAG edit),
   `ref_counterparty`), TYPED into feeds.yml, not derived. That one string is
   the raw table, DAG id, landing prefix, dbt source table and prepared model at
   once, so none of the five can drift. (`#feed-names-carry-the-source`)
-- **`conventions:` is a middle tier**: `defaults -> convention -> feed`,
-  shallow at each layer, because variation is mostly per SOURCE SYSTEM.
+- **`conventions/` is a middle tier**: `_defaults.yml -> convention -> feed`,
+  shallow at each layer, because variation is mostly per SOURCE SYSTEM. A
+  convention may name a **`parent:`**, so the tier is a chain; an undefined
+  parent and a cycle are errors at LOAD.
   `context.effective_defaults()` is the ONLY implementation of that ordering,
   and the console depends on it — `ui/registry._block` omits any key matching
   what the feed inherits, so a second copy of the merge would start pinning
@@ -440,9 +442,15 @@ How the datasets, columns and classes are actually derived is in
 ## Quick reference
 
 ```powershell
-# config-level tests: feeds.yml resolution + the console's write-back.
-# No stack, ~1s. Everything else is verified by running it. tests/README.md
+# config-level tests: registry resolution + the console's write-back.
+# No stack, ~6s. Everything else is verified by running it. tests/README.md
 python -m tests.run
+
+# what the registry resolves to, and WHICH TIER each value came from.
+# No stack. `check` exits 1 if the config will not load -- the CI seam.
+python -m reporting_platform.config list
+python -m reporting_platform.config show fo_trade --origin
+python -m reporting_platform.config check
 
 # bulk ingest everything pending (safe to re-run)
 docker compose exec airflow python -m scripts.bulk_ingest

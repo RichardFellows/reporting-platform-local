@@ -98,7 +98,7 @@ moment something in `ready/` is not reconstructable, it has quietly become a
 third copy of the data.
 
 A **normalize** stage sits between them, and `ready_prefix` joins
-`landing_prefix` in `feeds.yml` defaults (`config/feeds.yml:11`).
+`landing_prefix` in `config/feeds/_defaults.yml`.
 
 There is a third prefix, and it has the *same* lifetime as the evidence copy
 for the same reason — a refused delivery is evidence of what the upstream sent:

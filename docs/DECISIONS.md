@@ -115,6 +115,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 |---|---|
 | [feed-names-carry-the-source](#feed-names-carry-the-source) | One string is the raw table, DAG id, prefix, source and model at once |
 | [feed-conventions](#feed-conventions) | `defaults → convention → feed`, and why there may be only one implementation of that merge |
+| [the-registry-is-a-directory](#the-registry-is-a-directory) | One file per feed, and the cache key that makes it work |
 | [source-column-names](#source-column-names) | A column may be named differently in the file than in the platform |
 | [a-declared-column-migrates-itself](#a-declared-column-migrates-itself) | **The directions are not symmetrical**: declared columns are added, undeclared ones are never dropped |
 | [provenance-is-added-not-backfilled](#provenance-is-added-not-backfilled) | The migration is lazy, and one un-migrated feed fails *every* prepared model |
@@ -552,7 +553,7 @@ again. A separate slimmer image would have to duplicate the platform package and
 could then be built against a different version of it.
 
 Its bind mounts are read-write, unlike `spark-master`/`spark-worker`: the whole
-point is that it edits `reporting_platform/config/feeds.yml`, the dbt project
+point is that it edits `reporting_platform/config/feeds/`, the dbt project
 and `seed/`. Those edits land in the working tree on the host and show up in
 `git diff`, which is what makes a feed added there reviewable as an ordinary
 change.
@@ -1390,6 +1391,83 @@ namespace holds no data, and this is the same precedent the cold-start
 bootstrap already sets.
 
 
+## the-registry-is-a-directory
+
+`feeds.yml` was one file holding `defaults:`, `conventions:` and a list of
+every feed. It is now a tree:
+
+```
+reporting_platform/config/feeds/
+    _defaults.yml            the defaults tier -- the mapping itself
+    conventions/ref_src.yml  one convention -- the settings mapping itself
+    fo_trade.yml             one feed -- the block itself
+```
+
+No wrapper keys: a feed file IS what used to sit under `feeds:`. Re-stating
+the key inside the file that names it is the kind of redundancy that drifts.
+
+**The reason is the diff, and the diff is the deliverable.** Adding a feed was
+an append into a shared sequence, so two feed PRs conflicted with each other
+by construction; a column change was a few lines inside a file that grows with
+the estate. Now a new feed is one new file with no context lines, a column
+change is a small diff in a small file, `git log config/feeds/fo_trade.yml` is
+that feed's history rather than everybody's, and CODEOWNERS can name a feed --
+which cannot be expressed inside one file at all. The per-feed *comments* move
+with their feed, which matters more than it sounds: `ref_collateral`'s note on
+why its retention class is `operational` is the most valuable content in that
+block, and it used to be nine lines of context in everyone else's diff.
+
+**The filename is the identity, cross-checked at load.** `fo_trade.yml`
+declares `name: fo_trade` or it is an error, and the filename must be a legal
+name -- lowercase, digits, underscores. That is not tidiness. The name is the
+raw table, the DAG id, the landing prefix, the dbt source table and the
+prepared model at once ([feed-names-carry-the-source](#feed-names-carry-the-source)),
+so a filename that disagrees with the `name:` inside it adds a sixth spelling
+that nothing reconciles -- and the realistic way in is copying a file to start
+a new feed and changing one of the two. A convention file carries no `name:`
+at all: a convention setting one would supply it to every feed inheriting it.
+
+**It also closes a hole nothing was guarding.** `_feeds_at` built the registry
+with `out[block["name"]] = Feed(...)`, so two blocks sharing a name collapsed
+into one entry, last one wins, nothing raising -- the exact failure
+[feed-conventions](#feed-conventions) names as the reason a convention may not
+set `name:`, guarded there and unguarded here. A directory cannot hold two
+files with one name.
+
+**The cache key is the part that is easy to get subtly wrong.** Every config
+cache here is keyed on an mtime so that a long-lived process -- Airflow's DAG
+file processor, the console -- picks up an edit without a restart. The obvious
+translation is the directory's mtime, and it is wrong: **a directory's mtime
+moves when a file is added or removed and NOT when one is edited.** That is
+fine for `models_in`, whose set only changes on add/remove, and wrong here.
+Keyed that way, editing a convention would never reach the DAG processor --
+a convention changed, no feed changing, nothing reporting an error, which is
+precisely the bug `_load`'s mtime key was written to kill, in a new shape.
+`layout.registry_files()` therefore stats every file in the tree. Measured at
+40 feeds: 115us to build the key against 3.5us for a single stat, against the
+0.17s `lineage/columns.py` already spends tracing one model's columns.
+`tests/test_layout.py` pins all three edit paths, and they fail as expected
+when the key is swapped for the directory's mtime -- verified by swapping it.
+
+**The migration was a move, not a rewrite, and that was checked rather than
+asserted.** Everything downstream of the parse is unchanged: `_registry_at`
+assembles the same three tiers the single file carried, and `effective_defaults`
+merges them as it always did. The acceptance criterion was that every resolved
+`Feed` came out byte-identical -- `dataclasses.asdict` over the whole registry
+before and after, diffed, 4 feeds and 100 fields, no difference.
+`layout.split_document()` did the split with ruamel round-trip so the comments
+survived, and is still exercised on every test run because
+`tests/support.config_dir()` builds its fixtures with it: fifty call sites
+write a fixture as one document, and one implementation means a fixture cannot
+be assembled by rules the real config was not.
+
+**`python -m reporting_platform.config show <feed> --origin` is the other half.**
+A middle tier only earns its keep if values are not written where they are
+used, which makes "why is this feed reading a pipe delimiter" a question about
+three files. Layering is survivable when there is a render command; that is
+the render command, and it reads `effective_defaults()` rather than re-walking
+the tiers, so it cannot disagree with the loader it describes.
+
 ## feed-conventions
 
 `feeds.yml` had exactly two tiers: a global `defaults:` block and a per-feed
@@ -1401,6 +1479,15 @@ every feed block of that system and drifted between them.
 `conventions:` is the middle tier. Resolution is `defaults -> convention ->
 feed`, each layer overriding the last, and it is the same
 `{**a, **b}` the `defaults` merge already was.
+
+**A convention may name a `parent:`**, so the middle tier is a chain rather
+than a single link -- global, vendor, system, feed. An undefined parent and a
+cycle are both errors at load, for the reasons every other resolution failure
+here is: the first would resolve silently to `_defaults.yml` alone and produce
+a feed configured subtly wrong, the second would be a `RecursionError` naming
+nothing. Depth is what makes
+[the-registry-is-a-directory](#the-registry-is-a-directory)'s `--origin` view
+load-bearing rather than a convenience.
 
 **Shallow at every layer.** A dict-valued key such as `column_types` is
 replaced by the more specific layer, not merged into it. With a deep merge
@@ -1434,7 +1521,7 @@ new one starts strict:
 |---|---|
 | a feed naming an undefined convention | falls back to `defaults:` and produces a feed configured subtly wrong, rather than one that does not exist |
 | an unknown key inside a convention | dropped by the `allowed` filter with no comment — `delimeter:` would simply never apply |
-| a convention setting `name` or `convention` | `name` collapses two feeds into one registry entry, last one wins; `convention` does not chain, so it would record a name that had no effect |
+| a convention setting `name` or `convention` | `name` collapses two feeds into one registry entry, last one wins; `convention` is how a FEED names one, so it would record a name that had no effect -- a convention chains with `parent:` |
 
 Unknown keys are rejected in `conventions:` but **not** in feed blocks. That is
 inconsistent on purpose: conventions are new surface with nothing depending on
@@ -2331,7 +2418,7 @@ and macOS/Windows should leave it unset -- Docker Desktop's VM maps ownership
 and 50000 is correct there.
 
 Verified by recreating all eight services: `id` reports `uid=1000 gid=0(root)`
-in each, `feeds.yml` is writable, `inbox/.processed/` is creatable, and a feed
+in each, `config/feeds/` is writable, `inbox/.processed/` is creatable, and a feed
 created through the console over HTTP returned 200 having written all five
 files with `dbt parse` clean -- the exact call that returned 500 before.
 

@@ -31,22 +31,30 @@ once.
 ---
 
 
-## 1. `reporting_platform/config/feeds.yml` — the registry
+## 1. `reporting_platform/config/feeds/treasury_margin_call.yml` — the registry
 
-This is the single source of truth. It creates the raw table, the Airflow DAG,
-the asset that triggers `prepared_build`, and the retention/maintenance
-entries. Nothing else in the platform needs to learn the feed's name.
+One file per feed. It creates the raw table, the Airflow DAG, the asset that
+triggers `prepared_build`, and the retention/maintenance entries. Nothing else
+in the platform needs to learn the feed's name.
+
+**The filename is the name**, and the `name:` inside must match it — a check
+at load, because that one string reaches five places and a file copied to
+start a new feed is how the two come apart.
 
 ```yaml
-  - name: treasury_margin_call
-    description: Margin calls per counterparty and call type, from treasury.
-    source_system: TREASURY
-    filename_pattern: 'marginCalls_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
-    business_key: [margin_call_id]
-    expected_min_rows: 10
-    columns: [margin_call_id, counterparty_id, call_type, call_amount,
-              currency, effective_date, due_date, status]
+name: treasury_margin_call
+description: Margin calls per counterparty and call type, from treasury.
+source_system: TREASURY
+filename_pattern: 'marginCalls_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+business_key: [margin_call_id]
+expected_min_rows: 10
+columns: [margin_call_id, counterparty_id, call_type, call_amount,
+          currency, effective_date, due_date, status]
 ```
+
+The tiers above it are `feeds/_defaults.yml` and `feeds/conventions/<name>.yml`;
+`python -m reporting_platform.config show treasury_margin_call --origin` says
+which one supplied each value once it loads.
 
 Four things that are easy to get wrong:
 
@@ -98,7 +106,7 @@ Optional, and worth a thought rather than a default:
 | `supersession:` | Only if a later delivery does **not** simply restate the whole population for its COB date. The one built mode is `full_snapshot`, which is the default and what every feed here does; `delta_append` and `correction` are refused at load with the reason. Set it explicitly on a feed whose shape you want stated rather than assumed — the failure it prevents is silent, because a delta feed deduped as a snapshot loses every key its newest file omits and the row counts still look plausible. See [DECISIONS.md#supersession-is-declared-not-assumed](DECISIONS.md#supersession-is-declared-not-assumed). |
 | `delivery:` | The delivery is a zip (`kind: archive`, plus `member_pattern`) rather than one plain CSV. See [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) for the shapes, and [DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) / [#control-file-gate](DECISIONS.md#control-file-gate) for what each key actually does. The console validates it with the exact function feeds.yml load does, so a typo here fails in the form rather than at the next Airflow parse. |
 
-### Inherited from `defaults:`, and when to override
+### Inherited from `_defaults.yml`, and when to override
 
 The keys above are the ones you *add*. These already have values from the
 `defaults:` block at the top of `feeds.yml`, and a feed block lists one only to
@@ -263,7 +271,7 @@ schema drift, the absent delivery, the non-overlapping SCD2 ranges
 `dbt_utils.mutually_exclusive_ranges` tests, the cadence difference between a
 daily feed and a weekly one.
 
-Every **other** feed in `feeds.yml` is generated from its own definition by
+Every **other** feed in the registry is generated from its own definition by
 `reporting_platform/ui/sampledata.py`, the console's generator, which
 `generate_feeds.py` calls after the hand-written four. So one command seeds all
 of them:

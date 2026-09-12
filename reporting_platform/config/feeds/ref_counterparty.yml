@@ -1,0 +1,12 @@
+name: ref_counterparty
+convention: ref_src
+description: Counterparty reference data. Slowly changing.
+filename_pattern: 'CPTY_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+business_key: [counterparty_id]
+columns:
+  - counterparty_id
+  - legal_name
+  - country_code
+  - sector
+  - parent_counterparty_id
+  - is_active

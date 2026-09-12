@@ -1,0 +1,17 @@
+name: ref_rating
+convention: ref_src
+description: External agency credit ratings.
+filename_pattern: 'RATING_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+business_key: [counterparty_id, agency]
+# Agency ratings arrive weekly, not daily. Without this the gap
+# check infers the business calendar from the daily feeds and
+# reports every non-delivery day as a gap -- it did exactly that on its
+# first run, five false gaps in a ten-day window. `weekly` asks only that
+# each week containing COB dates saw at least one delivery.
+cadence: weekly
+columns:
+  - counterparty_id
+  - agency
+  - rating
+  - rating_date
+  - outlook

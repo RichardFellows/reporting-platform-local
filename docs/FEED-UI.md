@@ -20,7 +20,7 @@ docker compose logs --tail 20 feed-ui
 
 **It is not a second source of truth.** Every read goes through
 `common.context.feeds()`; every write goes back into
-`reporting_platform/config/feeds.yml` and the dbt project. A feed added here
+`reporting_platform/config/feeds/` and the dbt project. A feed added here
 produces the same diff as one added by hand — check `git diff` after using it,
 because that diff is the actual deliverable and it is meant to be reviewed.
 
@@ -57,7 +57,7 @@ The **New feed** form writes all five files:
 
 | | File | Written by |
 |---|---|---|
-| 1 | `reporting_platform/config/feeds.yml` | `ui/registry.py` |
+| 1 | `reporting_platform/config/feeds/<name>.yml` | `ui/registry.py` |
 | 2 | `dbt/models/raw/_sources.yml` | `ui/scaffold.py` |
 | 3 | `dbt/models/prepared/<feed>.sql` | `ui/scaffold.py` |
 | 4 | `dbt/models/prepared/_prepared.yml` | `ui/scaffold.py` |
@@ -94,7 +94,7 @@ would write a `feeds.yml` the next Airflow parse refuses to load — and the
 console's whole point is that its diff is one you can merge.
 
 **Expected by** is a plain text field, not `<input type="time">`. The value
-written to `feeds.yml` is a quoted `"HH:MM"` string, and the browser's time
+written to the feed's file is a quoted `"HH:MM"` string, and the browser's time
 widget localises what it displays — which would show an Asian desk a different
 number from the one the file holds. Leave it blank for a feed that has made no
 promise; the lateness check then skips it.
