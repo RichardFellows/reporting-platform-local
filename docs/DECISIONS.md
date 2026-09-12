@@ -2226,6 +2226,10 @@ done, so the delivery is HELD in the inbox for the next pass. `NotReady` and
 
 ### The metadata sibling
 
+*A worked example of both shapes, with every key, is in
+[DELIVERY-SHAPES.md#the-metadata-sibling](DELIVERY-SHAPES.md#the-metadata-sibling);
+what follows is why it holds what it holds.*
+
 `landing/<feed>/<delivery>.meta.json`. The landed objects are byte-identical
 to what the upstream sent but carry the PLATFORM's names, so the originals --
 and everything else about the arrival -- survive only here: source filename,
