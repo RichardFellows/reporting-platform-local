@@ -207,7 +207,9 @@ The procedures are `docs/ADDING-A-FEED.md` (five files, no DAG edit),
   the raw table, DAG id, landing prefix, dbt source table and prepared model at
   once, so none of the five can drift. (`#feed-names-carry-the-source`)
 - **`conventions/` is a middle tier**: `_defaults.yml -> convention -> feed`,
-  shallow at each layer, because variation is mostly per SOURCE SYSTEM.
+  shallow at each layer, because variation is mostly per SOURCE SYSTEM. A
+  convention may name a **`parent:`**, so the tier is a chain; an undefined
+  parent and a cycle are errors at LOAD.
   `context.effective_defaults()` is the ONLY implementation of that ordering,
   and the console depends on it — `ui/registry._block` omits any key matching
   what the feed inherits, so a second copy of the merge would start pinning

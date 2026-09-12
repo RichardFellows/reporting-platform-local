@@ -148,3 +148,22 @@ def test_origins_names_the_tier_each_value_came_from():
     # Nothing declared `cadence`; it is the dataclass default and says so
     # rather than being attributed to the nearest file that might have.
     assert where["cadence"] == "built-in", where
+
+
+def test_origins_names_the_link_that_declared_it_not_the_one_named():
+    """WITH A CHAIN, "inherited" is not an answer -- "from where" is.
+
+    A feed names one convention; the value may have been declared three links
+    above it. Reporting the convention the feed points at would be true and
+    useless, and would send someone to edit a file that does not contain the
+    line they are looking for.
+    """
+    d = config_dir(synthetic(
+        'conventions:\n'
+        '  group: {delimiter: "|", expected_min_rows: 5}\n'
+        '  group_eu: {parent: group, expected_min_rows: 9}\n',
+        "    convention: group_eu\n"))
+    from reporting_platform.common.context import origins
+    where = origins("t_one")
+    assert where["delimiter"].endswith("conventions/group.yml"), where
+    assert where["expected_min_rows"].endswith("conventions/group_eu.yml"), where

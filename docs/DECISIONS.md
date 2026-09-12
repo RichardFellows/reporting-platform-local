@@ -1480,6 +1480,15 @@ every feed block of that system and drifted between them.
 feed`, each layer overriding the last, and it is the same
 `{**a, **b}` the `defaults` merge already was.
 
+**A convention may name a `parent:`**, so the middle tier is a chain rather
+than a single link -- global, vendor, system, feed. An undefined parent and a
+cycle are both errors at load, for the reasons every other resolution failure
+here is: the first would resolve silently to `_defaults.yml` alone and produce
+a feed configured subtly wrong, the second would be a `RecursionError` naming
+nothing. Depth is what makes
+[the-registry-is-a-directory](#the-registry-is-a-directory)'s `--origin` view
+load-bearing rather than a convenience.
+
 **Shallow at every layer.** A dict-valued key such as `column_types` is
 replaced by the more specific layer, not merged into it. With a deep merge
 there is no way to *remove* an inherited entry, and "why is this column still a
@@ -1512,7 +1521,7 @@ new one starts strict:
 |---|---|
 | a feed naming an undefined convention | falls back to `defaults:` and produces a feed configured subtly wrong, rather than one that does not exist |
 | an unknown key inside a convention | dropped by the `allowed` filter with no comment — `delimeter:` would simply never apply |
-| a convention setting `name` or `convention` | `name` collapses two feeds into one registry entry, last one wins; `convention` does not chain, so it would record a name that had no effect |
+| a convention setting `name` or `convention` | `name` collapses two feeds into one registry entry, last one wins; `convention` is how a FEED names one, so it would record a name that had no effect -- a convention chains with `parent:` |
 
 Unknown keys are rejected in `conventions:` but **not** in feed blocks. That is
 inconsistent on purpose: conventions are new surface with nothing depending on

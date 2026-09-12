@@ -1119,9 +1119,15 @@ def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
 CONVENTION_FORBIDDEN = {
     "name": "that is per-feed identity, and sharing one would collapse two "
             "feeds into a single registry entry",
-    "convention": "conventions do not chain -- setting it here would record a "
-                  "name that had no effect",
+    "convention": "that is how a FEED names its convention. A convention "
+                  "chains by naming `parent:` instead, which is resolved "
+                  "here rather than recorded on the feed",
 }
+
+# The key a convention chains with. Not a `Feed` field -- it is about the
+# registry's shape, not a feed's settings -- so it has to be allowed past the
+# unknown-key check explicitly, and stripped before the merge.
+PARENT_KEY = "parent"
 
 
 def resolve_conventions(section: dict[str, Any],
@@ -1161,18 +1167,57 @@ def resolve_conventions(section: dict[str, Any],
             raise ValueError(
                 f"{at(cname)}: a convention may not set {key!r}: "
                 f"{CONVENTION_FORBIDDEN[key]}")
-        unknown = set(settings) - allowed
+        unknown = set(settings) - allowed - {PARENT_KEY}
         if unknown:
             raise ValueError(
                 f"{at(cname)}: unknown key(s) "
                 f"{', '.join(sorted(unknown))}. Valid keys are: "
-                f"{', '.join(sorted(allowed - CONVENTION_FORBIDDEN.keys()))}")
+                f"{', '.join(sorted((allowed | {PARENT_KEY}) - CONVENTION_FORBIDDEN.keys()))}")
 
-    return section
+    resolved: dict[str, dict[str, Any]] = {}
+    for cname in section:
+        _chain(cname, section, resolved, (), at)
+    return resolved
+
+
+def _chain(cname: str, section: dict[str, Any],
+           resolved: dict[str, dict[str, Any]],
+           seen: tuple[str, ...], at) -> dict[str, Any]:
+    """One convention with its `parent:` chain applied, memoised in `resolved`.
+
+    SHALLOW AT EVERY LINK, like every other layer of this merge: a dict-valued
+    key such as `column_types` is replaced by the more specific convention,
+    not merged into it. A deep merge leaves no way to REMOVE an inherited
+    entry, and the reason that matters gets worse with depth, not better --
+    "why is this column still a decimal" would become a question answered by
+    reading the whole chain. `config show --origin` is the other half of
+    making depth survivable.
+
+    TWO THINGS ARE ERRORS AT LOAD, for the reason an undefined convention on a
+    feed is: an undefined parent would silently resolve to `_defaults.yml`
+    alone and produce feeds configured subtly wrong, and a cycle would
+    otherwise be a RecursionError naming nothing.
+    """
+    if cname in resolved:
+        return resolved[cname]
+    if cname in seen:
+        raise ValueError(
+            f"{at(cname)}: convention cycle -- "
+            f"{' -> '.join([*seen[seen.index(cname):], cname])}")
+    settings = dict(section[cname])
+    parent = settings.pop(PARENT_KEY, "") or ""
+    if parent and parent not in section:
+        raise ValueError(
+            f"{at(cname)}: names `parent: {parent}`, which is not defined. "
+            f"Available: {', '.join(sorted(set(section) - {cname})) or '(none)'}")
+    base = _chain(parent, section, resolved, (*seen, cname), at) if parent else {}
+    resolved[cname] = {**base, **settings}
+    return resolved[cname]
 
 
 def effective_defaults(convention: str = "",
                        registry: dict[str, Any] | None = None,
+                       known: dict[str, dict[str, Any]] | None = None,
                        ) -> dict[str, Any]:
     """What a feed block inherits before its own keys are applied.
 
@@ -1189,8 +1234,9 @@ def effective_defaults(convention: str = "",
     diff.
     """
     registry = _registry() if registry is None else registry
-    known = resolve_conventions(registry.get("conventions") or {},
-                                registry.get("_convention_paths"))
+    if known is None:
+        known = resolve_conventions(registry.get("conventions") or {},
+                                    registry.get("_convention_paths"))
     if convention and convention not in known:
         raise ValueError(
             f"convention {convention!r} is not defined -- no "
@@ -1219,7 +1265,7 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
             raise ValueError(
                 f"{path}: names convention {cname!r}, which is not defined. "
                 f"Available: {', '.join(sorted(known)) or '(none)'}")
-        merged = {**effective_defaults(cname, registry), **block}
+        merged = {**effective_defaults(cname, registry, known), **block}
         merged["delivery"] = resolve_delivery_config(
             block["name"], merged.get("delivery"))
         merged["arrival"] = resolve_arrival_config(
@@ -1285,22 +1331,35 @@ def origins(feed_name: str) -> dict[str, str]:
     if block is None:
         raise KeyError(feed_name)
     cname = block.get("convention") or ""
-    known = resolve_conventions(registry["conventions"],
-                                registry["_convention_paths"])
-    convention = known.get(cname) or {}
+    section = registry["conventions"]
+    paths = registry["_convention_paths"]
+    # Validate (and so reject a cycle) before walking the chain by hand.
+    resolve_conventions(section, paths)
     defaults = registry.get("defaults") or {}
+
+    # THE CHAIN, LEAF FIRST -- naming the link that DECLARED a value, not the
+    # one the feed happens to point at. With `parent:` the merged convention
+    # answers "inherited" and not "from where", and "from where" is the only
+    # reason to run this.
+    chain: list[str] = []
+    seen: set[str] = set()
+    while cname and cname in section and cname not in seen:
+        seen.add(cname)
+        chain.append(cname)
+        cname = (section[cname] or {}).get(PARENT_KEY) or ""
 
     out: dict[str, str] = {}
     for field_ in Feed.__dataclass_fields__:                 # type: ignore[attr-defined]
         if field_ in block:
             out[field_] = TIER_FEED
-        elif field_ in convention:
-            out[field_] = registry["_convention_paths"].get(
-                cname, f"convention:{cname}")
-        elif field_ in defaults:
-            out[field_] = str(layout.defaults_path(CONFIG_DIR))
+            continue
+        for link in chain:
+            if field_ in (section[link] or {}):
+                out[field_] = paths.get(link, f"convention:{link}")
+                break
         else:
-            out[field_] = TIER_BUILTIN
+            out[field_] = (str(layout.defaults_path(CONFIG_DIR))
+                           if field_ in defaults else TIER_BUILTIN)
     return out
 
 
