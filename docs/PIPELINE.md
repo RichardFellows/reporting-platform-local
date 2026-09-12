@@ -112,6 +112,12 @@ retention dates each differently:
 
 An object it cannot date is **kept and counted**, never deleted on a guess.
 
+The `.meta.json` sibling exists only for a delivery the **inbox gate** renamed
+— it records the name the upstream actually used, plus the bytes, md5 and row
+count as measured at the door. A worked example of both its shapes, and every
+key, is in
+[DELIVERY-SHAPES.md#the-metadata-sibling](DELIVERY-SHAPES.md#the-metadata-sibling).
+
 ## 3. `normalize` — one delivery becomes one manifest
 
 `ingest/normalize.py`. Cheap, idempotent, no Spark. Writes one JSON manifest

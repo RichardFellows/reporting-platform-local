@@ -179,6 +179,160 @@ happened** — what arrived, what the control file declared, what encoding was
 detected — facts not recomputable once the container is gone. It never records
 **derived state**, which stays derived.
 
+## The metadata sibling
+
+The manifest above describes a delivery for the *platform*. The metadata
+sibling describes it for *whoever asks what the upstream actually sent* — and
+it exists only for a delivery that came through the inbox gate, because that is
+the only path on which the landed object's name is **not** the name the sender
+used.
+
+`landing/<feed>/<delivery>.meta.json`, written by `ingest/conform.py`, beside
+the delivery it describes. An approved sender writing straight to `landing/`
+gets none: nothing was renamed, so there is nothing to record.
+
+### A legacy sender with a control file
+
+The upstream sends `marginCalls.csv` and `marginCalls.ctl` into the inbox. The
+data file's name carries no date at all; the control file declares it. The
+gate renames both and writes a third object:
+
+```
+landing/treasury_margin_call/
+  marginCalls_20260801.csv            <- the delivery, byte-identical
+  marginCalls_20260801.ctl            <- the control file, byte-identical, PROMOTED
+  marginCalls_20260801.csv.meta.json  <- this
+```
+
+```json
+{
+  "bytes": 41203,
+  "cob_date": "2026-08-01",
+  "declared": {
+    "cob_date": "2026-08-01"
+  },
+  "feed": "treasury_margin_call",
+  "landing_control_filename": "marginCalls_20260801.ctl",
+  "landing_filename": "marginCalls_20260801.csv",
+  "md5": "9d2f1c7a4b6e803f5a1d9c2b7e4f6a81",
+  "metadata_version": 1,
+  "promoted_at": "2026-08-01T06:31:14.882913+00:00",
+  "promoted_by": "inbox",
+  "received_at": "2026-08-01T06:31:12+00:00",
+  "row_count": 4211,
+  "source_control_filename": "marginCalls.ctl",
+  "source_filename": "marginCalls.csv",
+  "source_system": "TREASURY"
+}
+```
+
+Keys are sorted and the JSON is indented — `metadata_bytes()` writes it with
+`sort_keys=True`, so two deliveries diff cleanly against each other.
+
+`declared` holds **only what the control file said about identity**: `cob_date`,
+and `version` when the sender states which restatement this is. A row count or
+checksum in the same file is *not* here — those belong to `delivery.control`
+and are checked at ingest, so that the trusted path is never the less-verified
+one. A key absent from `arrival.control` is absent from `declared`, because
+"the sender did not say" and "the sender said zero" are different facts.
+
+### An archive member
+
+The upstream sends one zip. The gate unpacks it and lands each member as an
+ordinary delivery for its own COB date; **the container itself never reaches
+`landing/`**. So each member's sidecar carries three extra keys, and they are
+the only record the container ever existed:
+
+```json
+{
+  "bytes": 128440,
+  "cob_date": "2026-09-03",
+  "declared": {},
+  "feed": "custody_position",
+  "landing_filename": "custodyPositions_20260903.csv",
+  "md5": "3f8b1e05c9a27d64b0e5f1a83c7d2049",
+  "metadata_version": 1,
+  "promoted_at": "2026-09-03T05:12:41.004117+00:00",
+  "promoted_by": "inbox",
+  "received_at": "2026-09-03T05:12:40+00:00",
+  "row_count": 9817,
+  "source_container": "custodyPositions_20260903.zip",
+  "source_container_bytes": 44120,
+  "source_container_md5": "c14a7f39b8d25e60af31c8d94b7e0526",
+  "source_filename": "positions_20260903.csv",
+  "source_system": "CUSTODY"
+}
+```
+
+`declared` is empty: an archive feed is gated on `member_pattern`, not on a
+control file, and combining `control:` with `kind: archive` is refused at load.
+There is no `landing_control_filename` or `source_control_filename` key at all
+— absent, not null.
+
+### Every key
+
+| Key | Plain / control-gated | Archive member | Is |
+|---|---|---|---|
+| `metadata_version` | ✓ | ✓ | `1`. The format's own version, so a reader can tell what it is looking at |
+| `feed` / `source_system` | ✓ | ✓ | from `feeds.yml` |
+| `cob_date` | ✓ | ✓ | the date the delivery is FOR — from the control file, the source filename, or `member_pattern` |
+| `landing_filename` | ✓ | ✓ | the name the platform gave it |
+| `landing_control_filename` | ✓ | — | the promoted control file's name, derived from `delivery.control.pattern` with the landing stem |
+| `source_filename` | ✓ | ✓ | **the name the upstream used** — for a member, its name inside the zip |
+| `source_control_filename` | ✓ | — | the control file's name as sent |
+| `source_container` | — | ✓ | the zip's filename |
+| `source_container_md5` / `_bytes` | — | ✓ | the zip's checksum and size |
+| `received_at` | ✓ | ✓ | when the inbox saw it |
+| `promoted_at` / `promoted_by` | ✓ | ✓ | when the gate moved it, and that it was the gate |
+| `bytes` / `md5` / `row_count` | ✓ | ✓ | **measured at the door** — see below |
+| `declared` | ✓ | `{}` | what the control file said about IDENTITY, and nothing else |
+
+### The measurements are recorded, never compared
+
+`bytes`, `md5` and `row_count` come from `observe()`, and the function is
+deliberately not called `verify`. An earlier draft compared them against the
+control file's declarations and rejected a mismatch at the door. That put a
+second implementation of the row-count check on one of the two arrival paths,
+and left an approved sender writing straight to landing with **weaker**
+checking than a legacy one — the trusted path being the less-verified one,
+which is backwards. The comparison happens once, at ingest, for everybody.
+
+They are measured anyway because they are **provenance**. If the ingest later
+disputes the row count, these say whether the file *changed after arrival* or
+*arrived wrong* — a distinction nothing else in the platform can draw.
+
+`row_count` is parsed with the feed's own dialect rather than by counting
+newlines: a quoted field containing a newline is one row and two lines, and a
+naive count would report a correct file as short.
+
+### Two rules that look like details and are not
+
+**It embeds no copy of the control file's text.** An earlier version did, and
+correctly — the gate *consumed* the control file, which reached landing no
+other way. It is promoted now, byte-identical, under
+`landing_control_filename`, so a copy here would be a second version of the
+same bytes with nothing keeping the two in step.
+
+**The `.meta.json` suffix is load-bearing.** `retention/landing.py` dates an
+object from its own name and refuses to delete anything it cannot date. A
+metadata object carries its delivery's name inside its own, so it dates by
+stripping the suffix — no lookup, no extra S3 call — and an orphaned one still
+expires instead of accumulating in the evidence prefix forever.
+
+### What reads it
+
+| Reader | Uses |
+|---|---|
+| `registry/deliveries.py::_sidecar()` | the **first** of three md5 sources, before the object's ETag and before reading the bytes (REQ-104) |
+| `ingest/arrival.py::landed_md5_lookup()` | tells a corrected re-delivery from an unchanged **resend** — the latter is a no-op, not a `_v2` |
+| `retention/landing.py` | dates the sidecar by its own name, as above |
+
+All three tolerate it being absent or unreadable rather than raising. Bad
+provenance is not a reason to refuse to record that a delivery exists — the
+same reasoning that makes the registry write best-effort at normalize time.
+
+---
+
 ---
 
 ## 1. `conventions:` — the lever that reduces work — **BUILT**
