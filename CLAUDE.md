@@ -458,15 +458,25 @@ How the datasets, columns and classes are actually derived is in
   RUNNING IT in a clean virtualenv, not read off the imports — `test_sniff`
   imports duckdb at module level and its absence aborts the whole run with no
   summary line.
-- **`lineage --columns` is NOT usable at that tier.** Without compiled SQL and
-  a catalog it reports 7 of 11 tables as `not derivable` and still **exits
-  0** — green on almost nothing. It needs a build first, or a
-  `--require-derivable`; the exit code does not yet distinguish "read it and
-  it was clean" from "could not read it", which is this file's own rule about
-  a subject it could not READ.
+- **`lineage --columns` is NOT usable at that tier, and `--require-derivable`
+  is why it is a gate at the tier above.** Without compiled SQL and a catalog
+  it reports 7 of 11 tables as `not derivable` and exits **0** — green on
+  almost nothing. `--columns --require-derivable` refuses when any managed
+  table could not be read at all: `unresolved` is a column it READ and could
+  not trace, `not derivable` is a table it could not read, and reporting the
+  second as the first is this file's own rule broken by the tool that
+  enforces the rest of them. The count now prints either way.
+- **The jar triple is checked** — `tests/test_value_checks.py`'s sibling
+  `tests/test_versions.py` pins `ICEBERG_VERSION` across all **five** files
+  that declare it, the extensions across five, the server against the
+  `nessie-gc` jar, and the configured pair against a hand-kept list of
+  combinations somebody has run. Compatibility itself is upstream's
+  build-time fact and is not computed.
+- **A declared column that no prepared model selects now fails** —
+  `test_lineage.py`, the one drift quadrant nothing covered.
 - **Still ungated**: the image build (the cosmos `--no-deps` trap — the
   Dockerfile's `dbt --version` smoke test IS the gate, it just never runs in
-  CI), `dbt parse`, DAG import, and the jar version triple.
+  CI), `dbt parse`, and DAG import.
 
 ```powershell
 # config-level tests: registry resolution + the console's write-back.
@@ -584,6 +594,10 @@ docker compose exec -T airflow python -m reporting_platform.lineage
 # every column of every managed table, classified. EXITS 1 on any `unresolved`
 # -- the CI seam, because the lineage package itself may never refuse.
 docker compose exec -T airflow python -m reporting_platform.lineage --columns
+# ...and 1 on any table it could not READ, which is a different fact and the
+# ordinary state of every model before a build. This is the post-build gate;
+# without it `unresolved: none` is also what 7 unreadable tables look like.
+docker compose exec -T airflow python -m reporting_platform.lineage --columns --require-derivable
 # the datasets live in their OWN namespaces, not the job's -- a jobs query
 # showing no inputs/outputs is not evidence that nothing was emitted
 curl -s http://localhost:15000/api/v1/namespaces

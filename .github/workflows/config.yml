@@ -10,11 +10,14 @@
 # What it therefore does NOT cover, so nobody reads a green tick as more than
 # it is: the image builds (the cosmos `--no-deps` trap, caught by
 # `Dockerfile.airflow`'s own `dbt --version` smoke test), `dbt parse` (a bad
-# `ref()` or schema YAML dbt rejects), DAG import, and column-level lineage --
-# `lineage --columns` runs here but reports 7 of 11 tables as `not derivable`
-# without compiled SQL and a catalog, and still exits 0, so as a gate at this
-# tier it would be green on almost nothing. Those belong in a second workflow
-# that builds the image. See docs/DECISIONS.md#the-registry-is-a-directory
+# `ref()` or schema YAML dbt rejects), DAG import, and column-level lineage.
+#
+# `lineage --columns` is the one worth being explicit about: it RUNS here, and
+# reports 7 of 11 tables as `not derivable` without compiled SQL and a
+# catalog, and exits 0 -- green on almost nothing. The post-build tier should
+# run `--columns --require-derivable`, which refuses when any managed table
+# could not be read; at THIS tier that flag correctly fails, which is why it
+# is not below. See docs/DECISIONS.md#the-registry-is-a-directory
 name: config
 
 on:

@@ -21,6 +21,8 @@ tests/.
 """
 from __future__ import annotations
 
+import re
+
 from tests.support import config_dir
 
 
@@ -485,3 +487,56 @@ def test_no_classification_name_is_eaten_by_the_secrets_masker():
             f"{name!r} contains a value the secrets masker redacts; it would "
             f"reach Marquez mangled. See columns.INGEST_ADDED.")
     assert len(set(classes)) == len(classes), "the classes are distinct"
+
+
+
+# --------------------------------------------- the drift nothing else catches
+def test_every_declared_column_reaches_its_prepared_model():
+    """A COLUMN IN THE CONTRACT THAT NO MODEL SELECTS IS SILENT.
+
+    Step 3 of ADDING-A-COLUMN.md is a hand-written line in the prepared
+    model, and it is the only manual step in that procedure -- steps 1 and 2
+    migrate the raw table on their own (`ensure_raw_schema`, `migrate_raw`).
+    Skip it and the column arrives, lands in raw, is retained for its full
+    evidence window, classifies `sourced` in `lineage --columns` because it
+    traces to the landing file perfectly well, is named by no dbt test, and
+    never reaches a report. The build is green.
+
+    IT IS THE ONE DRIFT DIRECTION NOTHING ELSE COVERS. The reverse fails
+    loudly at the build -- a model selecting a column raw does not have is an
+    AnalysisException. A column in raw that the feed no longer declares is
+    already `unresolved` and already exits 1 (`columns.ingest_columns`). This
+    quadrant had no check at all.
+
+    READS THE MODEL TEMPLATE, not the compiled SQL, and that is a deliberate
+    trade. It is weaker -- a name in a comment would satisfy it -- but it
+    needs no catalog and no prior build, so it runs in the config tier where
+    the mistake is actually made. The macro calls carry the column name as a
+    literal (`clean_string('watch_status')`), which is what makes the
+    template readable at all.
+    """
+    context, _ = _setup()
+    unmodelled, missing = [], {}
+    for name, feed in context.feeds().items():
+        model = context.DBT_MODELS_DIR / "prepared" / f"{name}.sql"
+        if not model.is_file():
+            # A feed may legitimately land evidence with nothing built on it.
+            # REPORTED rather than skipped in silence: "checked 4 of 4" and
+            # "checked 4, skipped 36" are different facts about a pass.
+            unmodelled.append(name)
+            continue
+        sql = model.read_text(encoding="utf-8")
+        absent = [c for c in feed.columns
+                  if not re.search(rf"\b{re.escape(c)}\b", sql)]
+        if absent:
+            missing[name] = absent
+
+    assert not missing, (
+        "declared in the registry and selected by no prepared model: "
+        + "; ".join(f"{feed}: {', '.join(cols)}"
+                    for feed, cols in sorted(missing.items()))
+        + ". They will land in raw and stop there, on a green build -- see "
+          "docs/ADDING-A-COLUMN.md step 3.")
+    assert len(context.feeds()) - len(unmodelled) > 0, (
+        f"no feed has a prepared model, so this checked nothing: "
+        f"{unmodelled}")
