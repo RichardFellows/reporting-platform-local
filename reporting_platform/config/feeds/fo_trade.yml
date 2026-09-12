@@ -1,0 +1,18 @@
+name: fo_trade
+description: Daily position-level trade extract from the front office.
+source_system: FO_SRC
+filename_pattern: 'TRADE_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+business_key: [trade_id]
+expected_min_rows: 100
+# The front office closes and extracts before the reference systems do.
+expected_by: "06:30"
+columns:
+  - trade_id
+  - counterparty_id
+  - book
+  - product_type
+  - notional
+  - currency
+  - trade_date
+  - maturity_date
+  - mtm_value

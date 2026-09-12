@@ -29,6 +29,7 @@ import yaml
 
 # Re-exported, not merely imported: these names are part of this module's
 # published surface and dozens of call sites read them from here.
+from reporting_platform.common import layout
 from reporting_platform.common.nessie import Nessie          # noqa: F401
 from reporting_platform.common.settings import (CATALOG,     # noqa: F401
                                                 CONFIG_DIR, ENV)
@@ -66,8 +67,83 @@ def _load(name: str) -> dict[str, Any]:
 
     `st_mtime_ns` rather than `st_mtime`: two edits inside one filesystem
     timestamp tick are entirely possible from a web form.
+
+    THE FEED REGISTRY NO LONGER COMES THROUGH HERE. It is a directory --
+    `feeds/`, one file per feed plus `_defaults.yml` and `conventions/` --
+    read by `_registry_at` below, which keys on the mtime of EVERY file in it
+    for exactly the reason spelled out above. This function still serves
+    `retention.yml` and `maintenance.yml`, which are single files.
     """
     return _load_at(name, (CONFIG_DIR / name).stat().st_mtime_ns)
+
+
+def _read_one(path: Path) -> dict[str, Any]:
+    """Parse one registry file, refusing a shape that is not a mapping."""
+    with open(path) as fh:
+        loaded = yaml.safe_load(fh)
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"{path}: must be a mapping of settings, got "
+            f"{type(loaded).__name__}. There is no wrapper key in this "
+            f"layout -- the filename is the name.")
+    return loaded
+
+
+@lru_cache(maxsize=_CONFIG_CACHE)
+def _registry_at(key: tuple[tuple[str, int], ...]) -> dict[str, Any]:
+    """The whole feed registry, parsed but not resolved.
+
+    `{"defaults": {...}, "conventions": {name: {...}}, "feeds": {name: {...}}}`
+    -- the same three tiers the single `feeds.yml` carried, assembled from the
+    tree. Everything downstream of this point is unchanged by the split, which
+    is what made the migration a move rather than a rewrite.
+
+    `key` is `layout.registry_files()` and is passed IN rather than computed
+    here, so the one stat pass over the directory serves every cache below.
+    """
+    defaults = {}
+    path = layout.defaults_path(CONFIG_DIR)
+    if path.is_file():
+        defaults = _read_one(path)
+
+    conventions, convention_paths = {}, {}
+    for path in layout.convention_paths(CONFIG_DIR):
+        block = _read_one(path)
+        name = layout.check_declares_its_name(path, block, "convention",
+                                              expect_name=False)
+        conventions[name] = block
+        convention_paths[name] = str(path)
+
+    feeds_, feed_paths = {}, {}
+    for path in layout.feed_paths(CONFIG_DIR):
+        block = _read_one(path)
+        name = layout.check_declares_its_name(path, block, "feed")
+        block["name"] = name
+        feeds_[name] = block
+        feed_paths[name] = str(path)
+
+    return {"defaults": defaults, "conventions": conventions, "feeds": feeds_,
+            "_convention_paths": convention_paths, "_feed_paths": feed_paths}
+
+
+def _registry() -> dict[str, Any]:
+    """The parsed registry, re-read whenever any file in the tree changes."""
+    return _registry_at(layout.registry_files(CONFIG_DIR))
+
+
+def where(feed_name: str) -> str:
+    """The file to name in an error about `feed_name`.
+
+    THE ERROR NAMES THE FILE, which is most of what the split bought: the same
+    message used to open `feeds.yml: feed 'ref_rating' ...` and now opens
+    `feeds/ref_rating.yml: ...`, which locates the problem instead of naming
+    it. Falls back to the conventional path for a feed being validated before
+    it has been written -- the console does that on every form submission.
+    """
+    return _registry().get("_feed_paths", {}).get(
+        feed_name, f"{layout.FEEDS_DIR}/{feed_name}.yml")
 
 
 @dataclass(frozen=True)
@@ -370,13 +446,13 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
         return {"kind": "file"}
     if not isinstance(delivery, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery:` must be a mapping, got "
+            f"{where(feed_name)}: `delivery:` must be a mapping, got "
             f"{type(delivery).__name__}")
 
     unknown = set(delivery) - DELIVERY_KEYS
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery:` has unknown key(s) "
+            f"{where(feed_name)}: `delivery:` has unknown key(s) "
             f"{', '.join(sorted(unknown))}. Valid: "
             f"{', '.join(sorted(DELIVERY_KEYS))}")
 
@@ -389,12 +465,12 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
             continue
         if value in NOT_BUILT.get(key, {}):
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.{key}: {value}` is "
+                f"{where(feed_name)}: `delivery.{key}: {value}` is "
                 f"described in docs/DELIVERY-SHAPES.md but NOT BUILT -- "
                 f"{NOT_BUILT[key][value]}")
         if value not in allowed:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.{key}: {value!r}` is "
+                f"{where(feed_name)}: `delivery.{key}: {value!r}` is "
                 f"not recognised. Valid: {', '.join(allowed)}")
         out[key] = value
 
@@ -405,7 +481,7 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
         # a wrong guess silently ingests the wrong files.
         if not delivery.get("member_pattern"):
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} is `kind: archive` and sets no "
+                f"{where(feed_name)}: is `kind: archive` and sets no "
                 f"`member_pattern`. Which members belong to this feed is not "
                 f"guessable -- a zip routinely carries a manifest, a checksum "
                 f"or another feed's file alongside the data.")
@@ -414,11 +490,11 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
             re.compile(out["member_pattern"])
         except re.error as exc:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `delivery.member_pattern` is "
+                f"{where(feed_name)}: `delivery.member_pattern` is "
                 f"not a valid regex: {exc}") from exc
     elif delivery.get("member_pattern"):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} sets `member_pattern` with "
+            f"{where(feed_name)}: sets `member_pattern` with "
             f"`kind: {out['kind']}`. It is only read for archives, so leaving "
             f"it here would suggest a filter that never runs.")
 
@@ -426,7 +502,7 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
     if control is not None:
         if out["kind"] != "file":
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} sets `delivery.control` with "
+                f"{where(feed_name)}: sets `delivery.control` with "
                 f"`kind: {out['kind']}`. Gating an archive on a control file "
                 f"is described in docs/DELIVERY-SHAPES.md but NOT BUILT -- "
                 f"only `kind: file` reads `control:`.")
@@ -451,27 +527,27 @@ def resolve_control_format(feed_name: str, block: str,
         return {"kind": "regex"}
     if not isinstance(fmt, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format` must be a "
+            f"{where(feed_name)}: `{block}.format` must be a "
             f"mapping, got {type(fmt).__name__}")
 
     unknown = set(fmt) - CONTROL_FORMAT_KEYS
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format` has unknown "
+            f"{where(feed_name)}: `{block}.format` has unknown "
             f"key(s) {', '.join(sorted(unknown))}. Valid: "
             f"{', '.join(sorted(CONTROL_FORMAT_KEYS))}")
 
     kind = fmt.get("kind", "regex")
     if kind not in CONTROL_FORMATS:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format.kind: {kind!r}` "
+            f"{where(feed_name)}: `{block}.format.kind: {kind!r}` "
             f"is not recognised. Valid: {', '.join(CONTROL_FORMATS)}")
 
     if kind == "regex":
         extra = set(fmt) - {"kind"}
         if extra:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `{block}.format` is "
+                f"{where(feed_name)}: `{block}.format` is "
                 f"`kind: regex` and sets {', '.join(sorted(extra))}. A regex "
                 f"is searched over the file's whole TEXT, so it has no "
                 f"delimiter, quoting or columns -- those are read only for "
@@ -487,7 +563,7 @@ def resolve_control_format(feed_name: str, block: str,
     delimiter = fmt.get("delimiter")
     if not isinstance(delimiter, str) or len(delimiter) != 1:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format` is `kind: "
+            f"{where(feed_name)}: `{block}.format` is `kind: "
             f"delimited` and its `delimiter` is {delimiter!r}, not a single "
             f"character. It is deliberately not inherited from the feed's own "
             f"`delimiter` -- a control file's separator is the sender's "
@@ -497,14 +573,14 @@ def resolve_control_format(feed_name: str, block: str,
     quote_char = fmt.get("quote_char", '"')
     if not isinstance(quote_char, str) or len(quote_char) != 1:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format.quote_char` is "
+            f"{where(feed_name)}: `{block}.format.quote_char` is "
             f"{quote_char!r}, not a single character.")
     out["quote_char"] = quote_char
 
     header = fmt.get("header", True)
     if not isinstance(header, bool):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format.header` is "
+            f"{where(feed_name)}: `{block}.format.header` is "
             f"{header!r}, not true or false.")
     out["header"] = header
 
@@ -516,27 +592,27 @@ def resolve_control_format(feed_name: str, block: str,
     if columns is None:
         if not header:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `{block}.format` sets "
+                f"{where(feed_name)}: `{block}.format` sets "
                 f"`header: false` and no `columns`. A headerless file names "
                 f"nothing, so nothing can name a field -- list the columns in "
                 f"the order the sender writes them.")
         return out
     if header:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format` sets `columns` "
+            f"{where(feed_name)}: `{block}.format` sets `columns` "
             f"with `header: true`. One source for the names: the header row "
             f"the file carries, or this list. Add `header: false` if the "
             f"sender writes no header row.")
     if not isinstance(columns, list) or not columns or not all(
             isinstance(c, str) and c.strip() for c in columns):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format.columns` must be "
+            f"{where(feed_name)}: `{block}.format.columns` must be "
             f"a non-empty list of names, got {columns!r}")
     names = [c.strip() for c in columns]
     dupes = sorted({c for c in names if names.count(c) > 1})
     if dupes:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.format.columns` names "
+            f"{where(feed_name)}: `{block}.format.columns` names "
             f"{', '.join(dupes)} more than once -- a field naming one of them "
             f"would not say which.")
     out["columns"] = names
@@ -555,14 +631,14 @@ def _resolve_control_field(feed_name: str, block: str, key: str, value: Any,
     if fmt["kind"] == "delimited":
         if not isinstance(value, str) or not value.strip():
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `{block}.{key}` is "
+                f"{where(feed_name)}: `{block}.{key}` is "
                 f"{value!r}. Under `kind: delimited` it names a COLUMN of the "
                 f"control file, not a regex.")
         name = value.strip()
         declared = fmt.get("columns")
         if declared is not None and name not in declared:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} `{block}.{key}` names column "
+                f"{where(feed_name)}: `{block}.{key}` names column "
                 f"{name!r}, which is not one of "
                 f"`{block}.format.columns` ({', '.join(declared)}). The file "
                 f"has no header row, so that list is the only thing that can "
@@ -574,11 +650,11 @@ def _resolve_control_field(feed_name: str, block: str, key: str, value: Any,
         compiled = re.compile(value)
     except (re.error, TypeError) as exc:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.{key}` is not a valid "
+            f"{where(feed_name)}: `{block}.{key}` is not a valid "
             f"regex: {exc}") from exc
     if group not in compiled.groupindex:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `{block}.{key}` {value!r} has no "
+            f"{where(feed_name)}: `{block}.{key}` {value!r} has no "
             f"`(?P<{group}>...)` group -- that is the only thing {reader} "
             f"reads out of a match.")
     return value
@@ -593,32 +669,32 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, Any]:
     """
     if not isinstance(control, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery.control` must be a "
+            f"{where(feed_name)}: `delivery.control` must be a "
             f"mapping, got {type(control).__name__}")
 
     unknown = set(control) - CONTROL_KEYS
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery.control` has unknown "
+            f"{where(feed_name)}: `delivery.control` has unknown "
             f"key(s) {', '.join(sorted(unknown))}. Valid: "
             f"{', '.join(sorted(CONTROL_KEYS))}")
 
     pattern = control.get("pattern")
     if not pattern or not isinstance(pattern, str):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery.control` sets no "
+            f"{where(feed_name)}: `delivery.control` sets no "
             f"`pattern`. Which control file belongs to a delivery is not "
             f"guessable.")
     if "{stem}" not in pattern:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery.control.pattern` "
+            f"{where(feed_name)}: `delivery.control.pattern` "
             f"{pattern!r} does not reference `{{stem}}` -- without it every "
             f"delivery for this feed would look for the same control filename.")
     try:
         re.compile(pattern.format(stem="X"))
     except re.error as exc:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `delivery.control.pattern` is not "
+            f"{where(feed_name)}: `delivery.control.pattern` is not "
             f"a valid regex once `{{stem}}` is filled in: {exc}") from exc
 
     out: dict[str, Any] = {"pattern": pattern}
@@ -689,27 +765,27 @@ def resolve_supersession_config(feed_name: str, supersession: Any) -> dict[str, 
         return {"mode": "full_snapshot"}
     if not isinstance(supersession, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `supersession:` must be a mapping, "
+            f"{where(feed_name)}: `supersession:` must be a mapping, "
             f"got {type(supersession).__name__}")
 
     unknown = set(supersession) - SUPERSESSION_KEYS
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `supersession:` has unknown key(s) "
+            f"{where(feed_name)}: `supersession:` has unknown key(s) "
             f"{', '.join(sorted(unknown))}. Valid: "
             f"{', '.join(sorted(SUPERSESSION_KEYS))}")
 
     mode = supersession.get("mode", "full_snapshot")
     if mode in SUPERSESSION_NOT_BUILT:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `supersession.mode: {mode}` is "
+            f"{where(feed_name)}: `supersession.mode: {mode}` is "
             f"described in the requirements (REQ-202) but NOT BUILT -- "
             f"{SUPERSESSION_NOT_BUILT[mode]}. Every prepared model resolves "
             f"supersession with `dedupe_rank`, which implements "
             f"`full_snapshot` only.")
     if mode not in SUPERSESSION_MODES:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `supersession.mode: {mode!r}` is "
+            f"{where(feed_name)}: `supersession.mode: {mode!r}` is "
             f"not recognised. Valid: {', '.join(SUPERSESSION_MODES)} "
             f"(not built: {', '.join(sorted(SUPERSESSION_NOT_BUILT))})")
     return {"mode": mode}
@@ -741,13 +817,13 @@ def parse_expected_by(feed_name: str, value: Any) -> str:
         # first), so it depends on whether somebody padded the hour and would
         # work for every feed until the first one written `9:00`.
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `expected_by: {value!r}` is "
+            f"{where(feed_name)}: `expected_by: {value!r}` is "
             f"{type(value).__name__}, not a string. Quote it -- unquoted, "
             f"YAML reads 7:00 as the integer 420 (sexagesimal).")
     text = value.strip()
     if not _EXPECTED_BY_RE.match(text):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `expected_by: {value!r}` is not a "
+            f"{where(feed_name)}: `expected_by: {value!r}` is not a "
             f"24-hour HH:MM time. Examples: '07:00', '18:30'. A delivery due "
             f"at the end of the day is '23:59'; '24:00' is not a time.")
     return text
@@ -779,20 +855,20 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
         return {}
     if not isinstance(arrival, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival:` must be a mapping, got "
+            f"{where(feed_name)}: `arrival:` must be a mapping, got "
             f"{type(arrival).__name__}")
 
     unknown = set(arrival) - ARRIVAL_KEYS
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival:` has unknown key(s) "
+            f"{where(feed_name)}: `arrival:` has unknown key(s) "
             f"{', '.join(sorted(unknown))}. Valid: "
             f"{', '.join(sorted(ARRIVAL_KEYS))}")
 
     source_pattern = arrival.get("source_pattern")
     if not source_pattern or not isinstance(source_pattern, str):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} sets `arrival:` with no "
+            f"{where(feed_name)}: sets `arrival:` with no "
             f"`source_pattern`. That pattern is how the inbox recognises this "
             f"feed's delivery under the name the UPSTREAM sends, which is by "
             f"definition not the name landing will hold.")
@@ -800,7 +876,7 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
         compiled = re.compile(source_pattern)
     except re.error as exc:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.source_pattern` is not a "
+            f"{where(feed_name)}: `arrival.source_pattern` is not a "
             f"valid regex: {exc}") from exc
 
     out: dict[str, Any] = {"source_pattern": source_pattern}
@@ -813,7 +889,7 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
             continue
         if not arrival[key]:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} has an empty "
+                f"{where(feed_name)}: has an empty "
                 f"`arrival.{key}:` block. Fill it in, or remove the key -- an "
                 f"empty one reads as configured and does nothing.")
         out[key] = resolver(feed_name, arrival[key])
@@ -831,12 +907,12 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
     in_control = "cob_date" in out.get("control", {})
     if in_name and in_control:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} takes its COB date from both "
+            f"{where(feed_name)}: takes its COB date from both "
             f"`arrival.source_pattern` and `arrival.control.cob_date`. "
             f"One fact, one source -- drop whichever is not the real one.")
     if not in_name and not in_control:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival:` gives the gate no way "
+            f"{where(feed_name)}: `arrival:` gives the gate no way "
             f"to find the COB date. Either `source_pattern` captures "
             f"(?P<cob_date>\\d{{8}}), or `arrival.control.cob_date` "
             f"reads it out of the control file -- without one the delivery "
@@ -858,7 +934,7 @@ def _finish_arrival(feed_name: str, out: dict[str, Any],
         try:
             if "cob_date" not in re.compile(filename_pattern).groupindex:
                 raise ValueError(
-                    f"feeds.yml: feed {feed_name!r} has an `arrival:` block, so "
+                    f"{where(feed_name)}: has an `arrival:` block, so "
                     f"the inbox renames its deliveries to match "
                     f"`filename_pattern` -- but that pattern captures no "
                     f"(?P<cob_date>...), so there is nowhere to write the "
@@ -881,18 +957,18 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
     """
     if not isinstance(archive, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.archive` must be a "
+            f"{where(feed_name)}: `arrival.archive` must be a "
             f"mapping, got {type(archive).__name__}")
     unknown = set(archive) - {"member_pattern"}
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.archive` has unknown "
+            f"{where(feed_name)}: `arrival.archive` has unknown "
             f"key(s) {', '.join(sorted(unknown))}. Valid: member_pattern")
 
     pattern = archive.get("member_pattern")
     if not pattern or not isinstance(pattern, str):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.archive` sets no "
+            f"{where(feed_name)}: `arrival.archive` sets no "
             f"`member_pattern`. Which members belong to this feed is not "
             f"guessable -- a zip routinely carries a checksum, a manifest or "
             f"another feed's file alongside the data, and a wrong guess would "
@@ -901,11 +977,11 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
         compiled = re.compile(pattern)
     except re.error as exc:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.archive.member_pattern` "
+            f"{where(feed_name)}: `arrival.archive.member_pattern` "
             f"is not a valid regex: {exc}") from exc
     if "cob_date" not in compiled.groupindex:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.archive.member_pattern` "
+            f"{where(feed_name)}: `arrival.archive.member_pattern` "
             f"{pattern!r} captures no (?P<cob_date>...). Each member is "
             f"landed as its own delivery, so each must say which day it is "
             f"for -- a date on the CONTAINER instead would mean the members "
@@ -930,32 +1006,32 @@ def _resolve_arrival_control(feed_name: str, control: Any) -> dict[str, Any]:
     """
     if not isinstance(control, dict):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.control` must be a "
+            f"{where(feed_name)}: `arrival.control` must be a "
             f"mapping, got {type(control).__name__}")
 
     unknown = set(control) - ARRIVAL_CONTROL_KEYS
     if unknown:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.control` has unknown "
+            f"{where(feed_name)}: `arrival.control` has unknown "
             f"key(s) {', '.join(sorted(unknown))}. Valid: "
             f"{', '.join(sorted(ARRIVAL_CONTROL_KEYS))}")
 
     pattern = control.get("pattern")
     if not pattern or not isinstance(pattern, str):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.control` sets no "
+            f"{where(feed_name)}: `arrival.control` sets no "
             f"`pattern`. Which control file belongs to a delivery is not "
             f"guessable.")
     if "{stem}" not in pattern:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.control.pattern` "
+            f"{where(feed_name)}: `arrival.control.pattern` "
             f"{pattern!r} does not reference `{{stem}}` -- without it every "
             f"delivery for this feed would look for the same control filename.")
     try:
         re.compile(pattern.format(stem="X"))
     except re.error as exc:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} `arrival.control.pattern` is not a "
+            f"{where(feed_name)}: `arrival.control.pattern` is not a "
             f"valid regex once `{{stem}}` is filled in: {exc}") from exc
 
     out: dict[str, Any] = {"pattern": pattern}
@@ -999,7 +1075,7 @@ def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
     """
     if arrival.get("control") and not (delivery or {}).get("control"):
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} sets `arrival.control` but no "
+            f"{where(feed_name)}: sets `arrival.control` but no "
             f"`delivery.control`. The inbox promotes the control file into "
             f"landing/ alongside the renamed delivery, and `delivery.control` "
             f"is what reads it there -- without it the control file lands and "
@@ -1023,7 +1099,7 @@ def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
         d_fmt = delivery_control.get("format") or default
         if a_fmt != d_fmt:
             raise ValueError(
-                f"feeds.yml: feed {feed_name!r} reads one control file two "
+                f"{where(feed_name)}: reads one control file two "
                 f"ways -- `arrival.control.format` is {a_fmt} and "
                 f"`delivery.control.format` is {d_fmt}. The gate promotes the "
                 f"control file into landing/ unchanged, so both blocks parse "
@@ -1048,8 +1124,10 @@ CONVENTION_FORBIDDEN = {
 }
 
 
-def resolve_conventions(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validate the `conventions:` section and return it, or {} if absent.
+def resolve_conventions(section: dict[str, Any],
+                        paths: dict[str, str] | None = None,
+                        ) -> dict[str, dict[str, Any]]:
+    """Validate the conventions and return them, or {} if there are none.
 
     Checked HERE, at load, rather than where a value is used, because the
     failure modes are otherwise silent: a misspelled convention name falls
@@ -1062,32 +1140,40 @@ def resolve_conventions(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     start, whereas the same check on feed blocks could refuse to load an
     existing feeds.yml for a key that has always been harmlessly ignored.
     """
-    section = cfg.get("conventions") or {}
+    section = section or {}
+    paths = paths or {}
+
+    def at(cname: str) -> str:
+        return paths.get(
+            cname, f"{layout.FEEDS_DIR}/{layout.CONVENTIONS_DIR}/{cname}.yml")
+
     if not isinstance(section, dict):
         raise ValueError(
-            f"feeds.yml: `conventions:` must be a mapping of name to settings, "
-            f"got {type(section).__name__}")
+            f"conventions must be a mapping of name to settings, got "
+            f"{type(section).__name__}")
     allowed = {f.name for f in Feed.__dataclass_fields__.values()}  # type: ignore[attr-defined]
     for cname, settings in section.items():
         if not isinstance(settings, dict):
             raise ValueError(
-                f"feeds.yml: convention {cname!r} must be a mapping, got "
+                f"{at(cname)}: must be a mapping of settings, got "
                 f"{type(settings).__name__}")
         for key in sorted(CONVENTION_FORBIDDEN.keys() & set(settings)):
             raise ValueError(
-                f"feeds.yml: convention {cname!r} may not set {key!r}: "
+                f"{at(cname)}: a convention may not set {key!r}: "
                 f"{CONVENTION_FORBIDDEN[key]}")
         unknown = set(settings) - allowed
         if unknown:
             raise ValueError(
-                f"feeds.yml: convention {cname!r} sets unknown key(s) "
+                f"{at(cname)}: unknown key(s) "
                 f"{', '.join(sorted(unknown))}. Valid keys are: "
                 f"{', '.join(sorted(allowed - CONVENTION_FORBIDDEN.keys()))}")
+
     return section
 
 
 def effective_defaults(convention: str = "",
-                       cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+                       registry: dict[str, Any] | None = None,
+                       ) -> dict[str, Any]:
     """What a feed block inherits before its own keys are applied.
 
     `defaults:` overlaid with the named convention, SHALLOW at each layer -- a
@@ -1102,38 +1188,38 @@ def effective_defaults(convention: str = "",
     inherited values into feed blocks while producing a deliberate-looking
     diff.
     """
-    cfg = _load("feeds.yml") if cfg is None else cfg
-    known = resolve_conventions(cfg)
+    registry = _registry() if registry is None else registry
+    known = resolve_conventions(registry.get("conventions") or {},
+                                registry.get("_convention_paths"))
     if convention and convention not in known:
         raise ValueError(
-            f"feeds.yml: convention {convention!r} is not defined. "
+            f"convention {convention!r} is not defined -- no "
+            f"{layout.FEEDS_DIR}/{layout.CONVENTIONS_DIR}/{convention}.yml. "
             f"Available: {', '.join(sorted(known)) or '(none)'}")
-    return {**(cfg.get("defaults") or {}), **(known.get(convention) or {})}
-
-
-@lru_cache(maxsize=_CONFIG_CACHE)
-def _conventions_at(mtime_ns: int) -> dict[str, dict[str, Any]]:
-    return resolve_conventions(_load("feeds.yml"))
+    return {**(registry.get("defaults") or {}), **(known.get(convention) or {})}
 
 
 def conventions() -> dict[str, dict[str, Any]]:
-    """The `conventions:` section, keyed by name. Empty if there is none."""
-    return _conventions_at((CONFIG_DIR / "feeds.yml").stat().st_mtime_ns)
+    """Every convention, keyed by name. Empty if `conventions/` holds none."""
+    registry = _registry()
+    return resolve_conventions(registry.get("conventions") or {},
+                               registry.get("_convention_paths"))
 
 
 @lru_cache(maxsize=_CONFIG_CACHE)
-def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
-    cfg = _load("feeds.yml")
-    known = resolve_conventions(cfg)
+def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
+    registry = _registry_at(key)
+    known = resolve_conventions(registry["conventions"],
+                                registry["_convention_paths"])
     out: dict[str, Feed] = {}
-    for block in cfg["feeds"]:
+    for name, block in registry["feeds"].items():
+        path = registry["_feed_paths"][name]
         cname = block.get("convention") or ""
         if cname and cname not in known:
             raise ValueError(
-                f"feeds.yml: feed {block['name']!r} names convention "
-                f"{cname!r}, which is not defined. Available: "
-                f"{', '.join(sorted(known)) or '(none)'}")
-        merged = {**effective_defaults(cname, cfg), **block}
+                f"{path}: names convention {cname!r}, which is not defined. "
+                f"Available: {', '.join(sorted(known)) or '(none)'}")
+        merged = {**effective_defaults(cname, registry), **block}
         merged["delivery"] = resolve_delivery_config(
             block["name"], merged.get("delivery"))
         merged["arrival"] = resolve_arrival_config(
@@ -1159,14 +1245,63 @@ def _feeds_at(mtime_ns: int) -> dict[str, Feed]:
 def feeds() -> dict[str, Feed]:
     """The feed registry, keyed by name.
 
-    Keyed on feeds.yml's mtime for the same reason `_load` is -- see there.
-    A registry edit is picked up by every process on its next call.
+    Keyed on the mtime of EVERY file under `feeds/` for the reason `_load` is
+    keyed on one -- see there, and `layout.registry_files` for why a
+    directory's own mtime will not do. A registry edit is picked up by every
+    process on its next call.
     """
-    return _feeds_at((CONFIG_DIR / "feeds.yml").stat().st_mtime_ns)
+    return _feeds_at(layout.registry_files(CONFIG_DIR))
 
 
 def feed(name: str) -> Feed:
     return feeds()[name]
+
+
+# The tiers, outermost first, as `origins()` reports them.
+TIER_FEED = "feed"
+TIER_BUILTIN = "built-in"
+
+
+def origins(feed_name: str) -> dict[str, str]:
+    """Which tier supplied each of a feed's settings.
+
+    WHY THIS EXISTS. Resolution is `_defaults.yml -> convention -> feed`, and
+    the whole point of a middle tier is that a value need not be written where
+    it is used -- so "why is this feed reading a pipe delimiter" stops being
+    answerable by opening one file. With `parent:` on conventions the chain is
+    longer still. This makes the answer a command instead of an exercise.
+
+    READS THE SAME MERGE THE LOADER DOES. `effective_defaults()` is the only
+    implementation of the ordering and this calls it rather than re-walking
+    the tiers, so a report of where a value came from cannot disagree with
+    where it actually came from -- which would be worse than no report.
+
+    Returns {field: tier}, where tier is "feed", the path of the convention
+    or of `_defaults.yml`, or "built-in" for a `Feed` dataclass default that
+    nothing declared.
+    """
+    registry = _registry()
+    block = registry["feeds"].get(feed_name)
+    if block is None:
+        raise KeyError(feed_name)
+    cname = block.get("convention") or ""
+    known = resolve_conventions(registry["conventions"],
+                                registry["_convention_paths"])
+    convention = known.get(cname) or {}
+    defaults = registry.get("defaults") or {}
+
+    out: dict[str, str] = {}
+    for field_ in Feed.__dataclass_fields__:                 # type: ignore[attr-defined]
+        if field_ in block:
+            out[field_] = TIER_FEED
+        elif field_ in convention:
+            out[field_] = registry["_convention_paths"].get(
+                cname, f"convention:{cname}")
+        elif field_ in defaults:
+            out[field_] = str(layout.defaults_path(CONFIG_DIR))
+        else:
+            out[field_] = TIER_BUILTIN
+    return out
 
 
 # The prepared and reporting tables are DERIVED from the dbt project, not
@@ -1533,7 +1668,7 @@ def check_retention_class(feed_name: str, value: Any) -> str:
     known = retention_classes()
     if text not in known:
         raise ValueError(
-            f"feeds.yml: feed {feed_name!r} names retention class {text!r}, "
+            f"{where(feed_name)}: names retention class {text!r}, "
             f"which retention.yml does not declare. Available: "
             f"{', '.join(sorted(known))}. Add it under `retention_classes:` "
             f"there before naming it here.")

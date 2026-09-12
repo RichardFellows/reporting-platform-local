@@ -28,7 +28,7 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from tests.support import config_dir
+from tests.support import config_dir, feed_text, registry_text
 
 FEED = """
 defaults:
@@ -449,7 +449,7 @@ def test_a_console_save_does_not_pin_an_inherited_expected_by_or_class():
     after = {n: (f.expected_by, f.retention_class) for n, f in feeds().items()}
     assert before == after, (before, after)
 
-    text = (d / "feeds.yml").read_text()
+    text = registry_text(d)
     # Declared once on the convention, and once on the one feed that overrides
     # it -- three feeds inherit it and none of them may have gained a copy.
     assert text.count('expected_by: "07:30"') == 1, text.count(
@@ -473,7 +473,7 @@ def test_a_console_save_round_trips_the_arrival_block():
     after = dict(feeds()["trs_position"].arrival)
     assert before == after, (before, after)
 
-    text = (d / "feeds.yml").read_text()
+    text = feed_text(d, "trs_position")
     assert "source_pattern: 'positions\\.csv'" in text, text
     assert "cob_date: 'ReportingDate" in text, text
 
@@ -492,7 +492,7 @@ def test_turning_arrival_off_removes_the_block():
         filename_pattern="trs_position_(?P<cob_date>\\d{8})\\.csv")
     registry.update(spec)
     assert feeds()["trs_position"].needs_conforming is False
-    assert "arrival:" not in (d / "feeds.yml").read_text()
+    assert "arrival:" not in feed_text(d, "trs_position")
 
 
 def test_arrival_control_without_delivery_control_is_rejected():

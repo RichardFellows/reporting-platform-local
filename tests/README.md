@@ -15,7 +15,7 @@ docker compose exec -T airflow python -m tests.run
 ## What is in scope here
 
 The parts of the platform that are **pure Python and pure config**: what
-`feeds.yml` resolves to, and what the feed console writes back into it. These
+the feed registry resolves to, and what the feed console writes back into it. These
 need nothing from the stack — no Spark, no Airflow, no MinIO — so they run in
 under a second and are cheap enough to run on every change.
 

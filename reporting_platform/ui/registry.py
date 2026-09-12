@@ -1,11 +1,18 @@
-"""Read and write reporting_platform/config/feeds.yml.
+"""Read and write the feed registry under reporting_platform/config/feeds/.
 
-ROUND-TRIP, NOT RE-EMIT. feeds.yml is more comment than data -- the reasoning
+ROUND-TRIP, NOT RE-EMIT. A feed file is more comment than data -- the reasoning
 for `cadence: weekly` on rating, for the per-feed filename pattern, for
-`schema_drift: warn` -- and a plain `yaml.safe_load` / `yaml.safe_dump` cycle
-silently deletes all of it. ruamel's round-trip loader preserves comments,
-key order and quoting style, so adding a feed through the UI produces a diff
-that touches only the feed being added.
+`retention_class: operational` on collateral -- and a plain `yaml.safe_load` /
+`yaml.safe_dump` cycle silently deletes all of it. ruamel's round-trip loader
+preserves comments, key order and quoting style.
+
+ONE FILE PER FEED, so adding one is a new file and removing one is an unlink.
+That is most of what this module used to do by hand: appending into a shared
+`feeds:` sequence needed a blank line inserted before the new block, and
+ruamel attaches such a line to the PREVIOUS item's trailing comment -- so
+deleting a feed you had just added left the blank line behind and did not
+restore the file. There is no sequence to append to now, and that whole class
+of problem went with it. See docs/DECISIONS.md#the-registry-is-a-directory
 """
 from __future__ import annotations
 
@@ -20,9 +27,16 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import SingleQuotedScalarString as SQ
 
+from reporting_platform.common import layout
 from reporting_platform.common.context import CONFIG_DIR, Feed
 
-FEEDS_YML = Path(CONFIG_DIR) / "feeds.yml"
+# Redirected by `tests/support.registry_on` at a throwaway tree, so every
+# path below is derived from it rather than bound once at import.
+CONFIG_ROOT = Path(CONFIG_DIR)
+
+
+def feed_path(name: str) -> Path:
+    return layout.feeds_root(CONFIG_ROOT) / f"{name}.yml"
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 COLUMN_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -745,45 +759,43 @@ def _position_for(block: CommentedMap, key: str) -> int:
     return len(block)
 
 
-def read_raw() -> tuple[Any, YAML]:
+def read_raw(name: str) -> tuple[Any, YAML]:
+    """One feed's file, round-tripped. Raises if there is no such feed."""
     y = _yaml()
-    with FEEDS_YML.open(encoding="utf-8") as fh:
+    path = feed_path(name)
+    if not path.is_file():
+        raise FeedValidationError({"name": f"no such feed: {name!r}"})
+    with path.open(encoding="utf-8") as fh:
         return y.load(fh), y
 
 
-def _write(doc, y: YAML) -> None:
+def _write(block, y: YAML, path: Path) -> None:
     """Serialise to a string first, then replace the file in one write.
 
-    Not a straight `y.dump(doc, fh)`: that truncates feeds.yml before the
-    emitter produces anything, so an emitter error would leave the single
-    source of truth for the whole platform as a zero-byte file.
+    Not a straight `y.dump(block, fh)`: that truncates the file before the
+    emitter produces anything, so an emitter error would leave a feed's
+    definition as a zero-byte file -- which, unlike a missing one, still
+    loads, as a feed with no keys at all.
+
+    The `name:` check is the successor to the old "refusing to write a
+    feeds.yml with no `feeds:` key": the one thing the file may never lose is
+    the identity that has to match its filename.
     """
     buf = io.StringIO()
-    y.dump(doc, buf)
+    y.dump(block, buf)
     text = buf.getvalue()
-    if "feeds:" not in text:
-        raise RuntimeError("refusing to write a feeds.yml with no `feeds:` key")
-    # Exactly one trailing newline. `add` puts a blank line before the block it
-    # appends, and ruamel attaches that to the PREVIOUS item's trailing comment
-    # -- so removing the last feed leaves the blank line behind, and deleting a
-    # feed you had just added did not restore the file. Pure noise in a diff,
-    # which for a file whose diff is the deliverable is what matters.
-    text = text.rstrip() + "\n"
-    FEEDS_YML.write_text(text, encoding="utf-8")
+    if "name:" not in text:
+        raise RuntimeError(
+            f"refusing to write {path.name} with no `name:` key")
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
 def add(spec: FeedSpec) -> None:
-    doc, y = read_raw()
-    doc["feeds"].append(_block(spec))
-    # Blank line before the new block, matching how the hand-written ones are
-    # separated. Cosmetic, but this file is read far more often than written,
-    # and a console-added feed should not be identifiable by its spacing.
-    try:
-        doc["feeds"].yaml_set_comment_before_after_key(
-            len(doc["feeds"]) - 1, before="\n")
-    except Exception:                                          # noqa: BLE001
-        pass
-    _write(doc, y)
+    path = feed_path(spec.name)
+    if path.exists():
+        raise FeedValidationError({"name": f"feed exists: {spec.name!r}"})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write(_block(spec), _yaml(), path)
 
 
 def update(spec: FeedSpec) -> None:
@@ -792,40 +804,30 @@ def update(spec: FeedSpec) -> None:
     Keys the UI does not manage are left untouched, so hand-tuning a feed in
     the file and then editing it in the UI does not quietly revert the tuning.
     """
-    doc, y = read_raw()
-    for block in doc["feeds"]:
-        if block.get("name") != spec.name:
-            continue
-        new = _block(spec)
-        for key in BLOCK_ORDER:
-            if key in new:
-                if key in block:
-                    block[key] = new[key]
-                else:
-                    # A key set for the first time. Assigning it would append
-                    # it after `columns`, ordering the block by when it was
-                    # edited rather than the order docs/ADDING-A-FEED.md reads
-                    # in. Insert it at its place instead.
-                    block.insert(_position_for(block, key), key, new[key])
-            elif key in block:
-                # Fell back to the default: drop the override rather than
-                # leaving a stale value behind.
-                del block[key]
-        _write(doc, y)
-        return
-    raise FeedValidationError({"name": f"no such feed: {spec.name!r}"})
+    block, y = read_raw(spec.name)
+    new = _block(spec)
+    for key in BLOCK_ORDER:
+        if key in new:
+            if key in block:
+                block[key] = new[key]
+            else:
+                # A key set for the first time. Assigning it would append it
+                # after `columns`, ordering the block by when it was edited
+                # rather than the order docs/ADDING-A-FEED.md reads in.
+                # Insert it at its place instead.
+                block.insert(_position_for(block, key), key, new[key])
+        elif key in block:
+            # Fell back to the default: drop the override rather than
+            # leaving a stale value behind.
+            del block[key]
+    _write(block, y, feed_path(spec.name))
 
 
 def remove(name: str) -> None:
-    doc, y = read_raw()
-    kept = [b for b in doc["feeds"] if b.get("name") != name]
-    if len(kept) == len(doc["feeds"]):
+    path = feed_path(name)
+    if not path.is_file():
         raise FeedValidationError({"name": f"no such feed: {name!r}"})
-    while len(doc["feeds"]):
-        doc["feeds"].pop()
-    for b in kept:
-        doc["feeds"].append(b)
-    _write(doc, y)
+    path.unlink()
 
 
 def spec_from_feed(fd: Feed) -> FeedSpec:

@@ -49,21 +49,21 @@ now.
 
 ---
 
-## 1. `reporting_platform/config/feeds.yml`
+## 1. `reporting_platform/config/feeds/ref_rating.yml`
 
 Add it to the feed's `columns:`, at the end.
 
 ```yaml
-  - name: ref_rating
-    convention: ref_src
-    ...
-    columns:
-      - counterparty_id
-      - agency
-      - rating
-      - rating_date
-      - outlook
-      - watch_status          # new
+name: ref_rating
+convention: ref_src
+...
+columns:
+  - counterparty_id
+  - agency
+  - rating
+  - rating_date
+  - outlook
+  - watch_status          # new
 ```
 
 If the file's header does not spell it as a legal identifier, rename it here

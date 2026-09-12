@@ -65,7 +65,7 @@ def test_undefined_convention_is_an_error():
     """
     msg = _raises('conventions:\n  ref: {delimiter: "|"}\n',
                   "    convention: rfe\n")
-    assert "feed 't_one'" in msg, msg
+    assert "t_one.yml" in msg, msg
     assert "not defined" in msg and "Available: ref" in msg, msg
 
 

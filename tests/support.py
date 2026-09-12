@@ -7,10 +7,10 @@ MinIO -- so they run on a laptop in under a second and inside the existing
 image with no rebuild.
 
 Everything here works by pointing REPORTING_CONFIG_DIR at a throwaway copy of
-the config and re-importing. `common.context` caches on the config file's
-mtime rather than its name, so a second copy in a second directory is a clean
-slate; what is NOT clean is the already-imported module object, hence
-`_purge()`.
+the config and re-importing. `common.context` caches on the mtimes of the
+registry FILES rather than on their names, so a second copy in a second
+directory is a clean slate; what is NOT clean is the already-imported module
+object, hence `_purge()`.
 
 THAT IS PROCESS-WIDE STATE, SO IT IS RESTORED. `config_dir()` sets two
 environment variables and empties `sys.modules` of the package under test;
@@ -86,9 +86,20 @@ def config_dir(feeds_yml: str | None = None) -> pathlib.Path:
     """
     d = pathlib.Path(tempfile.mkdtemp(prefix="rp-test-"))
     _MADE.append(d)
-    (d / "feeds.yml").write_text(
-        feeds_yml if feeds_yml is not None
-        else (CONFIG / "feeds.yml").read_text(encoding="utf-8"), encoding="utf-8")
+    if feeds_yml is None:
+        # The REAL registry tree, copied. Pinning what this repo actually
+        # ships is the more valuable case, and a copy rather than a symlink
+        # so a test that writes (the console round-trip ones do) cannot
+        # touch the working tree.
+        shutil.copytree(CONFIG / "feeds", d / "feeds")
+    else:
+        # A fixture is still written as ONE document and split on the way in.
+        # Fifty call sites build one, and a synthetic registry is far easier
+        # to read whole than as four files in a string. `split_document` is
+        # the same function the migration off `feeds.yml` used, so a fixture
+        # cannot be assembled by different rules than the real config was.
+        from reporting_platform.common import layout
+        layout.split_document(feeds_yml, d)
     shutil.copy(CONFIG / "retention.yml", d / "retention.yml")
     # The third shipped config file. `maintenance_config()` reads it, and a
     # test directory without it sends the reader to the image's path, which
@@ -114,13 +125,13 @@ def feeds_from(feeds_yml: str | None = None):
 
 
 def registry_on(d: pathlib.Path):
-    """The console's registry module, pointed at this config dir's feeds.yml.
+    """The console's registry module, pointed at this config dir's tree.
 
-    FEEDS_YML is module-level, so it has to be redirected after the import
+    CONFIG_ROOT is module-level, so it has to be redirected after the import
     that `config_dir()` invalidated.
     """
     import reporting_platform.ui.registry as registry
-    registry.FEEDS_YML = d / "feeds.yml"
+    registry.CONFIG_ROOT = d
     return registry
 
 
@@ -139,3 +150,30 @@ feeds:
     business_key: [k]
     columns: [k, v]
 {feed_extra}"""
+
+
+def feed_text(d: pathlib.Path, name: str) -> str:
+    """One feed's file as written, for asserting on what the console emitted.
+
+    The successor to reading `feeds.yml` and slicing the block out of it by
+    string search: the block IS the file now, so there is nothing to slice
+    and nothing to get wrong at the boundary between two feeds.
+    """
+    return (d / "feeds" / f"{name}.yml").read_text(encoding="utf-8")
+
+
+def registry_text(d: pathlib.Path) -> str:
+    """The WHOLE registry tree concatenated -- the successor to reading the
+    single `feeds.yml`.
+
+    All three tiers, because that is what the assertions using this are
+    about: "this value is declared once in the registry" is only true if the
+    count covers `_defaults.yml` and `conventions/` as well as the feeds.
+    Counting the feed files alone would let a value be pinned into a feed
+    AND left on its convention without the count noticing.
+
+    Sorted, so a before/after diff is stable.
+    """
+    root = d / "feeds"
+    return "".join(f"--- {p.relative_to(root)}\n{p.read_text(encoding='utf-8')}"
+                   for p in sorted(root.rglob("*.yml")))

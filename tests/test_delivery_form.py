@@ -15,7 +15,7 @@ What it covers is the ROUND TRIP: form payload -> FeedSpec -> written YAML
 """
 from __future__ import annotations
 
-from tests.support import config_dir, registry_on, synthetic
+from tests.support import config_dir, feed_text, registry_on, synthetic
 
 ARCHIVE_PAYLOAD = {
     "name": "cus_position",
@@ -104,7 +104,7 @@ def test_plain_feed_writes_no_delivery_key_at_all():
                                            if k != "delivery"})
     registry.validate(spec, existing=set())
     registry.add(spec)
-    assert "delivery:" not in (d / "feeds.yml").read_text()
+    assert "delivery:" not in feed_text(d, "cus_position")
 
 
 # --------------------------------------------------------- validation reuse
@@ -145,12 +145,12 @@ def test_editing_adds_a_delivery_block():
     spec = registry.FeedSpec.from_payload(plain)
     registry.validate(spec, existing=set())
     registry.add(spec)
-    assert "delivery:" not in (d / "feeds.yml").read_text()
+    assert "delivery:" not in feed_text(d, "trs_margin_call")
 
     updated = registry.FeedSpec.from_payload(CONTROL_PAYLOAD)
     registry.validate(updated, existing={"trs_margin_call"}, updating=True)
     registry.update(updated)
-    text = (d / "feeds.yml").read_text()
+    text = feed_text(d, "trs_margin_call")
     assert "delivery:" in text and "pattern: '{stem}\\.ctl'" in text, text
 
 
@@ -162,13 +162,13 @@ def test_editing_removes_an_existing_delivery_block():
     spec = registry.FeedSpec.from_payload(CONTROL_PAYLOAD)
     registry.validate(spec, existing=set())
     registry.add(spec)
-    assert "delivery:" in (d / "feeds.yml").read_text()
+    assert "delivery:" in feed_text(d, "trs_margin_call")
 
     plain = {k: v for k, v in CONTROL_PAYLOAD.items() if k != "delivery"}
     cleared = registry.FeedSpec.from_payload(plain)
     registry.validate(cleared, existing={"trs_margin_call"}, updating=True)
     registry.update(cleared)
-    assert "delivery:" not in (d / "feeds.yml").read_text()
+    assert "delivery:" not in feed_text(d, "trs_margin_call")
 
 
 def test_editing_something_else_preserves_an_existing_delivery_block():
@@ -237,7 +237,7 @@ def test_the_written_format_carries_no_resolved_defaults():
     spec = registry.FeedSpec.from_payload(DELIMITED_PAYLOAD)
     registry.validate(spec, existing=set())
     registry.add(spec)
-    text = (d / "feeds.yml").read_text()
+    text = feed_text(d, "trs_margin_piped")
     assert "quote_char" not in text, text
     assert "header:" not in text, text
 
