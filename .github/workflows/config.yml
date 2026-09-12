@@ -1,0 +1,67 @@
+# The config-level gate: everything about this platform that can be checked
+# without starting it.
+#
+# WHY THIS IS THE CHEAP TIER AND WHAT IT DELIBERATELY OMITS. The stack is six
+# services, an Iceberg catalog and a Spark cluster; a gate that needs them
+# runs in tens of minutes and so runs rarely, and a gate that runs rarely is
+# not a gate. All this tier needs is Python plus four packages -- no Spark,
+# no dbt, no Docker, no catalog -- and answers in about ten seconds.
+#
+# What it therefore does NOT cover, so nobody reads a green tick as more than
+# it is: the image builds (the cosmos `--no-deps` trap, caught by
+# `Dockerfile.airflow`'s own `dbt --version` smoke test), `dbt parse` (a bad
+# `ref()` or schema YAML dbt rejects), DAG import, and column-level lineage --
+# `lineage --columns` runs here but reports 7 of 11 tables as `not derivable`
+# without compiled SQL and a catalog, and still exits 0, so as a gate at this
+# tier it would be green on almost nothing. Those belong in a second workflow
+# that builds the image. See docs/DECISIONS.md#the-registry-is-a-directory
+name: config
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  config:
+    runs-on: ubuntu-latest
+    env:
+      # Both are read at import (common/settings.py, common/context.py), so
+      # they are set for the job rather than per step. The defaults are the
+      # container's paths, which do not exist on a runner -- without these
+      # every check reports that the platform manages nothing.
+      REPORTING_CONFIG_DIR: ${{ github.workspace }}/reporting_platform/config
+      DBT_PROJECT_DIR: ${{ github.workspace }}/dbt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'          # the image's interpreter
+
+      # NOT the image's requirements -- this is the whole dependency set the
+      # config layer has, which is what makes this tier possible at all.
+      # `tests/run.py` is written without pytest for the same reason, and the
+      # suite passes with no sqlglot, pyspark, psycopg2, boto3 or dbt.
+      #
+      # DERIVED BY RUNNING IT IN A CLEAN VIRTUALENV, not by reading imports.
+      # pyyaml and ruamel.yaml are the obvious two; `requests` comes in
+      # through `common/nessie.py` (test_arrivals), and `duckdb` because
+      # `test_sniff` imports it at MODULE level -- which aborts the whole run
+      # rather than failing one test, so the suite exits 1 with no summary
+      # line at all. The exit code is still right, which is what a gate needs.
+      # Pinned to the image's duckdb for the reason the image pins it:
+      # 1.1.3 cannot ATTACH an Iceberg catalog.
+      - name: Install the config layer's dependencies
+        run: |
+          pip install --quiet \
+            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5"
+
+      # The registry has to load before anything else is worth asking. Its own
+      # step rather than relying on the suite, so a broken feed file reports
+      # as "config" and not as whichever test happened to touch it first.
+      - name: The registry loads
+        run: python -m reporting_platform.config check
+
+      - name: Config-level tests
+        run: python -m tests.run

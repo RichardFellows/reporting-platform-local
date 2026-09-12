@@ -14,6 +14,7 @@ to get it would put the split back.
 """
 from __future__ import annotations
 
+import codecs
 import hashlib
 import logging
 import os
@@ -829,6 +830,133 @@ def parse_expected_by(feed_name: str, value: Any) -> str:
     return text
 
 
+# ------------------------------------------------- the remaining value checks
+# THESE WERE THE CONSOLE'S AND ONLY THE CONSOLE'S. `ui/registry.validate` has
+# always rejected a `cadence` that is not daily or weekly, a multi-character
+# delimiter and an unknown encoding -- and the loader accepted all three, so
+# the form refused what a hand edit, a merge, or a migration script could
+# still write. Verified before moving them: `cadence: fortnightly` loaded
+# clean, passed every test, and silently behaved as `daily`, which for a
+# weekly feed reinstates the false gaps `cadence:` was added to remove.
+#
+# `registry.py` already had the rule and the reason four lines below these,
+# for `expected_by` and `retention_class`: "BOTH VALIDATED WITH THE
+# PLATFORM'S OWN FUNCTIONS, not a second copy of the rules." These are now
+# the same shape, and the console calls them rather than restating them.
+#
+# ONE FUNCTION PER CONCERN, each taking (feed_name, value) and returning the
+# value, so `_feeds_at` applies them in one loop and the console reports them
+# per form field.
+CADENCES = ("daily", "weekly")
+SCHEMA_DRIFT_MODES = ("warn", "fail")
+
+
+def check_cadence(feed_name: str, value: Any) -> str:
+    """How often the feed is expected to deliver. See `Feed.cadence`.
+
+    THE SILENT ONE. `completeness.find_gaps` is `if how == "weekly": ... else:
+    <daily>`, so any other value is daily and nothing says so -- a weekly feed
+    typed `fortnightly` reports every non-delivery day as a gap, which is the
+    exact failure `cadence:` exists to prevent, restored by a typo.
+    """
+    text = str(value).strip()
+    if text not in CADENCES:
+        raise ValueError(
+            f"{where(feed_name)}: `cadence: {value!r}` is not recognised. "
+            f"Valid: {', '.join(CADENCES)}. Anything else is read as "
+            f"'daily' by the gap check and reports every non-delivery day "
+            f"as a gap.")
+    return text
+
+
+def check_schema_drift(feed_name: str, value: Any) -> str:
+    """What an unexpected or missing column does. See `Feed.schema_drift`.
+
+    `ingest_feed` checks this too, and keeps doing so: that check is what
+    finally made `fail` mean something after the setting spent months being
+    read by nothing, and a `Feed` built by hand rather than through `feeds()`
+    still reaches it. This moves the same refusal to load, where it costs a
+    parse rather than a delivery.
+    """
+    text = str(value).strip()
+    if text not in SCHEMA_DRIFT_MODES:
+        raise ValueError(
+            f"{where(feed_name)}: `schema_drift: {value!r}` is not "
+            f"recognised. Valid: {', '.join(SCHEMA_DRIFT_MODES)}.")
+    return text
+
+
+def check_expected_min_rows(feed_name: str, value: Any) -> int:
+    """The floor below which an ingest abandons its branch.
+
+    Negative is refused rather than clamped: `row_count < -1` is never true,
+    so a negative floor is a declared check that cannot fire -- and the
+    reading of a negative number here is "I meant to set a floor", not "I
+    meant to disable one", which is what `0` already says.
+    """
+    try:
+        rows = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{where(feed_name)}: `expected_min_rows: {value!r}` is not a "
+            f"whole number.") from None
+    if rows < 0:
+        raise ValueError(
+            f"{where(feed_name)}: `expected_min_rows: {rows}` is negative, so "
+            f"the floor can never fire. Use 0 to declare no floor.")
+    return rows
+
+
+def check_single_char(feed_name: str, key: str, value: Any) -> str:
+    """`delimiter` and `quote_char` reach Spark's `sep` and `quote`.
+
+    Both take a SINGLE character. A two-character value does not fail the
+    read -- it splits on neither and lands one column holding the whole row,
+    with every declared column then reporting as missing. The feed's own
+    delimiter was unchecked at load while a CONTROL FILE's was not
+    (`resolve_control_format`), which is the wrong way round: the feed's is
+    the one every delivery is read with.
+    """
+    text = "" if value is None else str(value)
+    if len(text) != 1:
+        raise ValueError(
+            f"{where(feed_name)}: `{key}: {value!r}` is "
+            f"{len(text)} characters, not 1. It becomes Spark's "
+            f"{'sep' if key == 'delimiter' else 'quote'}, which takes a "
+            f"single character -- a longer one splits on neither and lands "
+            f"one column holding the whole row. Use \\t for a tab.")
+    return text
+
+
+def check_file_encoding(feed_name: str, value: Any) -> str:
+    """The codec the delivery is read with.
+
+    `codecs.lookup` rather than a list, because the set of valid encodings is
+    Python's and restating a subset of it would refuse something that works.
+    """
+    text = str(value).strip()
+    try:
+        codecs.lookup(text)
+    except LookupError:
+        raise ValueError(
+            f"{where(feed_name)}: `file_encoding: {value!r}` is not an "
+            f"encoding Python knows. Try utf-8, latin-1 or cp1252.") from None
+    return text
+
+
+# DECLARED-ONLY, and that is what keeps the defaults in one place. A key
+# absent from `_defaults.yml`, the convention and the feed is left absent so
+# the `Feed` dataclass default applies -- re-stating those here would be a
+# second copy of every default, which is the failure this whole file is
+# organised against.
+VALUE_CHECKS = (
+    ("cadence", check_cadence),
+    ("schema_drift", check_schema_drift),
+    ("expected_min_rows", check_expected_min_rows),
+    ("file_encoding", check_file_encoding),
+)
+
+
 # --------------------------------------------------------------- the gate
 # What `arrival:` may say. Same rule as `delivery:`: every key here is read by
 # ingest/conform.py.
@@ -1276,6 +1404,12 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
             block["name"], merged.get("expected_by"))
         merged["retention_class"] = check_retention_class(
             block["name"], merged.get("retention_class"))
+        for key, check in VALUE_CHECKS:
+            if key in merged:
+                merged[key] = check(name, merged[key])
+        for key in ("delimiter", "quote_char"):
+            if key in merged:
+                merged[key] = check_single_char(name, key, merged[key])
         check_gates_are_coherent(block["name"], merged["arrival"],
                                    merged["delivery"])
         names, sources = split_columns(merged.get("columns") or [])

@@ -1533,6 +1533,36 @@ later, deliberately, as its own change.
 The console offers the defined conventions as a **closed list**, never free
 text, for the same reason: a typo there is not an error anyone would see.
 
+**Six value checks used to live only in the console, and that was the same
+bug one level down.** `ui/registry.validate` rejected `cadence` that was not
+daily or weekly, a multi-character `delimiter` or `quote_char`, a negative
+`expected_min_rows` and an unknown `file_encoding` — and the LOADER checked
+none of them. So the form refused what a hand edit, a merge, or a migration
+script could still write, which is exactly the asymmetry the comment four
+lines above them warned about for the two that *were* shared
+(`parse_expected_by`, `check_retention_class`).
+
+Measured before moving them: `cadence: fortnightly` loaded clean, passed all
+450 tests and `config check`, and behaved as `daily`. `find_gaps` is
+`if how == "weekly": ... else: <daily>`, so for a weekly feed that reports
+every non-delivery day as a gap — the exact failure `cadence:` was added to
+remove, reinstated by a typo the form would have caught. The feed's own
+`delimiter` was unchecked while a **control file's** was not, which is the
+wrong way round: the feed's is the one every delivery is read with.
+
+They are `check_*` functions in `common/context.py` now, applied at load to
+**declared values only** — a key absent from all three tiers is left absent so
+the `Feed` default applies, because restating each default beside its check
+would be a second copy of every default. `tests/test_value_checks.py` asserts
+each from both sides, since one shared function is the only thing stopping
+them drifting apart again.
+
+`schema_drift` is the exception worth naming: `ingest_feed` already checked it
+and still does. That check is what finally made `fail` mean something after
+the setting spent months being read by nothing, and a `Feed` built by hand
+rather than through `feeds()` still reaches it. Checking at load as well just
+moves the cost from a delivery to a parse.
+
 ## ready-is-a-derived-index
 
 `landing/` was doing two jobs with opposite requirements. It is the immutable

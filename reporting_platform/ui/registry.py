@@ -16,7 +16,6 @@ of problem went with it. See docs/DECISIONS.md#the-registry-is-a-directory
 """
 from __future__ import annotations
 
-import codecs
 import io
 import re
 from dataclasses import dataclass, field
@@ -341,7 +340,14 @@ def _format_from_payload(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-_FILE_PREFIX_RE = re.compile(r"^feeds\.yml: ")
+# ANY path ending `.yml: `, not the literal `feeds.yml: ` this matched when
+# the registry was one file. Since the split a message opens with the feed's
+# own path -- `feeds/fo_trade.yml: `, and the ABSOLUTE path for a feed that
+# already exists, because `context.where()` reports the file it actually
+# read. Left as it was, every form error carried a container path in front of
+# it, and no test noticed: the assertions are on what the message SAYS, not
+# on what was stripped from the front of it.
+_FILE_PREFIX_RE = re.compile(r"^\S*\.yml: ")
 
 
 def _form_message(exc: Exception) -> str:
@@ -504,43 +510,38 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         errors["source_columns"] = (
             f"two columns claim the same source name: {', '.join(clashes)}")
 
-    if spec.expected_min_rows < 0:
-        errors["expected_min_rows"] = "cannot be negative"
-    if spec.cadence not in ("daily", "weekly"):
-        errors["cadence"] = "must be 'daily' or 'weekly'"
-    if spec.schema_drift not in ("warn", "fail"):
-        errors["schema_drift"] = "must be 'warn' or 'fail'"
-
-    # BOTH VALIDATED WITH THE PLATFORM'S OWN FUNCTIONS, not a second copy of
-    # the rules. A form that accepted `7am` or a class retention.yml does not
-    # declare would write a feeds.yml the next Airflow parse refuses to load,
-    # and the console's whole point is that its diff is one you can merge.
+    # EVERY VALUE CHECK BELOW IS THE PLATFORM'S OWN FUNCTION, not a second
+    # copy of the rules. A form that accepted `7am`, a class retention.yml
+    # does not declare, or `cadence: fortnightly` would write a feed file the
+    # next Airflow parse refuses to load -- and the console's whole point is
+    # that its diff is one you can merge.
+    #
+    # `cadence`, `schema_drift`, `expected_min_rows`, `delimiter`,
+    # `quote_char` and `file_encoding` used to be restated here, and the
+    # loader checked NONE of them: the form refused what a hand edit or a
+    # merge could still write, and `cadence: fortnightly` then behaved as
+    # `daily` with nothing saying so. They moved to `common/context.py`
+    # alongside the two that were already shared.
     from reporting_platform.common.context import (
-        check_retention_class, parse_expected_by,
+        check_cadence, check_expected_min_rows, check_file_encoding,
+        check_retention_class, check_schema_drift, check_single_char,
+        parse_expected_by,
     )
+    named = lambda key: lambda name, value: check_single_char(name, key, value)
     for field, check, value in (
             ("expected_by", parse_expected_by, spec.expected_by or ""),
-            ("retention_class", check_retention_class, spec.retention_class)):
+            ("retention_class", check_retention_class, spec.retention_class),
+            ("cadence", check_cadence, spec.cadence),
+            ("schema_drift", check_schema_drift, spec.schema_drift),
+            ("expected_min_rows", check_expected_min_rows,
+             spec.expected_min_rows),
+            ("delimiter", named("delimiter"), spec.delimiter),
+            ("quote_char", named("quote_char"), spec.quote_char),
+            ("file_encoding", check_file_encoding, spec.file_encoding)):
         try:
             check(spec.name or "this feed", value)
         except ValueError as exc:
             errors[field] = _form_message(exc)
-
-    # Spark's CSV reader takes a single character for `sep` and `quote`. A
-    # two-character value is accepted by the form and then either throws inside
-    # the ingest or, worse, splits on neither character and lands one column.
-    if len(spec.delimiter) != 1:
-        errors["delimiter"] = (
-            "must be exactly one character (type \\t for a tab) -- it becomes "
-            "Spark's `sep`, which takes a single character")
-    if len(spec.quote_char) != 1:
-        errors["quote_char"] = "must be exactly one character"
-    try:
-        codecs.lookup(spec.file_encoding)
-    except LookupError:
-        errors["file_encoding"] = (
-            f"unknown encoding {spec.file_encoding!r} -- try utf-8, latin-1 "
-            f"or cp1252")
 
     if errors:
         raise FeedValidationError(errors)
