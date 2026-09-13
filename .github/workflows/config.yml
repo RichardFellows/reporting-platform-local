@@ -8,16 +8,25 @@
 # no dbt, no Docker, no catalog -- and answers in about ten seconds.
 #
 # What it therefore does NOT cover, so nobody reads a green tick as more than
-# it is: the image builds (the cosmos `--no-deps` trap, caught by
-# `Dockerfile.airflow`'s own `dbt --version` smoke test), `dbt parse` (a bad
-# `ref()` or schema YAML dbt rejects), DAG import, and column-level lineage.
+# it is: `dbt parse`, DAG import and the cosmos `--no-deps` trap, all three of
+# which need the image's dependency set and so moved to `parse.yml` -- THE
+# TIER ABOVE, not a replacement for this one; and column-level lineage, which
+# needs a built catalog and is gated nowhere yet. The image BUILD is still
+# ungated too: `parse.yml` installs the same pins by hand, and
+# `tests/test_ci_pins.py` -- which runs HERE -- is what stops the two copies
+# drifting.
 #
-# `lineage --columns` is the one worth being explicit about: it RUNS here, and
-# reports 7 of 11 tables as `not derivable` without compiled SQL and a
-# catalog, and exits 0 -- green on almost nothing. The post-build tier should
-# run `--columns --require-derivable`, which refuses when any managed table
-# could not be read; at THIS tier that flag correctly fails, which is why it
-# is not below. See docs/DECISIONS.md#the-registry-is-a-directory
+# `lineage --columns` is the one worth being explicit about, because this
+# header used to say it RUNS here AND IT NEVER HAS -- there is no such step
+# below, and adding one would be worse than leaving it out. Without compiled
+# SQL and a catalog it reports 7 of 11 tables `not derivable`; for the other
+# 4 it falls back to the feed's DECLARED columns, so every column it
+# classifies is `sourced` by construction -- 28 of 28, measured. `unresolved`
+# is the one thing `--columns` exits 1 on, and here it is UNREACHABLE: the
+# step would be a tick that cannot fail. `--require-derivable` inverts it into
+# a failure that can only ever mean "you have not built yet". Both belong to a
+# post-build tier, and there is not one.
+# See docs/DECISIONS.md#a-gate-that-cannot-fail
 name: config
 
 on:

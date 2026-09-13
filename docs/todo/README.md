@@ -10,7 +10,6 @@ item that no longer reproduces should be deleted rather than worked.
 
 | | Item | Value | Effort |
 |---|---|---|---|
-| [01](01-ci-dbt-parse-and-dag-import.md) | CI: a second tier that runs `dbt parse` and imports the DAGs | high | half a day |
 | [02](02-console-cannot-create-an-unpacked-archive-feed.md) | The console cannot create a feed whose zip is unpacked at the gate | high | 2–3 hours |
 | [03](03-keep-years-doc-drift.md) | `keep_years: 8` in the docs; the config says 10 | medium | 15 min |
 | [04](04-conventions-do-not-chain-comment.md) | `_defaults.yml` says conventions do not chain; `parent:` chains them | medium | 10 min |
@@ -21,10 +20,6 @@ item that no longer reproduces should be deleted rather than worked.
 
 ## Where to start
 
-**01** has the most lasting value: it closes the tier `CLAUDE.md` itself lists
-as ungated, and the failures it catches — a DAG that does not import, dbt
-broken by a dependency resolution — are invisible until the scheduler parses.
-
 **03 + 04 + 05 are one small PR.** Three separately verified wrong things, an
 hour in total, and each is the kind this repo treats as worse than a bug: a
 comment that lies, a number that disagrees with the config it describes, and a
@@ -32,6 +27,14 @@ test suite that fails where its own README says to run it.
 
 **02** is a half-shipped feature rather than a defect: the loader, the
 validator and the YAML writer all accept a feed shape the form cannot express.
+
+## Done
+
+**01, CI: a second tier that runs `dbt parse` and imports the DAGs** —
+`.github/workflows/parse.yml`, with `scripts/check_dag_imports.py` and
+`tests/test_ci_pins.py`. Deleted rather than ticked, per the rule above: the
+item no longer reproduces, and what it was asking for is described in
+`CLAUDE.md` where it is maintained.
 
 ## Adding an item
 

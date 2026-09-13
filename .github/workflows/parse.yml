@@ -1,0 +1,171 @@
+# The parse-level gate: everything that needs the image's dependency set but
+# not the running stack.
+#
+# THE TIER ABOVE `config.yml`, AND SEPARATE FROM IT ON PURPOSE. That one needs
+# Python and four packages and answers in ten seconds, which is why it can run
+# on every push; this one installs Airflow, dbt, their providers and cosmos,
+# and takes a couple of minutes. Merging the two would make the cheap tier
+# expensive and buy nothing -- they fail on different things. Read
+# `config.yml`'s header before moving anything between them.
+#
+# WHAT THIS CATCHES THAT NOTHING ELSE DID:
+#
+#   * The cosmos `--no-deps` trap. Under Airflow's constraint file
+#     `astronomer-cosmos` pins `typing_extensions==4.12.2`; dbt's `mashumaro`
+#     needs 4.13+ for `evaluate_forward_ref`, and every dbt invocation then
+#     dies at import -- in dbt, not cosmos, and not until something runs dbt.
+#     The only guard was `Dockerfile.airflow`'s own `dbt --version` smoke
+#     test, which CI never ran. It is a step below.
+#     See docs/DECISIONS.md#cosmos-no-deps
+#   * A bad `ref()`: `dbt parse` refuses a node name that resolves to
+#     nothing, and so does the `dbt ls` the build DAGs run while importing.
+#     It also catches Jinja that will not compile and YAML it cannot load.
+#     MEASURED, BECAUSE THE LIMIT MATTERS AS MUCH AS THE COVERAGE: it does
+#     NOT reject an unknown generic test (`dbt_utils.not_a_real_test` parses
+#     green) or an unknown key in a column block. Those are resolved when a
+#     test is built, which is the tier that does not exist yet.
+#   * A DAG that does not import -- a syntax error, and equally
+#     `dbt_builds.py` REFUSING A NON-SPARK `DBT_TARGET`, which it does at
+#     import precisely so it surfaces here. Both build DAGs render their task
+#     graph by shelling out to `dbt ls` while being imported, so that step
+#     needs `dbt deps` to have run as much as `dbt parse` does; in the order
+#     below parse is what fails first when it has not.
+#     See docs/DECISIONS.md#cosmos-load-bearing-settings and #dbt-target-guard
+#
+# WHAT IT STILL DOES NOT COVER, so nobody reads a green tick as more than it
+# is: the image BUILD itself (this installs the same pins by hand, and
+# `tests/test_ci_pins.py` is what stops the two drifting), and column-level
+# lineage, which needs compiled SQL and a catalog --
+# `lineage --columns --require-derivable` is the post-build tier and there is
+# no post-build tier yet.
+#
+# HOW THIS ENVIRONMENT DIFFERS FROM THE IMAGE, in the one way that could
+# produce a false alarm: `apache/airflow:2.10.5-python3.11` ships a few dozen
+# providers preinstalled (the OpenLineage one among them, which is why
+# CLAUDE.md says not to install it explicitly), and a bare runner ships none.
+# Every provider the platform actually configures is installed below. If a DAG
+# ever imports one that only the base image has, this job fails where the
+# stack works -- add it to the constrained install below, never to the
+# unconstrained one.
+name: parse
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    env:
+      # Read at import, as in config.yml; the defaults are container paths
+      # that do not exist on a runner.
+      REPORTING_CONFIG_DIR: ${{ github.workspace }}/reporting_platform/config
+      DBT_PROJECT_DIR: ${{ github.workspace }}/dbt
+      DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
+      PYTHONPATH: ${{ github.workspace }}
+      # Every target is a Spark one and dbt_builds.py refuses anything else;
+      # spark_local is what the stack runs.
+      # See docs/DECISIONS.md#duckdb-is-not-an-engine
+      DBT_TARGET: spark_local
+
+      # dbt's three working directories, OUT OF THE dbt PROJECT as
+      # docker-compose.yml keeps them out of the bind mount -- so no step
+      # parses something an earlier one generated into the project. The
+      # reason differs (a runner has no host ownership to inherit), the
+      # arrangement should not. See docs/DECISIONS.md#dbt-working-directories
+      #
+      # `github.workspace`, NOT `runner.temp`: the `runner` context does not
+      # exist in a job-level `env:` block -- it renders EMPTY, and these
+      # become absolute paths at `/`, where the first write fails.
+      DBT_PACKAGES_INSTALL_PATH: ${{ github.workspace }}/.ci/dbt/packages/dbt_packages
+      DBT_LOG_PATH: ${{ github.workspace }}/.ci/dbt/logs
+      DBT_TARGET_PATH: ${{ github.workspace }}/.ci/dbt/target
+
+      # profiles.yml resolves these through env_var() WITH NO DEFAULT, so the
+      # profile does not render without them. They are inert: `dbt parse` and
+      # `dbt ls` open no connection, and nothing here may reach a real host.
+      NESSIE_URI: http://nessie.invalid/api/v2
+      S3_ENDPOINT: http://minio.invalid:9000
+      REPORTING_WAREHOUSE: s3a://lakehouse/warehouse
+
+      AIRFLOW_HOME: ${{ github.workspace }}/.ci/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/airflow/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # github.workspace is absolute, so this is sqlite's four-slash form.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:///${{ github.workspace }}/.ci/airflow/airflow.db
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'          # the image's interpreter
+
+      # THE PINS BELOW ARE A SECOND COPY OF `Dockerfile.airflow`'s, and
+      # `tests/test_ci_pins.py` fails if they diverge -- a CI tier that
+      # installs a working combination the image does not have proves nothing
+      # about what runs. Change them there, not here.
+      #
+      # Providers under Airflow's own constraints, so pip cannot drag in a
+      # different airflow version to satisfy them.
+      # See docs/DECISIONS.md#airflow-provider-constraints
+      - name: Airflow and its providers, under Airflow's constraint file
+        run: |
+          pip install --quiet \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt" \
+            "apache-airflow==2.10.5" \
+            "apache-airflow-providers-apache-spark" \
+            "apache-airflow-providers-amazon"
+
+      # dbt is deliberately NOT constrained by Airflow's file. pyspark, duckdb,
+      # pandas and pyarrow are in the image and NOT here: nothing this job runs
+      # opens a Spark session or reads a table, `spark_session()` imports
+      # pyspark inside the function, and 300 MB of wheels would double the job.
+      # If a DAG ever imports one at module level, this job is where you find
+      # out -- install it then, and say which import needs it.
+      - name: dbt
+        run: |
+          pip install --quiet "dbt-core==1.8.7" "dbt-spark[PyHive]==1.8.0"
+          # dbt_builds.py defaults DBT_EXECUTABLE_PATH to the image's
+          # /home/airflow/.local/bin/dbt, and Cosmos SPAWNS that path to
+          # render the DAG. On a runner it does not exist, and the failure is
+          # a rendering error, not "no such file".
+          echo "DBT_EXECUTABLE_PATH=$(command -v dbt)" >> "$GITHUB_ENV"
+
+      # --no-deps, AND THAT IS NOT AN OPTIMISATION. See the header, and
+      # docs/DECISIONS.md#cosmos-no-deps
+      - name: astronomer-cosmos, --no-deps exactly as the image installs it
+        run: |
+          pip install --quiet --no-deps "astronomer-cosmos==1.15.1"
+          pip install --quiet "aenum" "deprecation"
+
+      # THE SMOKE TEST FROM `Dockerfile.airflow`, RUN IN CI FOR THE FIRST TIME.
+      # If the step above resolved typing_extensions backwards, dbt does not
+      # start -- and the traceback is in mashumaro, naming neither cosmos nor
+      # this pin.
+      - name: dbt still runs after that
+        run: |
+          dbt --version
+          python -c "import cosmos; print('cosmos', cosmos.__version__)"
+
+      # What `airflow-init` does on a cold stack. Without dbt_utils, `dbt ls`
+      # cannot compile a dbt_utils test and the two build DAGs do not IMPORT
+      # -- so this is a precondition of the last step, not a separate check.
+      # See docs/DECISIONS.md#airflow-init-load-bearing-steps
+      - name: dbt deps
+        run: dbt deps --project-dir "$DBT_PROJECT_DIR" --profiles-dir "$DBT_PROFILES_DIR"
+
+      - name: dbt parse
+        run: dbt parse --project-dir "$DBT_PROJECT_DIR" --profiles-dir "$DBT_PROFILES_DIR" --target "$DBT_TARGET"
+
+      # Cosmos caches each `dbt ls` render in an Airflow VARIABLE, so importing
+      # the build DAGs needs a metadata database. sqlite, thrown away with the
+      # runner; no scheduler is started and nothing is ever scheduled.
+      - name: An Airflow metadata database
+        run: |
+          mkdir -p "$AIRFLOW_HOME"
+          airflow db migrate >/dev/null
+
+      - name: Every DAG imports
+        run: python -m scripts.check_dag_imports

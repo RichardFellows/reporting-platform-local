@@ -113,10 +113,10 @@ to run something for the first time, expect it to fail and read what it says.
   `Dockerfile.airflow` smoke-tests `dbt --version`; re-run `pip install
   --dry-run` before moving `COSMOS_VERSION`.
   (`#cosmos-no-deps`)
-- **`airflow-init` does four things**: db migrate, admin user, `pools set
-  lakehouse_write 1`, `dbt deps`. Without packages, `dbt ls` cannot compile a
-  `dbt_utils` test and the two build DAGs do not *import*.
-  (`#airflow-init-four-things`)
+- **`airflow-init` does five things**: db migrate, admin user, `pools set
+  lakehouse_write 1`, the registry schema, `dbt deps`. Without packages,
+  `dbt ls` cannot compile a `dbt_utils` test and the two build DAGs do not
+  *import*. (`#airflow-init-load-bearing-steps`)
 - **dbt's three working directories live under `/opt/platform/run`, not the
   `./dbt` bind mount** (`DBT_LOG_PATH`, `DBT_TARGET_PATH`,
   `packages-install-path`): a bind mount keeps host ownership, so `dbt deps`
@@ -353,7 +353,11 @@ them.
   failure look identical.
 - **`unresolved` is a DEFECT that does not fail a build**: nothing in this
   package may raise, an export must never gain the power to stop the pipeline.
-  The seam is CI — `lineage --columns` exits 1 on any.
+  The seam is MEANT to be CI — `lineage --columns` exits 1 on any — but **no
+  tier runs it**, and that is deliberate: without a catalog the column list
+  falls back to the feed's declared columns, so every column reads `sourced`
+  and `unresolved` cannot arise. The gate needs a post-build tier.
+  (`#a-gate-that-cannot-fail`)
 - **No value this package emits may contain a credential word.** Facet values
   pass through Airflow's SecretsMasker and this estate's Postgres user and
   password are both `platform`, so a class called `platform_column` reached
@@ -373,18 +377,39 @@ them.
   load, so the form refused what a hand edit or a merge could still write.
   They are `check_*` functions in `common/context.py` now, called from both.
   `tests/test_value_checks.py` asserts each from both sides.
-- **`.github/workflows/config.yml` is the cheap tier and the only one that
-  exists**: `config check` + `python -m tests.run` on a bare runner, ~10s.
+- **`.github/workflows/config.yml` is the cheap tier**: `config check` +
+  `python -m tests.run` on a bare runner, ~10s.
   Its dependency set (pyyaml, ruamel.yaml, requests, duckdb) was DERIVED BY
   RUNNING IT in a clean virtualenv, not read off the imports — `test_sniff`
   imports duckdb at module level and its absence aborts the whole run with no
   summary line.
-- **`lineage --columns` is NOT usable at that tier, and `--require-derivable`
-  is why it is a gate at the tier above.** Without compiled SQL and a catalog
-  it reports 7 of 11 tables as `not derivable` and exits **0** — green on
-  almost nothing. `unresolved` is a column it READ and could not trace;
-  `not derivable` is a table it could not read, and reporting the second as
-  the first is this file's own rule broken by the tool enforcing the rest.
+- **`.github/workflows/parse.yml` is the tier above, and it is SEPARATE so the
+  cheap one stays cheap**: the image's pins installed with pip (~2–3 min),
+  then `dbt --version`, `dbt deps`, `dbt parse` and
+  `python -m scripts.check_dag_imports`. That last is Airflow's own `DagBag`,
+  because importing `dbt_builds.py` renders both build DAGs through `dbt ls`
+  — so it needs a metadata db (sqlite is enough) and `dbt deps` to have run.
+  **An empty DagBag has no import errors either**, so it also asserts every
+  file produced a DAG and every feed produced an `ingest_*`.
+- **`dbt parse` catches a bad `ref()`, uncompilable Jinja and unloadable YAML
+  — and NOT an unknown generic test or an unknown key in a column block**,
+  both of which parse green. Measured, not assumed: those resolve when a test
+  is BUILT, which is the tier that still does not exist.
+- **The parse tier's pins are a second copy of `Dockerfile.airflow`'s, and
+  `tests/test_ci_pins.py` fails when they diverge** — versions, the provider
+  set, the constraint-file URL, `--no-deps` on cosmos and the `dbt --version`
+  smoke test after it. It reads the workflow's `run:` blocks as YAML, never
+  the file text: matching prose is how its first two versions passed with the
+  thing they checked deleted.
+- **`lineage --columns` is run by NEITHER tier, and that is not an
+  oversight.** Without compiled SQL and a catalog it reports 7 of 11 tables as
+  `not derivable` and exits **0** — and the 4 it does read come from
+  `feeds.yml`, every column `sourced`, so it cannot fail. `--require-derivable`
+  makes it fail every time instead. `unresolved` is a column it READ and could
+  not trace; `not derivable` is a table it could not read, and reporting the
+  second as the first is this file's own rule broken by the tool enforcing the
+  rest. `dbt parse` writes no compiled SQL, so the parse tier does not change
+  this. (`#a-gate-that-cannot-fail`)
 - **The jar triple is checked** — `tests/test_value_checks.py`'s sibling
   `tests/test_versions.py` pins `ICEBERG_VERSION` across all **five** files
   that declare it, the extensions across five, the server against the
@@ -400,14 +425,20 @@ them.
   Both go false SILENTLY, because building the feature is what falsifies them
   and whoever builds it is reading code, not the docs. Backticked identifiers
   are deliberately NOT checked — too noisy to gate.
-- **Still ungated**: the image build (the cosmos `--no-deps` trap — the
-  Dockerfile's `dbt --version` smoke test IS the gate, it just never runs in
-  CI), `dbt parse`, and DAG import.
+- **Still ungated**: the image BUILD itself (`parse.yml` reproduces its
+  dependency set with pip rather than building it, so the apt layers, the
+  nessie-gc jar and the layer ordering are proven by nothing but a local
+  build), and anything needing a built catalog — `dbt build`, and
+  `lineage --columns --require-derivable`, the post-build tier.
 
 ```powershell
 # config-level tests: registry resolution + the console's write-back.
 # No stack, ~6s. Everything else is verified by running it. tests/README.md
 python -m tests.run
+
+# every DAG file imports, and produced the DAGs it should have. What CI's
+# parse tier runs; in the container it needs no argument.
+docker compose exec -T airflow python -m scripts.check_dag_imports
 
 # what the registry resolves to, and WHICH TIER each value came from.
 # No stack. `check` exits 1 if the config will not load -- the CI seam.
