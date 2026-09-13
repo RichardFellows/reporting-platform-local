@@ -269,3 +269,131 @@ def test_a_swept_archive_is_not_re_extracted():
         assert set(s3.objects) == after
     finally:
         uninstall(monkey)
+
+
+# ================================= a container gated on its own control file
+# `delivery.control` used to be refused for `kind: archive` at load. A
+# container is a landed delivery like any other, and what it declares is about
+# the DELIVERY -- the row count across its members -- except the checksum,
+# which is the container's own because that is the object the sender hashed.
+
+def _gated(*fields: str) -> str:
+    """FEED with a `delivery.control` block declaring exactly `fields`.
+
+    Two fixtures rather than one because a field the block declares and the
+    file omits is refused -- correctly -- so a test about the row count must
+    not silently also require a checksum.
+    """
+    lines = "".join(f"        {f}\n" for f in fields)
+    return FEED.replace(
+        "      member_pattern: 'positions_.*\\.csv'",
+        "      member_pattern: 'positions_.*\\.csv'\n"
+        "      control:\n"
+        "        pattern: '{stem}\\.ctl'\n" + lines)
+
+
+GATED = _gated("row_count: 'ROWS=(?P<rows>\\d+)'")
+GATED_MD5 = _gated("row_count: 'ROWS=(?P<rows>\\d+)'",
+                   "md5: 'MD5=(?P<md5>[0-9a-fA-F]{32})'")
+
+CONTROL_KEY = "landing/cus_position/custodyPositions_20260903.ctl"
+TWO_MEMBERS = {
+    "positions_1.csv": "position_id,counterparty_id,quantity\nP1,C1,10\n",
+    "positions_2.csv": "position_id,counterparty_id,quantity\nP2,C2,20\n",
+}
+
+
+def test_an_archive_waits_for_its_control_file():
+    s3, monkey, fd, norm = _setup(TWO_MEMBERS, feeds_yml=GATED)
+    try:
+        try:
+            norm.normalize(fd, ZIP_KEY)
+        except norm.NotReady as exc:
+            assert "waiting on a control file" in str(exc), exc
+        else:
+            raise AssertionError("expected NotReady")
+    finally:
+        uninstall(monkey)
+
+
+def test_nothing_is_extracted_while_the_container_waits():
+    """The gate runs BEFORE the members are written. Extracting first would
+    rewrite every member into `ready/` on each poll of a wait that has not
+    finished -- and leave parts behind that no manifest yet points at."""
+    s3, monkey, fd, norm = _setup(TWO_MEMBERS, feeds_yml=GATED)
+    try:
+        before = set(s3.objects)
+        try:
+            norm.normalize(fd, ZIP_KEY)
+        except norm.NotReady:
+            pass
+        assert set(s3.objects) == before, set(s3.objects) - before
+    finally:
+        uninstall(monkey)
+
+
+def test_the_declared_row_count_is_the_total_across_the_members():
+    s3, monkey, fd, norm = _setup(TWO_MEMBERS, feeds_yml=GATED)
+    try:
+        s3.put(CONTROL_KEY, "ROWS=2\n")
+        m = norm.normalize(fd, ZIP_KEY)
+        assert m["control_object"] == CONTROL_KEY, m
+        # Two members, one row each: what ingest counts once they are unioned.
+        assert m["declared_row_count"] == 2, m
+        assert len(m["parts"]) == 2, m
+    finally:
+        uninstall(monkey)
+
+
+def test_the_declared_checksum_covers_the_container_not_the_parts():
+    """The sender hashed the zip it sent. The members under `ready/` are this
+    platform's own extraction, and no checksum the sender could write would
+    describe them -- so `checksum_objects` names the container, and ingest
+    hashes that without knowing what kind of delivery it is holding."""
+    import hashlib
+
+    s3, monkey, fd, norm = _setup(TWO_MEMBERS, feeds_yml=GATED_MD5)
+    try:
+        container_md5 = hashlib.md5(s3.objects[ZIP_KEY][0]).hexdigest()
+        s3.put(CONTROL_KEY, f"ROWS=2\nMD5={container_md5}\n")
+        m = norm.normalize(fd, ZIP_KEY)
+        assert m["checksum_objects"] == [ZIP_KEY], m
+        assert m["declared_md5"] == container_md5, m
+
+        from reporting_platform.ingest import ingest_feed
+        assert ingest_feed._checksum_objects(m) == [ZIP_KEY], m
+        assert ingest_feed._delivery_md5(m) == container_md5
+    finally:
+        uninstall(monkey)
+
+
+def test_a_manifest_written_before_checksum_objects_existed_still_verifies():
+    """The key is new. Every delivery that could carry a declared md5 before
+    it was single-part, and its one part IS its source object, so falling back
+    to `parts` hashes the same bytes -- an identity, not a guess."""
+    import hashlib
+
+    s3, monkey, fd, norm = _setup(TWO_MEMBERS, feeds_yml=GATED_MD5)
+    try:
+        from reporting_platform.ingest import ingest_feed
+        old = {"parts": [{"object_key": ZIP_KEY}]}
+        assert ingest_feed._checksum_objects(old) == [ZIP_KEY], old
+        assert ingest_feed._delivery_md5(old) == hashlib.md5(
+            s3.objects[ZIP_KEY][0]).hexdigest()
+    finally:
+        uninstall(monkey)
+
+
+def test_the_control_file_is_not_mistaken_for_a_delivery():
+    """`matching()` routes landed objects by `filename_pattern`, which a
+    control file never satisfies -- so the .ctl beside the zip is not itself
+    normalized into a delivery."""
+    s3, monkey, fd, norm = _setup(TWO_MEMBERS, feeds_yml=GATED)
+    try:
+        s3.put(CONTROL_KEY, "ROWS=2\n")
+        report = norm.reconcile(fd)
+        assert len(report["created"]) == 1, report
+        assert report["created"][0].endswith(
+            "custodyPositions_20260903.zip.json"), report
+    finally:
+        uninstall(monkey)

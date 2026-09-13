@@ -112,10 +112,17 @@ def test_unknown_control_key_is_rejected():
     assert "unknown key" in msg and "rowz" in msg, msg
 
 
-def test_control_with_kind_archive_is_not_built():
-    msg = _bad(FEED.replace("      kind: file", "      kind: archive")
-               .replace("    columns:", "      member_pattern: '.*'\n    columns:"))
-    assert "NOT BUILT" in msg, msg
+def test_control_gates_an_archive_too():
+    """A container is a landed delivery like any other, so `delivery.control`
+    gates it: `row_count` the total across its members, `md5` the container's
+    own. Refused at load until the archive normalizer learned to read one."""
+    _s3, monkey, fd, _norm = _setup(
+        feeds_yml=FEED.replace("      kind: file", "      kind: archive")
+                      .replace("    columns:",
+                               "      member_pattern: '.*\\.csv'\n    columns:"))
+    uninstall(monkey)
+    assert fd.delivery["kind"] == "archive", fd.delivery
+    assert fd.delivery["control"]["row_count"] == "ROWS=(?P<rows>\\d+)", fd.delivery
 
 
 # ---------------------------------------------------------- the normalizer
@@ -192,11 +199,19 @@ def test_is_control_file_recognises_the_shape_not_a_specific_delivery():
     no landed data file to match a stem against yet -- so this checks SHAPE
     (does it look like a control file for this feed?), not that a
     corresponding delivery exists. That correspondence is `_find_control_key`'s
-    job, at normalize time, once both files have actually landed."""
+    job, at normalize time, once both files have actually landed.
+
+    SHAPE INCLUDES THE STEM'S SHAPE. `{stem}` is not a wildcard: a control
+    file's stem is its data file's stem by construction, so `anything.ctl` is
+    not this feed's -- and treating it as such is what made every feed with a
+    `.ctl` claim every `.ctl`. Existence is still not required: the delivery
+    below has not landed and its control file is still recognised.
+    """
     s3, monkey, fd, norm = _setup()
     try:
         assert norm.is_control_file(fd, "MarginCall_20260903.ctl")
-        assert norm.is_control_file(fd, "anything.ctl")
+        assert norm.is_control_file(fd, "MarginCall_20991231.ctl")   # never delivered
+        assert not norm.is_control_file(fd, "anything.ctl")
         assert not norm.is_control_file(fd, "MarginCall_20260903.csv")
     finally:
         uninstall(monkey)
@@ -239,3 +254,134 @@ def test_pending_is_empty_while_awaiting_control():
         assert find_pending(fd) == []
     finally:
         uninstall(monkey)
+
+
+# ============================ two feeds, one control-file suffix ============
+# `{stem}` is not a wildcard: a control file's stem is its DATA file's stem by
+# construction. Substituting `.+` for it made every feed with a `.ctl` claim
+# every `.ctl` at the door, so `route()` refused all of them as ambiguous and
+# both feeds waited for ever on files sitting in `.rejected/`.
+
+TWO_FEEDS = """
+defaults:
+  landing_prefix: landing
+  ready_prefix: ready
+
+feeds:
+  - name: tr_margin
+    description: x
+    source_system: TRS
+    filename_pattern: 'MarginCall_(?P<cob_date>\\d{8})\\.csv'
+    business_key: [k]
+    columns: [k]
+    delivery:
+      kind: file
+      control: {pattern: '{stem}\\.ctl', row_count: 'ROWS=(?P<rows>\\d+)'}
+  - name: cus_position
+    description: x
+    source_system: CUS
+    filename_pattern: 'POS_(?P<cob_date>\\d{8})\\.csv'
+    business_key: [k]
+    columns: [k]
+    delivery:
+      kind: file
+      control: {pattern: '{stem}\\.ctl', row_count: 'ROWS=(?P<rows>\\d+)'}
+"""
+
+
+def _route(feeds_yml, filename):
+    config_dir(feeds_yml)
+    from reporting_platform.ingest import inbox
+    return inbox.route(filename)
+
+
+def test_two_feeds_may_share_a_control_suffix():
+    """The ordinary case, and it used to be unusable: every `.ctl` matched
+    both feeds, so every `.ctl` was rejected as ambiguous."""
+    feed, reason, is_control = _route(TWO_FEEDS, "MarginCall_20260903.ctl")
+    assert feed is not None and feed.name == "tr_margin", reason
+    assert is_control is True
+
+    feed, reason, is_control = _route(TWO_FEEDS, "POS_20260903.ctl")
+    assert feed is not None and feed.name == "cus_position", reason
+    assert is_control is True
+
+
+def test_a_control_file_belonging_to_no_feed_is_unroutable_not_ambiguous():
+    """Two different problems with two different fixes. It used to be claimed
+    by whichever feed happened to declare `.ctl` and landed in that feed's
+    prefix, gating a delivery that will never exist."""
+    feed, reason, _ = _route(TWO_FEEDS, "something_else.ctl")
+    assert feed is None, feed
+    assert "matches no feed" in reason, reason
+
+
+def test_feeds_that_cannot_be_told_apart_are_refused_at_load():
+    """Names differing ONLY by extension: `A_20260903.ctl` could be either
+    feed's, and nothing at the door can decide. The platform cannot handle it,
+    so it must not load -- a build failure, not a Tuesday morning."""
+    undecidable = TWO_FEEDS.replace(
+        "'POS_(?P<cob_date>\\d{8})\\.csv'", "'MarginCall_(?P<cob_date>\\d{8})\\.txt'")
+    msg = _bad(undecidable)
+    assert "can claim the same control file" in msg, msg
+    assert "MarginCall_00000000.ctl" in msg, msg
+    assert "tr_margin" in msg and "cus_position" in msg, msg
+
+
+def test_a_distinct_suffix_makes_that_pair_loadable_again():
+    """The fix the message names, and it has to actually work."""
+    fixed = (TWO_FEEDS
+             .replace("'POS_(?P<cob_date>\\d{8})\\.csv'",
+                      "'MarginCall_(?P<cob_date>\\d{8})\\.txt'")
+             .replace("control: {pattern: '{stem}\\.ctl', row_count: 'ROWS=(?P<rows>\\d+)'}\n"
+                      "  - name: cus_position",
+                      "control: {pattern: '{stem}\\.ctl', row_count: 'ROWS=(?P<rows>\\d+)'}\n"
+                      "  - name: cus_position"))
+    fixed = fixed[:fixed.index("  - name: cus_position")] + \
+        fixed[fixed.index("  - name: cus_position"):].replace("{stem}\\.ctl", "{stem}\\.trl")
+    config_dir(fixed)
+    from reporting_platform.common.context import feeds
+    assert set(feeds()) == {"tr_margin", "cus_position"}
+
+
+def test_a_feed_claiming_every_control_file_is_refused_beside_another():
+    """No literal extension, so no stem shape to test -- it falls back to
+    matching the suffix alone, which is today's behaviour and claims
+    everything. Alone that is fine; beside another control feed it is exactly
+    the collision this refuses."""
+    wildcard = TWO_FEEDS.replace("'POS_(?P<cob_date>\\d{8})\\.csv'",
+                                 "'POS_(?P<cob_date>\\d{8})\\.(csv|txt)'")
+    assert "can claim the same control file" in _bad(wildcard)
+
+
+def test_that_same_feed_loads_on_its_own():
+    """The fallback must not become a refusal for an estate with one
+    control-gated feed -- nothing that loads today may stop loading."""
+    alone = """
+defaults: {landing_prefix: landing, ready_prefix: ready}
+feeds:
+  - name: cus_position
+    description: x
+    source_system: CUS
+    filename_pattern: 'POS_(?P<cob_date>\\d{8})\\.(csv|txt)'
+    business_key: [k]
+    columns: [k]
+    delivery:
+      kind: file
+      control: {pattern: '{stem}\\.ctl', row_count: 'ROWS=(?P<rows>\\d+)'}
+"""
+    config_dir(alone)
+    from reporting_platform.common.context import feeds
+    from reporting_platform.ingest import normalize as norm
+    fd = feeds()["cus_position"]
+    assert norm.is_control_file(fd, "anything.ctl") is True
+
+
+def test_a_date_first_legacy_name_is_still_distinguishable():
+    """A stem starting with the date is an ordinary legacy shape, and a cruder
+    rule -- comparing literal prefixes -- would refuse it for having none."""
+    datefirst = TWO_FEEDS.replace("'POS_(?P<cob_date>\\d{8})\\.csv'",
+                                  "'(?P<cob_date>\\d{8})_positions\\.csv'")
+    config_dir(datefirst)
+    from reporting_platform.common.context import feeds
+    assert set(feeds()) == {"tr_margin", "cus_position"}

@@ -247,6 +247,11 @@ def _arrival_from_payload(raw: Any) -> dict[str, Any]:
                                     ("pattern", "cob_date", "version"))
     if control:
         out["control"] = control
+    archive = raw.get("archive")
+    if isinstance(archive, dict):
+        member_pattern = str(archive.get("member_pattern") or "").strip()
+        if member_pattern:
+            out["archive"] = {"member_pattern": member_pattern}
     # An `arrival:` block with only a control block and no source_pattern is
     # meaningless -- nothing would match it -- and returning {} means a form
     # whose arrival fields are present but unused produces a feed with no
@@ -474,6 +479,25 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
         except ValueError as exc:
             errors["delivery"] = str(exc)
 
+    # ...and whether the REGISTRY can still tell its control files apart, which
+    # is the one rule here that is not about this feed alone.
+    #
+    # THE FORM MUST REFUSE IT BECAUSE `add()` DOES NOT VERIFY. A collision is
+    # refused at load, and load is the whole registry -- so a feed saved with
+    # one would not break itself, it would stop `feeds()` resolving at all,
+    # taking every DAG and every other feed with it until somebody edited YAML
+    # by hand. The same function the loader calls, over the registry this feed
+    # is about to join.
+    if not errors:
+        from reporting_platform.common import context
+
+        try:
+            others = {n: f for n, f in context.feeds().items() if n != spec.name}
+            others[spec.name] = _as_feed(spec)
+            context.check_control_patterns_are_distinguishable(others)
+        except ValueError as exc:
+            errors["delivery"] = str(exc)
+
     if not spec.columns:
         errors["columns"] = "at least one column is required"
     else:
@@ -612,6 +636,18 @@ def _arrival_block(value: dict[str, Any]) -> CommentedMap:
     control = value.get("control")
     if isinstance(control, dict) and control:
         av["control"] = _control_block(control, ("cob_date", "version"))
+    # WRITTEN BACK, and its absence here was a silent edit. `spec_from_feed`
+    # hands over the resolved arrival block, archive and all, so an
+    # `arrival.archive` this did not write was DROPPED by any edit made
+    # through the console -- turning a feed whose deliveries are unpacked at
+    # the door into one that expects a conformant CSV. The save then failed
+    # validation for a reason ("no way to find the COB date") that named
+    # neither the archive block nor the edit that removed it.
+    archive = value.get("archive")
+    if isinstance(archive, dict) and archive.get("member_pattern"):
+        aa = CommentedMap()
+        aa["member_pattern"] = SQ(archive["member_pattern"])
+        av["archive"] = aa
     return av
 
 
@@ -829,6 +865,27 @@ def remove(name: str) -> None:
     if not path.is_file():
         raise FeedValidationError({"name": f"no such feed: {name!r}"})
     path.unlink()
+
+
+def _as_feed(spec: FeedSpec) -> Feed:
+    """The prospective feed as a `Feed`, for the checks that need the registry.
+
+    Only the fields those checks read are resolved -- the patterns and the two
+    control blocks. It is NOT the feed `feeds()` would build (no convention
+    merge, no defaults), and nothing but a cross-feed check should take one:
+    the loader stays the authority on what a saved feed resolves to.
+    """
+    from reporting_platform.common import context
+
+    return Feed(
+        name=spec.name, description=spec.description,
+        source_system=spec.source_system,
+        filename_pattern=spec.filename_pattern,
+        business_key=list(spec.business_key), columns=list(spec.columns),
+        arrival=context.resolve_arrival_config(spec.name or "(unnamed)",
+                                               spec.arrival),
+        delivery=context.resolve_delivery_config(spec.name or "(unnamed)",
+                                                 spec.delivery))
 
 
 def spec_from_feed(fd: Feed) -> FeedSpec:

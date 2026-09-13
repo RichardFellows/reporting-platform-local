@@ -163,6 +163,15 @@ Shapes and mechanism: `docs/DELIVERY-SHAPES.md`,
 - **An identity failure is QUARANTINED to `.rejected/`; an integrity failure
   LANDS and fails at ingest** — landing is the evidence copy, and a bad
   delivery is what it exists to prove.
+- **`{stem}` IS NOT A WILDCARD: a control file is attributed by its stem**,
+  which is its data file's stem by construction. Two feeds may both send
+  `.ctl`; two feeds whose data names differ only by EXTENSION cannot be told
+  apart at the door and are refused at LOAD (so `config check`, so CI) rather
+  than having every control file they send rejected as ambiguous for ever. A
+  `.ctl` whose stem matches no feed's data names is unroutable, not claimed by
+  whoever happened to declare the suffix. `sample_name`/`stem_pattern` READ a
+  pattern where `render_filename` BUILDS one, which is why they are permissive
+  where it refuses. (`#a-control-file-is-attributed-by-its-stem`)
 - **HOW a control file is read is `control.format`; WHAT is read out of it is
   the fields.** The default is `regex` -- a pattern per field over the whole
   text -- and `delimited` makes every field a COLUMN NAME instead, for a
@@ -172,11 +181,33 @@ Shapes and mechanism: `docs/DELIVERY-SHAPES.md`,
   refuses otherwise; `delimiter` is required and never inherited from the
   feed's own, because pipes read as commas is not an error, it is one column
   named by the whole header line. (`#control-file-formats`)
-- **A zip is unpacked AT THE GATE** (`arrival.archive.member_pattern`): one
-  file in, N ordinary deliveries out, container never landed but recorded in
-  each member's metadata. Each member carries its own COB date; members that
-  are *parts* of one date are NOT BUILT here. So `landing/` holds only objects
-  Spark can read.
+- **THERE ARE TWO ZIP MECHANISMS AND THE COB DATE PICKS ONE.** On each
+  member: `arrival.archive.member_pattern`, unpacked AT THE GATE — one file
+  in, N ordinary deliveries out, container never landed but recorded in each
+  member's metadata, so `landing/` holds only objects Spark can read. On the
+  container: `delivery.kind: archive`, the zip LANDS and `normalize` explodes
+  it into `ready/` as the parts of ONE delivery. Neither source, or both, is
+  refused at load.
+- **A member may carry its own control file inside the container**
+  (`arrival.control` + `arrival.archive`), which is how statically named
+  members get dated; both are promoted, renamed, and verified at ingest by
+  `delivery.control` like any other pair. A member's control file MISSING from
+  the container is a refusal, not a wait — a container arrives complete. This
+  combination used to load and then wait for ever in silence.
+  (`#unpacking-happens-at-the-gate`)
+- **`delivery.control` gates EITHER kind.** For an archive, `row_count` is the
+  total across the members and `md5` is the CONTAINER's — the object the
+  sender hashed. The manifest's `checksum_objects` says which objects a
+  declared md5 covers, so `ingest_feed` verifies both kinds through one path
+  and never branches on the kind; `ui/arrivals.checks()` depends on the same
+  invariant. (`#control-file-gate`)
+- **A DELIVERY SHAPE IS A REGISTRY ENTRY, not a branch**:
+  `conform.ARRIVAL_SHAPES` at the door (pure planners returning
+  `Planned`/`Refused`/`Duplicate`/`Waiting` — `inbox.py` dispatches on those
+  four and nothing else) and `normalize.NORMALIZERS` on the landing side, with
+  `normalize._gate` shared so any new normalizer inherits control-file gating.
+  A new shape that needs a fifth outcome type is asking the watcher for
+  something it cannot do. (`#a-delivery-shape-is-a-registry-entry`)
 - **`landing/` is the evidence copy; `ready/` is the work queue.** A
   **normalize** stage turns a delivery into a MANIFEST — COB date, the objects
   holding the rows, delimiter/quoting/encoding — which is what `ingest`

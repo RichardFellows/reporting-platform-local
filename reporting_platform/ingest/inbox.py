@@ -347,12 +347,7 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
         # Already-conformant names take the plain path even for a feed that
         # HAS an arrival block -- see route()'s docstring.
         if feed.needs_conforming and feed.parse_filename(path.name) is None:
-            if conform.is_archive(feed):
-                results.extend(_promote_archive(feed, path, seen))
-                continue
-            outcome = _promote(feed, path, seen)
-            if outcome is not None:
-                results.append(outcome)
+            results.extend(_promote(feed, path, seen))
             continue
 
         try:
@@ -384,232 +379,174 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
 
 
 def _promote(feed: Feed, path: Path,
-             seen: dict[str, tuple[int, float, int]]) -> dict | None:
-    """Run one legacy delivery through the conformance gate.
+             seen: dict[str, tuple[int, float, int]]) -> list[dict]:
+    """Run one inbox file through the conformance gate and write what it says.
 
-    Returns the outcome, or None when the delivery is simply not ready yet and
-    nothing should be reported -- `NotReady` is the ordinary case this whole
-    mechanism exists for, and reporting it every few seconds would bury the
-    outcomes that matter.
+    ONE WRITER FOR EVERY ARRIVAL SHAPE. What a file BECOMES is
+    `conform.plan_arrival`'s answer -- one delivery for a plain file, N for an
+    archive, and whatever a shape added later returns; what happens to the
+    objects and to the inbox copy is decided here, once. There were two of
+    these functions, a plain one and an archive one, and they had already
+    drifted: one treated a missing control file as a wait and the other could
+    not express the idea at all, and the write order was written down twice.
 
-    THREE OBJECTS GO TO LANDING, not one: the renamed data file, the renamed
-    control file, and the metadata sibling. The delivery is the data file and
-    its control file together, so landing holds the pair -- which is what lets
-    `delivery.control` verify it there exactly as it verifies a delivery an
-    approved sender wrote straight into the bucket. Nothing is consumed here.
+    ORDER OF WRITES, per delivery: control file, then data file, then
+    metadata. The data file is what a triggered run acts on, so writing it
+    after its control file means a run can never find a delivery whose control
+    file has not arrived yet. If the metadata write then fails, the delivery
+    is complete and will ingest with its provenance missing -- the failure to
+    prefer over the reverse. Originals stay in the inbox on any failure, so
+    the next pass retries; every write is a PutObject to a derived key, so a
+    retry overwrites rather than duplicating.
 
-    ORDER OF WRITES: control file, then data file, then metadata. The data
-    file is what a triggered run acts on, so writing it last means a run can
-    never find a delivery whose control file has not arrived yet. If the
-    metadata write then fails, the delivery is complete and will ingest with
-    its provenance missing -- the failure to prefer over the reverse.
-    Originals stay in the inbox on any failure, so the next pass retries;
-    every write is a PutObject to a derived key, so a retry overwrites rather
-    than duplicating.
+    THE INBOX COPY MOVES LAST, and where it moves is decided from the outcomes
+    as a whole: `.rejected/` if the file itself could not be named,
+    `.processed/` if anything at all came of it, and nowhere if it is merely
+    waiting or if every write failed.
     """
-    control_name = conform.find_control(
-        feed, path.name, [p.name for p in INBOX.iterdir() if not _skip(p)])
-    control_path = INBOX / control_name if control_name else None
-    control_text = None
-    if control_path is not None:
-        try:
-            control_text = control_path.read_text(
-                encoding=feed.file_encoding, errors="replace")
-        except OSError as exc:
-            log.error("cannot read control file %s: %s", control_name, exc)
-            return {"file": path.name, "status": "control unreadable",
-                    "feed": feed.name, "error": str(exc)[:300]}
-
     content = path.read_bytes()
+    received = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    inbox_names = [p.name for p in INBOX.iterdir() if not _skip(p)]
+
+    def _read_sibling(name: str) -> bytes:
+        return (INBOX / name).read_bytes()
+
     landed = list_landing(feed)
     try:
-        plan = conform.conform(
+        outcomes = conform.plan_arrival(
             feed, path.name, content,
-            control_filename=control_name,
-            control_text=control_text,
-            received_at=datetime.fromtimestamp(path.stat().st_mtime,
-                                               tz=timezone.utc),
+            siblings=conform.Siblings(names=inbox_names, read=_read_sibling),
+            received_at=received,
             # A re-delivery for a date already landed must not overwrite the
             # original -- landing is the evidence copy. The listing is what
-            # lets the gate pick the next free `_vN`.
+            # lets the gate pick the next free `_vN`...
             taken={k.rsplit("/", 1)[-1] for k in landed},
             # ...and this is what stops it picking one for a delivery that is
             # not a re-delivery at all, only the same file sent twice.
             landed_md5=landed_md5_lookup(feed, landed))
-    except conform.NotReady as exc:
-        log.debug("%s", exc)
-        return None
-    except conform.DuplicateDelivery as exc:
-        # NOT a rejection. The delivery is already landed and already
-        # ingested; there is nothing to write and nothing to trigger. The inbox
-        # copy still moves to `.processed/`, where `_move` timestamps a
-        # colliding name, so the resend stays on disk as evidence it happened
-        # -- it is simply not evidence of a new delivery.
-        log.info("%s", exc)
-        _move(path, PROCESSED, feed.name)
-        if control_path is not None and control_path.exists():
-            _move(control_path, PROCESSED, feed.name)
-            seen.pop(control_name, None)
-        seen.pop(path.name, None)
-        return {"file": path.name, "status": "duplicate", "feed": feed.name,
-                "landed_as": exc.landing_filename, "reason": str(exc)}
-    except conform.ConformanceError as exc:
-        # AN IDENTITY FAILURE, and the only kind that can happen here. The
-        # delivery cannot be NAMED -- no COB date, or a pattern no concrete
-        # filename can be built from -- so there is no landing key to write it
-        # to and no amount of waiting fixes it. Content failures are not
-        # checked here at all: they land and the ingest refuses.
-        log.warning("rejecting %s: %s", path.name, exc)
-        _quarantine(feed, path, "identity", str(exc))
-        _move(path, REJECTED)
-        if control_path is not None and control_path.exists():
-            # The control file is quarantined with the delivery it gates: on
-            # its own it is unreadable evidence, and the commonest identity
-            # failure is that the two disagree.
-            _quarantine(feed, control_path, "identity",
-                        f"control file for {path.name}: {exc}")
-            _move(control_path, REJECTED)
-        seen.pop(path.name, None)
-        return {"file": path.name, "status": "rejected", "feed": feed.name,
-                "reason": str(exc)}
+    except OSError as exc:
+        # Reading a sibling the planner asked for. Left in place: the next
+        # pass retries, and a half-read control file must not land a delivery.
+        log.error("cannot read a file %s needs: %s", path.name, exc)
+        return [{"file": path.name, "status": "control unreadable",
+                 "feed": feed.name, "error": str(exc)[:300]}]
 
-    try:
-        if plan["control_landing_filename"] and control_text is not None:
-            put_landing_bytes(feed, plan["control_landing_filename"],
-                              control_path.read_bytes())
-        key = put_landing_bytes(feed, plan["landing_filename"], content)
-        put_landing_bytes(feed, plan["metadata_filename"],
-                          conform.metadata_bytes(plan["metadata"]),
-                          content_type="application/json")
-    except Exception as exc:                            # noqa: BLE001
-        log.error("upload failed for %s: %s", path.name, str(exc)[:300])
-        return {"file": path.name, "status": "upload failed",
-                "feed": feed.name, "error": str(exc)[:300]}
+    results: list[dict] = []
+    consumed: set[str] = set()
+    written, refused_itself, failed = 0, False, 0
+    refusal_reason = ""
 
-    moved = _move(path, PROCESSED, feed.name)
-    if control_path is not None and control_path.exists():
-        _move(control_path, PROCESSED, feed.name)
-        seen.pop(control_name, None)
-    seen.pop(path.name, None)
+    for outcome in outcomes:
+        consumed.update(getattr(outcome, "consumed", ()))
 
-    outcome = {"file": path.name, "status": "conformed", "feed": feed.name,
-               "key": key, "landed_as": plan["landing_filename"],
-               "control_landed_as": plan["control_landing_filename"],
-               "cob_date": plan["cob_date"].isoformat(),
-               "moved_to": str(moved.relative_to(INBOX))}
-    outcome.update(_trigger(feed, key))
-    log.info("conformed %s -> %s (%s)%s", path.name, key,
-             plan["cob_date"].isoformat(),
-             "" if outcome.get("triggered") else
-             f" (NOT triggered: {outcome.get('reason')})")
-    return outcome
+        if isinstance(outcome, conform.Waiting):
+            # The ordinary case this whole mechanism exists for. Reported at
+            # DEBUG and not in the results: on every poll it would bury the
+            # outcomes that matter.
+            log.debug("%s", outcome.reason)
+            continue
 
+        if isinstance(outcome, conform.Duplicate):
+            # NOT a rejection. The delivery is already landed and already
+            # ingested; there is nothing to write and nothing to trigger.
+            log.info("%s", outcome.reason)
+            written += 1
+            results.append({"file": outcome.source_name, "status": "duplicate",
+                            "feed": feed.name,
+                            "landed_as": outcome.landing_filename,
+                            "reason": outcome.reason})
+            continue
 
-def _promote_archive(feed: Feed, path: Path,
-                     seen: dict[str, tuple[int, float, int]]) -> list[dict]:
-    """Unpack one container and land every member as its own delivery.
+        if isinstance(outcome, conform.Refused):
+            # AN IDENTITY FAILURE, and the only kind that can happen here. The
+            # delivery cannot be NAMED -- no COB date, or a control file that
+            # does not say what it was configured to say -- so there is no
+            # landing key to write it to and no amount of waiting fixes it.
+            # Content failures are not checked here at all: they land and the
+            # ingest refuses.
+            log.warning("rejecting %s: %s", outcome.source_name, outcome.reason)
+            if outcome.source_name == path.name:
+                refused_itself, refusal_reason = True, outcome.reason
+                _quarantine(feed, path, "identity", outcome.reason)
+            else:
+                # THE MEMBER'S OWN BYTES, not the container's. The container is
+                # never landed -- the members are the deliveries -- so
+                # quarantining the whole archive would keep the nineteen good
+                # members alongside the one bad one and make the evidence
+                # harder to read. The container is named in the reason instead.
+                from reporting_platform.registry.rejections import (
+                    quarantine_quietly,
+                )
+                quarantine_quietly(feed, outcome.source_name, outcome.data,
+                                   reason_class="member",
+                                   reason=outcome.reason, received_at=received)
+            results.append({"file": outcome.source_name, "status": "rejected",
+                            "feed": feed.name, "reason": outcome.reason})
+            continue
 
-    ONE INBOX FILE BECOMES N LANDED DELIVERIES. That is the whole idea: a zip
-    is a transport wrapper, the gate removes it, and every member then follows
-    the ordinary single-file path -- so `landing/` holds only objects Spark can
-    read, and no stage downstream needs to know an archive was ever involved.
-
-    The container itself is NOT landed. The members are byte-for-byte what the
-    upstream sent; the metadata records the container's name, size and md5, so
-    what arrived stays provable without keeping an object nothing reads.
-
-    `taken` is advanced as members land, not read once: two members for the
-    same COB date inside one zip would otherwise both render the
-    unversioned name and the second would overwrite the first.
-
-    A CONTAINER RESENT WHOLE is the commonest duplicate here, and it is the
-    expensive one: without the md5 check every member restates its own
-    COB date at once. Duplicates count as HANDLED -- if they did not, a
-    zip whose members are all already landed would find nothing to land, stay
-    in the inbox, and be unpacked again on every pass forever.
-    """
-    content = path.read_bytes()
-    received = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    try:
-        members = conform.unpack(feed, path.name, content)
-    except conform.ConformanceError as exc:
-        log.warning("rejecting %s: %s", path.name, exc)
-        _quarantine(feed, path, "identity", str(exc))
-        _move(path, REJECTED)
-        seen.pop(path.name, None)
-        return [{"file": path.name, "status": "rejected", "feed": feed.name,
-                 "reason": str(exc)}]
-
-    landing_keys = list_landing(feed)
-    taken = {k.rsplit("/", 1)[-1] for k in landing_keys}
-    landed_md5 = landed_md5_lookup(feed, landing_keys)
-    results, landed, duplicates = [], [], 0
-    for member_name, member_bytes in members:
         try:
-            plan = conform.conform_member(
-                feed, path.name, content, member_name, member_bytes,
-                received_at=received, taken=taken, landed_md5=landed_md5)
-            key = put_landing_bytes(feed, plan["landing_filename"], member_bytes)
-            put_landing_bytes(feed, plan["metadata_filename"],
-                              conform.metadata_bytes(plan["metadata"]),
+            if outcome.control is not None and outcome.control_landing_filename:
+                put_landing_bytes(feed, outcome.control_landing_filename,
+                                  outcome.control)
+            key = put_landing_bytes(feed, outcome.landing_filename, outcome.data)
+            put_landing_bytes(feed, outcome.metadata_filename,
+                              conform.metadata_bytes(outcome.metadata),
                               content_type="application/json")
-        except conform.DuplicateDelivery as exc:
-            log.info("%s member %s: %s", path.name, member_name, exc)
-            duplicates += 1
-            results.append({"file": f"{path.name}!{member_name}",
-                            "status": "duplicate", "feed": feed.name,
-                            "landed_as": exc.landing_filename,
-                            "reason": str(exc)})
-            continue
-        except conform.ConformanceError as exc:
-            # ONE BAD MEMBER DOES NOT DISCARD THE REST. The others are real
-            # deliveries that arrived and can be ingested; reporting the
-            # failure and continuing beats rejecting a whole week of files
-            # because one of them is misnamed.
-            log.warning("%s member %s rejected: %s", path.name, member_name, exc)
-            # THE MEMBER'S OWN BYTES, not the container's. The container is
-            # never landed -- the members are the deliveries -- so quarantining
-            # the zip would keep the nineteen good members alongside the one
-            # bad one and make the evidence harder to read. The container is
-            # named in the reason instead.
-            from reporting_platform.registry.rejections import quarantine_quietly
-            quarantine_quietly(
-                feed, f"{path.name}!{member_name}", member_bytes,
-                reason_class="member",
-                reason=f"member of {path.name}: {exc}", received_at=received)
-            results.append({"file": f"{path.name}!{member_name}",
-                            "status": "rejected", "feed": feed.name,
-                            "reason": str(exc)})
-            continue
-        except Exception as exc:                        # noqa: BLE001
-            log.error("upload failed for %s!%s: %s", path.name, member_name,
+        except Exception as exc:                            # noqa: BLE001
+            log.error("upload failed for %s: %s", outcome.source_name,
                       str(exc)[:300])
-            results.append({"file": f"{path.name}!{member_name}",
+            failed += 1
+            results.append({"file": outcome.source_name,
                             "status": "upload failed", "feed": feed.name,
                             "error": str(exc)[:300]})
             continue
-        taken.add(plan["landing_filename"])
-        landed.append((member_name, plan, key))
 
-    if not landed and not duplicates:
-        # Nothing reached landing and nothing was already there, so the
-        # container is still worth another pass or an operator's attention --
-        # leave it where it is.
+        written += 1
+        results.append({"file": outcome.source_name, "status": "conformed",
+                        "feed": feed.name, "key": key,
+                        "landed_as": outcome.landing_filename,
+                        "control_landed_as": outcome.control_landing_filename,
+                        "cob_date": outcome.cob_date.isoformat()})
+
+    # WHERE THE INBOX COPY GOES, from the outcomes as a whole.
+    if refused_itself:
+        destination = REJECTED
+    elif written:
+        destination = PROCESSED
+    else:
+        # Waiting on a control file, or every write failed. Either way the file
+        # is still worth another pass, so it stays exactly where it is.
         return results
 
-    moved = _move(path, PROCESSED, feed.name)
+    moved = _move(path, destination, None if refused_itself else feed.name)
     seen.pop(path.name, None)
-    for member_name, plan, key in landed:
-        outcome = {"file": f"{path.name}!{member_name}", "status": "conformed",
-                   "feed": feed.name, "key": key,
-                   "landed_as": plan["landing_filename"],
-                   "cob_date": plan["cob_date"].isoformat(),
-                   "moved_to": str(moved.relative_to(INBOX))}
-        outcome.update(_trigger(feed, key))
-        results.append(outcome)
-    log.info("unpacked %s -> %d delivery(ies) for %s%s", path.name, len(landed),
-             feed.name,
-             f" ({duplicates} already landed, skipped)" if duplicates else "")
+    for name in sorted(consumed):
+        sibling = INBOX / name
+        if not sibling.is_file():
+            continue
+        if refused_itself:
+            # Quarantined with the delivery it gates: on its own a control
+            # file is unreadable evidence, and the commonest identity failure
+            # is that the two disagree.
+            _quarantine(feed, sibling, "identity",
+                        f"control file for {path.name}: {refusal_reason}")
+        _move(sibling, destination, None if refused_itself else feed.name)
+        seen.pop(name, None)
+
+    # THE TRIGGER COMES AFTER THE MOVE -- see the module docstring. One run per
+    # delivery that actually landed; a duplicate names nothing new to ingest.
+    for result in results:
+        if result["status"] != "conformed":
+            continue
+        result["moved_to"] = str(moved.relative_to(INBOX))
+        result.update(_trigger(feed, result["key"]))
+        log.info("conformed %s -> %s (%s)%s", result["file"], result["key"],
+                 result["cob_date"],
+                 "" if result.get("triggered") else
+                 f" (NOT triggered: {result.get('reason')})")
+    if failed:
+        log.warning("%s: %d delivery(ies) could not be written; the inbox copy "
+                    "was moved because others were", path.name, failed)
     return results
 
 

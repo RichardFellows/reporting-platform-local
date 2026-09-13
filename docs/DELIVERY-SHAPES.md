@@ -471,7 +471,19 @@ delivery:
   member_pattern: '.*\.csv'   # which members belong to this feed
   cob_date_from: container   # container | member | path -- only container is built
   parts: concat               # concat | separate -- only concat is built
+  control:                    # optional, and it gates the CONTAINER -- see §4
+    pattern: '{stem}\.ctl'
+    row_count: 'ROWS=(?P<rows>\d+)'   # the TOTAL across the members
+    md5: 'MD5=(?P<md5>[0-9a-fA-F]{32})'   # the CONTAINER's own checksum
 ```
+
+**This is the shape for statically named members with a date on the
+container.** For the other arrangement — members that each carry their own
+date, or their own control file — the container is a transport wrapper and is
+unpacked at the door instead (`arrival.archive`, §"Unpacking at the gate" and
+[DECISIONS.md#unpacking-happens-at-the-gate](DECISIONS.md#unpacking-happens-at-the-gate)).
+Which of the two a feed wants is decided by **where the COB date is**, and the
+loader refuses the combinations that cannot answer that.
 
 The normalizer reads the container from `landing/`, explodes matching members
 into `ready/<feed>/<stem>/`, and writes one manifest whose `parts` list them.
@@ -525,8 +537,14 @@ the only place a control file is parsed, for either block and either format.
 See [DECISIONS.md#control-file-formats](DECISIONS.md#control-file-formats)
 for the refusals and what each one prevents.
 
-Only on top of `kind: file`; combining `control:` with `kind: archive` is
-rejected at load as NOT BUILT, alongside archive's own unbuilt corners.
+**On top of either kind.** `control:` with `kind: archive` gates the
+container: the control file sits beside the zip in `landing/`, `row_count` is
+the total across the members (what ingest counts once the parts are unioned)
+and `md5` is the **container's own**, because that is the object the sender
+hashed — the members are this platform's extraction and no checksum the
+sender could write would describe them. Which object a declared checksum
+covers is recorded per delivery in the manifest's `checksum_objects`, so
+ingest verifies both kinds through one code path.
 `normalize()` will not emit a manifest until a sibling in the same landing
 folder matches `pattern`, and reads `declared_row_count` out of it where
 `row_count` is set. A missing control file raises `NotReady`, a new

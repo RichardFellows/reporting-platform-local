@@ -499,14 +499,17 @@ def resolve_delivery_config(feed_name: str, delivery: Any) -> dict[str, Any]:
             f"`kind: {out['kind']}`. It is only read for archives, so leaving "
             f"it here would suggest a filter that never runs.")
 
+    # READ FOR EVERY KIND. It gates the LANDED delivery, and what a delivery
+    # is differs per kind without changing what the gate means: for
+    # `kind: file` the control file sits beside the CSV and describes it; for
+    # `kind: archive` it sits beside the CONTAINER and describes the delivery
+    # the container becomes -- `row_count` the total across its members,
+    # `md5` the container's own, because the container is the object the
+    # sender hashed and the members are something this platform extracted.
+    # `normalize` records which object the declared checksum covers
+    # (`checksum_objects`) so ingest never has to branch on the kind.
     control = delivery.get("control")
     if control is not None:
-        if out["kind"] != "file":
-            raise ValueError(
-                f"{where(feed_name)}: sets `delivery.control` with "
-                f"`kind: {out['kind']}`. Gating an archive on a control file "
-                f"is described in docs/DELIVERY-SHAPES.md but NOT BUILT -- "
-                f"only `kind: file` reads `control:`.")
         out["control"] = _resolve_control(feed_name, control)
     return out
 
@@ -1024,11 +1027,34 @@ def resolve_arrival_config(feed_name: str, arrival: Any,
 
     # EXACTLY ONE SOURCE FOR THE COB DATE. Neither, and the gate cannot name
     # the file it is meant to produce; both, and one fact has two sources that
-    # can disagree. AN ARCHIVE IS THE THIRD CASE: each member is its own
-    # delivery carrying its own date, so `member_pattern` supplies it and the
-    # container needs none. A container may still carry one and it is simply
-    # not read, so this rule stops short of forbidding it.
+    # can disagree.
+    #
+    # AN ARCHIVE ASKS THE SAME QUESTION OF A DIFFERENT NAME. Each member is
+    # its own delivery carrying its own date, so the pair is `member_pattern`
+    # and the member's own control file -- and the CONTAINER's name is not a
+    # source either way. A container may still carry a date and it is simply
+    # not read, which is why `source_pattern` is not consulted here.
     if "archive" in out:
+        in_name = "cob_date" in re.compile(
+            out["archive"]["member_pattern"]).groupindex
+        in_control = "cob_date" in out.get("control", {})
+        if in_name and in_control:
+            raise ValueError(
+                f"{where(feed_name)}: takes each member's COB date from both "
+                f"`arrival.archive.member_pattern` and "
+                f"`arrival.control.cob_date`. One fact, one source -- drop "
+                f"whichever is not the real one.")
+        if not in_name and not in_control:
+            raise ValueError(
+                f"{where(feed_name)}: `arrival.archive.member_pattern` "
+                f"{out['archive']['member_pattern']!r} captures no "
+                f"(?P<cob_date>...) and there is no `arrival.control.cob_date` "
+                f"to read one out of a member's control file. Each member is "
+                f"landed as its own delivery, so each must say which day it "
+                f"is for -- from its name, or from a control file packed "
+                f"beside it. A date on the CONTAINER instead would mean the "
+                f"members are parts of one delivery, which is `delivery.kind: "
+                f"archive`, not this.")
         return _finish_arrival(feed_name, out, filename_pattern)
 
     in_name = "cob_date" in compiled.groupindex
@@ -1079,9 +1105,11 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
     unpacked at the door and its MEMBERS land as ordinary deliveries, so
     `landing/` never holds an archive and nothing downstream reads one.
 
-    Each member is a complete delivery for its own COB date, which is why
-    `member_pattern` must capture one: unpacking turns one inbox file into N,
-    each following the ordinary single-file path with no grouping.
+    Each member is a complete delivery for its own COB date. WHERE that date
+    comes from is not decided here: `member_pattern` may capture it, or a
+    control file packed beside the member may declare it. That is one rule
+    with two blocks in it, so it lives in `resolve_arrival_config` where both
+    are visible -- the same place the equivalent rule for a plain file lives.
     """
     if not isinstance(archive, dict):
         raise ValueError(
@@ -1102,19 +1130,11 @@ def _resolve_arrival_archive(feed_name: str, archive: Any) -> dict[str, str]:
             f"another feed's file alongside the data, and a wrong guess would "
             f"silently land the wrong files.")
     try:
-        compiled = re.compile(pattern)
+        re.compile(pattern)
     except re.error as exc:
         raise ValueError(
             f"{where(feed_name)}: `arrival.archive.member_pattern` "
             f"is not a valid regex: {exc}") from exc
-    if "cob_date" not in compiled.groupindex:
-        raise ValueError(
-            f"{where(feed_name)}: `arrival.archive.member_pattern` "
-            f"{pattern!r} captures no (?P<cob_date>...). Each member is "
-            f"landed as its own delivery, so each must say which day it is "
-            f"for -- a date on the CONTAINER instead would mean the members "
-            f"are parts of one delivery, which is a different shape and is "
-            f"not built.")
     return {"member_pattern": pattern}
 
 
@@ -1233,6 +1253,69 @@ def check_gates_are_coherent(feed_name: str, arrival: dict[str, Any],
                 f"control file into landing/ unchanged, so both blocks parse "
                 f"the same bytes and only one of these can be the file the "
                 f"sender writes.")
+
+
+# ------------------------------------- control files must be attributable
+def check_control_patterns_are_distinguishable(registry: dict[str, Any]) -> None:
+    """No two feeds may claim the same control filename. Refused at LOAD.
+
+    THE ONE ROUTING QUESTION THAT CANNOT BE ANSWERED LATER. A control file
+    names no COB date and matches no `filename_pattern`; all the door has to
+    go on is its name. If two feeds could both own that name, `route()` has
+    nothing left to decide with -- it refuses the file as ambiguous, and BOTH
+    feeds then wait for ever on control files sitting in `.rejected/`, at
+    INFO, with each delivery reported as merely awaiting its control file.
+
+    So it is refused here instead, where the fix is a one-line config edit and
+    the failure is a build failure rather than a Tuesday morning. This is the
+    same argument `check_gates_are_coherent` makes: a combination the platform
+    cannot execute must not be loadable.
+
+    HOW IT DECIDES. Each feed's control filenames are its own data-name stems
+    plus a suffix, so a representative one can be built and offered to every
+    feed's `claims_control_file`. Two claimants is a collision. A feed whose
+    data pattern has no literal extension claims control files by suffix alone
+    -- it is a wildcard, and this catches it the moment any other feed
+    declares a control block, which is right: at the door it genuinely cannot
+    be told apart.
+
+    WHAT IT DOES NOT PROVE. `sample_name` produces ONE representative name per
+    pattern, so two feeds whose names overlap only somewhere that sample does
+    not land are not detected. Detecting those means intersecting two regular
+    languages, which is a great deal of machinery for a case no real
+    onboarding produces; the realistic collision -- two source systems that
+    both send `.ctl` -- always lands on the sample.
+    """
+    # Imported here, not at module scope: `filenames` imports `Feed` from this
+    # module, so a top-level import either way round is a cycle.
+    from reporting_platform.common.filenames import (
+        claims_control_file, example_control_file,
+    )
+
+    probes: list[tuple[str, str, str]] = []          # (feed, block, filename)
+    for name, fd in registry.items():
+        for block in ("arrival", "delivery"):
+            example = example_control_file(fd, block)
+            if example:
+                probes.append((name, block, example))
+
+    for owner, block, filename in probes:
+        claimants = sorted(n for n, fd in registry.items()
+                           if claims_control_file(fd, filename, "arrival")
+                           or claims_control_file(fd, filename, "delivery"))
+        if len(claimants) > 1:
+            others = [n for n in claimants if n != owner]
+            raise ValueError(
+                f"{where(owner)}: its `{block}.control.pattern` and "
+                f"{', '.join(where(n) for n in others)} can claim the same "
+                f"control file. A name of the form {filename!r} would match "
+                f"{' and '.join(claimants)}, and a control file names no COB "
+                f"date and matches no filename_pattern, so its name is all "
+                f"the inbox has to attribute it with -- it would be rejected "
+                f"as ambiguous and every delivery it gates would wait for "
+                f"ever. Give each source system's control files a "
+                f"distinguishable suffix (`.ctl`, `.trl`, `.done`), or make "
+                f"the feeds' own filenames distinguishable.")
 
 
 # A convention may set anything a feed block may, EXCEPT these two.
@@ -1419,6 +1502,10 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
         merged["source_columns"] = {**sources, **(merged.get("source_columns") or {})}
         allowed = {f.name for f in Feed.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         out[block["name"]] = Feed(**{k: v for k, v in merged.items() if k in allowed})
+    # AFTER THE LOOP, because it is the first rule here that is about the
+    # registry rather than about a feed: whether two feeds can be told apart
+    # is not a question either of them can answer alone.
+    check_control_patterns_are_distinguishable(out)
     return out
 
 

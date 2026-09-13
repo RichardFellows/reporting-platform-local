@@ -108,22 +108,18 @@ def test_plain_feed_writes_no_delivery_key_at_all():
 
 
 # --------------------------------------------------------- validation reuse
-def test_validate_rejects_control_combined_with_archive():
-    """The SAME function feeds.yml load calls, not a second copy of the
-    rules -- this asserts the reuse, not the rule (tests/test_control.py
-    already covers the rule itself)."""
+def test_validate_accepts_control_combined_with_archive():
+    """The SAME function feeds.yml load calls, not a second copy of the rules
+    -- this asserts the reuse, not the rule (tests/test_control.py covers the
+    rule itself). A container gated on a control file is built now, so the
+    form has to accept what the loader accepts."""
     _, registry = _setup()
-    bad = {**ARCHIVE_PAYLOAD,
-          "delivery": {"kind": "archive", "member_pattern": "x",
-                       "control": {"pattern": r"{stem}\.ctl"}}}
-    spec = registry.FeedSpec.from_payload(bad)
-    try:
-        registry.validate(spec, existing=set())
-    except registry.FeedValidationError as exc:
-        assert "delivery" in exc.errors, exc.errors
-        assert "NOT BUILT" in exc.errors["delivery"], exc.errors
-    else:
-        raise AssertionError("expected FeedValidationError")
+    payload = {**ARCHIVE_PAYLOAD,
+               "delivery": {"kind": "archive", "member_pattern": r".*\.csv",
+                            "control": {"pattern": r"{stem}\.ctl",
+                                        "row_count": r"ROWS=(?P<rows>\d+)"}}}
+    spec = registry.FeedSpec.from_payload(payload)
+    registry.validate(spec, existing=set())          # no raise
 
 
 def test_validate_rejects_archive_with_no_member_pattern():
@@ -299,3 +295,161 @@ def test_validate_reports_a_bad_format_against_the_form():
         assert "delimiter" in exc.errors["delivery"], exc.errors
     else:
         raise AssertionError("expected FeedValidationError")
+
+
+# ------------------------------------------- a zip unpacked at the door -----
+# `arrival.archive` had NO round trip at all: `_arrival_block` never wrote it,
+# so editing an archive feed through the console dropped the block and turned
+# a feed whose deliveries are unpacked at the door into one expecting a
+# conformant CSV. The save then failed validation for a reason ("no way to
+# find the COB date") that named neither the archive block nor the edit.
+
+GATE_ARCHIVE_PAYLOAD = {
+    "name": "cus_weekly",
+    "description": "A weekly zip holding one complete file per COB date.",
+    "source_system": "CUS",
+    "filename_pattern": r"cus_weekly_(?P<cob_date>\d{8})\.csv",
+    "business_key": ["position_id"],
+    "columns": ["position_id", "quantity"],
+    "arrival": {"source_pattern": r"weekly_\d{8}\.zip",
+                "archive": {"member_pattern": r"POS_(?P<cob_date>\d{8})\.csv"}},
+}
+
+
+def test_an_archive_gate_feed_creates_and_loads_correctly():
+    d, registry = _setup()
+    spec = registry.FeedSpec.from_payload(GATE_ARCHIVE_PAYLOAD)
+    registry.validate(spec, existing=set())
+    registry.add(spec)
+
+    from reporting_platform.common.context import feeds
+    fd = feeds()["cus_weekly"]
+    assert fd.arrival["archive"]["member_pattern"] == r"POS_(?P<cob_date>\d{8})\.csv"
+    assert "member_pattern" in feed_text(d, "cus_weekly")
+
+
+def test_editing_an_archive_feed_keeps_its_archive_block():
+    """THE ROUND TRIP, which is where this was lost: `spec_from_feed` hands
+    back the resolved arrival block, so anything the writer does not write is
+    deleted by the next save of an unrelated field."""
+    d, registry = _setup()
+    spec = registry.FeedSpec.from_payload(GATE_ARCHIVE_PAYLOAD)
+    registry.validate(spec, existing=set())
+    registry.add(spec)
+
+    from reporting_platform.common.context import feeds
+    edited = registry.spec_from_feed(feeds()["cus_weekly"])
+    edited.description = "Edited for an unrelated reason."
+    registry.validate(edited, existing={"cus_weekly"}, updating=True)
+    registry.update(edited)
+
+    fd = feeds()["cus_weekly"]
+    assert fd.arrival["archive"]["member_pattern"] == r"POS_(?P<cob_date>\d{8})\.csv"
+    assert fd.needs_conforming is True, fd.arrival
+
+
+def test_a_zip_of_control_gated_members_round_trips():
+    """Both blocks and the archive block together -- the shape that used to
+    load and then wait for ever on control files the gate had discarded."""
+    d, registry = _setup()
+    payload = {
+        **GATE_ARCHIVE_PAYLOAD,
+        "name": "cus_weekly_gated",
+        "filename_pattern": r"cus_weekly_gated_(?P<cob_date>\d{8})\.csv",
+        "arrival": {"source_pattern": r"weekly_\d{8}\.zip",
+                    "control": {"pattern": r"{stem}\.ctl",
+                                "cob_date": r"DATE=(?P<cob_date>\d{8})"},
+                    "archive": {"member_pattern": r"POSITIONS_[A-Z]\.csv"}},
+        "delivery": {"control": {"pattern": r"{stem}\.ctl",
+                                 "row_count": r"ROWS=(?P<rows>\d+)"}},
+    }
+    spec = registry.FeedSpec.from_payload(payload)
+    registry.validate(spec, existing=set())
+    registry.add(spec)
+
+    from reporting_platform.common.context import feeds
+    fd = feeds()["cus_weekly_gated"]
+    assert fd.arrival["archive"]["member_pattern"] == r"POSITIONS_[A-Z]\.csv"
+    assert fd.arrival["control"]["cob_date"] == r"DATE=(?P<cob_date>\d{8})"
+    assert fd.delivery["control"]["row_count"] == r"ROWS=(?P<rows>\d+)"
+
+
+# ------------------------- the console cannot write an unloadable registry ---
+# A control-pattern collision is refused at LOAD, and load is the WHOLE
+# registry -- so a feed saved with one does not break itself, it stops
+# `feeds()` resolving at all and takes every other feed and every DAG with it.
+# `add()` does not verify what it wrote, so the form is the only guard.
+
+COLLIDING_PAYLOAD = {
+    "name": "cus_margin_call",
+    "description": "A second feed whose control files cannot be told apart.",
+    "source_system": "CUS",
+    # Same stem shape as CONTROL_PAYLOAD's feed, differing only by extension.
+    "filename_pattern": r"MarginCall_(?P<cob_date>\d{8})\.txt",
+    "business_key": ["margin_call_id"],
+    "columns": ["margin_call_id", "amount"],
+    "delivery": {"control": {"pattern": r"{stem}\.ctl",
+                             "row_count": r"ROWS=(?P<rows>\d+)"}},
+}
+
+
+def _add(registry, payload):
+    spec = registry.FeedSpec.from_payload(payload)
+    registry.validate(spec, existing=set())
+    registry.add(spec)
+    return spec
+
+
+def test_the_form_refuses_a_feed_whose_control_files_collide():
+    d, registry = _setup()
+    _add(registry, CONTROL_PAYLOAD)
+    spec = registry.FeedSpec.from_payload(COLLIDING_PAYLOAD)
+    try:
+        registry.validate(spec, existing={"trs_margin_call"})
+    except registry.FeedValidationError as exc:
+        assert "delivery" in exc.errors, exc.errors
+        assert "can claim the same control file" in exc.errors["delivery"], exc.errors
+    else:
+        raise AssertionError("expected FeedValidationError")
+
+
+def test_the_registry_still_loads_after_that_refusal():
+    """THE POINT OF REFUSING IN THE FORM. If the save had gone through, the
+    next `feeds()` would raise and nothing would resolve -- not the other
+    feed, not the DAGs, not the console that wrote it."""
+    d, registry = _setup()
+    _add(registry, CONTROL_PAYLOAD)
+    spec = registry.FeedSpec.from_payload(COLLIDING_PAYLOAD)
+    try:
+        registry.validate(spec, existing={"trs_margin_call"})
+    except registry.FeedValidationError:
+        pass
+    from reporting_platform.common.context import feeds
+    assert "trs_margin_call" in feeds()
+
+
+def test_a_distinguishable_second_control_feed_is_accepted():
+    """The rule must not refuse the ordinary case: two source systems that
+    both send `.ctl`, with names that can be told apart."""
+    d, registry = _setup()
+    _add(registry, CONTROL_PAYLOAD)
+    fine = {**COLLIDING_PAYLOAD, "name": "cus_position",
+            "filename_pattern": r"POS_(?P<cob_date>\d{8})\.csv"}
+    _add(registry, fine)
+
+    from reporting_platform.common.context import feeds
+    assert {"trs_margin_call", "cus_position"} <= set(feeds())
+
+
+def test_editing_a_control_feed_does_not_collide_with_itself():
+    """The candidate replaces its own entry in the registry it is checked
+    against -- comparing a feed with its unedited self would refuse every
+    edit."""
+    d, registry = _setup()
+    _add(registry, CONTROL_PAYLOAD)
+    from reporting_platform.common.context import feeds
+    edited = registry.spec_from_feed(feeds()["trs_margin_call"])
+    edited.description = "Edited."
+    registry.validate(edited, existing={"trs_margin_call"}, updating=True)
+    registry.update(edited)
+    assert "trs_margin_call" in feeds()

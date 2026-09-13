@@ -24,6 +24,7 @@ Whether a real Airflow run behaves the same is verified by running it.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -579,14 +580,25 @@ def test_archive_block_resolves():
     assert fd.arrival["archive"]["member_pattern"] == "POS_(?P<cob_date>\\d{8})\\.csv"
 
 
-def test_member_pattern_must_capture_a_cob_date():
+def test_a_member_needs_a_cob_date_from_its_name_or_its_control_file():
     """Each member is landed as its OWN delivery, so each must say which day
-    it is for. A date on the container instead means the members are parts of
-    one delivery -- a different shape, and not built."""
+    it is for. Neither source, and the gate cannot name what it unpacks."""
     msg = _bad(ARCHIVE_FEED.replace("POS_(?P<cob_date>\\d{8})\\.csv",
                                     "POS_\\d{8}\\.csv"))
     assert "captures no (?P<cob_date>...)" in msg, msg
-    assert "not built" in msg, msg
+    assert "arrival.control.cob_date" in msg, msg
+
+
+def test_a_member_may_not_take_its_date_from_both_sources():
+    """One fact, one source -- the same rule a plain delivery is held to."""
+    both = ARCHIVE_FEED.replace(
+        "      archive:",
+        "      control:\n"
+        "        pattern: '{stem}\\.ctl'\n"
+        "        cob_date: 'DATE=(?P<cob_date>\\d{8})'\n"
+        "      archive:")
+    msg = _bad(both)
+    assert "One fact, one source" in msg, msg
 
 
 def test_member_pattern_is_required():
@@ -839,3 +851,180 @@ def test_a_container_resent_whole_restates_nothing():
         except c.DuplicateDelivery:
             duplicates += 1
     assert duplicates == len(members), f"only {duplicates} of {len(members)} caught"
+
+
+# ==================== a zip whose members carry their own control files =====
+# The shape that used to load and then deadlock: `arrival.archive` with
+# `arrival.control` was accepted, the control members were dropped at the gate,
+# and every landed member then waited in `landing/` for a file that could
+# never arrive -- silently, at INFO, on every poll. The members are paired with
+# their control files inside the container now, and both are promoted.
+
+MEMBER_CONTROL_FEED = """
+defaults:
+  landing_prefix: landing
+  ready_prefix: ready
+  delimiter: ","
+
+feeds:
+  - name: cust_position
+    description: A zip whose members are named nothing useful and dated by control files.
+    source_system: CUST
+    filename_pattern: 'cust_position_(?P<cob_date>\\d{8})(?:_v(?P<version>\\d+))?\\.csv'
+    business_key: [position_id]
+    expected_min_rows: 1
+    arrival:
+      source_pattern: 'weekly_\\d{8}\\.zip'
+      control:
+        pattern: '{stem}\\.ctl'
+        cob_date: 'DATE=(?P<cob_date>\\d{8})'
+      archive:
+        member_pattern: 'POSITIONS_[A-Z]\\.csv'
+    delivery:
+      kind: file
+      control:
+        pattern: '{stem}\\.ctl'
+        row_count: 'ROWS=(?P<rows>\\d+)'
+    columns: [position_id, quantity]
+"""
+
+MEMBER_A = b"position_id,quantity\nP1,10\n"
+MEMBER_B = b"position_id,quantity\nP2,20\nP3,30\n"
+MEMBER_ZIP = {
+    "POSITIONS_A.csv": MEMBER_A, "POSITIONS_A.ctl": b"DATE=20260831\nROWS=1\n",
+    "POSITIONS_B.csv": MEMBER_B, "POSITIONS_B.ctl": b"DATE=20260901\nROWS=2\n",
+    "checksums.txt": b"ignore me",
+}
+
+
+def test_a_statically_named_member_may_be_dated_by_its_control_file():
+    """`member_pattern` captures no date here and that is now legal: the
+    control file packed beside the member supplies it. Exactly one source,
+    the same rule a plain delivery is held to."""
+    fd = _feed(MEMBER_CONTROL_FEED, name="cust_position")
+    assert fd.arrival["archive"]["member_pattern"] == "POSITIONS_[A-Z]\\.csv"
+    assert fd.arrival["control"]["cob_date"] == "DATE=(?P<cob_date>\\d{8})"
+
+
+def test_a_control_member_is_never_landed_as_a_delivery():
+    """A permissive member_pattern and a control file the sender writes with a
+    claimed extension is an ordinary combination. Landing the control file as
+    a delivery would ingest its own text as rows."""
+    loose = MEMBER_CONTROL_FEED.replace(
+        "member_pattern: 'POSITIONS_[A-Z]\\.csv'", "member_pattern: '.*'")
+    assert "member_pattern: '.*'" in loose, "the fixture edit did not apply"
+    fd = _feed(loose, name="cust_position")
+    c = _conform()
+    got = [n for n, _ in c.unpack(fd, "weekly_20260901.zip", _zip(MEMBER_ZIP))]
+    # `.*` claims every member; the two .ctl files are excluded anyway, and
+    # checksums.txt is landed because the pattern really does claim it.
+    assert got == ["POSITIONS_A.csv", "POSITIONS_B.csv", "checksums.txt"], got
+
+
+def test_each_member_is_paired_with_its_own_control_file():
+    fd = _feed(MEMBER_CONTROL_FEED, name="cust_position")
+    c = _conform()
+    outcomes = c.plan_arrival(fd, "weekly_20260901.zip", _zip(MEMBER_ZIP))
+    assert all(isinstance(o, c.Planned) for o in outcomes), outcomes
+    assert [o.landing_filename for o in outcomes] == [
+        "cust_position_20260831.csv", "cust_position_20260901.csv"], outcomes
+    assert [o.control_landing_filename for o in outcomes] == [
+        "cust_position_20260831.ctl", "cust_position_20260901.ctl"], outcomes
+    # The control file is PROMOTED, so its bytes travel with the plan.
+    assert outcomes[0].control == b"DATE=20260831\nROWS=1\n", outcomes[0]
+    assert outcomes[0].data == MEMBER_A, outcomes[0]
+
+
+def test_a_promoted_member_records_both_of_its_names_and_its_container():
+    fd = _feed(MEMBER_CONTROL_FEED, name="cust_position")
+    c = _conform()
+    meta = c.plan_arrival(fd, "weekly_20260901.zip", _zip(MEMBER_ZIP))[0].metadata
+    assert meta["source_filename"] == "POSITIONS_A.csv", meta
+    assert meta["source_control_filename"] == "POSITIONS_A.ctl", meta
+    assert meta["landing_control_filename"] == "cust_position_20260831.ctl", meta
+    assert meta["source_container"] == "weekly_20260901.zip", meta
+    assert meta["declared"] == {"cob_date": "2026-08-31"}, meta
+    # IDENTITY ONLY, here as on the plain path: ROWS is in the same file and
+    # is delivery.control's to check at ingest.
+    assert "row_count" not in meta["declared"], meta
+
+
+def test_a_member_whose_control_file_is_missing_is_refused_not_held():
+    """A container arrives complete, so a control file absent from it will
+    never turn up beside it. Holding the member would wait for ever and report
+    nothing -- the failure this whole path was built to remove."""
+    fd = _feed(MEMBER_CONTROL_FEED, name="cust_position")
+    c = _conform()
+    members = {k: v for k, v in MEMBER_ZIP.items() if k != "POSITIONS_B.ctl"}
+    outcomes = c.plan_arrival(fd, "weekly_20260901.zip", _zip(members))
+    assert isinstance(outcomes[0], c.Planned), outcomes
+    assert isinstance(outcomes[1], c.Refused), outcomes
+    assert "has no control file" in outcomes[1].reason, outcomes[1]
+    # ONE BAD MEMBER DOES NOT DISCARD THE REST, and the refusal carries the
+    # MEMBER's bytes so the quarantined evidence is the file that is wrong.
+    assert outcomes[1].data == MEMBER_B, outcomes[1]
+    assert outcomes[1].source_name == "weekly_20260901.zip!POSITIONS_B.csv"
+
+
+def test_a_control_member_that_does_not_parse_refuses_that_member():
+    fd = _feed(MEMBER_CONTROL_FEED, name="cust_position")
+    c = _conform()
+    # NOT `COBDATE=20260901`: a control field is SEARCHED for over the whole
+    # text, so `DATE=(?P<cob_date>\d{8})` finds itself inside that and parses.
+    members = {**MEMBER_ZIP, "POSITIONS_B.ctl": b"ReportingDay|20260901\n"}
+    outcomes = c.plan_arrival(fd, "weekly_20260901.zip", _zip(members))
+    assert isinstance(outcomes[1], c.Refused), outcomes
+    assert "does not say what it was configured to say" in outcomes[1].reason
+
+
+def test_an_unreadable_container_refuses_the_container_itself():
+    """`source_name` is how the caller tells a bad member from a bad file: one
+    quarantines the member's bytes, the other the inbox file."""
+    fd = _feed(MEMBER_CONTROL_FEED, name="cust_position")
+    c = _conform()
+    outcomes = c.plan_arrival(fd, "weekly_20260901.zip", b"not a zip at all")
+    assert isinstance(outcomes[0], c.Refused), outcomes
+    assert outcomes[0].source_name == "weekly_20260901.zip", outcomes[0]
+
+
+# ------------------------------------------- the shapes share one vocabulary
+def test_the_plain_shape_returns_the_same_four_outcomes():
+    """`inbox.py` dispatches on the outcome type and nothing else, so a shape
+    that cannot express itself in these four is one the watcher cannot act
+    on. Pinned for the plain path, which is the one every feed uses."""
+    fd = _feed()
+    c = _conform()
+    siblings = c.Siblings(names=["positions.csv", "positions.ctl"],
+                          read=lambda n: _ctl().encode())
+
+    waiting = c.plan_arrival(fd, "positions.csv", DATA,
+                             siblings=c.Siblings(names=["positions.csv"]))
+    assert isinstance(waiting[0], c.Waiting), waiting
+
+    planned = c.plan_arrival(fd, "positions.csv", DATA, siblings=siblings)
+    assert isinstance(planned[0], c.Planned), planned
+    assert planned[0].landing_filename == "trs_position_20260801.csv"
+    # The inbox control file travels with the delivery and is moved with it.
+    assert planned[0].consumed == ("positions.ctl",), planned[0]
+
+    dupe = c.plan_arrival(fd, "positions.csv", DATA, siblings=siblings,
+                          taken={"trs_position_20260801.csv"},
+                          landed_md5=lambda name: hashlib.md5(DATA).hexdigest())
+    assert isinstance(dupe[0], c.Duplicate), dupe
+
+    refused = c.plan_arrival(fd, "positions.csv", DATA,
+                             siblings=c.Siblings(
+                                 names=["positions.csv", "positions.ctl"],
+                                 read=lambda n: b"nothing it can read"))
+    assert isinstance(refused[0], c.Refused), refused
+    assert refused[0].consumed == ("positions.ctl",), refused[0]
+
+
+def test_every_shape_is_reachable_from_the_registry():
+    """A planner nothing dispatches to is a shape that does not exist. The
+    table is the seam a new one is added at, so it is asserted rather than
+    assumed."""
+    c = _conform()
+    assert set(c.ARRIVAL_SHAPES) == {"file", "archive"}, c.ARRIVAL_SHAPES
+    assert c.arrival_shape(_feed()) == "file"
+    assert c.arrival_shape(_feed(MEMBER_CONTROL_FEED, "cust_position")) == "archive"

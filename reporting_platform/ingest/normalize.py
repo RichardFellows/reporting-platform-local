@@ -60,12 +60,26 @@ log = logging.getLogger("normalize")
 # than discovering a missing key three layers down.
 MANIFEST_VERSION = 1
 
-# One entry per delivery kind, mapping to the string recorded in the
-# manifest's `normalizer` field. Adding a kind is an entry here plus a
-# function, not a new branch in five places. The control-file gate (step 4 of
-# docs/DELIVERY-SHAPES.md) is orthogonal to this -- it modifies `kind: file`
-# rather than adding a kind, so it has no entry of its own.
-NORMALIZERS = {"file": "file/v1", "archive": "archive/v1"}
+# One entry per delivery kind: the function that builds the manifest, and the
+# string recorded in the manifest's `normalizer` field. Adding a kind is an
+# entry here plus a function -- not a new branch in five places.
+#
+# THE CONTRACT a normalizer signs:
+#
+#   normalizer(feed, object_key) -> manifest dict
+#
+#   * `parts` names the objects holding the rows, in the order ingest should
+#     union them, and each part's key is what lands in `_source_file`;
+#   * `checksum_objects` names what a declared md5 covers (see `_gate`);
+#   * it may COPY bytes, but only into `ready/`, which is a cache;
+#   * it raises `NotReady` when the delivery is incomplete and will complete
+#     on its own, and `ValueError` when it never will.
+#
+# The control-file gate is NOT a kind: it modifies a kind rather than adding
+# one, so it lives in `_gate` and every normalizer calls it. That is what
+# makes `delivery.control` work for an archive without an `archive+control`
+# entry existing anywhere.
+NORMALIZER_VERSIONS = {"file": "file/v1", "archive": "archive/v1"}
 
 
 class NotReady(Exception):
@@ -123,11 +137,9 @@ def is_control_file(feed: Feed, filename: str) -> bool:
     reach `landing/`, and the delivery it belongs to would wait on a control
     file that can never arrive.
     """
-    control = feed.delivery.get("control")
-    if not control:
-        return False
-    regex = control["pattern"].replace("{stem}", "(?P<stem>.+)")
-    return re.fullmatch(regex, filename) is not None
+    from reporting_platform.common.filenames import claims_control_file
+
+    return claims_control_file(feed, filename, "delivery")
 
 
 def _find_control_key(feed: Feed, object_key: str) -> str | None:
@@ -197,6 +209,33 @@ def _declared(feed: Feed, control_key: str) -> dict[str, Any]:
     return out
 
 
+def _gate(feed: Feed, object_key: str) -> tuple[str | None, dict[str, Any]]:
+    """The landed control file for this delivery, and what it declares.
+
+    SHARED BY EVERY NORMALIZER, which is the point: `delivery.control` gates
+    the LANDED delivery, and what a delivery is made of is the kind's
+    business, not the gate's. A plain CSV and a container are both "an object
+    in `landing/` that may have a control file beside it with the same stem",
+    so a normalizer added later inherits gating by calling this rather than by
+    reimplementing the wait.
+
+    Returns `(None, {})` for a feed with no `delivery.control`. Raises
+    `NotReady` when one is configured and has not landed yet -- the ordinary
+    case, not a failure.
+    """
+    if "control" not in feed.delivery:
+        return None, {}
+    filename = object_key.rsplit("/", 1)[-1]
+    control_key = _find_control_key(feed, object_key)
+    if control_key is None:
+        raise NotReady(
+            f"{feed.name}: {filename} is waiting on a control file "
+            f"matching {feed.delivery['control']['pattern']!r} (stem "
+            f"{_stem(filename)!r}) in the same landing folder. Not a "
+            f"failure -- a late feed, not a failed one.")
+    return control_key, _declared(feed, control_key)
+
+
 def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
     """The pass-through normalizer: one landing object, one delivery, no copy.
 
@@ -213,18 +252,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
             f"feed's.")
     cob_date, _version = parsed
 
-    control_key = None
-    declared: dict[str, Any] = {}
-    if "control" in feed.delivery:
-        control_key = _find_control_key(feed, object_key)
-        if control_key is None:
-            raise NotReady(
-                f"{feed.name}: {filename} is waiting on a control file "
-                f"matching {feed.delivery['control']['pattern']!r} (stem "
-                f"{_stem(filename)!r}) in the same landing folder. Not a "
-                f"failure -- a late feed, not a failed one.")
-        declared = _declared(feed, control_key)
-
+    control_key, declared = _gate(feed, object_key)
     head = _head(_bucket(), object_key)
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -255,7 +283,13 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
         "control_object": control_key,
         "declared_row_count": declared.get("row_count"),
         "declared_md5": declared.get("md5"),
-        "normalizer": NORMALIZERS["file"],
+        # WHICH OBJECTS THE DECLARED md5 COVERS. Here the delivery, its source
+        # object and its one part are the same object, so this says nothing
+        # new -- it exists because for an archive they are not, and ingest
+        # must not have to know which kind it is holding to hash the right
+        # bytes. See `_normalize_archive`.
+        "checksum_objects": [object_key],
+        "normalizer": NORMALIZER_VERSIONS["file"],
     }
 
 
@@ -306,6 +340,17 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
     extracted members land under `ready/`, where short retention and
     rebuildability apply -- never under `landing/`, which is the evidence copy
     and holds the container as delivered.
+
+    A CONTAINER MAY BE GATED ON A CONTROL FILE like any other landed
+    delivery -- `custodyPositions_20260903.zip` beside
+    `custodyPositions_20260903.ctl`. What it declares is about the DELIVERY,
+    not the container's bytes as a file: `row_count` is the total across the
+    members, because that is what ingest counts once the parts are unioned.
+    The md5 is the exception and it is the container's own, because the
+    container is the object the sender hashed -- the members are something
+    this platform extracted, and no checksum the sender could write would
+    describe them. `checksum_objects` below is how that is said once, here,
+    instead of ingest branching on the kind.
     """
     import io
     import zipfile
@@ -320,6 +365,11 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
             f"lives in the container name and nowhere else.")
     cob_date, _version = parsed
 
+    # BEFORE THE MEMBERS ARE EXTRACTED. Waiting on a control file is the
+    # ordinary state, and it runs on every poll -- extracting first would
+    # rewrite every member into `ready/` on each pass of a wait that has not
+    # finished yet.
+    control_key, declared = _gate(feed, object_key)
     head = _head(_bucket(), object_key)
     body = _client().get_object(Bucket=_bucket(), Key=object_key)["Body"].read()
     member_re = re.compile(feed.delivery["member_pattern"])
@@ -360,18 +410,34 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
             "header": feed.header,
             "encoding": feed.file_encoding,
         },
-        # `delivery.control` is rejected for `kind: archive` at load
-        # (context.resolve_delivery_config), so both are always None here.
-        "control_object": None,
-        "declared_row_count": None,
-        "declared_md5": None,
-        "normalizer": NORMALIZERS["archive"],
+        "control_object": control_key,
+        # The total across the members: what ingest counts after unioning the
+        # parts, which is the number a sender describing this delivery states.
+        "declared_row_count": declared.get("row_count"),
+        "declared_md5": declared.get("md5"),
+        # THE CONTAINER, not the parts. The sender hashed the zip it sent;
+        # the members under `ready/` are this platform's own extraction, and
+        # hashing them would compare the sender's checksum against bytes the
+        # sender never produced. One key, so a manifest never implies an order
+        # for a concatenation that is not happening.
+        "checksum_objects": [object_key],
+        "normalizer": NORMALIZER_VERSIONS["archive"],
     }
 
 
 def _kind(feed: Feed) -> str:
     """Which normalizer this feed needs, from its validated `delivery:` block."""
     return (feed.delivery or {}).get("kind", "file")
+
+
+# The dispatch table itself, below the functions it names. See
+# NORMALIZER_VERSIONS above for the contract a new entry signs.
+NORMALIZERS = {"file": _normalize_file, "archive": _normalize_archive}
+
+# Kinds whose parts do not exist until the normalizer writes them, so their
+# manifest must always be stored -- `write=False` cannot be honoured. A kind
+# whose parts point back into `landing/` is not one of these.
+MATERIALISING_KINDS = frozenset({"archive"})
 
 
 # ------------------------------------------------------------------- storage
@@ -433,19 +499,20 @@ def normalize(feed: Feed, object_key: str, *, write: bool = True,
             f"{feed.name}: unknown delivery kind {kind!r}. Known: "
             f"{', '.join(sorted(NORMALIZERS))}")
 
-    if kind == "archive":
-        # WRITE IS NOT OPTIONAL FOR AN ARCHIVE. `write=False` exists so a
-        # manual `--object landing/...` ingest does not leave a queue entry
-        # behind, which is free when the part IS the landing object. An
-        # archive's parts must be materialised before anything can read them,
-        # so skipping the manifest would leave extracted members the `ready/`
-        # sweep -- which iterates manifests -- could never collect.
-        manifest = _normalize_archive(feed, object_key)
+    if kind in MATERIALISING_KINDS:
+        # WRITE IS NOT OPTIONAL FOR A KIND THAT MATERIALISES ITS PARTS.
+        # `write=False` exists so a manual `--object landing/...` ingest does
+        # not leave a queue entry behind, which is free when the part IS the
+        # landing object. An archive's parts must be materialised before
+        # anything can read them, so skipping the manifest would leave
+        # extracted members the `ready/` sweep -- which iterates manifests --
+        # could never collect.
+        manifest = NORMALIZERS[kind](feed, object_key)
         key = write_manifest(feed, manifest)
         _register(feed, manifest, key)
         return manifest
 
-    manifest = _normalize_file(feed, object_key)
+    manifest = NORMALIZERS[kind](feed, object_key)
     if write:
         key = manifest_key(feed, object_key)
         if force or not _exists(key):

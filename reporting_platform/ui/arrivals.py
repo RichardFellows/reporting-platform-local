@@ -182,15 +182,20 @@ def checks(row: dict[str, Any]) -> dict[str, Any]:
     misleading thing to do:
 
     **The checksum is answerable here.** `declared_md5` is what the control
-    file said; `md5` is what the landed object hashes to, measured once when
-    the delivery was registered. `ingest_feed._parts_md5` hashes the same
-    bytes -- every feed that can carry a `delivery.control` block is
-    single-part by construction (`kind: archive` is refused a control block at
-    load), so the delivery's one part IS its source object. Comparing them is
-    therefore the same comparison ingest makes rather than an approximation of
-    it. A delivery with more than one part is reported `not_comparable` rather
-    than guessed at: that combination cannot arise today, and inventing an
-    answer for it is how it would be wrong the day it does.
+    file said; `md5` is what the registry measured, and it measures the
+    delivery's SOURCE OBJECT -- the CSV for a plain delivery, the container
+    for an archive. Ingest hashes the manifest's `checksum_objects`, which
+    every normalizer sets to that same source object, for the reason
+    `normalize._normalize_archive` gives: the sender hashed what it sent, and
+    an archive's parts are this platform's own extraction. So the two values
+    compared here are the two ingest compares, not an approximation of them.
+
+    THAT IS AN INVARIANT ACROSS TWO MODULES, so it is written down in both. A
+    normalizer that ever points `checksum_objects` somewhere other than the
+    source object -- a shape whose sender checksums the parts, say -- makes
+    this comparison wrong rather than merely unavailable, and must add
+    whatever distinguishes it to the registry row before this can answer.
+    `tests/test_arrivals.py` pins the invariant.
 
     **The row count is not.** Nothing counts rows without reading the file,
     and reading the file is a Spark job. `declared` is what the control file
@@ -205,12 +210,12 @@ def checks(row: dict[str, Any]) -> dict[str, Any]:
     """
     declared_md5 = (row.get("declared_md5") or "").strip().lower()
     landed_md5 = (row.get("md5") or "").strip().lower()
-    parts = row.get("parts")
-    parts = len(parts) if isinstance(parts, list) else (parts or 1)
 
     if not declared_md5:
         md5_verdict = "not_declared"
-    elif parts > 1:
+    elif not landed_md5:
+        # Nothing to compare against: the registry could not measure the
+        # object. Saying so beats reporting a mismatch against an empty string.
         md5_verdict = "not_comparable"
     elif declared_md5 == landed_md5:
         md5_verdict = "ok"

@@ -56,17 +56,33 @@ def _at_branch(table: str, branch: str | None) -> str:
     return f"{catalog}.{namespace}.`{name}@{branch}`"
 
 
-def _parts_md5(manifest: dict) -> str:
+def _checksum_objects(manifest: dict) -> list[str]:
+    """The objects a declared md5 covers, in the order they are hashed.
+
+    THE NORMALIZER DECIDES, not this module: for a plain delivery the sender
+    hashed the object that landed, and for an archive it hashed the CONTAINER,
+    while the parts are members this platform extracted and no sender ever
+    checksummed. Making that the manifest's answer is what keeps one code path
+    here -- ingest reads `parts` to load rows and this to verify bytes, and
+    never asks what kind of delivery it is holding.
+
+    Falls back to `parts` for a manifest written before the key existed. Every
+    delivery that could carry a declared md5 then was single-part, and its one
+    part IS its source object, so the fallback is the same bytes -- not a
+    guess, an identity that happened to hold.
+    """
+    keys = manifest.get("checksum_objects")
+    if keys:
+        return list(keys)
+    return [p["object_key"] for p in manifest["parts"]]
+
+
+def _delivery_md5(manifest: dict) -> str:
     """md5 of the delivery's bytes, as landed.
 
     Read through boto3 rather than Spark: this is a checksum of the OBJECT,
     which is what the sender hashed, not of the rows Spark parsed out of it.
     Going through the dataframe would hash a re-serialisation and never match.
-
-    Concatenated in `parts` order for a multi-part delivery, which is the same
-    order `read_landing` unions them in. A single-part delivery -- every
-    `kind: file` feed, which is every feed that can have a control file at all
-    -- is just that one object's hash.
     """
     import hashlib
 
@@ -74,9 +90,8 @@ def _parts_md5(manifest: dict) -> str:
 
     digest = hashlib.md5()
     s3, bucket = _client(), _bucket()
-    for part in manifest["parts"]:
-        digest.update(s3.get_object(Bucket=bucket,
-                                    Key=part["object_key"])["Body"].read())
+    for key in _checksum_objects(manifest):
+        digest.update(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
     return digest.hexdigest()
 
 
@@ -597,11 +612,13 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # corruption that did not happen.
         declared_md5 = (manifest.get("declared_md5") or "").strip().lower() or None
         if declared_md5 is not None:
-            actual_md5 = _parts_md5(manifest)
+            hashed = _checksum_objects(manifest)
+            actual_md5 = _delivery_md5(manifest)
             if actual_md5 != declared_md5:
                 raise ValueError(
-                    f"{fd.name} {bdate}: delivery hashes to {actual_md5}, "
-                    f"control file {manifest.get('control_object')} declared "
+                    f"{fd.name} {bdate}: {', '.join(hashed)} hashes to "
+                    f"{actual_md5}, control file "
+                    f"{manifest.get('control_object')} declared "
                     f"{declared_md5}. The file is not the file the sender "
                     f"checksummed -- truncated, re-encoded in transit, or a "
                     f"different file altogether. Branch {branch} left for "
