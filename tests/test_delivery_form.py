@@ -453,3 +453,34 @@ def test_editing_a_control_feed_does_not_collide_with_itself():
     registry.validate(edited, existing={"trs_margin_call"}, updating=True)
     registry.update(edited)
     assert "trs_margin_call" in feeds()
+
+
+def test_the_form_offers_a_control_block_for_an_archive():
+    """The FORM must be able to create what the loader accepts.
+
+    It hid the control fields whenever `kind: archive` was selected, and
+    `readDelivery()` dropped the block outright, because the loader refused
+    that combination. The loader accepts it now -- a container gated on a
+    control file beside it in landing -- so hiding them would leave a feed
+    shape creatable only by hand. Asserted against the page source because
+    that is where the rule lives; there is no JS runtime in this suite.
+    """
+    import pathlib
+
+    page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
+            / "ui" / "static" / "index.html").read_text()
+    sync = page[page.index("function syncDeliveryVisibility"):]
+    sync = sync[:sync.index("\n  }")]
+    for field in ("controlPatternField", "ctlFormatField", "controlRowCountField",
+                  "controlMd5Field"):
+        line = next(l for l in sync.splitlines() if l.strip().startswith(field))
+        assert "isArchive" not in line, line
+    # the member pattern is still archive-only, which is the point of the shape
+    assert "isArchive" in next(l for l in sync.splitlines()
+                               if l.strip().startswith("memberPatternField"))
+
+    read = page[page.index("const readDelivery"):]
+    read = read[:read.index("\n  };")]
+    # the archive branch must fall through to the control block, not return
+    assert read.count("return") <= 2, read
+    assert "out.control = control" in read, read

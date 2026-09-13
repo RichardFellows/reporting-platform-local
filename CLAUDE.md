@@ -52,11 +52,10 @@ to run something for the first time, expect it to fail and read what it says.
 - **Compose builds one image per service**: `build airflow` does not rebuild
   `airflow-init`. Build them together.
 - **Editing `.env` or `docker-compose.yml` needs the container recreated**, not
-  restarted — including a variable added to the `x-s3-env` anchor, which is how
-  `REGISTRY_DSN` reaches a container. So does editing a module a long-running
-  process already imported: `feeds()` re-reads config on mtime, but the `inbox`
-  watcher holds its imports, so restart it after touching `ingest/` or
-  `common/` or it reports config as broken that is valid on disk.
+  restarted — including a variable added to the `x-s3-env` anchor. So does
+  editing a module a long-running process already imported: `feeds()` re-reads
+  config on mtime, but the `inbox` watcher holds its imports, so restart it
+  after touching `ingest/` or `common/`.
 - **A DAG run left non-terminal starves every other run.** DAGs `queued` with
   `start=None` mean a stale run.
 - **Never use `airflow dags test`** — it blocks the next run under
@@ -79,32 +78,24 @@ to run something for the first time, expect it to fail and read what it says.
   `common/settings.py`, which is what lets `spark.py` name the catalog without
   importing `context`.
 - **Every Spark job runs on the cluster, never `local[*]`.** `SPARK_MASTER` is
-  read in two places that must not diverge — `spark_session()` in
-  `common/spark.py` and `spark.master` in `dbt/profiles.yml`;
-  `spark_session()` refuses a `local` master rather than run in the Airflow
-  container with the cluster idle. Each app caps at 2 cores/2g or standalone
-  mode holds every free core until the session stops and the next job waits
-  forever instead of failing. <http://localhost:8080>.
-  (`#spark-master-single-source`, `#spark-worker-sizing`, ARCHITECTURE
-  § *Where Spark actually runs*)
+  read in two places that must not diverge — `spark_session()` and
+  `spark.master` in `dbt/profiles.yml` — and `spark_session()` refuses a
+  `local` master. Each app caps at 2 cores/2g, or standalone mode holds every
+  free core and the next job waits forever instead of failing.
+  <http://localhost:8080>. (`#spark-master-single-source`,
+  `#spark-worker-sizing`)
 - **Spark inside an Airflow task must go through `scripts/_spark_task.py`** (a
   subprocess), or the JVM keeps the task process alive, heartbeats stop and the
   scheduler zombie-reaps it. The *driver* lives in that process, so this holds
   on a cluster too. (`#spark-in-a-subprocess`)
-- **THREE jar versions live in `.env`** and diverging them gives you
+- **THREE jar versions live in `.env`**, and diverging them gives
   `NoSuchMethodError` on the first write, never anything saying "version".
   `ICEBERG_VERSION` must be identical in the Spark image and in *both* drivers
-  (`spark_session()`, `spark.jars.packages` in `dbt/profiles.yml`) — every
-  submitting process runs a pip pyspark with no jars of its own.
-  `NESSIE_SPARK_EXT_VERSION` tracks **Iceberg, not the server** (0.103.3 ↔
-  1.8.1, 0.108.1 ↔ 1.11.0); newer-than-yours is the failing direction.
-  `NESSIE_SERVER_VERSION` sets the server image and the `nessie-gc` jar, equal
-  to each other, allowed to be newer than the extensions. `.env.example` has a
-  known-good set; `docker compose exec spark-worker env | grep VERSION` says
-  what is baked in. (`#jar-versions`)
-
-## dbt and the build DAGs
-
+  — every submitting process runs a pip pyspark with no jars of its own.
+  `NESSIE_SPARK_EXT_VERSION` tracks **Iceberg, not the server**;
+  `NESSIE_SERVER_VERSION` sets the server image and the `nessie-gc` jar and may
+  be newer than the extensions. `tests/test_versions.py` pins all three.
+  (`#jar-versions`)
 - **Fixing a macro proves nothing about models that don't call it.** Grep for
   the construct, not the macro. (`dbt/macros/engine.sql` holds engine-specific
   SQL; `naming.sql` overrides `generate_schema_name` so layers land in
@@ -128,199 +119,137 @@ to run something for the first time, expect it to fail and read what it says.
   (`#airflow-init-four-things`)
 - **dbt's three working directories live under `/opt/platform/run`, not the
   `./dbt` bind mount** (`DBT_LOG_PATH`, `DBT_TARGET_PATH`,
-  `packages-install-path`) — a bind mount keeps host ownership, so no `chown` in
-  the image reaches it and `dbt deps` fails with `Permission denied`. Packages
-  are shared through a named volume mounted one level **above** `dbt_packages`
-  (`dbt deps` rmtree's that directory; a mount point cannot be removed). If
-  packages come back missing or root-owned, remove the volume — a rebuild will
-  not re-seed an existing one. (`#dbt-working-directories`,
-  `#dbt-packages-volume`)
-
-## Arrival: inbox → landing → ready
-
-Shapes and mechanism: `docs/DELIVERY-SHAPES.md`,
-`docs/DECISIONS.md#the-inbox-is-the-conformance-gate`,
-`#unpacking-happens-at-the-gate`, `#ready-is-a-derived-index`.
-
+  `packages-install-path`): a bind mount keeps host ownership, so `dbt deps`
+  fails with `Permission denied`. Packages share a named volume mounted one
+  level **above** `dbt_packages`, because `dbt deps` rmtree's that directory.
+  (`#dbt-working-directories`, `#dbt-packages-volume`)
 - **`landing/` has a contract: everything in it is correctly named and
   classified.** An approved sender writes there directly; everything else goes
   through the **inbox conformance gate** (`ingest/conform.py`, driven by
-  `ingest/inbox.py`). A feed with an `arrival:` block is the second kind.
-- **THE INBOX ESTABLISHES IDENTITY; INGESTION VERIFIES INTEGRITY.** The keys
-  are split to enforce it: `arrival.control` carries `cob_date`/`version` (what
-  the file must be NAMED) and rejects `row_count`/`md5` at load;
-  `delivery.control` carries `row_count`/`md5`, checked at ingest for every
-  delivery however it arrived, so the trusted path is never the less-verified
-  one. They are complementary — `arrival.control` without `delivery.control` is
-  rejected.
-- **The control file is PROMOTED, not consumed**: the delivery is data file
-  plus control file, and the gate renames both into landing. Such a feed has
-  **two filenames and they are different strings** — `Feed.claims_source` for
-  the upstream's, `Feed.parse_filename` for landing's. The rename is generated
-  from `filename_pattern` and fed back through `parse_filename`, so a name
-  landing would reject cannot be produced; a re-delivery for a landed date gets
-  `_v2` rather than overwriting the evidence.
+  `ingest/inbox.py`) — a feed with an `arrival:` block.
+- **THE INBOX ESTABLISHES IDENTITY; INGESTION VERIFIES INTEGRITY.**
+  `arrival.control` carries `cob_date`/`version` and refuses `row_count`/`md5`
+  at load; `delivery.control` carries `row_count`/`md5` and is checked at
+  ingest for every delivery however it arrived. Complementary, not
+  alternatives: `arrival.control` without `delivery.control` is refused.
+- **The control file is PROMOTED, not consumed**, so such a feed has **two
+  filenames and they are different strings** — `Feed.claims_source` for the
+  upstream's, `Feed.parse_filename` for landing's. The rename is built from
+  `filename_pattern` and fed back through `parse_filename`, so a name landing
+  would reject cannot be produced.
 - **An identity failure is QUARANTINED to `.rejected/`; an integrity failure
   LANDS and fails at ingest** — landing is the evidence copy, and a bad
   delivery is what it exists to prove.
-- **`{stem}` IS NOT A WILDCARD: a control file is attributed by its stem**,
-  which is its data file's stem by construction. Two feeds may both send
-  `.ctl`; two feeds whose data names differ only by EXTENSION cannot be told
-  apart at the door and are refused at LOAD (so `config check`, so CI) rather
-  than having every control file they send rejected as ambiguous for ever. A
-  `.ctl` whose stem matches no feed's data names is unroutable, not claimed by
-  whoever happened to declare the suffix. `sample_name`/`stem_pattern` READ a
-  pattern where `render_filename` BUILDS one, which is why they are permissive
-  where it refuses. (`#a-control-file-is-attributed-by-its-stem`)
+- **`{stem}` IS NOT A WILDCARD: a control file is attributed by its stem.**
+  Two feeds may share `.ctl`; two whose data names differ only by EXTENSION
+  are refused at LOAD, because at the door nothing can tell their control
+  files apart. A `.ctl` matching no feed's data shape is unroutable.
+  (`#a-control-file-is-attributed-by-its-stem`)
 - **HOW a control file is read is `control.format`; WHAT is read out of it is
-  the fields.** The default is `regex` -- a pattern per field over the whole
-  text -- and `delimited` makes every field a COLUMN NAME instead, for a
-  pipe-or-whatever table with its own headers. `ingest/control.py` is the ONLY
-  parser, for both blocks and both formats. The two blocks read the SAME
-  PROMOTED BYTES, so a format declared on each must be identical and load
-  refuses otherwise; `delimiter` is required and never inherited from the
-  feed's own, because pipes read as commas is not an error, it is one column
-  named by the whole header line. (`#control-file-formats`)
-- **THERE ARE TWO ZIP MECHANISMS AND THE COB DATE PICKS ONE.** On each
-  member: `arrival.archive.member_pattern`, unpacked AT THE GATE — one file
-  in, N ordinary deliveries out, container never landed but recorded in each
-  member's metadata, so `landing/` holds only objects Spark can read. On the
-  container: `delivery.kind: archive`, the zip LANDS and `normalize` explodes
-  it into `ready/` as the parts of ONE delivery. Neither source, or both, is
-  refused at load.
-- **A member may carry its own control file inside the container**
-  (`arrival.control` + `arrival.archive`), which is how statically named
-  members get dated; both are promoted, renamed, and verified at ingest by
-  `delivery.control` like any other pair. A member's control file MISSING from
-  the container is a refusal, not a wait — a container arrives complete. This
-  combination used to load and then wait for ever in silence.
-  (`#unpacking-happens-at-the-gate`)
+  the fields.** `regex` (the default) is a pattern per field over the whole
+  text; `delimited` makes every field a COLUMN NAME. `ingest/control.py` is
+  the only parser. Both blocks read the same promoted bytes, so a format
+  declared on each must be identical, and `delimiter` is never inherited from
+  the feed's own. (`#control-file-formats`)
+- **THERE ARE TWO ZIP MECHANISMS AND THE COB DATE PICKS ONE.** On each member:
+  `arrival.archive`, unpacked AT THE GATE, N deliveries out, container never
+  lands. On the container: `delivery.kind: archive`, the zip lands and
+  `normalize` explodes it into `ready/` as parts of ONE delivery. Neither
+  source, or both, is refused at load.
+  (`#unpacking-happens-at-the-gate`, `#archive-normalizer`)
+- **A member may carry its own control file inside the container**, which is
+  how statically named members get dated; both are promoted and verified at
+  ingest. A member's control file MISSING from the container is a refusal, not
+  a wait — a container arrives complete.
 - **`delivery.control` gates EITHER kind.** For an archive, `row_count` is the
-  total across the members and `md5` is the CONTAINER's — the object the
-  sender hashed. The manifest's `checksum_objects` says which objects a
-  declared md5 covers, so `ingest_feed` verifies both kinds through one path
-  and never branches on the kind; `ui/arrivals.checks()` depends on the same
-  invariant. (`#control-file-gate`)
+  total across members and `md5` is the CONTAINER's. The manifest's
+  `checksum_objects` says which objects a declared md5 covers, so
+  `ingest_feed` never branches on the kind — an invariant `ui/arrivals.checks()`
+  shares. (`#control-file-gate`)
 - **A DELIVERY SHAPE IS A REGISTRY ENTRY, not a branch**:
-  `conform.ARRIVAL_SHAPES` at the door (pure planners returning
-  `Planned`/`Refused`/`Duplicate`/`Waiting` — `inbox.py` dispatches on those
-  four and nothing else) and `normalize.NORMALIZERS` on the landing side, with
-  `normalize._gate` shared so any new normalizer inherits control-file gating.
-  A new shape that needs a fifth outcome type is asking the watcher for
-  something it cannot do. (`#a-delivery-shape-is-a-registry-entry`)
+  `conform.ARRIVAL_SHAPES` at the door (planners returning
+  `Planned`/`Refused`/`Duplicate`/`Waiting`, the only four `inbox.py` acts on)
+  and `normalize.NORMALIZERS` on the landing side, sharing `normalize._gate`.
+  (`#a-delivery-shape-is-a-registry-entry`)
 - **`landing/` is the evidence copy; `ready/` is the work queue.** A
   **normalize** stage turns a delivery into a MANIFEST — COB date, the objects
   holding the rows, delimiter/quoting/encoding — which is what `ingest`
-  consumes and `find_pending` returns. A plain CSV copies nothing (the part
-  points back into `landing/`), so `ingest` keeps one code path while zips and
-  control files get their own normalizers.
+  consumes and `find_pending` returns. A plain CSV copies nothing.
 - **`_source_file` must stay the PART's key, never the manifest's** —
   `already_ingested` matches on it, so the manifest key re-ingests every
   delivery forever.
-- **`find_pending` computes its keep-set from `landing/`, not the manifests**:
-  `ready/` is a days-long cache, landing is the only prefix holding every date.
-  So the `ready:` window bounds the **derived parts, not the manifests** — a
-  manifest whose landing object exists is kept at any age, or the sweep and the
-  reconcile undo each other nightly (157 deleted, 157 remade, both logging
-  success). Ingestion is never recorded in the manifest; it stays derived from
-  the raw table. `ready/` reconciles from `landing/` on demand, so nothing
-  pushed straight into the bucket is stranded — and since the registry follows
-  manifests, that reconcile is also what makes the registry rebuildable.
+- **`find_pending` computes its keep-set from `landing/`, not the manifests**,
+  the only prefix holding every date. So `ready:` bounds the **derived parts,
+  not the manifests**, or the sweep and the reconcile undo each other nightly.
+  `ready/` reconciles from `landing/` on demand, which is also what makes the
+  registry rebuildable.
   (`#the-ready-window-bounds-the-parts-not-the-manifests`)
-
-## Feeds and columns
-
-The procedures are `docs/ADDING-A-FEED.md` (five files, no DAG edit),
-`docs/ADDING-A-COLUMN.md` (three files and one command) and `docs/FEED-UI.md`.
-
 - **A feed is named `<source_system>_<feed>`** (`fo_trade`,
   `ref_counterparty`), TYPED into feeds.yml, not derived. That one string is
   the raw table, DAG id, landing prefix, dbt source table and prepared model at
   once, so none of the five can drift. (`#feed-names-carry-the-source`)
 - **`conventions/` is a middle tier**: `_defaults.yml -> convention -> feed`,
-  shallow at each layer, because variation is mostly per SOURCE SYSTEM. A
-  convention may name a **`parent:`**, so the tier is a chain; an undefined
-  parent and a cycle are errors at LOAD.
-  `context.effective_defaults()` is the ONLY implementation of that ordering,
-  and the console depends on it — `ui/registry._block` omits any key matching
-  what the feed inherits, so a second copy of the merge would start pinning
-  inherited values into feed blocks. An undefined convention, an unknown key in
-  one, or `name`/`convention` in one are errors at LOAD. (`#feed-conventions`)
+  shallow at each layer, chained through `parent:`.
+  `context.effective_defaults()` is the ONLY implementation of that ordering
+  and the console reads it, or saving a feed pins inherited values into its
+  block. An undefined convention or parent, a cycle, an unknown key in one, or
+  `name`/`convention` in one are errors at LOAD. (`#feed-conventions`)
 - **A column may be named differently in the file than in the platform** —
   `- trade_id: "Trade Id"` renames at ingest, so raw onwards is ordinary
   identifiers and macros never quote one; drift is reported in the file's
   names. (`#source-column-names`, `#identifiers-in-macros`)
 - **`generate_feeds.py` is not one of those five files**: it hand-writes the
   four original feeds, whose pathologies are the point, and generates the rest
-  via `ui/sampledata.py`. Pass `types=` when calling that directly, or it
-  re-guesses from the column name and a `decimal` gets a string `safe_cast`
-  silently nulls.
+  via `ui/sampledata.py`. Pass `types=` when calling that directly, or a
+  `decimal` gets a string `safe_cast` silently nulls.
 - **The feed console (`reporting_platform/ui`, <http://localhost:8082>) writes
-  those five files from a form** and drives land → ingest → build. Its
-  **Arrivals** page (`ui/arrivals.py`) is the one view that is neither: what
-  became of every file offered, joined per request from `registry.delivery`,
-  `registry.rejection`, `inbox.route()` and Airflow, and **written nowhere** —
-  an arrivals table would hold verdicts the platform derives and could not be
-  rebuilt. A declared **md5** is comparable there (same bytes ingest hashes);
-  a declared **row_count** is not, and says `at_ingest`. `no run recorded`
+  those five files from a form** and drives land → ingest → build. It is a
+  front end for the procedure, not a second source of truth. Its one-feed build
+  **never merges** — publication belongs to the Airflow builds — and is
+  EXCLUSIVE, so it must be able to end: `jobs.stream` kills at
+  `FEED_UI_JOB_TIMEOUT` and `DELETE /api/jobs/<id>` cancels, both by PROCESS
+  GROUP, or the JVM holding the cores is orphaned. `feeds()` caches on
+  **mtime**, or a new feed never reaches the DAG processor.
+- **The Arrivals page is a JOIN, written nowhere** (`ui/arrivals.py`): what
+  became of every file offered, assembled per request from `registry.delivery`,
+  `registry.rejection`, `inbox.route()` and Airflow. A declared **md5** is
+  comparable there, a **row_count** is not (`at_ingest`), and `no run recorded`
   means Airflow trimmed its history, never "not ingested".
-  (`#the-arrivals-view-is-a-join-not-a-record`) It is a
-  front end for that procedure, not a second source of truth: the change is an
-  ordinary reviewable diff, checked with `dbt parse` (~5s, no Spark). Its
-  one-feed build **never merges**, on purpose — publication belongs to the
-  Airflow builds, not a button labelled "test". That build is EXCLUSIVE, so it
-  must be able to end: `jobs.stream` kills its subprocess at
-  `FEED_UI_JOB_TIMEOUT` (default 3600s) and `DELETE /api/jobs/<id>` cancels
-  one, both by PROCESS GROUP — dbt spawns spark-submit spawns a JVM, and
-  signalling the direct child alone orphans the part holding the cores. Because it edits config a
-  running Airflow is reading, `feeds()` and `_load()` are cached on **mtime**:
-  a plain `@lru_cache` there means a new feed never reaches the DAG
-  processor.
+  (`#the-arrivals-view-is-a-join-not-a-record`)
 - **ADDING A COLUMN TO AN EXISTING FEED IS THE COMMONEST CHANGE A LIVE FEED
   EVER HAS, and the raw table is the part not in the git diff.**
-  `ensure_raw_table` is `CREATE TABLE IF NOT EXISTS` and reconciles nothing;
-  `ensure_raw_schema` does, on the branch, for the whole declared contract.
-  Without it a declared column passes every check in `ingest_feed` and dies at
-  the write with `INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS`, naming
-  an ARITY and neither the column nor `feeds.yml`. **The directions are NOT
-  symmetrical**: a declared column is added, an undeclared one is NEVER dropped
-  — a rename is character-for-character a drop plus an add, so the destructive
-  reading of an ambiguous edit is the one nothing acts on. An orphan is
-  NULL-filled and reported. (`#a-declared-column-migrates-itself`)
+  `ensure_raw_schema` reconciles the declared contract on the branch;
+  `ensure_raw_table` is `CREATE TABLE IF NOT EXISTS` and reconciles nothing.
+  Without it the write dies with `INSERT_COLUMN_ARITY_MISMATCH`, naming neither
+  the column nor `feeds.yml`. A declared column is added; an undeclared one is
+  NEVER dropped, because a rename is a drop plus an add.
+  (`#a-declared-column-migrates-itself`)
 - **`on_schema_change: append_new_columns` in `dbt_project.yml`** — dbt's
   `ignore` default leaves a new column in the SELECT and never in the target,
-  green build and all. It adds the column but does not populate rows the run
-  did not touch, so on an SCD2 dimension every CURRENT row reads NULL until its
-  entity next changes; `--full-refresh` is a choice about DATA, not the only
-  way to get the COLUMN.
+  green build and all. It does not populate rows the run did not touch, so
+  `--full-refresh` is a choice about DATA, not the only way to get the COLUMN.
 - **Raw's four provenance columns are added, never backfilled** —
-  `_delivery_id`, `_received_at`, `_schema_version`, `_source_system`, selected
-  through `source_provenance()`. History reads NULL, so an as-of query must
-  fall back to `_source_file`. The migration is LAZY, so a feed that has not
-  delivered keeps the old schema and **every prepared model then fails, not
-  just its own**: run `ingest.migrate_raw` before the next ingest when
-  deploying one. (`#provenance-is-added-not-backfilled`)
+  `_delivery_id`, `_received_at`, `_schema_version`, `_source_system`, through
+  `source_provenance()`. History reads NULL, so an as-of query falls back to
+  `_source_file`. The migration is LAZY, so a feed that has not delivered
+  keeps the old schema and **every prepared model then fails, not just its
+  own**: run `ingest.migrate_raw` before the next ingest when deploying one.
+  (`#provenance-is-added-not-backfilled`)
 - **`supersession:` declares what `dedupe_rank` always assumed.**
   `full_snapshot` is the only built mode and the default; `delta_append` and
   `correction` raise NOT_BUILT at load. The value is the REFUSAL — a delta feed
   deduped as a snapshot silently loses every key its newest file omits.
   (`#supersession-is-declared-not-assumed`)
 - **As-of is a var, not a second model**: the same models with `--vars
-  '{knowledge_time: ...}'`, filtered by `known_as_of()` on
-  `coalesce(_received_at, _ingest_ts)`. It compiles to `1 = 1` when unset and
-  **refuses an incremental run**, because merging as-of rows into the published
-  table restates it backwards. `delivery_ref()` is the `_source_file` fallback
-  and strips the prefix (`_delivery_id` is a basename, `_source_file` a key);
-  the `not_null` test on `prepared.delivery_id` is the migration guard, since a
-  macro change reaches only the models rebuilt after it.
+  '{knowledge_time: ...}'`, filtered by `known_as_of()`. It compiles to
+  `1 = 1` when unset and **refuses an incremental run**, because merging as-of
+  rows into the published table restates it backwards.
   (`#as-of-is-a-var-not-a-second-model`,
   `#delivery-ref-is-the-fallback-with-the-prefix-stripped`)
 - **`expected_by:` is the ONE lateness concept** — a wall-clock `"HH:MM"`
-  judged the day AFTER the COB date (fixed at +1, forgiving on purpose).
-  **Quote it**: YAML 1.1 reads `7:00` as 420 and a leading zero hides that until
-  the first unpadded hour. No `expected_by` means skipped, not midnight. A
-  backfill (many late dates, one arrival day) is ONE event, described
-  differently but never suppressed.
+  judged the day AFTER the COB date. **Quote it**: YAML 1.1 reads `7:00` as
+  420, and a leading zero hides that until the first unpadded hour. No
+  `expected_by` means skipped, not midnight.
   (`#lateness-is-a-wall-clock-time-not-a-duration`)
 
 ## The registry (Postgres `platform`)
@@ -348,87 +277,55 @@ them.
   (`#a-run-is-the-first-thing-the-registry-cannot-rebuild`,
   `#version-is-per-report-and-as-at-date`)
 - **A CHANGE IS A DEPLOYMENT EVENT, NOT A RUN EVENT.** One ticket authorises a
-  version and every run until the next deployment inherits it, so the
-  deployment refs come from the ENVIRONMENT, not the trigger; `change_ref`
-  stays separate for a per-run restatement. `dbt_project_ref` (declared commit)
-  and `dbt_manifest_ref` (digest of what is on disk) both exist because they
-  diverge whenever the project is writable at run time — which is what the feed
-  console does — and `check_project_drift()` therefore compares DIGEST TO
-  DIGEST, refusing only in `uat`/`prod`.
-  (`#a-change-is-a-deployment-event-not-a-run-event`,
-  `#code-identity-is-a-digest-when-it-cannot-be-a-tag`)
+  version and every run until the next deployment inherits it, so deployment
+  refs come from the ENVIRONMENT, not the trigger. `dbt_project_ref` (declared
+  commit) and `dbt_manifest_ref` (digest on disk) diverge whenever the project
+  is writable at run time, which the console makes it, so
+  `check_project_drift()` compares DIGEST TO DIGEST and refuses only in
+  `uat`/`prod`.
 - **Adding a registry column needs `MIGRATIONS` as well as `SCHEMA`** — `CREATE
   TABLE IF NOT EXISTS` is a no-op on an existing table, so the column never
   appears and the INSERT fails later, in a task, at publish.
 - **AN AS-AT DATE HAS A LIFECYCLE, and `open` is the absence of a row.**
   `registry.as_at_transition` is append-only, `open -> locked -> submitted`,
-  back to `reopened` only deliberately and — from **submitted** — only with the
-  exposure owner's approval. **The publish gate runs BEFORE the merge**, since
-  `publish()` merges first and versions second, so a gate placed with the
-  versioning fires after `main` has moved. REQ-503 is that nothing branches on
-  what KIND of report it is; `tests/test_lifecycle.py` greps for that.
-  (`#the-as-at-date-has-a-lifecycle`)
-
-## Retention, tags and GC
-
+  reopened only deliberately and — from **submitted** — only with the exposure
+  owner's approval. **The publish gate runs BEFORE the merge**, or it fires
+  after `main` has moved. Nothing branches on what KIND of report it is
+  (REQ-503). (`#the-as-at-date-has-a-lifecycle`)
 - **Retention and GC delete data. `dry_run` first, always.** GC defers its
   deletes by design; the deferred-delete pass is the deliberate second step.
 - **THE ORPHAN SWEEP'S INPUT IS A KEEP-SET, so a short answer is a deletion
   order.** `orphan_storage` deletes every warehouse prefix not live on some
-  reference: a Nessie that is down therefore used to read as "nothing is
-  live". An unreadable reference (anything but a 404) now REFUSES the sweep,
-  an empty live set against a non-empty warehouse refuses too, and a refusal
-  exits non-zero — nothing deleted is not the same as nothing to delete. The
-  prefix depth is derived from `REPORTING_WAREHOUSE`, never assumed, or a
-  nested root makes every namespace an orphan.
-  (`#an-incomplete-keep-set-refuses`)
+  reference, so a Nessie that is down reads as "nothing is live". An unreadable
+  reference refuses the sweep, an empty live set against a non-empty warehouse
+  refuses too, and a refusal exits non-zero. Prefix depth is derived from
+  `REPORTING_WAREHOUSE`. (`#an-incomplete-keep-set-refuses`)
 - **The completeness check has THREE answers, not two**: `no data` (empty
   table), `no table` (`TABLE_OR_VIEW_NOT_FOUND` — a feed that has never
   delivered), `unreadable` (anything else, and it fails `--fail-on-gap`).
 - **A dry run may write to the index; it may not write anything a later step
-  reads to decide what to delete.** `registry_reconcile` ignored `dry_run` and
-  `deliveries.reconcile()` normalizes first, so `{"dry_run": true}` wrote 116
-  manifests into `ready/` and then mispredicted its own sweep. Skipping the task
-  is not the fix — it is the rebuild path, and *events are an optimisation, the
-  poll is the correctness guarantee*. Narrowed instead: rows written, manifests
-  not, count reported as `would_normalize`.
+  reads to decide what to delete.** `registry_reconcile` writes rows but not
+  manifests under `dry_run`, and reports `would_normalize` — skipping the task
+  is not the fix, because it is the rebuild path.
   (`#a-dry-run-may-write-to-the-index-not-to-object-storage`)
 - **A published tag is DATA retention, sized in years, not by the table
   keep-set.** `references.published_tags` is the reproducibility window: a tag
   pins every data file its commit referenced, so its lifetime is how long a
-  published run can still be read. It once carried the tables'
-  `keep_business_days: 10` and expired pins after a fortnight.
-  `landing.keep_years` must be >= the longest tag window and `retention.py`
-  **refuses to sweep** otherwise — landing is the only copy of what the
-  upstream sent, so a pin outliving its evidence cannot be honoured. (A tag's
-  own state stays live at any `nessie_gc` cutoff — verified.)
+  published run can still be read. `landing.keep_years` must be >= the longest
+  tag window and `retention.py` **refuses to sweep** otherwise — a pin
+  outliving its evidence cannot be honoured.
   (`#published-tags-are-the-reproducibility-window`)
 - **AN INGEST IS NOT A PUBLICATION, and they cut different tags.** An ingest
   pins `snapshot/<feed>/<bd>/<run_id>`; the **reporting build** cuts
-  `published/<report>/<bd>/<run_id>`, one per report, when it merges. While the
-  ingest cut `published/`, every check reading that prefix was reading ingests,
-  `per_report` matched nothing, and an ingest was kept for the full ten years.
-  A **report is a dbt EXPOSURE**, derived by `context.reports()` — not a new
-  config block. (`#an-ingest-is-not-a-publication`)
+  `published/<report>/<bd>/<run_id>`, one per report, when it merges. A
+  **report is a dbt EXPOSURE**, derived by `context.reports()` — not a config
+  block. (`#an-ingest-is-not-a-publication`)
 - **A feed's evidence window is its RETENTION CLASS**, named in `feeds.yml`,
   sized in `retention.yml` per environment, refused at LOAD if undeclared.
-  Classes govern `landing/` and `quarantine/` **only** — table keep-sets stay
-  per layer, because a per-feed raw window would fight `find_pending`. The
-  reproducibility interlock is per (report, feed) via `feeds_behind_report()`,
-  which walks the exposure's `ref()` closure: a feed behind no published report
-  is bound by no pin, which is the point — under the old global rule no class
-  could be shorter than the longest pin. `snapshot_tags` stays outside it. The
-  landing sweep reports `default_keep_years`/`classes_applied`, because one
-  number cannot describe a per-feed sweep.
-  (`#retention-classes-name-the-obligation`)
-
-## Lineage
-
-How the datasets, columns and classes are actually derived is in
-`docs/DECISIONS.md#lineage-is-derived-from-the-dbt-project` and
-`#a-column-with-no-source-says-so` — read those before changing
-`reporting_platform/lineage`. What matters from outside it:
-
+  Classes govern `landing/` and `quarantine/` **only** — a per-feed raw window
+  would fight `find_pending`. The reproducibility interlock is per (report,
+  feed) via `feeds_behind_report()`, so a feed behind no published report is
+  bound by no pin. (`#retention-classes-name-the-obligation`)
 - **OpenLineage is an EXPORT, Marquez a CONSUMER**, both off by default behind
   `OPENLINEAGE_DISABLED`. The provider is ALREADY in the image — installing it
   explicitly under Airflow's constraints is the cosmos trap exactly. Env is
@@ -441,13 +338,11 @@ How the datasets, columns and classes are actually derived is in
   rather than pulls. Nothing else about the deployment changed.
   (`#marquez-on-ubi`)
 - **It is not an authority, and not the record of what a run published.**
-  Lineage is derived from the dbt project by `context.model_refs()` — the SAME
-  walker `feeds_behind_report()` sizes retention windows with, so a second
-  graph that drifts is the failure this file keeps warning about;
-  `tests/test_lineage.py` asserts they agree. `registry.run_input` is the
-  publication record, and the two legitimately differ (an SCD2 dimension
-  contributes 10 of 40 deliveries; OpenLineage reports all 40 as read). Do not
-  reconcile them.
+  Lineage is derived by `context.model_refs()` — the SAME walker
+  `feeds_behind_report()` sizes retention with, and `tests/test_lineage.py`
+  asserts they agree. `registry.run_input` is the publication record, and the
+  two legitimately differ: an SCD2 dimension contributes 10 of 40 deliveries
+  while OpenLineage reports all 40 as read. Do not reconcile them.
 - **Register the custom extractor with `AIRFLOW__OPENLINEAGE__EXTRACTORS`** —
   **not** `__CUSTOM_EXTRACTORS`, which is read by nothing and warns about
   nothing. Without it Airflow emits jobs and no datasets at all, because
@@ -475,14 +370,9 @@ How the datasets, columns and classes are actually derived is in
 - **THE CONSOLE MAY NOT BE THE ONLY THING THAT VALIDATES A VALUE.** `cadence`,
   `schema_drift`, `expected_min_rows`, `delimiter`, `quote_char` and
   `file_encoding` were checked by `ui/registry.validate` and by NOTHING at
-  load — so the form refused what a hand edit or a merge could still write,
-  and `cadence: fortnightly` behaved as `daily` with nothing saying so. They
-  are `check_*` functions in `common/context.py` now, called from both, like
-  `parse_expected_by` and `check_retention_class` always were.
+  load, so the form refused what a hand edit or a merge could still write.
+  They are `check_*` functions in `common/context.py` now, called from both.
   `tests/test_value_checks.py` asserts each from both sides.
-
-## CI
-
 - **`.github/workflows/config.yml` is the cheap tier and the only one that
   exists**: `config check` + `python -m tests.run` on a bare runner, ~10s.
   Its dependency set (pyyaml, ruamel.yaml, requests, duckdb) was DERIVED BY
@@ -492,11 +382,9 @@ How the datasets, columns and classes are actually derived is in
 - **`lineage --columns` is NOT usable at that tier, and `--require-derivable`
   is why it is a gate at the tier above.** Without compiled SQL and a catalog
   it reports 7 of 11 tables as `not derivable` and exits **0** — green on
-  almost nothing. `--columns --require-derivable` refuses when any managed
-  table could not be read at all: `unresolved` is a column it READ and could
-  not trace, `not derivable` is a table it could not read, and reporting the
-  second as the first is this file's own rule broken by the tool that
-  enforces the rest of them. The count now prints either way.
+  almost nothing. `unresolved` is a column it READ and could not trace;
+  `not derivable` is a table it could not read, and reporting the second as
+  the first is this file's own rule broken by the tool enforcing the rest.
 - **The jar triple is checked** — `tests/test_value_checks.py`'s sibling
   `tests/test_versions.py` pins `ICEBERG_VERSION` across all **five** files
   that declare it, the extensions across five, the server against the
@@ -505,6 +393,13 @@ How the datasets, columns and classes are actually derived is in
   build-time fact and is not computed.
 - **A declared column that no prepared model selects now fails** —
   `test_lineage.py`, the one drift quadrant nothing covered.
+- **Two claims the DOCS make are gated** — `tests/test_doc_claims.py`. A
+  paragraph saying something is NOT BUILT must name a value
+  `context.NOT_BUILT`/`SUPERSESSION_NOT_BUILT` still lists, or be written as
+  history; a `` `"..."` `` quoted error must be one a module still raises.
+  Both go false SILENTLY, because building the feature is what falsifies them
+  and whoever builds it is reading code, not the docs. Backticked identifiers
+  are deliberately NOT checked — too noisy to gate.
 - **Still ungated**: the image build (the cosmos `--no-deps` trap — the
   Dockerfile's `dbt --version` smoke test IS the gate, it just never runs in
   CI), `dbt parse`, and DAG import.

@@ -670,16 +670,17 @@ function feedForm(f, creating) {
   function syncDeliveryVisibility() {
     const isArchive = deliveryKind.value === "archive";
     memberPatternField.style.display = isArchive ? "" : "none";
-    // Gating an archive on a control file is described in DELIVERY-SHAPES.md
-    // but NOT BUILT -- context.resolve_delivery_config rejects the
-    // combination, so the form does not offer it rather than let someone
-    // fill it in and hit that error at save.
-    controlPatternField.style.display = isArchive ? "none" : "";
-    ctlFormatField.style.display = isArchive ? "none" : "";
-    ctlFormatFields.style.display =
-      isArchive || ctlFormat.value !== "delimited" ? "none" : "";
-    controlRowCountField.style.display = isArchive ? "none" : "";
-    controlMd5Field.style.display = isArchive ? "none" : "";
+    // A control file gates EITHER kind: beside the CSV for a plain delivery,
+    // beside the container for an archive, where row_count is the total
+    // across the members and md5 is the container's own. The form used to
+    // hide these for an archive because the loader refused the combination;
+    // it does not any more, and hiding them would mean the form could not
+    // create a feed the loader accepts.
+    controlPatternField.style.display = "";
+    ctlFormatField.style.display = "";
+    ctlFormatFields.style.display = ctlFormat.value !== "delimited" ? "none" : "";
+    controlRowCountField.style.display = "";
+    controlMd5Field.style.display = "";
   }
   deliveryKind.addEventListener("change", syncDeliveryVisibility);
   syncDeliveryVisibility();
@@ -1010,13 +1011,14 @@ function feedForm(f, creating) {
   };
 
   const readDelivery = () => {
+    // The control block is read for BOTH kinds -- see syncDeliveryVisibility.
+    const out = {};
     if (deliveryKind.value === "archive") {
-      const d = {kind: "archive"};
-      if (memberPattern.value.trim()) d.member_pattern = memberPattern.value.trim();
-      return d;
+      out.kind = "archive";
+      if (memberPattern.value.trim()) out.member_pattern = memberPattern.value.trim();
     }
     const pat = controlPattern.value.trim();
-    if (!pat) return {};
+    if (!pat) return out;
     const control = {pattern: pat};
     const fmt = readControlFormat();
     if (fmt) control.format = fmt;
@@ -1024,7 +1026,8 @@ function feedForm(f, creating) {
     if (rc) control.row_count = rc;
     const md5 = controlMd5.value.trim();
     if (md5) control.md5 = md5;
-    return {control};
+    out.control = control;
+    return out;
   };
 
   refreshKeyChoices();
