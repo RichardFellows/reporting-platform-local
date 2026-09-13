@@ -325,7 +325,7 @@ services:
     # is not redundant: `inbox`, `feed-ui` and `watchdog` share this image but
     # not this container's `depends_on`, so they can be up and recording
     # deliveries while this has never run.
-    # See docs/DECISIONS.md#airflow-init-four-things
+    # See docs/DECISIONS.md#airflow-init-load-bearing-steps
     command: >
       bash -euc "
       airflow db migrate &&

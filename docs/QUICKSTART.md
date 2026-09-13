@@ -58,11 +58,11 @@ The other two are one-shot and **exiting `(0)` is the correct outcome** for
 both:
 
 - `minio-init` creates the buckets.
-- `airflow-init` migrates the metadata DB, creates the admin user, **creates
-  the `lakehouse_write` pool and runs `dbt deps`**. The last two used to be
-  manual steps later in this guide; both are done for you now, because
-  forgetting either broke the platform without saying so. Worth a glance the
-  first time:
+- `airflow-init` migrates the metadata DB, creates the admin user, creates the
+  delivery registry's schema, **creates the `lakehouse_write` pool and runs
+  `dbt deps`**. The last two used to be manual steps later in this guide; both
+  are done for you now, because forgetting either broke the platform without
+  saying so. Worth a glance the first time:
 
   ```bash
   docker compose logs airflow-init | tail -20

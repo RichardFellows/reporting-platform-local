@@ -113,7 +113,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [raw-is-a-source](#raw-is-a-source) | `models/raw/` contains no models on purpose |
 | [no-unused-config-paths](#no-unused-config-paths) | No `seeds:` block, and why an unused config path is a trap |
 | [identifiers-in-macros](#identifiers-in-macros) | Which macros call `ident()`, and why that is a decision |
-| [airflow-init-four-things](#airflow-init-four-things) | Migrate, admin user, the pool, `dbt deps` — miss the last and two DAGs do not import |
+| [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps) | Migrate, admin user, the pool, the registry schema, `dbt deps` — miss the last and two DAGs do not import |
 | [assets-are-or-not-and](#assets-are-or-not-and) | A bare schedule list is **AND**, which is almost never what you meant |
 | [retry-delay](#retry-delay) | Seconds, not the five minutes it used to be |
 
@@ -458,11 +458,16 @@ after the one that changed — put it higher and editing a directory list costs 
 full reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
 whatever registry mirror is in front of pip. Nothing below it depends on it.
 
-## airflow-init-four-things
+## airflow-init-load-bearing-steps
 
 `airflow-init` runs once and everything else waits on it *completing*, so no
-component races the database into existence. It does four things, each of which
-was once a manual step that silently broke the platform when skipped:
+component races the database into existence. It does five things, each of which
+was once a manual step that silently broke the platform when skipped.
+
+THE ANCHOR NO LONGER COUNTS THEM, and that is the point of the rename: it was
+`airflow-init-four-things`, the registry schema became the fifth, and a name
+that holds a number goes stale the next time this list grows. What is load
+bearing is that every step is.
 
 1. `db migrate` — the metadata schema. (Unlike Airflow 3, `airflow users` exists
    here.)
@@ -473,7 +478,12 @@ was once a manual step that silently broke the platform when skipped:
    exclude them from each other, which is the bug that once let
    `remove_orphan_files` run alongside a write. Without it every task sits
    `queued` forever with nothing to say why.
-4. `dbt deps` — no longer merely "the build fails until you run it". Cosmos
+4. `registry schema` — the delivery registry's tables, so a cold stack has
+   them before any DAG parses. `registry/db.py` also ensures the schema on its
+   first connect, and that is not redundant: `inbox`, `feed-ui` and `watchdog`
+   share this image but not this container's `depends_on`, so they can be up
+   and recording deliveries while this has never run.
+5. `dbt deps` — no longer merely "the build fails until you run it". Cosmos
    renders `prepared_build` and `reporting_build` by running `dbt ls`, which
    cannot compile a `dbt_utils` test without the package, so on a fresh clone
    those two DAGs would not **import**. Installing here makes the clone
@@ -945,7 +955,7 @@ the last publication of the day, and a feed is late, not lost
 
 Without the pool, every task sits `queued` forever with nothing to say why,
 which is why `airflow-init` creates it -- see
-[airflow-init-four-things](#airflow-init-four-things).
+[airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps).
 
 ## gc-lag-and-assertions
 
@@ -1402,9 +1412,19 @@ same value* -- applied to the tool that enforces the rest of them.
 
 `--require-derivable` adds the second condition, and the derivable count now
 prints either way, because `unresolved: none` over four of eleven tables reads
-as a pass unless the other seven are counted next to it. The flag is for the
-post-build tier: at the config tier it correctly fails, which is why
-`.github/workflows/config.yml` runs `--columns` without it and says so.
+as a pass unless the other seven are counted next to it.
+
+**NO TIER THAT EXISTS RUNS EITHER FORM**, and this paragraph claimed otherwise
+for a while -- that `.github/workflows/config.yml` ran `--columns` without the
+flag. It never did, and it should not. Without the flag, the four tables a
+config-level run CAN read are read from `feeds.yml`'s declared columns, not
+from a catalog, so every column is `sourced` by construction -- 28 of 28,
+measured -- and `unresolved` cannot arise at all: a tick that cannot fail,
+which is what this section is named after. With the flag it fails every time
+and says only "you have not built yet". The gate belongs to a post-build tier,
+there is not one, and `config.yml`'s header now says that instead of claiming
+the check. The tier that DOES exist above it, `parse.yml`, changes nothing
+here: `dbt parse` writes no compiled SQL.
 
 The flag alone, without `--columns`, is an argparse error rather than a silent
 no-op -- for the same reason `member_pattern` on a non-archive feed is

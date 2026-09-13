@@ -4,6 +4,12 @@ seed_clean/
 dbt/target/
 dbt/dbt_packages/
 dbt/logs/
+
+# Where .github/workflows/parse.yml puts dbt's and Airflow's working
+# directories: inside the workspace, because a job-level `env:` cannot see
+# the `runner` context. Ephemeral on a runner; ignored here so running the
+# same commands locally does not dirty the tree.
+.ci/
 __pycache__/
 *.pyc
 
