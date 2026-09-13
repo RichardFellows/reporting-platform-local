@@ -56,12 +56,13 @@ import hashlib
 import io
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 from reporting_platform.common.context import Feed
 from reporting_platform.common.filenames import (
-    FilenameError, literal_from_regex, render_filename,
+    FilenameError, claims_control_file, literal_from_regex, render_filename,
 )
 from reporting_platform.ingest import control as control_mod
 
@@ -119,18 +120,39 @@ class DuplicateDelivery(Exception):
 
 
 def is_source_control_file(feed: Feed, filename: str) -> bool:
-    """Whether `filename` is SHAPED like this feed's inbound control file.
+    """Whether `filename` is this feed's inbound control file, AT THE DOOR.
 
     A control file matches no `filename_pattern` and no `source_pattern` -- it
     names no delivery, it says something about one -- so without this the
     inbox would reject it to `.rejected/` and the delivery it belongs to would
     wait forever on a file that can never arrive.
+
+    THE STEM IS PART OF THE QUESTION. `claims_control_file` requires the stem
+    to be one this feed's own source names can have, so two feeds that both
+    send `.ctl` no longer each claim every control file at the door. An
+    ARCHIVE feed claims none here: its control files are packed inside the
+    container -- see `is_member_control_file`, which is the container's own
+    namespace and stays permissive because inside a container there is only
+    one feed to be.
+    """
+    return claims_control_file(feed, filename, "arrival")
+
+
+def is_member_control_file(feed: Feed, member_filename: str) -> bool:
+    """Whether an archive MEMBER is a control file rather than a delivery.
+
+    Deliberately the loose test -- the stem shape is not required, only the
+    control pattern's own shape. Inside a container there is no other feed to
+    confuse this with: the container has already been attributed, and the
+    member names are the sender's, not the platform's. What this must catch is
+    a `member_pattern` permissive enough to claim the control files as data,
+    which would ingest a control file's own text as rows.
     """
     pattern = feed.source_control_pattern()
     if not pattern:
         return False
     return re.fullmatch(pattern.replace("{stem}", "(?P<stem>.+)"),
-                        filename) is not None
+                        member_filename) is not None
 
 
 def control_filename_for(feed: Feed, data_filename: str) -> str | None:
@@ -431,7 +453,9 @@ def _free_name(feed: Feed, cob_date: date, version: int | None,
 
 
 def is_archive(feed: Feed) -> bool:
-    return bool((feed.arrival or {}).get("archive"))
+    """Whether the gate unpacks this feed's deliveries. One rule, in
+    `arrival_shape`, so a predicate and a dispatch cannot disagree."""
+    return arrival_shape(feed) == "archive"
 
 
 def _safe_member_name(name: str) -> str:
@@ -454,6 +478,37 @@ def _safe_member_name(name: str) -> str:
     return name
 
 
+def archive_members(feed: Feed, container_filename: str,
+                    content: bytes) -> list[tuple[str, bytes]]:
+    """Every member of the container, claimed or not, sorted by name.
+
+    Separate from `unpack` because the two questions are different: this is
+    what the container HOLDS, and `unpack` is which of those are DELIVERIES.
+    A member that is neither -- a checksum file, a manifest, and now a
+    member's control file -- has to be readable without being landed.
+    """
+    import io
+    import zipfile
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise ConformanceError(
+            f"{feed.name}: {container_filename} is not a readable zip: {exc}"
+        ) from exc
+
+    out: list[tuple[str, bytes]] = []
+    with zf:
+        # Sorted so the landing order does not depend on how the sender
+        # happened to build the archive.
+        for info in sorted(zf.infolist(), key=lambda i: i.filename):
+            if info.is_dir():
+                continue
+            out.append((_safe_member_name(info.filename),
+                        zf.read(info.filename)))
+    return out
+
+
 def unpack(feed: Feed, container_filename: str,
            content: bytes) -> list[tuple[str, bytes]]:
     """A container -> the (name, bytes) of every member this feed claims.
@@ -468,27 +523,18 @@ def unpack(feed: Feed, container_filename: str,
     matching NONE is an error, because an archive that unpacks to nothing is a
     delivery problem, not an empty day, and landing zero rows would pass
     `expected_min_rows` only by accident.
+
+    A MEMBER SHAPED LIKE THIS FEED'S CONTROL FILE IS NEVER A DELIVERY, even
+    when `member_pattern` would claim it. A permissive pattern (`.*\\.csv`) and
+    a control file the sender also writes as CSV is an ordinary combination,
+    and landing `POS_A.ctl.csv` as a delivery would ingest the control file's
+    own text as rows. The pattern says which members are data; the control
+    block says which are not, and the second wins.
     """
-    import io
-    import zipfile
-
     pattern = re.compile(feed.arrival["archive"]["member_pattern"])
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(content))
-    except zipfile.BadZipFile as exc:
-        raise ConformanceError(
-            f"{feed.name}: {container_filename} is not a readable zip: {exc}"
-        ) from exc
-
-    out: list[tuple[str, bytes]] = []
-    with zf:
-        # Sorted so the landing order does not depend on how the sender
-        # happened to build the archive.
-        for info in sorted(zf.infolist(), key=lambda i: i.filename):
-            if info.is_dir() or not pattern.fullmatch(info.filename):
-                continue
-            out.append((_safe_member_name(info.filename),
-                        zf.read(info.filename)))
+    out = [(name, body)
+           for name, body in archive_members(feed, container_filename, content)
+           if pattern.fullmatch(name) and not is_member_control_file(feed, name)]
     if not out:
         raise ConformanceError(
             f"{feed.name}: {container_filename} holds no member matching "
@@ -497,14 +543,19 @@ def unpack(feed: Feed, container_filename: str,
     return out
 
 
-def member_cob_date(feed: Feed, member_filename: str) -> date:
-    """The COB date a member carries in its own name."""
+def member_cob_date(feed: Feed, member_filename: str) -> date | None:
+    """The COB date a member carries in its own name, or None if it carries
+    none -- which is legal when `arrival.control` reads one out of the
+    member's control file instead. `resolve_arrival_config` guarantees exactly
+    one of the two exists."""
     pattern = feed.arrival["archive"]["member_pattern"]
     m = re.fullmatch(pattern, member_filename)
     if not m:
         raise ConformanceError(
             f"{feed.name}: member {member_filename!r} does not match "
             f"{pattern!r}")
+    if "cob_date" not in m.groupdict():
+        return None
     raw = m.group("cob_date")
     try:
         return datetime.strptime(raw, "%Y%m%d").date()
@@ -516,6 +567,8 @@ def member_cob_date(feed: Feed, member_filename: str) -> date:
 
 def conform_member(feed: Feed, container_filename: str, container_content: bytes,
                    member_filename: str, member_content: bytes, *,
+                   control_filename: str | None = None,
+                   control_text: str | None = None,
                    received_at: datetime | None = None,
                    taken: set[str] | None = None,
                    landed_md5: Callable[[str], str | None] | None = None
@@ -528,46 +581,302 @@ def conform_member(feed: Feed, container_filename: str, container_content: bytes
     container's name and checksum so what arrived is still provable without
     keeping an object nothing reads.
 
+    A MEMBER MAY HAVE ITS OWN CONTROL FILE, packed in the same container, and
+    then it is a delivery in every sense the plain path means: the control
+    file names the COB date, both are promoted into `landing/` renamed, and
+    `delivery.control` verifies the pair there. That is what makes a zip of
+    statically named members workable -- the members say nothing, so something
+    else has to, and the sender already ships it.
+
+    `NotReady` here means the control file is CONFIGURED AND ABSENT FROM THE
+    CONTAINER, which is a delivery error rather than a wait: a container
+    arrives complete, so a file missing from it will never turn up beside it.
+    The caller reports it as a refusal of that member; see `_plan_archive`.
+
     Raises `DuplicateDelivery` on the same terms `conform()` does. A container
     resent whole is the commonest way this happens -- the members inside it
     are byte-identical, and versioning them would restate every COB date
     the archive covers at once.
     """
-    cob_date = member_cob_date(feed, member_filename)
+    control = (feed.arrival or {}).get("control") or {}
+    declared: dict[str, Any] = {}
+    if control:
+        if control_filename is None or control_text is None:
+            raise NotReady(
+                f"{feed.name}: member {member_filename} of "
+                f"{container_filename} has no control file matching "
+                f"{control['pattern']!r} (stem {_stem(member_filename)!r}) "
+                f"inside the container. The member's COB date is read out of "
+                f"that file, so without it the member cannot be named.")
+        declared = read_control(feed, control_text, control_filename)
+
+    cob_date = declared.get("cob_date") or member_cob_date(feed, member_filename)
+    if cob_date is None:
+        # resolve_arrival_config guarantees one source exists, so reaching here
+        # means the configured one produced nothing -- which the readers above
+        # would already have raised on. A guard, because without a date the
+        # member cannot be named at all.
+        raise ConformanceError(
+            f"{feed.name}: no COB date for member {member_filename} of "
+            f"{container_filename} -- neither `arrival.archive.member_pattern` "
+            f"nor its control file yielded one.")
+
     observed = observe(feed, member_content)
     try:
-        landing_filename = _free_name(feed, cob_date, None, taken,
-                                      md5=observed["md5"], landed_md5=landed_md5)
+        landing_filename = _free_name(feed, cob_date, declared.get("version"),
+                                      taken, md5=observed["md5"],
+                                      landed_md5=landed_md5)
+        control_landing_filename = landing_control_filename(feed, landing_filename)
     except FilenameError as exc:
         raise ConformanceError(
             f"{feed.name}: cannot build the landing name for member "
             f"{member_filename}: {exc}") from exc
 
     now = datetime.now(timezone.utc)
+    metadata = {
+        "metadata_version": METADATA_VERSION,
+        "feed": feed.name,
+        "source_system": feed.source_system,
+        "cob_date": cob_date.isoformat(),
+        "landing_filename": landing_filename,
+        "source_filename": member_filename,
+        # The container is NOT landed, so this is the only record that it
+        # existed, what it was called and that these bytes came out of it.
+        "source_container": container_filename,
+        "source_container_md5": hashlib.md5(container_content).hexdigest(),
+        "source_container_bytes": len(container_content),
+        "received_at": (received_at or now).astimezone(timezone.utc).isoformat(),
+        "promoted_at": now.isoformat(),
+        "promoted_by": "inbox",
+        **observed,
+        "declared": {k: (v.isoformat() if isinstance(v, date) else v)
+                     for k, v in declared.items()},
+    }
+    if control_filename is not None:
+        # Present only for a member that HAD one, so the two keys mean what
+        # they mean on the plain path: absent, not null, when there was none.
+        metadata["landing_control_filename"] = control_landing_filename
+        metadata["source_control_filename"] = control_filename
     return {
         "landing_filename": landing_filename,
-        "control_landing_filename": None,
+        "control_landing_filename": (control_landing_filename
+                                     if control_filename is not None else None),
         "metadata_filename": landing_filename + METADATA_SUFFIX,
         "cob_date": cob_date,
-        "metadata": {
-            "metadata_version": METADATA_VERSION,
-            "feed": feed.name,
-            "source_system": feed.source_system,
-            "cob_date": cob_date.isoformat(),
-            "landing_filename": landing_filename,
-            "source_filename": member_filename,
-            # The container is NOT landed, so this is the only record that it
-            # existed, what it was called and that these bytes came out of it.
-            "source_container": container_filename,
-            "source_container_md5": hashlib.md5(container_content).hexdigest(),
-            "source_container_bytes": len(container_content),
-            "received_at": (received_at or now).astimezone(timezone.utc).isoformat(),
-            "promoted_at": now.isoformat(),
-            "promoted_by": "inbox",
-            **observed,
-            "declared": {},
-        },
+        "metadata": metadata,
     }
+
+
+# ============================================================ arrival shapes
+# HOW A FILE AT THE DOOR BECOMES DELIVERIES. One entry per shape, and adding a
+# shape is a planner plus a line in `ARRIVAL_SHAPES` -- not a branch in the
+# watcher, which is what this seam exists to prevent. Before it there were two
+# `_promote*` functions in `inbox.py`, each with its own copy of the write
+# order, the move rules and the trigger, already disagreeing about which
+# failures were fatal.
+#
+# THE CONTRACT, and it is deliberately small:
+#
+#   planner(feed, filename, content, siblings, ...) -> list[Outcome]
+#
+# PURE -- it reads bytes it is handed and returns what SHOULD be written,
+# never writing anything, which is what lets every shape be tested without S3
+# or a watcher. One inbox file may become many outcomes (an archive) or one (a
+# plain delivery), and the four outcome types below are the whole vocabulary
+# the caller has to understand.
+#
+# A NEW SHAPE MUST NOT NEED A NEW OUTCOME TYPE. If it does, the thing it wants
+# to say is something `inbox.py` does not yet know how to act on, and that is
+# the conversation to have before writing the planner.
+
+
+@dataclass(frozen=True)
+class Siblings:
+    """The files a delivery's control file could be among, and how to read one.
+
+    THE ONE ABSTRACTION THE SHAPES SHARE. A plain delivery's control file sits
+    beside it in the inbox directory; an archive member's sits beside it
+    INSIDE the container. Same question -- "which of these names is this
+    delivery's control file, and what does it say" -- asked of two different
+    namespaces, so `find_control` and `read_control` serve both and a future
+    shape (a tar, a sidecar directory, an object-store prefix) supplies its
+    own namespace rather than its own copy of the pairing rule.
+
+    `read` is a callable rather than a dict of bytes so a shape whose members
+    are expensive to materialise reads only the one file it turns out to need.
+    """
+    names: list[str] = field(default_factory=list)
+    read: Callable[[str], bytes] = lambda name: b""
+
+
+@dataclass(frozen=True)
+class Planned:
+    """One delivery the gate could name, and every object it should become.
+
+    `consumed` names the INBOX files that travelled with this delivery and
+    should be moved with it -- a plain delivery's control file, and nothing
+    for an archive member, whose control file was inside the container and
+    never existed as a file of its own.
+    """
+    source_name: str
+    data: bytes
+    landing_filename: str
+    metadata_filename: str
+    metadata: dict[str, Any]
+    cob_date: date
+    control: bytes | None = None
+    control_landing_filename: str | None = None
+    consumed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Refused:
+    """An IDENTITY failure: these bytes cannot be given a landing name.
+
+    `source_name` equal to the inbox file's own name means the file itself is
+    refused; anything else names something found inside it, and the caller
+    quarantines those bytes rather than the container's.
+    """
+    source_name: str
+    data: bytes
+    reason: str
+    consumed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Duplicate:
+    """These exact bytes are already landed for this COB date. Not a failure,
+    and not a restatement -- there is nothing to write and nothing to trigger."""
+    source_name: str
+    landing_filename: str
+    reason: str
+    consumed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Waiting:
+    """The delivery is here and incomplete -- its control file has not arrived.
+    Nothing is wrong; the caller leaves everything where it is and tries again."""
+    source_name: str
+    reason: str
+
+
+Outcome = Planned | Refused | Duplicate | Waiting
+
+
+def arrival_shape(feed: Feed) -> str:
+    """Which planner this feed's deliveries go through. See `ARRIVAL_SHAPES`."""
+    return "archive" if (feed.arrival or {}).get("archive") else "file"
+
+
+def plan_arrival(feed: Feed, filename: str, content: bytes, *,
+                 siblings: Siblings | None = None,
+                 received_at: datetime | None = None,
+                 taken: set[str] | None = None,
+                 landed_md5: Callable[[str], str | None] | None = None
+                 ) -> list[Outcome]:
+    """One file at the door -> what should be written for it. Writes nothing."""
+    return ARRIVAL_SHAPES[arrival_shape(feed)](
+        feed, filename, content, siblings or Siblings(),
+        received_at, taken, landed_md5)
+
+
+def _plan_file(feed: Feed, filename: str, content: bytes, siblings: Siblings,
+               received_at, taken, landed_md5) -> list[Outcome]:
+    """A plain delivery, with its control file beside it in the inbox."""
+    control_name = find_control(feed, filename, siblings.names)
+    control_bytes = siblings.read(control_name) if control_name else None
+    control_text = (control_bytes.decode(feed.file_encoding, errors="replace")
+                    if control_bytes is not None else None)
+    consumed = (control_name,) if control_name else ()
+    try:
+        plan = conform(feed, filename, content,
+                       control_filename=control_name, control_text=control_text,
+                       received_at=received_at, taken=taken,
+                       landed_md5=landed_md5)
+    except NotReady as exc:
+        return [Waiting(filename, str(exc))]
+    except DuplicateDelivery as exc:
+        return [Duplicate(filename, exc.landing_filename, str(exc), consumed)]
+    except ConformanceError as exc:
+        # The control file is refused WITH the delivery it gates: on its own it
+        # is unreadable evidence, and the commonest identity failure is that
+        # the two disagree.
+        return [Refused(filename, content, str(exc), consumed)]
+    return [Planned(
+        source_name=filename, data=content,
+        landing_filename=plan["landing_filename"],
+        metadata_filename=plan["metadata_filename"],
+        metadata=plan["metadata"], cob_date=plan["cob_date"],
+        control=control_bytes,
+        control_landing_filename=plan["control_landing_filename"],
+        consumed=consumed)]
+
+
+def _plan_archive(feed: Feed, filename: str, content: bytes,
+                  siblings: Siblings, received_at, taken,
+                  landed_md5) -> list[Outcome]:
+    """A container: N deliveries out, each following the single-file path.
+
+    `taken` ADVANCES AS MEMBERS ARE PLANNED, not read once: two members for
+    the same COB date inside one container would otherwise both render the
+    unversioned name and the second would overwrite the first.
+
+    ONE BAD MEMBER DOES NOT DISCARD THE REST. The others are real deliveries
+    that arrived and can be ingested, so a member's refusal is one `Refused`
+    among the batch rather than an exception that abandons it. A failure of
+    the CONTAINER -- unreadable zip, no member claimed -- refuses the inbox
+    file itself, which the caller tells apart by `source_name`.
+    """
+    try:
+        members = dict(archive_members(feed, filename, content))
+        claimed = unpack(feed, filename, content)
+    except ConformanceError as exc:
+        return [Refused(filename, content, str(exc))]
+
+    inside = Siblings(names=list(members), read=lambda name: members[name])
+    seen = set(taken or ())
+    out: list[Outcome] = []
+    for member_name, member_bytes in claimed:
+        control_name = find_control(feed, member_name, inside.names)
+        control_bytes = inside.read(control_name) if control_name else None
+        control_text = (control_bytes.decode(feed.file_encoding,
+                                             errors="replace")
+                        if control_bytes is not None else None)
+        try:
+            plan = conform_member(
+                feed, filename, content, member_name, member_bytes,
+                control_filename=control_name, control_text=control_text,
+                received_at=received_at, taken=seen, landed_md5=landed_md5)
+        except DuplicateDelivery as exc:
+            out.append(Duplicate(f"{filename}!{member_name}",
+                                 exc.landing_filename, str(exc)))
+            continue
+        except (ConformanceError, NotReady) as exc:
+            # NotReady CANNOT CLEAR ON ITS OWN HERE, so it is a refusal rather
+            # than a wait: a member's control file is packed in the same
+            # container, and a container is complete the moment it arrives.
+            # Waiting for a file that is already known to be absent would hold
+            # the delivery for ever and report nothing.
+            out.append(Refused(f"{filename}!{member_name}", member_bytes,
+                               str(exc)))
+            continue
+        seen.add(plan["landing_filename"])
+        out.append(Planned(
+            source_name=f"{filename}!{member_name}", data=member_bytes,
+            landing_filename=plan["landing_filename"],
+            metadata_filename=plan["metadata_filename"],
+            metadata=plan["metadata"], cob_date=plan["cob_date"],
+            control=control_bytes,
+            control_landing_filename=plan["control_landing_filename"]))
+    return out
+
+
+# Every shape this platform can accept at the door. See the contract above.
+ARRIVAL_SHAPES: dict[str, Callable[..., list[Outcome]]] = {
+    "file": _plan_file,
+    "archive": _plan_archive,
+}
 
 
 def metadata_bytes(metadata: dict[str, Any]) -> bytes:

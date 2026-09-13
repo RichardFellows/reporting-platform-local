@@ -256,6 +256,8 @@ docker compose up -d feed-ui     # http://localhost:8082
 
 ## See also
 
+- [DELIVERY-WALKTHROUGHS.md](DELIVERY-WALKTHROUGHS.md) — the same path with four
+  worked examples: every filename, rename, sidecar and manifest, verbatim
 - [ADDING-A-FEED.md](ADDING-A-FEED.md) — the five files a new feed touches
 - [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) — zips, control files, awkward deliveries
 - [RETENTION.md](RETENTION.md) — what is deleted, when, and what refuses to be

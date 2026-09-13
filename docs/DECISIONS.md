@@ -99,6 +99,8 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [archive-normalizer](#archive-normalizer) | A dated container of undated members |
 | [control-file-gate](#control-file-gate) | A normalizer that will not emit a manifest until the control file agrees |
 | [control-file-formats](#control-file-formats) | HOW a control file is read (`format`) versus WHAT is read out of it (the fields) |
+| [a-control-file-is-attributed-by-its-stem](#a-control-file-is-attributed-by-its-stem) | `{stem}` is not a wildcard, and two feeds that cannot be told apart do not load |
+| [a-delivery-shape-is-a-registry-entry](#a-delivery-shape-is-a-registry-entry) | Two tables and four outcome types, so the next awkward delivery is not a branch in the watcher |
 | [the-sniffer](#the-sniffer) | Onboarding from a real file |
 | [console-delivery-support](#console-delivery-support) | Creating an archive- or control-gated feed through the form |
 | [inbox-is-polled](#inbox-is-polled) | Polling, not inotify — *events are an optimisation, the poll is the correctness guarantee* |
@@ -1820,9 +1822,46 @@ Step 4 of `docs/DELIVERY-SHAPES.md`: a normalizer that will not emit a
 manifest until a second object -- the control file -- has also arrived, and
 that reads an exact row count out of it where the sender provides one.
 `delivery: {control: {pattern: '{stem}\.ctl', row_count: 'ROWS=(?P<rows>\d+)'}}`,
-on top of `kind: file` only; combining it with `kind: archive` is rejected at
-load as NOT BUILT, the same vocabulary `context.NOT_BUILT` already uses for
-the archive normalizer's own unbuilt corners.
+on top of **either kind**.
+
+### It gates the delivery, not the file, so the kind is not its business
+
+Combining it with `kind: archive` was rejected at load as NOT BUILT, and the
+refusal outlived its reason. A container is a landed delivery like any other,
+and what a control file says is about the DELIVERY: `row_count` is the total
+across the members, which is exactly what ingest counts once the parts are
+unioned, and needs no new rule at all.
+
+**The checksum is the one place the kinds genuinely differ**, and it is worth
+being precise. The sender hashed the object it sent -- the CSV, or the ZIP.
+The members under `ready/` are this platform's own extraction, and no checksum
+the sender could write would describe them, so hashing the parts and comparing
+would fail every time on a delivery that is perfectly intact. So the manifest
+records **`checksum_objects`**: which objects a declared md5 covers, decided
+by the normalizer that knows, and ingest hashes them without asking what kind
+of delivery it is holding. Both normalizers set it to the delivery's SOURCE
+OBJECT today; the key exists so that a shape whose sender checksums something
+else can say so instead of teaching `ingest_feed` a third rule.
+
+That invariant is relied on in a second place -- `ui/arrivals.checks()`
+compares the declared md5 against the md5 the registry measured of the source
+object -- so it is asserted in `tests/test_arrivals.py` rather than left as a
+coincidence between two modules.
+
+Absent from an older manifest, `checksum_objects` falls back to `parts`. Every
+delivery that could carry a declared md5 before the key existed was
+single-part, and its one part IS its source object, so the fallback hashes the
+same bytes: an identity that happened to hold, not a guess.
+
+### One gate, every normalizer
+
+The wait itself is `normalize._gate`, called by both normalizers rather than
+implemented in each. A normalizer added later inherits control-file gating by
+calling it, which is the difference between "the gate applies to file
+deliveries" and "the gate applies to deliveries". For an archive it runs
+**before** the members are extracted: waiting is the ordinary state and
+`reconcile` runs on every poll, so extracting first would rewrite every member
+into `ready/` on each pass of a wait that has not finished.
 
 **`pattern` is a regex template, not a literal filename template, and getting
 that backwards was the first draft.** `'{stem}\.ctl'.format(stem="X")` gives
@@ -2041,6 +2080,83 @@ widget writes one format into both control blocks, which makes the coherence
 error above unreachable from the form rather than something to be understood
 in it.
 
+
+## a-control-file-is-attributed-by-its-stem
+
+`{stem}` in a control pattern was substituted with `.+`, so
+`'{stem}\.ctl'` read as "any file ending `.ctl` is mine". Two feeds that both
+send `.ctl` -- an ordinary thing for two source systems to do -- therefore
+each claimed EVERY control file at the door, `route()` refused all of them as
+ambiguous, and both feeds then waited for ever on control files sitting in
+`.rejected/`. Observed while writing the delivery walkthroughs, on two demo
+feeds that had nothing to do with each other:
+
+```
+MARGIN_20260901.ctl    feed=None    reason: matches more than one feed's
+                                    control pattern (tr_margin_call, trs_position)
+```
+
+**The stem was never a wildcard.** A control file's name is its DATA file's
+stem plus a suffix -- `find_control` builds it that way and the predicates read
+it back -- so the stem is the shape of a name the feed already declares.
+Substituting the feed's own data-name shape for `{stem}` answers the question
+that was actually being asked, statically, with no I/O and no new state:
+
+| control filename | before | after |
+|---|---|---|
+| `MARGIN_20260901.ctl` | ambiguous | `tr_margin_call` |
+| `positions.ctl` | ambiguous | `trs_position` |
+| `something_else.ctl` | claimed by whichever feed declared `.ctl` | unroutable |
+
+That last row is the one behaviour change: a control file whose stem matches
+no feed's data names used to be claimed anyway and landed in that feed's
+prefix, gating a delivery that would never exist. It is refused at the door
+now, which puts it in the console's unclaimed queue instead of in `landing/`.
+
+### Reading a name is not building one
+
+`render_filename` refuses `\d`, `{8}` and `[A-Z]`: it must produce a name the
+feed will accept, so it only handles constructs with one literal form. That is
+much too strict for RECOGNISING a name -- `POS_\d{8}\.TXT` is an ordinary
+legacy pattern whose stems are perfectly recognisable. Hence `stem_pattern`,
+which splits the pattern at its last literal extension rather than rendering
+it, and `sample_name`, which produces one representative string for a pattern
+`render_filename` would refuse. The two are deliberately separate from the
+strict path: nothing parses a sample back, so it may be permissive.
+
+### And what cannot be told apart does not load
+
+Two feeds whose data names differ only by their extension -- `A_….csv` and
+`A_….txt`, both sending `A_20260903.ctl` -- are genuinely undecidable at the
+door. There is no rule to write: the name is all there is, and it belongs
+equally to both.
+
+So `check_control_patterns_are_distinguishable` refuses the pair at LOAD,
+which makes it a `config check` failure and therefore a CI failure. The
+argument is `check_gates_are_coherent`'s: a combination the platform cannot
+execute must not be loadable. Leaving it to the door would mean the platform
+"handles" it by rejecting every control file both feeds ever send, silently,
+for ever.
+
+It works by probe: each feed's own data-name shape yields a representative
+control filename, and every feed is asked whether it claims it. Two claimants
+is a collision. A feed whose pattern has no single literal extension claims
+control files by suffix alone -- it is a wildcard -- and is caught the moment
+any other feed declares a control block, which is right; alone it still loads,
+because nothing that loads today may stop loading.
+
+**The console checks it too, and must.** A collision refused at load is
+refused for the WHOLE registry: a feed saved with one would not break itself,
+it would stop `feeds()` resolving at all, taking every other feed and every
+DAG with it until somebody edited YAML by hand. `registry.add()` does not
+verify what it wrote, so `validate()` runs the same function over the registry
+the feed is about to join.
+
+**What the probe does not prove.** `sample_name` produces one representative
+name per pattern, so two feeds overlapping only somewhere that sample does not
+land are not detected. Proving the general case means intersecting two regular
+languages -- a great deal of machinery for a case no real onboarding produces,
+while the realistic collision always lands on the sample.
 
 ## the-sniffer
 
@@ -2649,12 +2765,56 @@ manifest holding members together, and nothing downstream needs to know an
 archive was ever involved.
 
 That is only true because **each member is a complete delivery for its own
-COB date** -- `member_pattern` must capture one, and a pattern that does
-not is rejected at load naming the gap. Members that are PARTS of one delivery
-(a single date split for size) are a genuinely different shape: they would
-have to stay grouped, which needs something to record the grouping, and that
-is the `parts: concat` design the old archive normalizer implements. It stays
-NOT BUILT at the gate.
+COB date** -- and each must therefore say which day it is for. Two sources
+can answer, exactly as for a plain delivery: `member_pattern` captures
+`(?P<cob_date>...)`, or `arrival.control` reads the date out of a control
+file **packed beside the member in the same container**. Exactly one, checked
+at load: neither and the gate cannot name what it unpacks; both and one fact
+has two sources that can disagree.
+
+Members that are PARTS of one delivery (a single date split for size) are a
+genuinely different shape: they would have to stay grouped, which needs
+something to record the grouping, and that is the `parts: concat` design the
+archive normalizer implements. It stays NOT BUILT at the gate, and the error
+now points at `delivery.kind: archive` as the thing that does implement it.
+
+### A member's control file is the same idea in a different namespace
+
+A plain delivery's control file sits beside it in the inbox directory; a
+member's sits beside it inside the zip. Same question -- which of these names
+is this delivery's control file, and what does it declare -- asked of two
+namespaces, so `find_control` and `read_control` serve both and the pairing
+rule exists once. That is what `conform.Siblings` is: the names a shape can
+see and how to read one, supplied by the shape.
+
+Two consequences worth stating, because they are where the shapes genuinely
+differ:
+
+**A member's missing control file is a REFUSAL, not a wait.** A container
+arrives complete, so a file absent from it will never turn up beside it later.
+Holding the member would wait for ever and report nothing at INFO -- which is
+precisely the failure this path was built to remove (see below).
+
+**A member shaped like the control file is never landed as a delivery**, even
+when `member_pattern` claims it. A permissive `.*\.csv` and a sender who
+writes its control file as CSV is an ordinary combination, and landing it
+would ingest the control file's own text as rows.
+
+### The deadlock this replaced
+
+`arrival.archive` with `arrival.control` **loaded cleanly and then did
+nothing**, which is the worst of the three ways it could have been wrong.
+`conform_member` read no control file at all, so the `.ctl` members were
+dropped at the gate and never promoted; `check_gates_are_coherent` requires
+`delivery.control` alongside `arrival.control`, so every landed member then
+waited in `landing/` for a control file that could not arrive. Nothing raised,
+nothing was quarantined, the log line was INFO on every poll, and the feed
+simply never ingested. Verified before the fix, on the live stack: two members
+landed, `awaiting_control` on both, `pending` empty, indefinitely.
+
+The lesson is the one this file keeps repeating -- a combination that cannot
+work must be refused at LOAD or made to work, and "loads and silently does
+nothing" is the option neither of those covers.
 
 ### Why not keep unpacking where it was
 
@@ -2734,6 +2894,52 @@ A real zip -- `weekly_20260803.zip`, holding `POS_20260801.csv`,
   key, no `parts` grouping and no archive normalizer involved.
 
 12 new tests in `tests/test_conform.py` (158 total).
+
+## a-delivery-shape-is-a-registry-entry
+
+Every awkward delivery this platform has met arrived as a variation on two
+questions -- what does this file at the door BECOME, and what does that landed
+object become a MANIFEST of -- and each was first answered with a branch. By
+the time zips could carry control files there were two `_promote*` functions
+in `inbox.py` that had already drifted (one treated a missing control file as
+a wait, the other could not express the idea), an `if kind == "archive"` in
+`normalize()`, and a predicate in `conform.py` asking the same question a
+third way.
+
+So each question now has a table, and adding a shape is an entry plus a
+function:
+
+| Seam | Table | Contract |
+|---|---|---|
+| the door | `conform.ARRIVAL_SHAPES` | `planner(feed, filename, content, siblings, ...) -> list[Outcome]`, PURE |
+| the landing side | `normalize.NORMALIZERS` | `normalizer(feed, object_key) -> manifest`, may copy bytes into `ready/` only |
+
+**The planners write nothing.** They return what SHOULD be written, which is
+what lets every shape be tested without S3 or a watcher, and what let the
+member-control path be verified before an inbox had ever run it.
+
+**Four outcome types are the whole vocabulary**: `Planned`, `Refused`,
+`Duplicate`, `Waiting`. `inbox.py` dispatches on those and on nothing else --
+not on the kind, not on whether a control file exists -- so a shape added
+later needs no change there. The rule that keeps it honest: **a new shape must
+not need a new outcome type.** If it does, it is asking the watcher to do
+something the watcher does not know how to do, and that is a conversation to
+have before writing the planner rather than a fifth branch.
+
+Two smaller things fall out of the split and both were bugs before it:
+
+* the write order (control file, then data, then metadata) and the move rules
+  are written down ONCE, so they cannot differ per shape;
+* `normalize._gate` is called by every normalizer, so `delivery.control`
+  applies to deliveries rather than to file deliveries -- which is most of why
+  gating a container needed no new kind.
+
+**What is deliberately NOT abstracted.** There is no plugin loader, no entry
+points, no configuration naming a Python path. A shape is code in this repo
+that a reviewer can read, and the tables are `dict`s two modules long. The
+extension point is "add a function and a line", not "make it configurable" --
+which for a platform whose whole argument is that config must be refused at
+load rather than interpreted at run time would be the wrong direction.
 
 ## an-unchanged-resend-is-a-no-op
 
@@ -4627,14 +4833,20 @@ being down costs the last column and nothing else.
 one of them.
 
 **The checksum is answerable.** `declared_md5` is what the control file said;
-`md5` on the same row is what the landed object hashes to, measured once when
-the delivery was registered. `ingest_feed._parts_md5` hashes the same bytes —
-every feed that can carry a `delivery.control` block is single-part by
-construction, since `kind: archive` is refused a control block at load — so
-comparing them is the same comparison ingest makes rather than an approximation
-of it. A multi-part delivery with a declared checksum reports `not_comparable`
-rather than a guess: the combination cannot arise today, and inventing an
-answer for it is how it would be wrong the day it does.
+`md5` on the same row is what the registry measured of the delivery's SOURCE
+object. `ingest_feed._delivery_md5` hashes the manifest's `checksum_objects`,
+which every normalizer sets to that same source object — the CSV for a plain
+delivery, the container for an archive, because that is what the sender
+hashed. So comparing them is the same comparison ingest makes rather than an
+approximation of it, and it holds for a multi-part delivery too: an archive
+gated on a control file is exactly that case, and calling it `not_comparable`
+on a part count would hide a mismatch ingest is about to fail on.
+
+THAT IS AN INVARIANT ACROSS TWO MODULES and it is pinned in
+`tests/test_arrivals.py`. A normalizer that ever points `checksum_objects`
+somewhere other than the source object makes this comparison wrong rather than
+merely unavailable, and has to add whatever distinguishes it to the registry
+row before the console can answer again.
 
 **The row count is not.** Nothing counts rows without reading the file, and
 reading the file is a Spark job. So the declared number is shown with the

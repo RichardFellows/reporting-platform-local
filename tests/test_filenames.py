@@ -162,3 +162,60 @@ def test_a_character_class_outside_a_group_is_refused():
         assert "no single literal form" in str(exc)
     else:
         raise AssertionError("an unbuildable name must refuse")
+
+
+# ==================================== reading a name, not building one =======
+# `stem_pattern` and `sample_name` exist because `render_filename` is
+# deliberately strict -- it refuses `\d`, `{8}` and `[A-Z]`, which is right for
+# writing a name a feed must accept and much too strict for recognising one.
+
+def _filenames():
+    from reporting_platform.common import filenames
+    return filenames
+
+
+def test_stem_pattern_strips_a_literal_extension():
+    f = _filenames()
+    assert f.stem_pattern(r"MARGIN_(?P<cob_date>\d{8})\.csv") == r"MARGIN_(?P<cob_date>\d{8})"
+    assert f.stem_pattern(r"POS_\d{8}\.TXT") == r"POS_\d{8}"
+    assert f.stem_pattern(r"positions\.csv") == "positions"
+
+
+def test_a_pattern_with_no_single_extension_has_no_stem_shape():
+    """`\\.(csv|txt)` names two extensions, so nothing can say where the stem
+    ends. The caller falls back to matching the control suffix alone -- which
+    is today's behaviour -- and the load-time check refuses two such feeds."""
+    f = _filenames()
+    assert f.stem_pattern(r"A_(?P<cob_date>\d{8})\.(csv|txt)") is None
+    assert f.stem_pattern("nodothere") is None
+
+
+def test_sample_name_reads_what_render_filename_refuses():
+    f = _filenames()
+    assert f.sample_name(r"POS_\d{8}") == "POS_00000000"
+    assert f.sample_name(r"POSITIONS_[A-Z]") == "POSITIONS_A"
+    assert f.sample_name(r"MARGIN_(?P<cob_date>\d{8})") == "MARGIN_00000000"
+    # An optional group is dropped: the FIRST delivery is the representative
+    # one, which is the same choice render_filename makes.
+    assert f.sample_name(r"A_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?") == "A_00000000"
+    # Alternation takes the first branch.
+    assert f.sample_name(r"(?:POS|POSITION)_\d{4}") == "POS_0000"
+
+
+def test_sample_name_gives_up_rather_than_guessing():
+    f = _filenames()
+    assert f.sample_name(r"A_(?P<cob_date>\d{8}") is None      # unbalanced
+    assert f.sample_name(r"A_.") is None                        # any character
+
+
+def test_a_sampled_name_is_matched_by_the_pattern_it_came_from():
+    """The property that makes it usable as a probe: it has to be a name the
+    feed would really claim, or the collision check would compare fictions."""
+    import re
+    f = _filenames()
+    for pattern in (r"POS_\d{8}", r"POSITIONS_[A-Z]", r"MARGIN_(?P<cob_date>\d{8})",
+                    r"A_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?",
+                    r"(?P<cob_date>\d{8})_positions"):
+        sample = f.sample_name(pattern)
+        assert sample is not None, pattern
+        assert re.fullmatch(pattern, sample), (pattern, sample)

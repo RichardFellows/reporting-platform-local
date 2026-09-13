@@ -96,14 +96,33 @@ def test_a_declared_row_count_is_answered_at_ingest_not_here():
     assert c["row_count"] == {"declared": 2, "verdict": "at_ingest"}, c
 
 
-def test_a_multi_part_delivery_is_not_comparable():
-    """`ingest_feed._parts_md5` hashes the parts in order; the registry
-    recorded the SOURCE object's hash. For one part those are the same bytes,
-    which is what makes the comparison legitimate at all -- for several they
-    are not, and the answer is that there isn't one."""
+def test_a_multi_part_delivery_is_still_comparable():
+    """A CONTAINER's declared md5 describes the container, and the registry
+    recorded the source object's hash -- the same bytes, whatever the part
+    count. An archive gated on a control file is exactly this case, and
+    reporting it `not_comparable` would hide a mismatch the ingest will fail
+    on."""
     feeds_from(synthetic())
-    c = _arrivals().checks(_row(parts=3, declared_md5="a" * 32))
-    assert c["md5"]["verdict"] == "not_comparable", c
+    c = _arrivals().checks(_row(parts=3, declared_md5="a" * 32, md5="a" * 32))
+    assert c["md5"]["verdict"] == "ok", c
+    c = _arrivals().checks(_row(parts=3, declared_md5="a" * 32, md5="b" * 32))
+    assert c["md5"]["verdict"] == "mismatch", c
+
+
+def test_the_checksum_invariant_holds_for_every_normalizer():
+    """THE INVARIANT THIS VIEW DEPENDS ON, pinned where it is relied upon: the
+    registry hashes the delivery's source object, so `checks()` may compare
+    only while every normalizer's `checksum_objects` names that same object.
+    A shape that checksums its parts instead breaks the comparison silently."""
+    import inspect
+
+    from reporting_platform.ingest import normalize as norm
+
+    for kind, fn in norm.NORMALIZERS.items():
+        body = inspect.getsource(fn)
+        assert '"checksum_objects": [object_key]' in body, (
+            f"{kind} does not checksum its source object; "
+            f"ui/arrivals.checks() and its docstring have to change with it")
 
 
 # ------------------------------------------------------------- the two names

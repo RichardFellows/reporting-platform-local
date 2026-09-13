@@ -169,3 +169,202 @@ def literal_from_regex(pattern: str, groups: dict[str, str], *,
                 f"has no single literal form.")
         out.append(ch); i += 1
     return "".join(out)
+
+
+# ===================================================== which feed's control file
+# A control file's name is, by construction, its DATA file's stem plus a
+# suffix: `find_control` builds it that way and these read it back. What that
+# means, and it took a collision to notice, is that `{stem}` is not a wildcard
+# -- it is the shape of a name the feed already declares.
+#
+# Substituting `.+` for it says "any file ending .ctl is mine", so two feeds
+# that both send `.ctl` each claimed every control file at the door and
+# `route()` refused all of them as ambiguous -- both feeds then waiting for
+# ever on control files sitting in `.rejected/`. Substituting the feed's own
+# data-name shape instead answers the question that was actually being asked.
+
+
+def stem_pattern(data_pattern: str) -> str | None:
+    """`data_pattern` minus its file extension, or None if it has no literal one.
+
+    The extension is everything after the LAST unescaped `\\.` in the pattern,
+    and it must be plain literal characters -- a pattern ending `\\.(csv|txt)`
+    has no single extension, so its stems cannot be told from anything.
+
+    Deliberately NOT done by rendering an example name and slicing it:
+    `render_filename` refuses `\\d`, `{8}` and `[A-Z]`, which is right for
+    building a name a feed must accept and much too strict for reading one.
+    `POS_\\d{8}\\.TXT` is an ordinary legacy pattern and its stems are
+    perfectly recognisable.
+    """
+    last = -1
+    i = 0
+    while i < len(data_pattern):
+        if data_pattern[i] == "\\":
+            if data_pattern[i + 1:i + 2] == ".":
+                last = i
+            i += 2
+            continue
+        i += 1
+    if last < 0:
+        return None
+    extension = data_pattern[last + 2:]
+    if not extension or not all(c.isalnum() or c in "_-" for c in extension):
+        return None
+    return data_pattern[:last]
+
+
+def sample_name(pattern: str) -> str | None:
+    """One concrete string the pattern matches, or None if it cannot be read.
+
+    A REPRESENTATIVE, not a valid delivery name: nothing parses this back, so
+    unlike `render_filename` it need not round-trip and can therefore handle
+    the constructs that one refuses. It exists for
+    `check_control_patterns_are_distinguishable`, which has to ask whether two
+    feeds could ever claim the same control filename and can only answer by
+    producing one.
+
+    Handles what feed patterns actually use -- literals, escapes, character
+    classes, `{n}` repetition, optional and non-capturing groups, alternation
+    -- and takes the first branch of every choice. THAT IS THE LIMIT WORTH
+    KNOWING: one sample per pattern, so two feeds whose names overlap only
+    somewhere the sample does not land are not detected. The realistic
+    collision -- two feeds with the same stem shape and the same control
+    suffix -- always lands on it.
+    """
+    out: list[str] = []
+    i = 0
+    ESCAPES = {"d": "0", "w": "a", "s": "_", "D": "a", "W": "_", "S": "a"}
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\":
+            nxt = pattern[i + 1:i + 2]
+            if not nxt:
+                return None
+            out.append(ESCAPES.get(nxt, nxt)); i += 2
+        elif ch == "[":
+            close = pattern.find("]", i)
+            if close < 0:
+                return None
+            inner = pattern[i + 1:close].lstrip("^")
+            if not inner:
+                return None
+            out.append(inner[0] if inner[0] != "\\" else ESCAPES.get(inner[1:2], "a"))
+            i = close + 1
+        elif ch == "(":
+            try:
+                close = _closing_paren(pattern, i)
+            except FilenameError:
+                return None
+            inner = pattern[i + 1:close]
+            for prefix in ("?P<", "?:", "?"):
+                if inner.startswith(prefix):
+                    inner = inner[len(prefix):]
+                    if prefix == "?P<":
+                        inner = inner[inner.index(">") + 1:]
+                    break
+            optional = pattern[close + 1:close + 2] == "?"
+            piece = sample_name(inner.split("|")[0])
+            if piece is None:
+                return None
+            # An optional group is dropped: `(?:_v(?P<version>\\d+))?` is the
+            # re-delivery marker, and the FIRST delivery is the representative
+            # one -- the same choice `render_filename` makes.
+            if not optional:
+                out.append(piece)
+            i = close + (2 if optional else 1)
+        elif ch == "{":
+            close = pattern.find("}", i)
+            if close < 0 or not out:
+                return None
+            count = pattern[i + 1:close].split(",")[0]
+            if not count.isdigit():
+                return None
+            out.append(out[-1] * (int(count) - 1))
+            i = close + 1
+        elif ch in "?*+":
+            i += 1                       # zero of the preceding piece is fine
+        elif ch in ".^$|)]}":
+            return None
+        else:
+            out.append(ch); i += 1
+    return "".join(out)
+
+
+def control_pattern_for(feed, block: str) -> str | None:
+    """This feed's control pattern for one block, as seen AT THE DOOR.
+
+    `arrival` is the control file the gate reads; `delivery` the one that
+    gates a landed delivery. An ARCHIVE feed's `arrival.control` answers None
+    here on purpose: its control files are packed inside the container and
+    never arrive as loose files, so a `.ctl` sitting in the inbox is not its
+    -- claiming one would attribute another feed's file, or make an
+    unattributable one look attributable.
+    """
+    if block == "arrival":
+        if (feed.arrival or {}).get("archive"):
+            return None
+        return ((feed.arrival or {}).get("control") or {}).get("pattern")
+    return ((feed.delivery or {}).get("control") or {}).get("pattern")
+
+
+def data_pattern_for(feed, block: str) -> str | None:
+    """The pattern naming the DATA file a `block` control file is paired with:
+    the name the upstream sends for `arrival`, the name landing holds for
+    `delivery`."""
+    if block == "arrival":
+        return (feed.arrival or {}).get("source_pattern")
+    return feed.filename_pattern
+
+
+def claims_control_file(feed, filename: str, block: str) -> bool:
+    """Whether `filename` is a control file THIS feed's delivery would carry.
+
+    Two conditions, and the second is the one that was missing: the name must
+    match the block's control pattern, AND the stem it matches with must be a
+    stem this feed's own data names can have.
+
+    A data pattern with no literal extension (`\\.(csv|txt)`) yields no stem
+    shape, and then this falls back to matching the suffix alone -- exactly
+    today's behaviour, so nothing that routes now stops routing. Two such
+    feeds are refused at LOAD instead, by
+    `context.check_control_patterns_are_distinguishable`, because at the door
+    they genuinely cannot be told apart.
+    """
+    import re
+
+    pattern = control_pattern_for(feed, block)
+    if not pattern:
+        return False
+    m = re.fullmatch(pattern.replace("{stem}", "(?P<stem>.+)"), filename)
+    if not m:
+        return False
+    data_pattern = data_pattern_for(feed, block)
+    if not data_pattern:
+        return False
+    stem = stem_pattern(data_pattern)
+    if stem is None:
+        return True                      # no stem shape to test: suffix only
+    try:
+        return re.fullmatch(stem, m.group("stem")) is not None
+    except re.error:                     # reported as a pattern error elsewhere
+        return True
+
+
+def example_control_file(feed, block: str) -> str | None:
+    """One control filename this feed would claim, for the load-time check."""
+    pattern = control_pattern_for(feed, block)
+    data_pattern = data_pattern_for(feed, block)
+    if not pattern or not data_pattern:
+        return None
+    stem = stem_pattern(data_pattern)
+    if stem is None:
+        return None
+    sample = sample_name(stem)
+    if sample is None:
+        return None
+    try:
+        return literal_from_regex(pattern.format(stem=sample.replace("\\", "\\\\")),
+                                  {}, what="an example control filename")
+    except FilenameError:
+        return None
