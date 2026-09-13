@@ -20,6 +20,33 @@ stable; if you rename one, grep for it first.
 Read `CLAUDE.md` for the short version of the rules that bite most often, and
 `docs/ARCHITECTURE.md` for how the pieces fit together.
 
+## Keeping an entry honest as the code moves
+
+An entry records why a decision was made, and that reasoning outlives the
+implementation — which is the point of the file, and also its one failure
+mode: **a reader cannot tell a rule still in force from a rule that was
+replaced, unless the entry says.** Three conventions keep that legible, and
+two of them are enforced by `tests/test_doc_claims.py`.
+
+**Superseded reasoning is kept and labelled, never deleted.** What was tried
+and what forced the change is the expensive part, and it is what stops the
+rejected design being proposed again. Mark it in place — a `> **Amended.**`
+block, or a sentence in the past tense saying what it used to do — so the
+status is visible without cross-referencing the code.
+
+**A claim that something is NOT BUILT names it as the code names it.** The
+unbuilt features are listed in `context.NOT_BUILT` and
+`context.SUPERSESSION_NOT_BUILT`, and the test requires every such claim here
+to name one of them, or to be written as history. This is the class of
+statement that goes false *silently*: building the feature is what falsifies
+it, and whoever builds it is reading code, not this file. It has happened —
+see the `> **Amended.**` block under
+[#console-delivery-support](#console-delivery-support).
+
+**No line numbers.** Name the file and the symbol. Twenty-one `file.py:NNN`
+references were checked and eighteen pointed at something else, several moved
+by the commit that added the entry citing them.
+
 ---
 
 ## Contents
@@ -243,13 +270,10 @@ onto `message`.
 logging is Quarkus's `quarkus-logging-json`, a **build-time** extension: it is
 either augmented into the image or it is not, and no property, mounted jar or
 environment variable can add it afterwards. It is absent from 0.99.0 and
-present from around 0.104. Verified rather than read off the docs — 0.99.0 with
-`QUARKUS_LOG_CONSOLE_JSON=true` logs plain text, unchanged, and says nothing
-about the property it ignored:
-
-```
-docker compose exec nessie ls /deployments/lib/main | grep -i logging-json
-```
+present from around 0.104. A server below that logs plain text with
+`QUARKUS_LOG_CONSOLE_JSON=true` set, unchanged, and says nothing about the
+property it ignored — the jar is either in `/deployments/lib/main` or it is
+not.
 
 So a server pinned back below 0.104 must lose those two lines with it. Left
 behind they are well-formed configuration that reads as working and does
@@ -265,12 +289,6 @@ Two things the format does not give you:
   ECS record whose `message` holds the whole combined-log line; the HTTP fields
   are not broken out. Currently that is one record every 10s from the
   healthcheck alone.
-
-0.108.1 also warns that the `quarkus.datasource.*` keys here are legacy and
-want migrating to `quarkus.datasource.postgresql.*` plus
-`nessie.version.store.persist.jdbc.datasource=postgresql`. It is a warning, not
-a failure, and the version store is the wrong thing to change in passing during
-a logging change.
 
 ## nessie-gc-jar
 
@@ -801,9 +819,6 @@ destination. Nothing needs copying: the path is identical inside every process
 in the container, so the dbt subprocess in the temporary project resolves it
 directly.
 
-Verified with a Cosmos-shaped temporary project whose `dbt_packages` symlink
-pointed at an **empty** directory: every `dbt_utils_*` test still resolved.
-
 ## cosmos-profile-config
 
 One `ProfileConfig` for everything: the committed `dbt/profiles.yml`, used
@@ -843,8 +858,7 @@ cannot address a Nessie branch ignores it and writes to the catalog's default
 branch instead. The build would then **succeed**, having written to `main` with
 no branch, no audit and nothing red anywhere.
 
-The fallback value matters for the same reason. It used to be `duckdb_local`,
-which was harmless only because `duckdb_local` was broken -- an unset
+The fallback value matters for the same reason. `duckdb_local` was broken -- an unset
 `DBT_TARGET` crashed loudly. Fixing that target would have turned the loud
 failure into a silent one.
 
@@ -862,10 +876,6 @@ platform needs -- `docs/ARCHITECTURE.md` says "triggered by ANY upstream asset",
 block the ones that arrived". With a list, one late feed silently holds up every
 build, which is exactly the batch window the per-feed design exists to remove.
 
-Verified against the live scheduler: with `schedule=[trade, cpty, rating]`, an
-ingest of trade alone emitted its dataset event and `prepared_build` never
-fired.
-
 `any_of()` reduces with `|`, which yields `DatasetAny`/`AssetAny` on Airflow
 2.9+ and 3.x. If that is unavailable the list is returned unchanged **and a
 warning is logged**, because degrading to AND silently is how this was missed in
@@ -873,7 +883,7 @@ the first place.
 
 ## retry-delay
 
-Retry delay is seconds, not the five minutes it used to be.
+Retry delay is **seconds**, set by `AIRFLOW_RETRY_DELAY_SECONDS`.
 
 Five minutes is a sensible production number -- it waits out a transient cluster
 or catalog blip without hammering it. On a laptop it is dead time: the whole
@@ -1019,11 +1029,6 @@ executor acquisition and catalog init before doing a few seconds of actual work.
 Per-file branch isolation is unchanged; only how the branch is named changed.
 Backticks are required, because branch names contain `/` and `-`.
 
-Verified against the live catalog that all three operations the ingest module
-performs work through it -- `CREATE TABLE IF NOT EXISTS`, the
-`MAX(_file_version)` read, and `DataFrameWriterV2.append()` -- and that a write
-lands on the branch with `main` untouched.
-
 ## watchdog-wall-clock-window
 
 The warehouse-flatness window is **wall-clock, not samples**, and the current
@@ -1168,12 +1173,6 @@ will go.
 `managed_tables()` derives the prepared and reporting table sets from the dbt
 project directory -- one model file, one table -- rather than from a list in
 `common/context.py`.
-
-That list was hand-maintained, and `docs/ADDING-A-FEED.md` had to call it out
-as **the one step with no error if you skip it**: the table simply never got
-compacted, its snapshots never expired, and retention never trimmed it. It grew
-quietly. A step that has to be documented as "remember this or nothing tells
-you" is a step that should not exist.
 
 The dbt project is the right source because it is *declarative*. The catalog is
 not: `SHOW TABLES` describes what happens to be there, so a table left behind by
@@ -1374,17 +1373,7 @@ it is a real bug and not a design preference: see
 `ensure_raw_namespace()` runs against `main` **before** the ingest branch is
 cut, separately from `ensure_raw_table()`.
 
-`ensure_raw_table` used to do both, and issued `CREATE NAMESPACE` *unqualified*
--- so against `main` -- while `CREATE TABLE` addressed the branch, which had
-been cut a moment earlier. On any catalog where the namespace already existed
-this was invisible, which is every warm stack. On one where it did not:
-
-```
-org.apache.iceberg.exceptions.NoSuchNamespaceException: Namespace does not exist: raw
-```
-
-Creating it *on the branch* is not the fix, and the reason is worth recording:
-Nessie's `` `table@branch` `` suffix applies to a **table** identifier. Used on
+Creating it *on the branch* is not the alternative it looks like. Nessie's `` `table@branch` `` suffix applies to a **table** identifier. Used on
 a namespace it does not fail -- it creates a namespace literally named
 `` `raw@ingest/...` `` on main. Verified against the live catalog, and then
 cleaned up by hand. A mechanism that fails by making junk rather than by
@@ -1394,26 +1383,14 @@ So the namespace is created on `main` first and the branch inherits it. A
 namespace holds no data, and this is the same precedent the cold-start
 bootstrap already sets.
 
-
 ## a-gate-that-cannot-fail
 
-`python -m reporting_platform.lineage --columns` is described in CLAUDE.md as
-THE CI seam: the lineage package may never raise, so `unresolved` has to be
-caught somewhere allowed to say no, and that CLI exits 1 on any. Measured on a
-runner with no stack:
-
-```
-raw.ref_rating: 5 columns  sourced=5
-prepared.fo_trade: not derivable (unbuilt or unpublished)
-... 7 of 11 tables ...
-unresolved: none          exit=0
-```
-
-Four tables classified, seven unreadable, **and it passed.** Column lineage
-needs the compiled SQL and the catalog, and the ordinary state of every model
-on an unbuilt checkout is that it has neither. So the seam the rest of the
-rules leaned on was structurally unable to go red at the only tier cheap
-enough to run on every push.
+`python -m reporting_platform.lineage --columns` is CLAUDE.md's CI seam: the
+lineage package may never raise, so `unresolved` has to be caught somewhere
+allowed to say no, and that CLI exits 1 on any. But column lineage needs the
+compiled SQL and the catalog, so without a stack it reads only the tables that
+exist — four of eleven on a bare runner — and exits **0**: green on almost
+nothing.
 
 **`unresolved` and `not derivable` are different facts and only one was a
 failure.** `unresolved` is a column the parser READ and could not trace -- a
@@ -1469,8 +1446,7 @@ is this repo's most-repeated failure shape and was, again, enforced by nothing.
 
 ## the-registry-is-a-directory
 
-`feeds.yml` was one file holding `defaults:`, `conventions:` and a list of
-every feed. It is now a tree:
+The feed registry is a directory, one file per feed:
 
 ```
 reporting_platform/config/feeds/
@@ -1503,13 +1479,6 @@ that nothing reconciles -- and the realistic way in is copying a file to start
 a new feed and changing one of the two. A convention file carries no `name:`
 at all: a convention setting one would supply it to every feed inheriting it.
 
-**It also closes a hole nothing was guarding.** `_feeds_at` built the registry
-with `out[block["name"]] = Feed(...)`, so two blocks sharing a name collapsed
-into one entry, last one wins, nothing raising -- the exact failure
-[feed-conventions](#feed-conventions) names as the reason a convention may not
-set `name:`, guarded there and unguarded here. A directory cannot hold two
-files with one name.
-
 **The cache key is the part that is easy to get subtly wrong.** Every config
 cache here is keyed on an mtime so that a long-lived process -- Airflow's DAG
 file processor, the console -- picks up an edit without a restart. The obvious
@@ -1525,18 +1494,6 @@ precisely the bug `_load`'s mtime key was written to kill, in a new shape.
 `tests/test_layout.py` pins all three edit paths, and they fail as expected
 when the key is swapped for the directory's mtime -- verified by swapping it.
 
-**The migration was a move, not a rewrite, and that was checked rather than
-asserted.** Everything downstream of the parse is unchanged: `_registry_at`
-assembles the same three tiers the single file carried, and `effective_defaults`
-merges them as it always did. The acceptance criterion was that every resolved
-`Feed` came out byte-identical -- `dataclasses.asdict` over the whole registry
-before and after, diffed, 4 feeds and 100 fields, no difference.
-`layout.split_document()` did the split with ruamel round-trip so the comments
-survived, and is still exercised on every test run because
-`tests/support.config_dir()` builds its fixtures with it: fifty call sites
-write a fixture as one document, and one implementation means a fixture cannot
-be assembled by rules the real config was not.
-
 **`python -m reporting_platform.config show <feed> --origin` is the other half.**
 A middle tier only earns its keep if values are not written where they are
 used, which makes "why is this feed reading a pipe delimiter" a question about
@@ -1545,12 +1502,6 @@ the render command, and it reads `effective_defaults()` rather than re-walking
 the tiers, so it cannot disagree with the loader it describes.
 
 ## feed-conventions
-
-`feeds.yml` had exactly two tiers: a global `defaults:` block and a per-feed
-one. The variation between feeds is neither. It is mostly **per source
-system** — one system sends pipe-delimited files, another sends zips with a
-control file — and that knowledge had nowhere to live, so it was retyped into
-every feed block of that system and drifted between them.
 
 `conventions:` is the middle tier. Resolution is `defaults -> convention ->
 feed`, each layer overriding the last, and it is the same
@@ -1588,11 +1539,6 @@ than letting the feed silently revert to `defaults:` — a feed that quietly
 starts reading a pipe file with a comma delimiter lands one column holding the
 whole row, and does not fail.
 
-**Three things are errors at load rather than silent.** This file's history is
-mostly settings that did nothing (`schema_drift` read by no code,
-`delete_after_merge` read by no code, a `landing:` block read by no code), so a
-new one starts strict:
-
 | Wrong | Why it cannot be a warning |
 |---|---|
 | a feed naming an undefined convention | falls back to `defaults:` and produces a feed configured subtly wrong, rather than one that does not exist |
@@ -1609,22 +1555,12 @@ later, deliberately, as its own change.
 The console offers the defined conventions as a **closed list**, never free
 text, for the same reason: a typo there is not an error anyone would see.
 
-**Six value checks used to live only in the console, and that was the same
-bug one level down.** `ui/registry.validate` rejected `cadence` that was not
-daily or weekly, a multi-character `delimiter` or `quote_char`, a negative
-`expected_min_rows` and an unknown `file_encoding` — and the LOADER checked
-none of them. So the form refused what a hand edit, a merge, or a migration
-script could still write, which is exactly the asymmetry the comment four
-lines above them warned about for the two that *were* shared
-(`parse_expected_by`, `check_retention_class`).
-
-Measured before moving them: `cadence: fortnightly` loaded clean, passed all
-450 tests and `config check`, and behaved as `daily`. `find_gaps` is
-`if how == "weekly": ... else: <daily>`, so for a weekly feed that reports
-every non-delivery day as a gap — the exact failure `cadence:` was added to
-remove, reinstated by a typo the form would have caught. The feed's own
-`delimiter` was unchecked while a **control file's** was not, which is the
-wrong way round: the feed's is the one every delivery is read with.
+`find_gaps` is `if how == "weekly": ... else: <daily>`, so a weekly
+feed typed `fortnightly` reports every non-delivery day as a gap -- the
+exact failure `cadence:` was added to remove, reinstated by a typo. And the
+feed's own `delimiter` was unchecked while a **control file's** was not,
+which is the wrong way round: the feed's is the one every delivery is read
+with.
 
 They are `check_*` functions in `common/context.py` now, applied at load to
 **declared values only** — a key absent from all three tiers is left absent so
@@ -1640,14 +1576,6 @@ rather than through `feeds()` still reaches it. Checking at load as well just
 moves the cost from a delivery to a parse.
 
 ## ready-is-a-derived-index
-
-`landing/` was doing two jobs with opposite requirements. It is the immutable
-evidence copy — what the upstream actually sent, kept for `keep_years`, and
-never deleted on a guess — and it was also the work queue. The tension was
-already visible in the code: `sweep_landing` will not delete an object whose
-name it cannot parse, which is correct for evidence and means anything the
-platform does not recognise accumulates in the queue forever, reported as a
-count in a nightly log and nowhere else.
 
 So the two are separate prefixes with separate lifetimes:
 
@@ -1739,9 +1667,18 @@ the container, not the members, and that is the one case this builds --
 `cob_date_from: member`/`path` and `parts: separate` are recognised keys
 with no implementation behind them.
 
+> **This is one of two archive mechanisms, and the date picks which.** A zip
+> whose MEMBERS carry the date is unpacked at the door instead and never
+> lands, which is [#unpacking-happens-at-the-gate](#unpacking-happens-at-the-gate)
+> -- a different key (`arrival.archive`), a different stage, N deliveries out
+> rather than one. Read that before concluding from `cob_date_from: member`
+> being unbuilt that a member-dated zip cannot be handled: it can, just not
+> by this normalizer. Either may be gated on a control file
+> ([#control-file-gate](#control-file-gate)).
+
 **Unbuilt values raise "NOT BUILT", not "unknown".** A typo and a missing
 feature are different problems with different fixes, so
-`context.NOT_BUILT` (`common/context.py:346`) lists them by name and
+`context.NOT_BUILT` (`common/context.py`) lists them by name and
 `resolve_delivery_config` checks that table before the `allowed` one. Folding
 them into one error would make a real gap look like a fixable spelling
 mistake, and it would only be caught by someone reading the source rather than
@@ -1769,13 +1706,13 @@ member is a derived artefact.
 
 **A member's `object_key` is derived from the container's filename and the
 member's own name, never a timestamp or a run id.** `already_ingested`
-matches on `_source_file` (`arrival.py:63`), so an unstable key would
+matches on `_source_file` (`arrival.py`), so an unstable key would
 re-ingest a re-normalized delivery as a new `_file_version` -- the same
 silent loop `find_pending`'s retention filter exists to prevent, one level
 down.
 
 **A member name is validated, not sanitised, before it is joined onto the
-destination prefix.** `_safe_member_name` (`ingest/normalize.py:155`) refuses
+destination prefix.** `_safe_member_name` (`ingest/normalize.py`) refuses
 anything containing a path separator or naming `.`/`..` outright, rather than
 stripping or normalising it into something that looks safe -- a zip member
 naming `../../ref_counterparty/injected.csv` is the standard archive-traversal
@@ -1803,184 +1740,74 @@ empty day.** `expected_min_rows` exists to catch a truncated file; landing a
 delivery with no parts would pass that floor by accident rather than by
 having actually delivered rows.
 
-Verified against `tests/fakes3.py` (`tests/test_archive.py`) with real zip
-bytes through Python's `zipfile`, AND end to end on the live stack: a
-throwaway `cus_position` feed (`kind: archive`, matching the test fixture)
-landed a real two-member zip in MinIO, `pending` reconciled it into a
-manifest at `ready/cus_position/custodyPositions_20260904.zip.json` with
-both members extracted under `ready/cus_position/custodyPositions_20260904/`,
-and `ingest` merged 3 rows to `main` -- `duckdb_console` against the
-published table showed `_source_file` set to each MEMBER's `ready/` key,
-never the container's or the manifest's, confirming the property
-`already_ingested` depends on. A second `pending` came back empty. The feed,
-raw table and landed/ready objects were all removed afterward -- this was
-verification, not onboarding.
-
 ## control-file-gate
 
-Step 4 of `docs/DELIVERY-SHAPES.md`: a normalizer that will not emit a
-manifest until a second object -- the control file -- has also arrived, and
-that reads an exact row count out of it where the sender provides one.
-`delivery: {control: {pattern: '{stem}\.ctl', row_count: 'ROWS=(?P<rows>\d+)'}}`,
-on top of **either kind**.
+A second object beside the delivery — the control file — saying the sender
+considers it complete and what it contains. `normalize` emits no manifest
+until it has landed, and reads the integrity pair out of it.
 
-### It gates the delivery, not the file, so the kind is not its business
+```yaml
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    row_count: 'ROWS=(?P<rows>\d+)'
+    md5: 'MD5=(?P<md5>[0-9a-fA-F]{32})'
+```
 
-Combining it with `kind: archive` was rejected at load as NOT BUILT, and the
-refusal outlived its reason. A container is a landed delivery like any other,
-and what a control file says is about the DELIVERY: `row_count` is the total
-across the members, which is exactly what ingest counts once the parts are
-unioned, and needs no new rule at all.
+**It gates the DELIVERY, not the file**, so it sits on either kind:
 
-**The checksum is the one place the kinds genuinely differ**, and it is worth
-being precise. The sender hashed the object it sent -- the CSV, or the ZIP.
-The members under `ready/` are this platform's own extraction, and no checksum
-the sender could write would describe them, so hashing the parts and comparing
-would fail every time on a delivery that is perfectly intact. So the manifest
-records **`checksum_objects`**: which objects a declared md5 covers, decided
-by the normalizer that knows, and ingest hashes them without asking what kind
-of delivery it is holding. Both normalizers set it to the delivery's SOURCE
-OBJECT today; the key exists so that a shape whose sender checksums something
-else can say so instead of teaching `ingest_feed` a third rule.
+* `row_count` is the total across an archive's members — what ingest counts
+  once the parts are unioned.
+* `md5` is the CONTAINER's for an archive, the object's for a plain delivery:
+  the sender hashed what it sent, and an archive's members are this
+  platform's own extraction. The manifest's `checksum_objects` records which
+  objects a declared md5 covers, so `ingest_feed` never branches on the kind;
+  absent, it falls back to `parts`, whose one part IS the source object for
+  any delivery that could carry a declared md5 before the key existed.
+* **That invariant spans two modules.** `ui/arrivals.checks()` compares the
+  declared md5 against the md5 the registry measured of the source object.
+  `tests/test_arrivals.py` pins it.
 
-That invariant is relied on in a second place -- `ui/arrivals.checks()`
-compares the declared md5 against the md5 the registry measured of the source
-object -- so it is asserted in `tests/test_arrivals.py` rather than left as a
-coincidence between two modules.
+**One gate, every normalizer.** The wait is `normalize._gate`, called by both
+rather than implemented in each, so a normalizer added later inherits gating.
+For an archive it runs BEFORE the members are extracted: waiting is the
+ordinary state and `reconcile` runs on every poll, so extracting first would
+rewrite every member on each pass of a wait that has not finished.
 
-Absent from an older manifest, `checksum_objects` falls back to `parts`. Every
-delivery that could carry a declared md5 before the key existed was
-single-part, and its one part IS its source object, so the fallback hashes the
-same bytes: an identity that happened to hold, not a guess.
+**`pattern` is a regex template, not a filename template.**
+`'{stem}\.ctl'.format(stem="X")` is `'X\.ctl'` — the backslash escapes the dot
+for the regex and is not a character in any real filename. `_find_control_key`
+substitutes the data file's own stem, `re.escape`d, and full-matches that
+regex against the other objects in the same landing folder; it does not build
+one candidate key and HEAD it. `resolve_delivery_config` validates
+`pattern.format(stem="X")` as a compilable regex for the same reason: the
+validation and the runtime have to agree what kind of string this is.
 
-### One gate, every normalizer
+**`NotReady` is not `ValueError`.** Absent is a wait that clears on its own;
+present-but-disagreeing is a format change upstream that never will, and
+conflating them makes a real break look like an ordinary wait.
+`feed_ingest.normalize_task` turns `NotReady` into `AirflowSkipException` —
+without it, `DEFAULT_ARGS`' two retries at `RETRY_DELAY` (seconds) harden "not
+here yet" into a failed run inside a minute. The delivery is picked up by the
+poll path (`find_pending`, `scripts.bulk_ingest`) once the control file lands.
+No timeout: [#no-arrival-timeout](#no-arrival-timeout).
 
-The wait itself is `normalize._gate`, called by both normalizers rather than
-implemented in each. A normalizer added later inherits control-file gating by
-calling it, which is the difference between "the gate applies to file
-deliveries" and "the gate applies to deliveries". For an archive it runs
-**before** the members are extracted: waiting is the ordinary state and
-`reconcile` runs on every poll, so extracting first would rewrite every member
-into `ready/` on each pass of a wait that has not finished.
+**The exact count is an equality check beside `expected_min_rows`, not a
+replacement for it.** The floor catches a truncated file and exists for every
+feed; the equality exists only where a control file states a count. Both
+abandon the branch and leave `main` untouched.
 
-**`pattern` is a regex template, not a literal filename template, and getting
-that backwards was the first draft.** `'{stem}\.ctl'.format(stem="X")` gives
-`'X\.ctl'` -- the backslash is the regex escape for the dot, not a character
-in any real filename. `_find_control_key` (`ingest/normalize.py:136`)
-substitutes `{stem}` with the DATA file's own stem, `re.escape`d, and then
-matches that regex, full match, against the other objects in the same
-landing folder -- it does not construct one candidate key and `HEAD` it. That
-is also why `resolve_delivery_config` validates `pattern.format(stem="X")`
-as a compilable regex rather than just checking it is a non-empty string:
-the validation and the runtime behaviour have to agree on what kind of
-string this is.
+**The manifest records `control_object`, `declared_row_count` and
+`declared_md5` as OBSERVATIONS**, never as an ingested flag —
+[#ready-is-a-derived-index](#ready-is-a-derived-index).
 
-**`NotReady` is not `ValueError`, on purpose, and it is a new exception
-rather than a sentinel return.** A missing control file is not a
-normalization failure -- nothing is wrong, the sender is not done -- and the
-two must not collapse into one code path with one log line. `reconcile()`
-(`ingest/normalize.py:reconcile`) catches it separately into its own
-`awaiting_control` list, logged at INFO rather than WARNING, because
-`reconcile` runs on every poll and would otherwise warn about the same
-ordinary wait forever. A control file that HAS arrived but does not match
-`row_count` is the opposite case -- the sender said something and it was
-wrong -- and stays a `ValueError`: a format change upstream, not a timing
-problem, and conflating the two would make a real break look like an
-ordinary wait that will clear on its own.
-
-**The exact count is an equality check next to `expected_min_rows`, not a
-replacement for it.** `expected_min_rows` is a floor chosen to catch a
-truncated file and exists whether or not a feed has a control file;
-`declared_row_count`, read back from the manifest at `ingest_feed.py:404`,
-only exists for a feed with `delivery.control.row_count` whose control file
-matched it. Both checks abandon the branch and leave `main` untouched, same
-as every other load-time refusal here.
-
-**The manifest records `control_object` and `declared_row_count` as
-OBSERVATIONS, never as an ingested flag** -- consistent with
-[#ready-is-a-derived-index](#ready-is-a-derived-index)'s manifest philosophy,
-which already listed "what a control file declared" among the things a
-manifest is *for* before this step existed to produce one. Both are `None`
-for `kind: archive` (rejected at load, so structurally always `None`) and for
-a `kind: file` feed with no `delivery.control` at all.
-
-### The gap this closes, and the one it does not
-
-**A control-gated delivery cannot be allowed to fail hard just because it is
-early.** `docs/DELIVERY-SHAPES.md`'s original description of this step said
-a late control file "times out through the existing `arrival_timeout_hours:
-26` path" -- checked while building this, and that path does not exist.
-`arrival_timeout_hours` is a `Feed` field with a default and nothing else;
-grep for it and every hit is a comment or a docstring. That claim is
-corrected here rather than carried forward, per CLAUDE.md's own habit: a
-guard -- or in this case an explanation -- written against a documented
-mechanism rather than the working one produces a false sense of safety.
-
-What actually prevents a hard failure: `airflow/dags/feed_ingest.py`'s
-`normalize_task` catches `NotReady` and raises `AirflowSkipException` rather
-than letting it propagate. Without that, `DEFAULT_ARGS` retries twice at
-`RETRY_DELAY` -- seconds, tuned for a transient infra hiccup -- which would
-turn "the control file is not here yet" into a hard-failed DAG run in well
-under a minute, for the ordinary case this mechanism exists to handle
-gracefully. Skipping leaves nothing further asked of that run; the delivery
-is picked up later by the same safety-net poll path that already exists for
-every other feed -- `resolve_arrival`'s `find_pending` fallback, or
-`scripts.bulk_ingest` -- which reconciles `ready/` again and finds the
-control file whenever it actually lands. `arrival_timeout_hours` remained
-exactly as unenforced as it was before this step; nothing there read it
-either, and turning it into an actual timeout -- distinguishing "still
-waiting" from "will now never arrive" -- is a real gap, not a solved one.
-The field has since been DELETED rather than left sitting there looking like
-the answer: see [#no-arrival-timeout](#no-arrival-timeout).
-
-**Inbox routing is a second gap `route()`'s data-file-only matching created,
-and it had to be closed for this to work at all locally.** A control file
-never matches any feed's `filename_pattern` -- it names no COB date --
-so `inbox.py`'s original `route()` would reject it to `.rejected/` and it
-would never reach `landing/`, permanently starving the delivery it belongs
-to. `is_control_file` (`ingest/normalize.py:111`) gives `route()` a second
-check once no `filename_pattern` claims the name, and `inbox._trigger` is
-called with `key=None` for a control file rather than the file's own key --
-that key names no delivery, and handing it to `resolve_arrival` as an
-`object_key` would try to normalize the control file itself as if it were
-the data file, which fails immediately (`parse_filename` rejects it). `None`
-routes the run through `resolve_arrival`'s `find_pending` fallback instead,
-which is exactly the safety-net poll described above, reached from the
-inbox-triggered path rather than only from a schedule or a manual run. This
-also incidentally fixes the earlier-triggered, now-skipped run for the data
-file: nothing was going to re-trigger it, and the control file's own arrival
-now does.
-
-Verified against `tests/test_control.py` (`tests/fakes3.py`), AND end to end
-on the live stack with a throwaway `trs_margin_call` feed against a real
-Airflow scheduler -- the one claim that mattered most, because it is the one
-`tests/fakes3.py` cannot make at all:
-
-* A data file landed with no control file. `airflow dags trigger
-  ingest_trs_margin_call -c '{"object_key": "landing/trs_margin_call/..."}'`
-  -- the exact conf `inbox._trigger` sends -- produced a DAG run in state
-  **`success`**, not `failed`: `normalize` shows `skipped` in
-  `airflow tasks states-for-dag-run`, every downstream task cascaded to
-  `skipped`, and the task log reads exactly the `NotReady` message written
-  above. No retry was spent on it.
-* The control file then landed. `pending` (the safety-net poll) picked the
-  delivery up on its own with no new trigger -- reconciling it into a
-  manifest carrying `control_object` and `declared_row_count: 2` -- and
-  `ingest` merged both rows to `main`.
-* A second delivery landed with a control file DECLARING THE WRONG COUNT
-  (`ROWS=99` against 1 actual row). `ingest` raised the equality-check
-  `ValueError` immediately, and `main` provably still held only the first
-  delivery's rows afterward -- confirming the branch was abandoned exactly
-  as `expected_min_rows`'s failure already does.
-* `inbox.route()` was checked directly against the real `feeds.yml`:
-  `MarginCall_...csv` routes as data, `MarginCall_...ctl` routes as this
-  feed's control file, and an unrelated filename is still rejected.
-
-One thing this did NOT need to prove separately: `arrival_timeout_hours`
-read nowhere, which the skip-then-poll behavior above does not
-depend on and was not exercised to depend on it. The feed, raw table and
-landed/ready objects were all removed afterward -- this was verification,
-not onboarding.
+**A control file matches no data pattern**, so `route()` checks control
+patterns only after both data patterns decline the name, and triggers with
+`key=None` — it names no delivery, and handing its key to `resolve_arrival`
+would try to normalize the control file as data. `None` routes the run through
+`find_pending`, which picks up whichever delivery it just unblocked. Which
+FEED a control file belongs to is
+[#a-control-file-is-attributed-by-its-stem](#a-control-file-is-attributed-by-its-stem).
 
 ## control-file-formats
 
@@ -2057,20 +1884,6 @@ the two paths, looking exactly like an upstream format change.
   is -- so it is checked there, and left to the delivery where a real header
   row will answer it.
 
-**Verified on the live stack**, not only against `tests/fakes3.py`: a
-throwaway feed whose control file is the pipe table above went through the
-real gate -- `conform` named the landing file `trs_ctlfmt_20260801.csv` out of
-the `BUSINESS_DATE` COLUMN -- into real MinIO, and back out through
-`normalize`, whose manifest carried `declared_row_count: 2` and the matching
-`declared_md5`. Renaming `RECORD_COUNT` to `ROW_COUNT` in the landed control
-file then failed at `normalize` naming the missing column and listing the ones
-present, rather than passing with nothing checked. Separately, the real
-`inbox` watcher was run over `positions.csv` + `positions.ctl` dropped in the
-inbox: `route` classified the pair, and the sweep promoted both into
-`landing/` as `trs_ctlfmt_20260801.csv` / `.ctl` with the date taken from the
-control column. The feed, its objects and its registry row were removed
-afterward -- this was verification, not onboarding.
-
 **The console writes the format too, and that is not decoration.** The feed
 console rewrites a feed's whole block from the form payload, so a key the form
 does not carry is a key the next save DELETES. A delimited control file
@@ -2080,21 +1893,7 @@ widget writes one format into both control blocks, which makes the coherence
 error above unreachable from the form rather than something to be understood
 in it.
 
-
 ## a-control-file-is-attributed-by-its-stem
-
-`{stem}` in a control pattern was substituted with `.+`, so
-`'{stem}\.ctl'` read as "any file ending `.ctl` is mine". Two feeds that both
-send `.ctl` -- an ordinary thing for two source systems to do -- therefore
-each claimed EVERY control file at the door, `route()` refused all of them as
-ambiguous, and both feeds then waited for ever on control files sitting in
-`.rejected/`. Observed while writing the delivery walkthroughs, on two demo
-feeds that had nothing to do with each other:
-
-```
-MARGIN_20260901.ctl    feed=None    reason: matches more than one feed's
-                                    control pattern (tr_margin_call, trs_position)
-```
 
 **The stem was never a wildcard.** A control file's name is its DATA file's
 stem plus a suffix -- `find_control` builds it that way and the predicates read
@@ -2107,11 +1906,6 @@ that was actually being asked, statically, with no I/O and no new state:
 | `MARGIN_20260901.ctl` | ambiguous | `tr_margin_call` |
 | `positions.ctl` | ambiguous | `trs_position` |
 | `something_else.ctl` | claimed by whichever feed declared `.ctl` | unroutable |
-
-That last row is the one behaviour change: a control file whose stem matches
-no feed's data names used to be claimed anyway and landed in that feed's
-prefix, gating a delivery that would never exist. It is refused at the door
-now, which puts it in the console's unclaimed queue instead of in `landing/`.
 
 ### Reading a name is not building one
 
@@ -2160,256 +1954,159 @@ while the realistic collision always lands on the sample.
 
 ## the-sniffer
 
-The sniffer backend for step 5 of `docs/DELIVERY-SHAPES.md`
-(`reporting_platform/ingest/sniff.py`): propose delimiter, quote, header,
+`reporting_platform/ingest/sniff.py`: propose delimiter, quote, header,
 encoding, per-column types and business-key candidates from a real delivered
-file. It is a normalizer that writes nothing -- a human decides.
+file. A normalizer that writes nothing — a human decides.
 
-**Uses DuckDB's `sniff_csv()` rather than hand-rolled frequency analysis.**
-`scripts/duckdb_console.py` already depends on DuckDB being installed, so
-this adds no new dependency. `sniff_delivery(con, path)` takes ANY path a
-duckdb connection can read -- verified once against real MinIO data by
-pointing a `scripts.duckdb_console.connect()` session (`httpfs`, S3 secret)
-straight at `s3://lakehouse/...`, correct delimiter and correct per-column
-types read from real values.
+**DuckDB's `sniff_csv()`, not hand-rolled frequency analysis.**
+`scripts/duckdb_console.py` already depends on DuckDB, so this adds no
+dependency. `sniff_delivery(con, path)` takes any path a duckdb connection
+can read; `sniff_bytes`/`sniff_archive`/`propose_feed` fetch the delivery
+with the boto3 client `ingest/arrival.py` already uses (or read a local file,
+for `.rejected/`) and sniff a LOCAL temp copy with a bare `duckdb.connect()`
+— no Iceberg attach and no S3 secret, for something that reads one object.
 
-**The console-facing entry points do not use that connection recipe at
-all**, and an earlier draft of this section said `REPORTING_DUCKDB_S3_SECRET`
-on `feed-ui` was the prerequisite for them -- corrected here rather than
-carried forward. `sniff_bytes`/`sniff_archive`/`propose_feed` fetch the
-delivery's bytes with the same boto3 client `ingest/arrival.py` already
-uses (or read a local file, for `.rejected/`) and sniff a LOCAL temp copy
-with a bare `duckdb.connect()` -- no Iceberg attach, no S3 secret, for
-something that is just reading one object. The env var was removed from
-`feed-ui` in `docker-compose.yml` rather than left set for a feature that
-does not read it.
+**`sniff_csv`'s type names are DuckDB's own SQL types, not Arrow's** —
+`BIGINT`/`DOUBLE`/`VARCHAR`/`DATE`/`TIMESTAMP`/`BOOLEAN`. `DUCKDB_TYPE_MAP`
+translates them into this platform's `column_types` vocabulary
+(`ui/scaffold.py`'s `COLUMN_TYPES`) with a module-level `assert` that keeps
+the two from drifting apart silently. A decimal-looking column comes back as
+plain `DOUBLE`, never `DECIMAL(p,s)`, but the map strips a parameter list
+before lookup so nothing depends on that.
 
-**`sniff_csv`'s type names are DuckDB's own SQL types, not Arrow's.** Asked
-directly and checked rather than assumed: `sniff_csv` on a real duckdb 1.5.5
-returns `BIGINT`/`DOUBLE`/`VARCHAR`/`DATE`/`TIMESTAMP`/`BOOLEAN`, not Arrow's
-`int64`/`float64`/`utf8`/`date32[day]`. `DUCKDB_TYPE_MAP` translates them
-into this platform's `column_types` vocabulary
-(`ui/scaffold.py:COLUMN_TYPES`) with a module-level `assert` that keeps the
-two from drifting apart silently. A decimal-looking column ("100.50") comes
-back as plain `DOUBLE`, never a parametrised `DECIMAL(p,s)` -- also checked
--- but the map strips a parameter list before lookup anyway, since nothing
-here should depend on duckdb continuing to prefer `DOUBLE`.
+**A type with no platform cast falls back to "string", not to the closest
+thing.** `TIME`, `TIMESTAMP`/`TIMESTAMPTZ`, `INTERVAL`, `BLOB` and `UUID` are
+deliberately absent from `DUCKDB_TYPE_MAP`: `dbt/macros/engine.sql`'s
+`parse_date` parses a DATE-shaped string and there is no timestamp
+equivalent, so mapping `TIMESTAMP` to `date` would drop the time of day with
+no error anywhere. "string" commits to nothing, which is why it is safe.
 
-**Types with no platform cast fall back to "string", not to a guess.**
-`TIME`, `TIMESTAMP` (and `TIMESTAMPTZ`), `INTERVAL`, `BLOB`, `UUID` are
-deliberately absent from `DUCKDB_TYPE_MAP` rather than mapped to the closest
-thing: `dbt/macros/engine.sql`'s `parse_date` only parses a DATE-shaped
-string, there is no `parse_timestamp`, so forcing a `TIMESTAMP` column into
-`date` would silently drop the time of day with no error raised anywhere.
-"string" is a TRY_CAST-free passthrough; it is the safe direction precisely
-because it commits to nothing.
+**Encoding is not detected by `sniff_csv` at all.** It assumes UTF-8
+(silently stripping a BOM) and raises a catchable error on anything else, so
+`_sniff_with_encoding` tries a BOM-implied encoding first, then
+`ENCODING_FALLBACKS` in order. Two rules in that list are load-bearing and
+`tests/test_sniff.py` asserts both:
 
-**Three things were tried and found wrong by actually running duckdb, not
-by reasoning about it, and are asserted against in `tests/test_sniff.py` so
-a regression back to any of them is caught:**
+* **`utf-16` is only ever tried when a BOM implies it**, never guessed.
+  `sniff_csv(..., encoding='utf-16')` on ASCII or latin-1 bytes does not
+  raise — it reinterprets byte pairs as UTF-16 code units and "succeeds" with
+  one garbled VARCHAR column at HIGH confidence, before any real candidate
+  gets a turn.
+* **`cp1252` is tried AFTER `latin-1`.** DuckDB's `latin-1` rejects the C1
+  range (0x80–0x9F) that `cp1252` accepts, so cp1252's accepted bytes are a
+  strict superset: in the other order latin-1 can never be the one that
+  succeeds, which is dead code wearing a comment that lies about it. In this
+  order plain Western-European text gets the more accurate label and `cp1252`
+  — the widest net — is what `encoding_confidence: "low"` flags. A byte
+  undefined in both raises one clear `ValueError` rather than a duckdb
+  traceback from whichever fallback ran last.
 
-1. *Encoding is not detected by `sniff_csv` at all.* It assumes UTF-8
-   (silently stripping a UTF-8 BOM -- checked) and raises a clear,
-   catchable error on anything else. `_sniff_with_encoding` tries a
-   BOM-implied encoding first, then `ENCODING_FALLBACKS` in order.
-2. *`utf-16` must never be guessed from content.* A first draft included it
-   in the fallback list, and `sniff_csv(..., encoding='utf-16')` on plain
-   ASCII/latin-1 bytes does NOT raise -- it reinterprets byte-pairs as
-   UTF-16 code units and "succeeds" with one garbled VARCHAR column,
-   reported as HIGH confidence, before any real candidate got a turn.
-   UTF-16 has no reliable signature without a BOM, so it is only ever tried
-   via `_bom_encoding` finding one.
-3. *`cp1252` must be tried AFTER `latin-1`, not before.* Checked byte by
-   byte against a real duckdb: duckdb's own `latin-1` rejects the C1 control
-   range (0x80-0x9F) that ordinary ISO-8859-1 would accept, and `cp1252`
-   accepts that entire range except five undefined slots -- so cp1252's
-   accepted byte range is latin-1's strict superset. Tried in the wrong
-   order, latin-1 can never be the one that succeeds, which is dead code
-   wearing a comment that lies about what it does. In the right order,
-   plain Western-European text gets the more accurate "latin-1" label, and
-   `cp1252` -- genuinely the widest net of anything in the list -- is what
-   `sniff_delivery` flags `encoding_confidence: "low"` for, as the true
-   last resort. Neither encoding is infallible: a byte undefined in both
-   (0x81, tested) raises one clear `ValueError` rather than a raw duckdb
-   traceback from whichever fallback happened to run last.
+**`candidate_keys` reuses `sniff_csv`'s own `Prompt` field** — a complete,
+already-escaped `read_csv(...)` call — rather than re-deriving the escaping to
+build a uniqueness scan. Single-column candidates only; a composite key is a
+human's call, and several independently-unique columns is not the claim that
+together they are the key. A header-only file proposes none.
 
-**`candidate_keys` reuses `sniff_csv`'s own `Prompt` field** -- a complete,
-already-escaped `read_csv(...)` call -- rather than re-deriving
-delimiter/quote/encoding escaping a second time to build a uniqueness-scan
-query. Single-column candidates only; a composite key is still a human's
-call. A header-only file (no data rows) proposes no candidates rather than
-a false positive from an empty uniqueness comparison.
-
-**Returns the FULL per-column type map, not yet reduced to overrides** --
-matching what `ui.scaffold.resolve_types` returns elsewhere. A caller
-persisting this into `feeds.yml` is expected to call
-`ui.scaffold.overrides_only(columns, column_types)` on it first, the same
-reduction every other write path already uses, so a column this sniffer
-agrees with `infer_type` about still produces no diff.
+**It returns the FULL per-column type map, not yet reduced to overrides**,
+matching `ui.scaffold.resolve_types`. A caller persisting it into a feed file
+calls `ui.scaffold.overrides_only` first, the same reduction every other write
+path uses, so a column the sniffer agrees with `infer_type` about produces no
+diff.
 
 ### Archives, and the console side
 
-`sniff_archive` extracts matching members to a local temp file and sniffs
-the FIRST one, sorted by name -- the same ordering `ingest/normalize.py`'s
-own archive normalizer uses. This is a real assumption, not an oversight:
-`parts: concat` (the only mode this platform builds) means every member in
-a delivery is the same logical shape cut into files, so one member's shape
-IS the delivery's shape. `member_pattern` is optional -- absent (the
-onboarding case; there is no feed yet to have declared one), every member
-is a candidate and `member_pattern_candidate` groups them by extension as a
-starting guess; passed (the re-sniff-an-existing-feed case), only matching
-members are considered.
+`sniff_archive` extracts matching members to a temp file and sniffs the FIRST
+one by name — the same ordering the archive normalizer uses. That is an
+assumption worth stating: `parts: concat` means every member is the same
+logical shape cut into files, so one member's shape IS the delivery's.
+`member_pattern` is optional — absent (onboarding, no feed yet), every member
+is a candidate and `member_pattern_candidate` groups them by extension;
+passed (re-sniffing an existing feed), only matching members are considered.
 
-**Only `cob_date_from: container` is ever proposed.** `member`/`path`
-sourcing is real, described in `docs/DELIVERY-SHAPES.md`, and NOT BUILT
-(`context.NOT_BUILT` rejects it at load) -- proposing it would suggest a
-value guaranteed to fail. `_container_has_a_date` reuses
-`ui.registry.derive_pattern`'s own check (does the container's filename
-have an 8-digit run to anchor a group to?) and `propose_feed` surfaces the
-answer as `container_has_date`, honestly, rather than pretending
-`member`/`path` were an option.
+**Only `cob_date_from: container` is ever proposed**, because
+`delivery.cob_date_from: member`/`path` are NOT BUILT and `context.NOT_BUILT`
+rejects them at load. `_container_has_a_date` reuses
+`ui.registry.derive_pattern`'s check — does the container's name have an
+8-digit run to anchor a group to? — and `propose_feed` reports the answer as
+`container_has_date` rather than proposing a value guaranteed to fail.
 
-**The console side is built, around a concrete mechanism rather than a
-general "any unclaimed object anywhere" scanner.** "Unclaimed deliveries" in
-`docs/DELIVERY-SHAPES.md`'s original description does not say how such an
-object would be discovered in general, and a bucket-wide scan is a real,
-unsolved design question this change does not answer. What DOES already
-exist in this codebase is `inbox/.rejected/`: a file dropped into the local
-inbox that `route()` could not match to any feed's `filename_pattern` or
-control pattern. `list_rejected` (`ingest/inbox.py`) lists it, **re-running
-`route()` rather than trusting a stored reason** -- feeds.yml may have
-changed since rejection, and a file that would now land is flagged
-(`now_claimed_by`, `now_routes_as_control`) rather than offered up to
-sniff, which would silently create a second, divergent feed for something
-an existing one already claims. `read_rejected` validates its `filename`
-argument as a bare name before joining it onto `INBOX` -- the same
-directory-traversal concern `ingest/normalize.py`'s `_safe_member_name`
-guards for an archive member, here for a name arriving over HTTP instead of
-out of a zip.
+**The console surfaces `inbox/.rejected/`, not a bucket-wide scan.** A
+general "any unclaimed object anywhere" discovery is an unsolved design
+question; what exists is the inbox's own backlog of files `route()` could not
+match. `list_rejected` lists it, **re-running `route()` rather than trusting a
+stored reason** — feeds.yml may have moved on, and a file that would now land
+is flagged (`now_claimed_by`, `now_routes_as_control`) rather than offered up
+to sniff, which would create a second feed for something an existing one
+claims. `read_rejected` validates its `filename` as a bare name before joining
+it onto `INBOX`, the traversal concern `_safe_member_name` guards for an
+archive member, here for a name arriving over HTTP.
 
-`feed-ui` gained a read-only `./inbox` mount in `docker-compose.yml`
-(`inbox` itself keeps the read-write one, since it is the process that
-moves files into `.rejected/`) and three routes: `GET /api/unclaimed`,
-`POST /api/unclaimed/{filename}/sniff`, and `POST /api/sniff` for a plain
-upload -- the same upload control the "new feed" form always had, now
-reading real values via `sniff_bytes` instead of only the header row via
-the older `/api/infer-columns` (kept, unused by the console's own JS now,
-since it is still a reasonable simpler alternative over the API and
-deleting a public route is a bigger call than this change makes). The
-proposal pre-fills `feedForm` directly -- its fields already read `f?.xxx`
-for an existing feed, and a sniffed proposal is shaped the same way, so no
-new form-rendering path was needed, only a caller that hands it a proposal
-instead of `null`.
+`feed-ui` has a read-only `./inbox` mount (`inbox` keeps the read-write one,
+being the process that moves files into `.rejected/`) and three routes: `GET
+/api/unclaimed`, `POST /api/unclaimed/{filename}/sniff`, and `POST /api/sniff`
+for a plain upload. A proposal pre-fills `feedForm` directly, since its fields
+already read `f?.xxx` for an existing feed and a proposal is shaped the same
+way.
 
-**Business key CANDIDATES are surfaced as a note, never auto-selected.**
-Several independently-unique columns is not the same claim as "together
-they are the key" -- auto-checking all of them would silently propose a
-composite key nobody asserted.
-
-**One real bug found by wiring this up rather than by reading the code:**
-`feedForm` sets `deliveryExpected.checked = f ? f.delivery_expected : true`
--- a truthy check on `f`, not `f?.delivery_expected ?? true`. A sniffed
-proposal is a real (truthy) object that never sets `delivery_expected` at
-all, so passing one straight through would have silently unchecked it --
-opting the new feed OUT of the gap check with nothing on screen explaining
-why. `newFeed` now defaults `draft.delivery_expected` before handing it to
-`feedForm`. Grepped for the same `f ? f.x : default` shape across the rest
-of the function afterward; only `header` uses it besides
-`delivery_expected`, and every sniffed proposal always sets `header`, so it
-was not at risk. (The field was called `completeness` when this was found;
-see `#delivery-expected-not-completeness`.)
-
-**The gap this surfaced -- `feedForm`/`FeedSpec` having no `delivery:` field
-at all -- is now closed.** See `#console-delivery-support` below for what
-was built.
-
-Verified end to end against the real console (`feed-ui`, host port
-overridden past a pre-existing, unrelated port-8082 conflict on the
-verification host -- see the session notes, not a platform concern): a
-`.rejected/MarginCall_20260904.csv` and a `.rejected/custodyPositions_20260904.zip`
-both listed correctly via `/api/unclaimed`, sniffed correctly via
-`/api/unclaimed/{filename}/sniff` (plain file and archive), and
-`/api/sniff` (the upload path) sniffed both a plain CSV and a zip. Path
-traversal in the filename was rejected. **Not verified**: an actual
-in-browser click-through of the new "Unclaimed deliveries" panel and the
-pre-filled form -- the JS was syntax-checked (`node --check`) and traced by
-hand against `feedForm`'s exact field-reading conventions (catching the
-`delivery_expected` bug above), but no browser was available in the session
-that built this.
+**Business key candidates are a note, never auto-selected**, and
+`draft.delivery_expected` is defaulted before `feedForm` sees a proposal:
+`feedForm` reads `f ? f.delivery_expected : true`, a truthy check on the
+object rather than on the field, so a proposal that does not set it would
+silently opt the new feed OUT of the gap check with nothing on screen saying
+so.
 
 ## console-delivery-support
 
-`ui.registry.FeedSpec` gained a `delivery` field, `BLOCK_ORDER` gained the
-key (right after `filename_pattern`), and `feedForm` gained the UI for it --
-closing the gap `#the-sniffer` surfaced: the console previously had no way
-to CREATE an archive or control-gated feed at all, sniffing one
-notwithstanding.
+`ui.registry.FeedSpec` carries `delivery` and `arrival`, `BLOCK_ORDER` carries
+both keys (after `filename_pattern`), and `feedForm` has the UI for them: the
+console creates and edits an archive or control-gated feed, rather than only
+sniffing one and describing what a human would then add by hand.
 
-**Validation reuses `context.resolve_delivery_config` directly, called from
-`ui.registry.validate`, rather than a second copy of the rules.** The same
-function feeds.yml load calls -- so a typo or an unbuilt combination
-(`control:` with `kind: archive`, a `member_pattern`-less archive) fails in
-the form with the SAME message it would raise at the next Airflow parse,
-verified by posting both through `TestClient` and reading the `422` back:
-`"...NOT BUILT -- only kind: file reads control:."`, byte for byte what
-`resolve_delivery_config` itself raises.
+**Validation reuses `context.resolve_delivery_config` and
+`resolve_arrival_config` directly, called from `ui.registry.validate`.** The
+same functions feeds.yml load calls — so a typo or an unbuilt combination (a
+`member_pattern`-less archive, `delivery.parts: separate`) fails in the form
+with the SAME message it would raise at the next Airflow parse. What the
+loader refuses is not this entry's to enumerate.
 
-**`kind: file` is never written explicitly.** It is the implicit default --
-`resolve_delivery_config` treats an absent `kind` the same way -- and
-writing it for the ordinary case would put `delivery: {kind: file}` in
-every feed the form creates, noise the four original feeds' blocks have
-never carried. `_delivery_from_payload` drops it; a blank `control:
-{pattern: "", row_count: ""}` (the fields present on the form but unused)
-similarly collapses to `{}`, not a delivery block that validates as broken.
+`validate` also runs `check_control_patterns_are_distinguishable` over the
+registry the feed is about to join, because that refusal is about the whole
+registry rather than one feed:
+[#a-control-file-is-attributed-by-its-stem](#a-control-file-is-attributed-by-its-stem).
 
-**Editing preserves an existing `delivery:` block it was not asked to
-change, and removes one that was cleared.** Both directions matter and
-neither was free: `spec_from_feed` (used by `/api/scaffold/{name}` and
-available to any future caller) now round-trips `fd.delivery`, or ANY edit
-through the console -- renaming a description, say -- would have silently
-deleted an archive feed's `delivery:` block, since `update()`'s generic
-loop already deletes a `BLOCK_ORDER` key the new spec does not set.
-Clearing the form's control fields on an edit correctly deletes the key
-rather than leaving a stale one, the same generic mechanism working in the
-other direction -- both asserted in `tests/test_delivery_form.py`.
+**The control block is offered for BOTH kinds.** A container gated on a
+control file beside it in landing is a shape the loader accepts, so
+`syncDeliveryVisibility` shows the control fields whichever kind is selected
+and `readDelivery` reads them for both. Only `member_pattern` is archive-only.
 
-**The sniffed proposal now feeds the new fields instead of only describing
-them.** An archive sniff's `member_pattern_candidate` sets
-`deliveryKind.value = "archive"` and pre-fills `memberPattern` (both in the
-upload handler and in `newFeed(draft)`, which builds the `f?.delivery`
-shape `feedForm` expects from the proposal's flatter fields before handing
-it over) -- the note that used to say "add a delivery: block to feeds.yml
-by hand" now says "check it actually picks out the data members".
-Gating an archive on a control file stays off the table on the form itself
-(hidden, not merely unvalidated) since `resolve_delivery_config` rejects
-the combination outright.
+**`kind: file` is never written explicitly.** It is the implicit default, and
+writing it for the ordinary case would put `delivery: {kind: file}` in every
+feed the form creates. `_delivery_from_payload` drops it; a blank `control:
+{pattern: "", row_count: ""}` — the fields present on the form but unused —
+collapses to `{}` rather than a block that validates as broken.
 
-**Verified against the real HTTP layer**, not just the registry functions
-in isolation -- `starlette.testclient.TestClient` against the real
-`app.py`, config pointed at a container-writable temp copy of `feeds.yml`
-rather than the checked-out one, because writing to the latter from inside
-`feed-ui` in this development environment hits a pre-existing, unrelated
-permission mismatch (the file is host-uid-owned; the container runs as
-uid 50000) that a plain `curl` against the running container hit first and
-that this verification worked around rather than "fixed" by touching the
-repository's file permissions. Confirmed: creating an archive feed
-end-to-end (response carries the fully-resolved `delivery`, defaults
-filled in); the same NOT-BUILT rejection a hand-edit would get; creating,
-then editing away, a control-gated feed's `delivery:` block. The dbt
-scaffold steps (`_sources.yml`, the prepared model) failed in this same
-run on that identical permission mismatch -- for a PLAIN feed with no
-`delivery:` too, confirming it is unrelated to this change and not
-something introduced by it.
+**Editing preserves a block it was not asked to change, and removes one that
+was cleared.** Both directions are load-bearing and neither is free:
+`spec_from_feed` round-trips `fd.delivery` and `fd.arrival`, or any edit
+through the console — renaming a description, say — silently deletes them,
+since `update()`'s generic loop drops a `BLOCK_ORDER` key the new spec does
+not set. `_arrival_block` must therefore write every sub-block it can be
+handed, `archive:` included. Clearing the control fields on an edit deletes
+the key, the same mechanism in the other direction. Both asserted in
+`tests/test_delivery_form.py`.
 
-11 new tests in `tests/test_delivery_form.py`.
+**A sniffed proposal fills the fields rather than describing them.** An
+archive sniff's `member_pattern_candidate` sets `deliveryKind` to `archive`
+and pre-fills `memberPattern`, in the upload handler and in `newFeed(draft)`,
+which builds the `f?.delivery` shape `feedForm` expects from the proposal's
+flatter fields.
 
 ## the-inbox-is-the-conformance-gate
 
 `landing/` has a CONTRACT: every object in it is correctly named and
 classified. `Feed.parse_filename` answers for every delivery, landing
-retention can date every object, and `find_pending` can compute its retention
-keep-set from the dates it sees there. Every simplification downstream rests
-on that one property.
+retention can date every object, and `find_pending` computes its keep-set from
+the dates it sees there. Every simplification downstream rests on that.
 
 Two ways in, and the contract holds either way:
 
@@ -2418,32 +2115,16 @@ Two ways in, and the contract holds either way:
 | direct `PutObject` into `landing/` | an **approved** sender that adheres to the contract | nothing; it already meets the standard |
 | the **inbox gate** | a legacy sender that does not | classify, wait for the control file, name it correctly, promote |
 
-`arrival:` in `feeds.yml` marks the second, and a feed without one is the
-first. Opt-in, because making it mandatory would demand a control file from
-senders who have no reason to ship one -- and every feed here today is the
-first kind.
+`arrival:` marks the second; a feed without one is the first. Opt-in, because
+making it mandatory would demand a control file from senders with no reason to
+ship one.
 
 ### The inbox establishes IDENTITY. Ingestion verifies INTEGRITY.
 
-This is the line the whole design turns on, and the first implementation got
-it wrong. The inbox exists to ensure a delivery is correctly named and has its
-prerequisites: which source system, which feed, which COB date, which
-version. It does **not** check the row count or the checksum.
-
-The first version did check them, at the door, and rejected a mismatch before
-anything landed. Two things were wrong with that:
-
-* **it put a second implementation of the same check on one of the two
-  paths.** `delivery.control` already checked the row count in `landing/`;
-  adding a parallel check in `conform.py` meant two code paths that had to be
-  kept in step by discipline.
-* **it left the trusted path less verified than the untrusted one.** An
-  approved sender writing straight to landing got no checksum check at all
-  (`delivery.control` had no `md5` key), while a legacy feed got one at the
-  door. Exactly backwards.
-
-So the keys are split by responsibility, and neither block may carry the
-other's:
+The line the whole design turns on. The gate ensures a delivery is correctly
+named and has its prerequisites — source system, feed, COB date, version. It
+does **not** check the row count or checksum, and neither block may carry the
+other's keys:
 
 ```yaml
 arrival:                       # IDENTITY -- read by the inbox
@@ -2458,150 +2139,97 @@ delivery:                      # INTEGRITY -- read in landing, checked at ingest
     md5: 'MD5=(?P<md5>[0-9a-fA-F]{32})'
 ```
 
-`arrival.control` rejects `row_count`/`md5` at load, as unknown keys. Both
-paths now verify identically, once, at ingest -- which is what "the process
-continues the same from there" actually requires.
+`arrival.control` rejects `row_count`/`md5` at load as unknown keys. Checking
+them at the door instead would put a second implementation of the same check
+on one of the two paths — and leave the TRUSTED path less verified than the
+untrusted one, since an approved sender writing straight to landing would get
+no checksum check at all. Both paths verify identically, once, at ingest.
 
 ### The control file is PROMOTED, not consumed
 
-The delivery is the data file and its control file **together**. So the inbox
-renames both and writes both into `landing/`, and `landing/` always holds the
-whole delivery whichever way it arrived. That is what lets `delivery.control`
-read it there for a legacy feed exactly as it does for an approved sender.
+The delivery is the data file and its control file **together**, so the gate
+renames both into `landing/` and the prefix always holds the whole delivery
+whichever way it arrived. That is what lets `delivery.control` read it there
+for a legacy feed exactly as for an approved sender. Consuming it at the door
+stalls the delivery forever and silently: landing never sees one, `normalize`
+waits on a sibling that cannot arrive, and `reconcile` reports
+`awaiting_control` at INFO because from its side the sender is merely late.
 
-The first version consumed the control file at the door. Combined with
-`delivery.control` that stalled the delivery **forever, silently** -- the
-inbox ate the control file, landing never saw one, and `normalize` waited on a
-sibling that could not arrive, reported as `awaiting_control` and logged at
-INFO because from `reconcile`'s side nothing was wrong and the sender was
-merely late. CLAUDE.md's own warning: a check whose window does not contain
-the thing it describes never stops. Verified by construction before it was
-fixed.
+So the two blocks are **complementary, not alternatives**:
+`check_gates_are_coherent` rejects an `arrival.control` with no
+`delivery.control`, which would promote a control file nothing reads and
+quietly lose the row count and checksum for the feeds least likely to deserve
+that trust.
 
-The consequence is that the two blocks are **complementary, not
-alternatives**: a legacy feed needs both, and `check_gates_are_coherent`
-rejects an `arrival.control` with no `delivery.control` -- which would promote
-a control file into landing that nothing ever reads, quietly losing the row
-count and checksum for the feeds least likely to deserve that trust. An
-earlier draft of that same function asserted the exact opposite; it is kept as
-a named example of a guard written against a design rather than against the
-working mechanism.
-
-**The promoted control file is named from `delivery.control.pattern`, not
-from the name it had in the inbox**, because `delivery.control` is what has to
-find it, and it is checked against that same regex before being used.
+**The promoted control file is named from `delivery.control.pattern`**, not
+from the name it had in the inbox, because that is the pattern which has to
+find it — and it is checked against that same regex before being used.
 
 ### Two names, and the rename cannot be wrong
 
 `positions.csv` in the inbox; `trs_position_20260801.csv` in landing.
 `Feed.claims_source` answers the first, `Feed.parse_filename` the second, and
-`ingest/conform.py` is the only thing that crosses between them. Conflating
-them is how the inbox would start rejecting the files it exists to accept.
+`ingest/conform.py` is the only thing that crosses between them.
 
-`common/filenames.render_filename` -- moved out of `ui/sampledata.py`, where
-it already existed to generate sample deliveries -- builds the landing name
-FROM `filename_pattern` and feeds it back through `parse_filename` before
-returning it. "The inbox renamed a file to something landing will not match"
-is therefore structurally impossible rather than something a test has to
-remember, and that failure is the silent kind: the file lands, `find_pending`
-never matches it, and the feed reports nothing pending forever.
+`common/filenames.render_filename` builds the landing name FROM
+`filename_pattern` and feeds it back through `parse_filename` before returning
+it, so "the inbox renamed a file to something landing will not match" is
+structurally impossible rather than something a test must remember. That
+failure is the silent kind: the file lands, `find_pending` never matches it,
+and the feed reports nothing pending for ever.
 
 ### Versions, so a re-delivery cannot overwrite evidence
 
-A corrected file for a COB date already landed must not overwrite the
-first one -- `landing/` is the evidence copy and the original is the evidence
-of what was originally ingested. The gate renders the unversioned name, and if
-the listing shows it taken, tries `_v2`, `_v3` and so on. A version the
-control file itself declares wins outright: the sender said which restatement
-this is, and second-guessing that is worse than obeying it.
+A corrected file for a landed COB date must not overwrite the first — the
+original is the evidence of what was originally ingested. The gate renders the
+unversioned name and, if the listing shows it taken, tries `_v2`, `_v3`. A
+version the control file itself declares wins outright: the sender said which
+restatement this is.
 
 ### Two failure modes, and they land differently
 
-* **IDENTITY failure** -- no feed claims the name, or no COB date can be
-  found. The file cannot be NAMED, so there is no landing key to write it to
-  and it cannot land at all. `.rejected/`.
-* **INTEGRITY failure** -- wrong row count, wrong checksum. Nothing to do with
-  naming. The delivery **lands**, because `landing/` is the evidence copy and
-  "the upstream sent us a truncated file on the 3rd" is precisely what it
-  exists to prove, and then the ingest refuses, abandons its Nessie branch and
-  leaves `main` untouched, exactly as `expected_min_rows` already does.
+* **IDENTITY failure** — no feed claims the name, or no COB date can be found.
+  The file cannot be NAMED, so there is no landing key to write it to.
+  `.rejected/`.
+* **INTEGRITY failure** — wrong row count or checksum. Nothing to do with
+  naming: the delivery **lands**, because "the upstream sent a truncated file
+  on the 3rd" is precisely what the evidence copy exists to prove, and the
+  ingest then refuses, abandons its branch and leaves `main` untouched.
 
 A missing control file is neither: nothing is wrong and the sender is not
-done, so the delivery is HELD in the inbox for the next pass. `NotReady` and
-`ConformanceError` stay separate types for the reason
-[#control-file-gate](#control-file-gate) gives.
+done, so the delivery is HELD for the next pass. `NotReady` and
+`ConformanceError` stay separate types —
+[#control-file-gate](#control-file-gate).
 
 ### The metadata sibling
 
-*A worked example of both shapes, with every key, is in
+*Every key, with worked examples, is in
 [DELIVERY-SHAPES.md#the-metadata-sibling](DELIVERY-SHAPES.md#the-metadata-sibling);
-what follows is why it holds what it holds.*
+this is why it holds what it holds.*
 
 `landing/<feed>/<delivery>.meta.json`. The landed objects are byte-identical
-to what the upstream sent but carry the PLATFORM's names, so the originals --
-and everything else about the arrival -- survive only here: source filename,
+to what the upstream sent but carry the PLATFORM's names, so the originals —
+and everything else about the arrival — survive only here: source filename,
 source control filename, source system, received and promoted times, and the
 bytes/rows/md5 as measured at the door. Those measurements are **recorded, not
 compared**; if the ingest later disputes the row count, they say whether the
-file changed after arrival or arrived wrong.
-
-It no longer embeds the control file's text. An earlier version did, correctly,
-because the gate consumed the control file and it reached landing no other way.
-It is promoted now, so a copy here would be a second version of the same bytes
+file changed after arrival or arrived wrong. It embeds no copy of the control
+file's text, which is promoted intact and would otherwise have two versions
 with nothing keeping them in step.
 
-**The `.meta.json` suffix is load-bearing**, for the same reason the control
-file's name is: `retention/landing.py` dates an object from its own name and
-refuses to delete anything it cannot date. A metadata object carries its
-delivery's name inside its own, so it dates by stripping the suffix, with no
-lookup, and an orphaned one still expires instead of accumulating forever.
+**The `.meta.json` suffix is load-bearing.** `retention/landing.py` dates an
+object from its own name and refuses to delete anything it cannot date; a
+metadata object carries its delivery's name inside its own, so it dates by
+stripping the suffix, with no lookup, and an orphan still expires.
 
-### A pre-existing bug this surfaced
-
-**Landing retention could not date a control file at all.** `TRADE_20260801.ctl`
-matches no `filename_pattern` -- it is not a delivery -- so `_expiry` returned
-None, the sweep counted it as `unrecognised`, and it would never be deleted.
-Latent while no feed used `delivery.control`; permanent accumulation once
-control files routinely land, which this change makes the normal case.
-
-Fixed by dating a control file from the SIBLING it gates -- the delivery in
-the same prefix whose stem its `delivery.control.pattern` matches -- found with
-no extra S3 call, because the sweep has already listed the prefix. Searching
-the control filename for an 8-digit run would be simpler and is deliberately
-not done: this authorises deletion from the evidence copy, and a name with two
-8-digit runs would pick the wrong one. No sibling means keep.
-
-### Verified on the live stack
-
-Real MinIO, real Spark, a real Airflow scheduler and the real inbox watcher
-container, with a throwaway `trs_position` feed carrying BOTH blocks -- removed
-afterwards along with its table, DAG, landing objects and processed files.
-
-* A good delivery (`positions.csv` + `positions.ctl` declaring
-  `ReportingDate|20260801`, `ROWS=2` and a real md5) produced
-  `conformed positions.csv -> landing/trs_position/trs_position_20260801.csv`,
-  and landing held **all three** objects: the renamed data file, the renamed
-  control file, and the `.meta.json`. `reconcile` then read the PROMOTED
-  control file through `delivery.control` and wrote a manifest carrying
-  `declared_row_count: 2` and `declared_md5`. The DAG reached `success` and
-  `main` held 2 rows.
-* A delivery that was **identifiable but corrupt** (`ROWS=99` against 1 row,
-  a bogus md5) was NOT rejected: it landed, with its control file and metadata,
-  and the DAG run went **`failed`** with
-  `1 rows read, control file ... declared 99. Branch left for inspection; main
-  is untouched.` `main` provably still held only the first date.
-* A **re-delivery for a date already landed** produced
-  `trs_position_20260801_v2.csv` (plus its control file and metadata) with the
-  original untouched, and ingested as `_file_version` 2 alongside version 1.
-* `sweep_landing --dry-run` reported `retained: 9, unrecognised: 0` -- three
-  deliveries times three objects, every one recognised and dated.
-
-One operational note worth having: **the inbox watcher must be restarted after
-a code change.** `feeds()` re-reads config on mtime, which covers a feed being
-added, but a long-running process holds the module code it imported at start.
-A stale watcher reported a config key as unknown that was valid on disk.
-
-30 new tests in `tests/test_conform.py`.
+**A control file is dated from the SIBLING it gates** — the delivery in the
+same prefix whose stem its `delivery.control.pattern` matches, found with no
+extra S3 call because the sweep has already listed the prefix. It matches no
+`filename_pattern` of its own, so without this the sweep counts it
+`unrecognised` and never deletes it. Searching the control filename for an
+8-digit run would be simpler and is deliberately not done: this authorises
+deletion from the evidence copy, and a name with two 8-digit runs picks the
+wrong one. No sibling means keep.
 
 ## containers-run-as-the-host-uid
 
@@ -2637,57 +2265,13 @@ Default `50000` preserves the old behaviour for anyone with no `.env` entry,
 and macOS/Windows should leave it unset -- Docker Desktop's VM maps ownership
 and 50000 is correct there.
 
-Verified by recreating all eight services: `id` reports `uid=1000 gid=0(root)`
-in each, `config/feeds/` is writable, `inbox/.processed/` is creatable, and a feed
-created through the console over HTTP returned 200 having written all five
-files with `dbt parse` clean -- the exact call that returned 500 before.
-
-### Two unrelated things this turned up
-
-**The feed console was never reachable on this machine.** Port 8082 was held
-by an unrelated `frigate` container bound to `127.0.0.1:8082`, so
-`docker compose up feed-ui` failed to bind and every request to
-`localhost:8082` was answered by Frigate's own error page -- which is what a
-"500 from the console" looked like before anyone had recreated the container.
-`FEED_UI_HOST_PORT` already existed for exactly this; it is set to 8092 in
-`.env` here. Worth knowing that a port conflict presents as a *plausible
-response from the wrong service*, not as a connection refused.
-
-**`_summary` omitted five fields the edit form can set**, and a console edit
-therefore destroyed them. Found by the serialiser round-trip test written for
-`arrival:` (below), then reproduced deliberately before fixing: a feed created
-with `delimiter: "|"`, `file_encoding: latin-1` and
-`source_columns: {k: "The Key"}` came back from one console edit as
-comma/utf-8 with no renames. The form reads `f?.delimiter ?? ","`, so a
-missing key is not blank -- it is the DEFAULT, posted straight back. `_block`
-then removes the feed's own `delimiter: "|"` rather than changing it, leaving
-a diff that reads as tidying up, and the ingest lands one column holding the
-whole row (`docs/DELIVERY-SHAPES.md`: "A pipe feed is `delimiter: "|"` and
-nothing else"). No shipped feed had a non-default format, so this was latent
--- and legacy onboarding is exactly where pipes and renamed headers appear.
-
-This is the third time this shape of bug has appeared: `column_types` had it
-(the comment in `_summary` records the cost), `arrival:` would have had it,
-and these five did. **The guard is now structural**:
-`test_the_api_returns_every_block_the_form_can_edit` compares every
-`FeedSpec` field against the literal keys of the dict `_summary` returns,
-read out of the source with `ast` so it needs no fastapi on the host.
-Adding a field to the form without adding it to the response now fails a test
-instead of quietly deleting data.
-
 ## no-folder-markers
 
-`minio-init` creates the **bucket** and nothing else. It used to also run
-
-```
-mc mb --ignore-existing local/lakehouse/landing;
-mc mb --ignore-existing local/lakehouse/warehouse;
-```
-
-which reads as "make the two prefixes" and is not what it did. S3 has no
-directories: a prefix exists exactly when an object whose key starts with it
-exists, so those commands could not create one. What they actually did was PUT
-a **zero-byte object whose key is literally `landing/`** -- a folder marker,
+`minio-init` creates the **bucket** and nothing else. S3 has no directories: a
+prefix exists exactly when an object whose key starts with it exists, so
+nothing can create one in advance. An `mc mb local/lakehouse/landing` reads as
+"make the prefix" and does not do that — it PUTs a
+**zero-byte object whose key is literally `landing/`**, a folder marker,
 which makes the MinIO console draw a folder icon and is otherwise a lie.
 
 ### Why bother removing two empty objects
@@ -2712,27 +2296,6 @@ set identically in `common/spark.py` and `dbt/profiles.yml`), which PUTs
 keys directly and has no notion of a parent directory. The only S3A use is
 `spark.read.csv("s3a://...")` READING a landing object that already exists.
 
-Verified in a bucket created with **no objects at all**: `CREATE NAMESPACE` /
-`CREATE TABLE` / `INSERT` against `s3a://lakehouse-fresh/warehouse` wrote six
-objects -- two parquet, four metadata -- under a `warehouse/` prefix that had
-never been "created", and left no marker of its own. Then, in the real bucket
-with both markers deleted, `minio-init` re-run produced none, an s3a read of a
-real landing CSV returned its 400 rows, and `lakehouse.raw.fo_trade` read back
-15,255 rows.
-
-### One mistake worth recording
-
-The fresh-bucket probe was run against a redirected `REPORTING_WAREHOUSE` but
-the SHARED Nessie catalog, so `CREATE TABLE` wrote a `probe` namespace into
-`main`. The bucket was then deleted before the table was dropped, which made
-`DROP TABLE` unfixable through Spark -- it loads the table to resolve it, and
-loading needs a `metadata.json` that no longer existed. Removed with a direct
-Nessie `DELETE` commit on the content keys instead.
-
-**Redirecting the warehouse location does not redirect the catalog.** A
-throwaway Iceberg table is only throwaway if the catalog entry goes too, and
-the drop has to happen before the storage does.
-
 ### Removing the markers from an existing stack
 
 They are not cleaned up automatically, on purpose: an init container that
@@ -2749,7 +2312,6 @@ for key in ('landing/', 'warehouse/'):
     s3.delete_object(Bucket=b, Key=key)
     print('deleted', key)"
 ```
-
 
 ## unpacking-happens-at-the-gate
 
@@ -2775,8 +2337,9 @@ has two sources that can disagree.
 Members that are PARTS of one delivery (a single date split for size) are a
 genuinely different shape: they would have to stay grouped, which needs
 something to record the grouping, and that is the `parts: concat` design the
-archive normalizer implements. It stays NOT BUILT at the gate, and the error
-now points at `delivery.kind: archive` as the thing that does implement it.
+archive normalizer implements. The gate has no key of its own for it and
+needs none -- `delivery.kind: archive` is the mechanism for that shape, and
+the error a member-dated pattern raises now says so.
 
 ### A member's control file is the same idea in a different namespace
 
@@ -2799,40 +2362,6 @@ precisely the failure this path was built to remove (see below).
 when `member_pattern` claims it. A permissive `.*\.csv` and a sender who
 writes its control file as CSV is an ordinary combination, and landing it
 would ingest the control file's own text as rows.
-
-### The deadlock this replaced
-
-`arrival.archive` with `arrival.control` **loaded cleanly and then did
-nothing**, which is the worst of the three ways it could have been wrong.
-`conform_member` read no control file at all, so the `.ctl` members were
-dropped at the gate and never promoted; `check_gates_are_coherent` requires
-`delivery.control` alongside `arrival.control`, so every landed member then
-waited in `landing/` for a control file that could not arrive. Nothing raised,
-nothing was quarantined, the log line was INFO on every poll, and the feed
-simply never ingested. Verified before the fix, on the live stack: two members
-landed, `awaiting_control` on both, `pending` empty, indefinitely.
-
-The lesson is the one this file keeps repeating -- a combination that cannot
-work must be refused at LOAD or made to work, and "loads and silently does
-nothing" is the option neither of those covers.
-
-### Why not keep unpacking where it was
-
-The archive normalizer (`normalize._normalize_archive`) extracts members into
-`ready/` at normalize time, which works and is verified. Moving it left is
-better for one reason that outweighs the churn: **it is the only thing left
-that puts data in `ready/`.** With unpacking at the gate, `ready/` holds
-nothing but manifests -- and since the conformance gate guarantees every
-landing object is correctly named, every field of a `kind: file` manifest is
-now derivable from `landing/` alone. `ready/` becomes a pure cache of a
-derivation, which is a much easier thing to reason about, and a candidate for
-removal entirely.
-
-It also fixes a smaller thing. `landing/` was documented as holding "exactly
-what the upstream sent, byte for byte", and for an archive feed that meant an
-object **Spark cannot read** -- the one kind of landed object that needed a
-whole extra stage before it was usable. Landing the members restores the
-property that everything in `landing/` is directly readable.
 
 ### The container is recorded, not landed
 
@@ -2870,44 +2399,11 @@ rather than normalised into something that looks safe. Note a strict
 guard exists for a permissive one, and the test uses a permissive pattern for
 exactly that reason.
 
-### An adjacent bug this surfaced
-
-An **empty sub-block was silently ignored**. `arrival.control:` or
-`arrival.archive:` with nothing under it parses as `None`, and the resolver
-skipped it with `.get(key) is not None` -- so the feed loaded as though the
-block were absent. For `archive:` that fell through to the plain-file
-COB-date rule and failed with a message about dates, which is not the
-problem. Both are now checked with `in` and an empty block is its own error
-naming itself.
-
-### Verified on the live stack
-
-A real zip -- `weekly_20260803.zip`, holding `POS_20260801.csv`,
-`POS_20260802.csv` and a `checksums.txt` -- dropped into `./inbox`:
-
-* the watcher logged `unpacked weekly_20260803.zip -> 2 delivery(ies)`;
-* `landing/cust_position/` held **four objects and no zip**: two dated CSVs and
-  their metadata siblings, with `checksums.txt` skipped as unclaimed;
-* the metadata recorded `source_container: weekly_20260803.zip` and a
-  `source_container_md5` that matches the zip in `.processed/` byte for byte;
-* both members ingested as ordinary deliveries, `_source_file` a plain landing
-  key, no `parts` grouping and no archive normalizer involved.
-
-12 new tests in `tests/test_conform.py` (158 total).
-
 ## a-delivery-shape-is-a-registry-entry
 
-Every awkward delivery this platform has met arrived as a variation on two
-questions -- what does this file at the door BECOME, and what does that landed
-object become a MANIFEST of -- and each was first answered with a branch. By
-the time zips could carry control files there were two `_promote*` functions
-in `inbox.py` that had already drifted (one treated a missing control file as
-a wait, the other could not express the idea), an `if kind == "archive"` in
-`normalize()`, and a predicate in `conform.py` asking the same question a
-third way.
-
-So each question now has a table, and adding a shape is an entry plus a
-function:
+Every awkward delivery is a variation on two questions: what does this file at
+the door BECOME, and what does that landed object become a MANIFEST of. Each
+has a table, and adding a shape is an entry plus a function:
 
 | Seam | Table | Contract |
 |---|---|---|
@@ -2926,14 +2422,6 @@ not need a new outcome type.** If it does, it is asking the watcher to do
 something the watcher does not know how to do, and that is a conversation to
 have before writing the planner rather than a fifth branch.
 
-Two smaller things fall out of the split and both were bugs before it:
-
-* the write order (control file, then data, then metadata) and the move rules
-  are written down ONCE, so they cannot differ per shape;
-* `normalize._gate` is called by every normalizer, so `delivery.control`
-  applies to deliveries rather than to file deliveries -- which is most of why
-  gating a container needed no new kind.
-
 **What is deliberately NOT abstracted.** There is no plugin loader, no entry
 points, no configuration naming a Python path. A shape is code in this repo
 that a reviewer can read, and the tables are `dict`s two modules long. The
@@ -2943,27 +2431,8 @@ load rather than interpreted at run time would be the wrong direction.
 
 ## an-unchanged-resend-is-a-no-op
 
-A byte-identical file delivered twice through the inbox gate used to land as
-`_v2`. It should land as nothing.
-
-`_free_name` versions a landing name that is already `taken`, which is right
-for a *corrected* file — `landing/` is the evidence copy, and overwriting the
-original destroys the evidence of what was originally ingested. It was wrong
-for a resend, and the cost is not an extra object. `_v2` is a `_source_file`
-value the raw table has never seen, so `already_ingested` does not match it,
-`next_file_version` gives it `MAX+1`, and `dedupe_rank` — which ranks
-`_file_version DESC, _row_number DESC` within `(_cob_date,
-business_key)` — lets the copy **supersede the delivery it is a copy of**.
-The rows are identical, so nothing looks wrong anywhere: the only artefact is
-a restatement in the history that the upstream never made.
-
-Reproduced as a pure function before it was fixed, same bytes, same control
-file, first name in `taken`:
-
-```
-first  -> trs_position_20260801.csv     517263d1618098b81bb21c1cb7cfed25
-resend -> trs_position_20260801_v2.csv  517263d1618098b81bb21c1cb7cfed25
-```
+A byte-identical file delivered twice through the inbox gate lands **nothing**
+— not a `_v2`, which would be a restatement the upstream never made.
 
 **Sameness is decided on the bytes, not on the name**, and only against
 deliveries already landed for the same COB date. `conform()` and
@@ -2990,17 +2459,13 @@ landed before this existed. The feed's landing listing is already in hand, so
 a name with nothing under it costs no request.
 
 **A container resent whole is the expensive case**, and it forced one further
-change. `_promote_archive` left the container in the inbox when nothing
+change. `_promote` left the container in the inbox when nothing
 landed, so a zip whose members were all duplicates would be unpacked again on
 every pass forever. Duplicates now count as handled.
 
 This does not *record* the resend anywhere but the log and the sweep outcome.
 The delivery registry is what makes a rejected or duplicate delivery a row
 rather than a moved file; until then, a no-op is the whole requirement.
-
-Seven tests in `tests/test_conform.py` (49 in that module). A conformant
-upstream needs none of this: it writes the same key twice and object storage
-makes it idempotent for free.
 
 ## delivery-expected-not-completeness
 
@@ -3036,17 +2501,6 @@ a silently ignored line. Nine files: `common/context.py`, `ui/registry.py`
 `arrival_timeout_hours` and `arrival_poke_seconds` are deleted. Nothing read
 either of them.
 
-`arrival_timeout_hours` was a `Feed` field with a default of 26 and twelve
-references, every one a comment or a docstring — including three that cited it
-as the *floor* for `ready.keep_days`. A number that appears in reasoning but
-in no code path is worse than an absent one: it reads as a mechanism, and
-[#control-file-gate](#control-file-gate) records a draft of
-`docs/DELIVERY-SHAPES.md` that claimed a late control file "times out through
-the existing `arrival_timeout_hours: 26` path" before that was checked against
-the code. CLAUDE.md's own rule, one level up: a guard written against a
-documented mechanism rather than the working one can only produce false
-alarms, and a *rationale* written against one produces false confidence.
-
 Deleted rather than implemented, on purpose. The requirements introduce
 `expected_by` as the lateness concept, with a named owner and an action.
 Building a second, weaker one now and superseding it in a phase's time repeats
@@ -3060,71 +2514,19 @@ yet" into a hard failure in under a minute, and the safety-net poll path
 (`find_pending`, or `scripts.bulk_ingest`) picks the delivery up whenever the
 control file lands, however long that takes.
 
-The three retention comments are re-anchored to the guard that actually holds.
-`ready/` has no correctness floor at all: `retention/ready.py` never sweeps a
-manifest whose parts are not yet in the raw table, **at any age**, which is a
-stronger statement than "seven days comfortably exceeds twenty-six hours" and
-was already written two paragraphs below each of them. Seven days is now
-described as what it is — a convenience for reading a recently extracted
-archive member, with re-normalization rebuilding an older one. (It does not
-bound the manifests at all any more; see
-[#the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests).)
-
-`arrival_poke_seconds` had exactly two references, the dataclass default and
-`feeds.yml`, and is the same defect one size smaller.
-
 ## published-tags-are-the-reproducibility-window
 
-`references.published_tags` was `keep_business_days: 10 / keep_month_ends: 80`
-— the same keep-set the *table* layers use. A published tag pins every data
-file its commit referenced, so that is a category error, and it was destroying
-evidence nightly.
+`references.published_tags` is DATA retention, sized in years, and it is not
+the keep-set the table layers use. A tag pins every data file its commit
+referenced, so **its lifetime is the only thing that decides whether a
+published run can still be read** — size it by a table keep-set and an
+ordinary daily publication loses its pin after about a fortnight.
 
-Two effects, both live and both observed on the running catalog rather than
-inferred:
-
-* an ordinary daily publication lost its pin once ten more COB dates had
-  been published — about a fortnight — and month-end pins lasted 80/12 ≈ 6.7
-  years against a period assumed to be longer;
-* within a **retained** date, only the newest tag survived. The tag name
-  carries no feed (`published/<cob_date>/<run_id>`) and
-  `record_publication` runs in *every* per-feed ingest DAG, so N feeds
-  publishing one COB date cut N tags for it. The code called the others
-  "earlier reruns of the same date" pinning "files for no benefit"; they were
-  other feeds' publications. A dry run against the live catalog said:
-
-  ```
-  WOULD DELETE 2 of 5 tags:
-     published/2026-08-01/e__20260904T154139084306
-     published/2026-08-01/e__20260904T190724822363
-  ```
-
-  Both inside the ten-business-day keep-set, deleted purely by the
-  newest-per-date rule. All five tags pin distinct commits, none equal to
-  `main`.
-
-### The GC cutoff is not a second threat, and that had to be checked first
-
-Before sizing anything: `nessie_gc.default_cutoff` is documented as "how far
-back each reference's commit log is treated as live. Content referenced ONLY
-by commits older than this is collectable." If a tag's own state were subject
-to it, the window set here would be decoration and `P30D` would be the real
-limit. `mark-live` against the running Nessie at three cutoffs:
-
-```
-NONE  -> numReferences=10, numCommits=1503, numContents=171
-P30D  -> numReferences=10, numCommits=1503, numContents=171
-P0D   -> numReferences=10, numCommits=20,   numContents=41
-        "...after 2 commits, commit f11ec7fb... is the first non-live commit"
-```
-
-Even at `P0D` the walk takes the HEAD before stopping. The cutoff bounds how
-much history *behind* a reference stays live; it never decides whether the
-reference's own state does. So a published tag protects what it pins at any
-cutoff, and **the tag's lifetime is the only thing that decides whether a
-published run can be reproduced**. Reading `lakehouse.raw.fo_trade` at the
-oldest tag returned its rows. No sweep or delete phase was run, and the three
-probe live-sets were deleted afterwards.
+**The `nessie_gc` cutoff is not a second threat.** It bounds how much history
+*behind* a reference stays live and never decides whether the reference's own
+state does — even at `P0D` the walk takes the HEAD before stopping. So a
+published tag protects what it pins at any cutoff, and the tag's own window is
+the whole of the question.
 
 ### The policy
 
@@ -3172,23 +2574,12 @@ unattended. It runs first in `run()` and before the dry-run branch — it refuse
 on *configuration*, and a dry run that passed where the real run would refuse
 would teach the wrong thing.
 
-It fired immediately on the shipped config (`landing: 8` against tags `10`),
-which is what raised `landing.keep_years` to 10 and made the tag window
-per-environment so `dev` (landing 1) stays coherent rather than refusing every
-sweep. All four environments now resolve `landing >= tags`.
-
 **This is not REQ-602 in full.** The complete rule is "retention must not
 delete anything a published RUN depends on", which needs a run record
 enumerating its delivery set — Phase 2. The window comparison catches the
 configuration that guarantees the loss; it cannot catch a single delivery
 expiring early inside an otherwise coherent window. Stated here so the
 approximation is not later mistaken for the requirement.
-
-24 tests in `tests/test_tag_retention.py`. Expiry cannot be exercised against
-the live catalog — every real tag is days old and a ten-year window keeps
-everything for a decade, which is the point — so the sweep is driven against a
-fake catalog whose commit times are whatever the test needs, with one test
-pinning the shipped config's coherence in all four environments.
 
 ## reproducibility-is-exercised-not-asserted
 
@@ -3221,59 +2612,7 @@ green one. Among the pins that diverge the oldest is chosen, because its
 exclusive files have been unreferenced by anything else for longest: the most
 GC identify passes have had a chance at them.
 
-**This was an AGE, and the age was wrong in both directions.** The rule was
-"older than `recent_partition_days`", on the stated grounds that `maintain.py`
-compacts partitions older than that cutoff and so rewrites their data files.
-`compact()` scopes its rewrite to `date_column >= today − recent_partition_days`
-— only the RECENT partitions — so a pin ages OUT of the compaction window
-rather than into it. And compaction is not the mechanism that produces
-divergence on this platform anyway: expiring a COB date is a
-metadata-level partition delete, so `main` stops referencing that date's files
-while every pin goes on referencing them, which is how REQ-700's reclamation
-run produced a genuinely divergent pin. On a catalog whose newest COB date
-is older than the compaction window — which is every catalog between deliveries
-— the age gate opens on a fixed date and reports GREEN on a pin still
-byte-identical to `main`. Worse than an unverified check: a check that turns
-green on a calendar.
-
-**The cost was the reason it was an age, and the cost turned out not to be
-there.** A file-set comparison reads Iceberg metadata, which needs Spark, and
-the check already opens a session per pin it reads — so a session per pin
-scanned looked like the price. It is not: Nessie's Iceberg catalog resolves
-``catalog.namespace.`table@ref`.files``, so ONE session addresses every
-reference. Measured on the live stack across 11 managed tables: 6.9s for
-`main`'s baseline, then ~1.0s per pin. The scan stops at the first pin that
-diverges, dedupes tags that share a commit, and is capped at
-`MAX_PINS_SCANNED` distinct commits so the cost is bounded by the cap rather
-than by how many reports have ever been published. A capped
-`not_yet_meaningful` says how many pins it looked at, because it means "none
-of these", not "none".
-
 ### `SELECT COUNT(*)` does not read the data
-
-The check used to be one count per table, on the stated grounds that the read
-"reads the data files that metadata names". It does not. Iceberg answers
-`COUNT(*)` — and `COUNT(<column>)` — from the record counts in its own
-manifests, without opening a parquet file. Measured, by deleting one data file
-the pin referenced and `main` did not:
-
-```
-COUNT(*)                                     -> 16400
-COUNT(trade_id)                              -> 16400
-COUNT(*) WHERE trade_id IS NOT NULL          -> raised
-COUNT(*) WHERE _cob_date = '2026-08-06' -> raised
-```
-
-The whole check reported `reproduced` on a pin whose data was gone. The count
-proves the METADATA chain resolves, which is worth asserting and is all it ever
-asserted. What proves the DATA survives is that the files the pin's snapshot
-names are still objects: `<table>.files` at the tag is the list, and object
-storage is asked whether they are there — one paginated LIST per table data
-prefix, no Spark, and it names the file that went rather than handing over a
-Py4J stack. Forcing a real scan with a predicate would also have worked and is
-not what this does: a full scan of every published table every night costs a
-great deal for no extra signal, because a file that is present is not corrupt
-in any failure mode this platform has. GC deletes; it does not rewrite.
 
 **It fails the run, where `completeness_check` beside it only warns.** A
 completeness gap is an upstream missing a Tuesday: real, not the platform's
@@ -3294,42 +2633,7 @@ published needs the run record — which deliveries, which code, which report
 version — and that is Phase 2/5. Until then this is a liveness check on the
 pin, which is the failure mode that actually occurs and the one that is silent.
 
-### Verified
-
-Against the live catalog, on the automatic path — no `--tag`. The scan looked
-at one pin, found it holding 37 data files `main` no longer references across
-eight tables, selected it, and read all eleven managed tables at it:
-
-```
-"divergence": {"pins_scanned": 1, "capped": false, "cap": 25, "tables": 11,
-               "exclusive_files": 37, ...},
-"selected": "oldest_diverging", "status": "reproduced", "ok": true
-```
-
-**And the BROKEN branch has now executed**, which it never had before. One of
-those 37 files — a `raw.fo_trade` parquet under
-`_cob_date_day=2026-08-06`, referenced by the pins and by nothing on
-`main` — was copied out of MinIO and deleted, so the blast radius was the pin
-under test. The check went red and named it:
-
-```
-EXIT=1  status BROKEN  ok false
-unreadable: 1 of 41 data file(s) the pin references are no longer in object
-            storage, e.g. warehouse/raw/fo_trade_…/data/
-            _cob_date_day=2026-08-06/00000-6-…-00001.parquet
-```
-
-The identical bytes were then put back (md5 `5405b5ef…1c6f`, 17310 bytes, equal
-before and after), the check returned `reproduced` with `missing_files: []`,
-and the pin again reads 400 rows at 2026-08-06 — a date `main` no longer holds.
-That same run is what established that `COUNT(*)` alone had reported
-`reproduced` with the file missing; see above.
-
 ## the-registry-records-observations-not-verdicts
-
-REQ-101, as amended. `reporting_platform/registry/`, in the Postgres
-`platform` database that had existed since the first compose file with nothing
-connected to it.
 
 The registry is the platform's record of what arrived: one row per delivery,
 carrying the COB date, arrival time, size, checksum, the name the upstream
@@ -3387,14 +2691,6 @@ conflict, and only what config can legitimately change is refreshed.
 REQ-106. `registry/rejections.py`, `retention/quarantine.py`, and a
 `quarantine:` block in `retention.yml`.
 
-A delivery the conformance gate refused used to be moved to `.rejected/` — a
-directory on the inbox container's bind mount — with a line in that container's
-log. Nothing recorded what it was, what was wrong with it, or that it had ever
-arrived; the evidence lived on one host, under no retention policy, and
-`docker compose down -v` took it with it. A rejected delivery is evidence
-exactly as much as an accepted one: it is frequently the entire explanation for
-a missing COB date.
-
 So the bytes go to `quarantine/` in object storage and `registry.rejection`
 says what they were and why. `.rejected/` stays and is written second — it is
 what the console's unclaimed queue reads and what the sniffer offers to onboard,
@@ -3436,54 +2732,43 @@ an IDENTITY failure — one that cannot be named — comes here. See
 
 REQ-303, REQ-304. Four columns on every raw table — `_delivery_id`,
 `_received_at`, `_schema_version`, `_source_system` — carried into `prepared`
-by `source_provenance()` in `dbt/macros/engine.sql`.
+by `source_provenance()` in `dbt/macros/engine.sql`, so a typed value traces
+to the delivery it came from, the contract it was read against and when it
+arrived, not merely to a file.
 
-`prepared` previously dropped all of them by selecting named columns, so a
-typed value could be traced to the file it came from and not to the delivery,
-the contract it was read against, or when it arrived. Retrofitting that across
-ten teams' models later is not a day of work, which is why it landed before
-there are ten teams' models. `_delivery_id` is not `_source_file`: the latter
-is the PART, and `already_ingested` depends on it staying the part, so for an
-archive the two differ.
+**`_delivery_id` is not `_source_file`.** The latter is the PART, and
+`already_ingested` depends on it staying the part, so for an archive the two
+differ.
 
-**`_schema_version` is derived, not declared.** A twelve-character digest of
-the ordered `(platform name, name in the file)` pairs. There is no
-`schema_version:` key in feeds.yml and there should not be: a version somebody
-has to remember to bump is wrong the first time somebody forgets, and the thing
-it describes is right there to be hashed. `column_types` is deliberately not in
-the digest — it says what the prepared model does with a column, not what the
-file contains, so retyping one in the console must not look like the upstream
-having changed its schema.
+**`_schema_version` is derived, not declared** — a twelve-character digest of
+the ordered `(platform name, name in the file)` pairs. A version somebody has
+to remember to bump is wrong the first time somebody forgets, and the thing it
+describes is there to be hashed. `column_types` is deliberately outside the
+digest: it says what the prepared model does with a column, not what the file
+contains, so retyping one must not look like an upstream schema change.
 
 **Added, never backfilled.** Iceberg adds a column as metadata, so rows
-ingested before the change read NULL. Backfilling would rewrite every partition
-of every raw table — new data files under live published tags, interacting with
-snapshot expiry and the pins retention was only just corrected to keep. The
-consequence is stated rather than discovered: an as-of query cannot use
-`_delivery_id` to reach back past the change and must fall back to
-`_source_file`, which resolves to the delivery for both shapes that exist
-today.
+ingested before the change read NULL. Backfilling would rewrite every
+partition of every raw table — new data files under live published tags,
+interacting with snapshot expiry and the pins retention keeps. The consequence
+is stated rather than left to be discovered: an as-of query cannot use
+`_delivery_id` to reach past the change and must fall back to `_source_file`.
 
-**The migration is lazy, and that broke the build.** `ensure_raw_schema` runs
-inside `ingest()`, on the branch, for the one feed being ingested — the right
-place, because that is where a table is guaranteed to exist and where a schema
-change can be abandoned with a failed load. But a feed that has not delivered
-since the column was added keeps the old schema, and every prepared model
-selects the new columns, so the next build fails for every feed that has not
-happened to deliver:
+**The migration is LAZY, which is why `ingest/migrate_raw.py` exists.**
+`ensure_raw_schema` runs inside `ingest()`, on the branch, for the feed being
+ingested — the right place, because that is where the table is guaranteed to
+exist and where a schema change can be abandoned with a failed load. But a
+feed that has not delivered since the column was added keeps the old schema
+while every prepared model selects the new one, so the next build fails for
+every feed that has not happened to deliver, with
+`[UNRESOLVED_COLUMN.WITH_SUGGESTION] ... _delivery_id cannot be resolved` —
+naming the column and not the reason. `migrate_raw` ensures the columns on
+every feed's raw table in one pass, on a branch, merged; it is idempotent,
+commits nothing when they are current, and runs first in
+`platform_housekeeping`. Run it by hand when deploying a new provenance
+column, BEFORE the next ingest.
 
-    [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with
-    name `_delivery_id` cannot be resolved.
-
-— observed on three of four models, which is how
-`reporting_platform/ingest/migrate_raw.py` came to exist. It ensures the
-columns on every feed's raw table in one pass, on a branch, merged; it is
-idempotent, commits nothing when they are all current, and runs first in
-`platform_housekeeping` so a future provenance column cannot leave the build
-broken overnight. Run it by hand when deploying one, BEFORE the next ingest.
-
-It covers the FEEDS' own columns too, for the same reason and by the same
-code — see
+It covers the FEEDS' own columns too, by the same code —
 [a-declared-column-migrates-itself](#a-declared-column-migrates-itself).
 
 ## a-declared-column-migrates-itself
@@ -3493,20 +2778,6 @@ delivering for months. **This is the most frequent change a live feed ever
 undergoes** — far more common than onboarding a new feed, which the whole of
 [ADDING-A-FEED.md](ADDING-A-FEED.md) exists for — and until this it was the
 one change with no path at all.
-
-It looked handled. `ensure_raw_table` builds its DDL from `columns`, so the
-raw table has always been derived from the contract; but it is `CREATE TABLE
-IF NOT EXISTS`, which is a no-op on the table that already exists.
-`reconcile_schema` was happy — the file has the column, the contract has the
-column, so drift was empty and nothing warned. The failure surfaced at the
-write, and said none of the above:
-
-    [INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS] Cannot write to
-    `lakehouse`.`raw`.`ref_rating`, the reason is too many data columns
-
-Not once, either: on every delivery for that feed from then on, each ingest
-abandoning its branch, with an error naming an arity and neither the column
-nor `feeds.yml`.
 
 **So `ensure_raw_schema` reconciles the whole contract, not just the
 platform's provenance four.** Same place, same branch, same commit discipline:
@@ -3567,13 +2838,10 @@ model is left in place rather than dropped, because a rename is
 indistinguishable from a removal plus an addition.
 
 **It adds the column; it does not populate rows the run does not touch.**
-Measured rather than assumed — a column added to `prepared.ref_rating` and run
-incrementally on a branch: the column appeared with no `--full-refresh`, the 9
-SCD2 versions the merge wrote carried its value, and the other 1,412 rows
-stayed NULL. On an SCD2 dimension that means every *current* row reads NULL
-until its entity next changes; on a COB-date model it means the lookback
-window and no further back. `--full-refresh` is therefore still the answer
-when history has to carry the value — the difference is that it is now a
+On an SCD2 dimension a column added by `append_new_columns` reads NULL on
+every *current* row until its entity next changes; on a COB-date model it
+carries only across the lookback window. `--full-refresh` is therefore the
+answer when history has to hold the value -- the difference is that it is a
 choice about DATA rather than the only way to obtain the COLUMN.
 
 ### The order the change is deployed in
@@ -3633,19 +2901,12 @@ and `arrival:` before it. One key, `mode`, and one built value,
 `full_snapshot`.
 
 **The behaviour is old; the declaration is new, and that is the point.**
-`dedupe_rank` has always implemented exactly one supersession rule — newest
-`_file_version` wins within a COB date, last row in file order wins within
-a version — and no feed anywhere said that was its shape. The assumption was
-true for all four feeds and invisible, which is the combination that eventually
-costs something: a feed whose second delivery is a DELTA rather than a
-restatement would be ingested without complaint and then silently reduced to
-that delta alone. Every key the newest file does not mention stops existing in
-`prepared`, for the dates it covers, with nothing raising anywhere and the row
-counts looking plausible.
-
-So declaring the mode does not make the other shapes work. It makes the
-platform REFUSE a feed whose supersession it cannot implement, which is the
-whole of the value:
+`dedupe_rank` has always implemented `full_snapshot` — newest `_file_version`
+wins, last row in file order wins within it — so a delta feed run through it is
+silently reduced to its newest file, losing every key that file omits, with
+nothing raising anywhere. Declaring the mode does not make the other shapes
+work; it makes the platform REFUSE a feed whose supersession it cannot
+implement. The value IS the refusal.
 
     feeds.yml: feed 'x' `supersession.mode: delta_append` is described in the
     requirements (REQ-202) but NOT BUILT -- each delivery carries only what
@@ -3977,16 +3238,6 @@ fight `find_pending`, which already derives one keep-set per feed from that
 feed's own landing prefix. `PREFIX_CLASSES` is closed and `class_keep_years`
 refuses anything outside it, so this cannot spread by accident.
 
-**The interlock became per (report, feed) via the lineage, and that is a
-deliberate RELAXATION.** The old rule compared one landing window against the
-longest window any report resolved to. With classes there is no single landing
-window — and under the old rule no class could ever be shorter than the longest
-pin, which would have made the whole feature decoration. So the question is
-asked the way it should always have been asked: for each report, does every
-feed BEHIND that report keep its evidence at least as long as that report's
-pin? `feeds_behind_report()` answers it by walking the exposure's `ref()`
-closure, the same derivation `reports()` and `managed_tables()` already use.
-
 What it costs is that a feed's window is now only as protected as the lineage
 walk is correct, which is why `feeds_behind_report` raises on a ref it cannot
 resolve rather than returning a short list. On this stack both reports resolve
@@ -4022,21 +3273,10 @@ quarantine's own window — the over-retaining direction. The two answer to
 different things: a rejected delivery explains a missing COB date whether
 or not anything published depends on the feed.
 
-**The sweep's summary was renamed.** It reported `keep_years` and `cutoff` at
-the top level, which read as the window the sweep applied and, after classes,
-were only the default class's. Verified: it said `keep_years: 10, cutoff:
-2016-09-05` while `ref_collateral` was swept at 7 years against a 2019 cutoff.
-They are `default_keep_years`/`default_cutoff` now, with `classes_applied`
-carrying the honest one-line answer and the per-feed entries carrying the rest.
-
 ## lateness-is-a-wall-clock-time-not-a-duration
 
-REQ-201. `Feed.expected_by` is `"HH:MM"`, and it replaces two config keys —
-`arrival_timeout_hours` and `arrival_poke_seconds` — that were deleted in phase
-0 for being settings nothing read, one of which had already been mistaken for a
-mechanism once.
-
-A wall clock rather than a duration because what an upstream actually commits
+REQ-201. `Feed.expected_by` is `"HH:MM"` — a wall clock rather than a duration,
+because what an upstream actually commits
 to is "by 07:00", and a duration needs an origin event that a delivery arriving
 by `PutObject` does not have. **The deadline is `expected_by` on the day AFTER
 the COB date**, fixed rather than configurable: a delivery describes a
@@ -4102,60 +3342,44 @@ change" about a rebuild that moved every figure.
 
 ## the-ready-window-bounds-the-parts-not-the-manifests
 
-Found by running `platform_housekeeping` end to end and reading its own log,
-three tasks apart, inside a single run:
+`ready.keep_days` bounds a delivery's DERIVED PARTS and its orphaned
+manifests. It does not bound manifests generally, and a sweep that deletes
+them is undone by the next `normalize.reconcile` — 157 deleted, 157 re-made,
+both logging success. A standing no-op is the shape of thing that survives for
+years, because nothing is ever red.
 
-```
-enforce_retention   ready/ sweep      157 manifests deleted
-registry_reconcile  normalize first   157 manifests re-created   newly registered: 0
-```
+**The manifest is the delivery's description of record**, not a queue entry.
+`deliveries.reconcile` walks MANIFESTS — the registry follows the platform
+having ACCEPTED a delivery as readable, not a landing object whose COB date
+nothing has established yet — so sweeping them by age would make the registry
+rebuildable for a week rather than from object storage. It is about 1KB
+against a landing object kept for years, and it lives as long as that object.
 
-`ready.sweep_feed` deleted every manifest past `keep_days` whose parts were in
-raw; `normalize.reconcile` then created a manifest for every landing object
-that lacked one, which after the sweep was all of them. The `ready:` window
-reclaimed nothing lasting and both subsystems logged success — a standing
-no-op, which is the shape of thing that survives for years because nothing is
-ever red.
+That also rules out the tempting fix in the other direction: teaching
+`normalize.reconcile` to skip landing objects that are already ingested. It
+would stop the churn and quietly break the same property.
 
-**The sweep was the one in the wrong, and which one is not obvious.** The
-tempting fix is the other way round: have `normalize.reconcile` skip landing
-objects that are already ingested, since a manifest for an ingested delivery is
-not a queue entry anybody needs. That breaks the property that makes the
-registry an index rather than a second source of truth. `deliveries.reconcile`
-walks MANIFESTS — the registry follows the platform having accepted a delivery
-as readable, not a raw landing object whose COB date nothing has yet
-established — so with the manifests swept and reconcile taught not to rebuild
-them, dropping the registry and rebuilding it would re-register only the last
-`keep_days` of deliveries. "Rebuildable from object storage by the same code
-that writes it" would quietly become "rebuildable for a week".
-
-So the manifest is not merely a queue entry. It is the delivery's description
-of record in object storage, it is about 1KB against a landing object kept for
-ten years, and it is kept for as long as that object is. What `ready:`
-actually bounds is narrower and was always the part worth reclaiming:
+What the window actually reclaims:
 
 * **Derived parts** — a zip member `_normalize_archive` extracted — of a
   manifest past `keep_days` whose parts are all ingested. That is the real
-  duplication, a second copy of data `landing/` already holds. The manifest
-  stays, so `normalize.reconcile` skips the landing object and nothing
-  re-extracts them; `normalize --force` rebuilds them if anything ever needs
-  to. On a queue of plain CSVs this reclaims nothing, because their parts point
-  back into `landing/` and nothing was ever copied — which on the shipped seed
-  is every one of the 199 objects in `ready/`.
-* **Orphaned manifests**, whose `source_object` is no longer in `landing/`, at
+  duplication: a second copy of data `landing/` already holds. The manifest
+  stays, so `reconcile` skips the landing object and nothing re-extracts;
+  `normalize --force` rebuilds them if anything needs them. A queue of plain
+  CSVs reclaims nothing, because their parts point back into `landing/` and
+  nothing was ever copied.
+* **Orphaned manifests**, whose `source_object` is gone from `landing/`, at
   any age. Nothing recreates one, because `reconcile` walks landing. These are
-  what the landing sweep leaves behind, which is why it runs immediately before
-  this one in `retention.run()`.
+  what the landing sweep leaves behind, which is why it runs immediately
+  before this one in `retention.run()`.
 
-`already_ingested` opens a Spark session per feed, and is now taken lazily —
-only when some manifest actually has derived parts old enough to consider, or
-an orphan to classify. On the shipped seed that is never, so the sweep costs
-four fewer JVM starts a night than it did while deleting nothing.
+`already_ingested` opens a Spark session per feed and is taken LAZILY — only
+when some manifest has derived parts old enough to consider, or an orphan to
+classify. On a queue of plain CSVs that is never.
 
-The report counts what was REMOVED rather than what was considered:
-`parts_deleted` and `manifests_deleted` (orphans only). A counter that tracked
-"past the window" would be describing work the next `normalize.reconcile`
-undoes, which is exactly what it used to do.
+The report counts what was REMOVED — `parts_deleted`, and `manifests_deleted`
+for orphans only. A counter for "past the window" would describe work the next
+`reconcile` undoes.
 
 ## a-dry-run-may-write-to-the-index-not-to-object-storage
 
@@ -4217,14 +3441,9 @@ broken REQ-602.
 
 `apache-airflow-providers-openlineage` 2.0.0 (with `openlineage-python` 1.27.0)
 is already in the image as a transitive dependency. Nothing needed installing —
-which is fortunate, because doing it the obvious way is the cosmos trap exactly.
-Under Airflow's own constraint file:
-
-```
-$ pip install --dry-run --constraint .../constraints-2.10.5/constraints-3.11.txt \
-      apache-airflow-providers-openlineage
-Would install typing_extensions-4.12.2
-```
+which is fortunate, because doing it the obvious way is the cosmos trap
+exactly. Under Airflow's own constraint file, installing the provider
+explicitly pins `typing_extensions` back.
 
 The image currently has 4.16.0. The constraint pins 4.12.2, dbt's `mashumaro`
 needs `evaluate_forward_ref` from 4.13+, and every dbt invocation would then die
@@ -4234,19 +3453,9 @@ rule generalises to any provider added later.
 
 ### A SKIPPED task never closes, and Airflow 2.10 cannot fix it
 
-Observed on the first run, which skipped every task because nothing was pending:
-Marquez showed `ingest_fo_trade.resolve_arrival` as `RUNNING` on a DAG run that
-had already succeeded. A subsequent `platform_housekeeping` run, whose tasks all
-do real work, closed 12 of 12 — so the success path is fine and the skip path is
-the whole of the problem.
-
 It is not a provider defect and no version bump fixes it. Airflow 2.10's
-listener spec offers exactly three task hooks:
-
-```
-airflow.listeners.spec.taskinstance ->
-  ['on_task_instance_failed', 'on_task_instance_running', 'on_task_instance_success']
-```
+listener spec offers exactly three task hooks — `on_task_instance_running`,
+`_success` and `_failed`.
 
 There is no `on_task_instance_skipped`. A task that emits START and then skips
 has no hook through which a terminal event could ever be sent. **This matters
@@ -4269,20 +3478,6 @@ for a developer box — OpenMetadata's own quickstart asks for 6 GiB and 4 vCPUs
 against roughly 6 GB free on the machine this was built on. `SEARCH_ENABLED=false`
 drops it entirely. Measured cost of what remains: **220 MB for the API and 25 MB
 for the web front end.** Search is a nice-to-have; lineage is the point.
-
-### Verified
-
-- Marquez 0.51.1 on the existing Postgres 16, its own `marquez` role and
-  database because the image hardcodes all three credentials and reads only
-  host and port from the environment. 91 flyway migrations applied on startup;
-  admin healthcheck reports `postgresql: healthy`.
-- Host ports remapped to 15000/15001/13000: the defaults 5000, 5001 and 3000
-  were all in use on the build machine (grafana owns 3000). Container-internal
-  ports are unchanged, so `marquez-api:5000` still resolves for Airflow.
-- `ingest_fo_trade` and `platform_housekeeping` both emitted into namespace
-  `reporting-platform-local`: 13 jobs, 12 `COMPLETED`, 1 stuck `RUNNING` — the
-  skipped task above, and nothing else.
-
 
 ## marquez-on-ubi
 
@@ -4338,52 +3533,17 @@ pinned at the 4.19.2 upstream resolved because `setupProxy.js` requires it and
   dependency; upstream's own Dockerfile uses `npm install` and so does this
   one.
 
-### Verified
-
-Both images built from the 0.51.1 tag and run against the live stack:
-
-- **API**: `ubi8/openjdk-17:1.23` builder, `ubi8/openjdk-17-runtime:1.23`
-  runtime, RHEL 8.10, OpenJDK 17.0.20.1. **613 MB against upstream's 895 MB**,
-  and the runtime image holds the same three files upstream's did — the jar is
-  49,457,974 bytes against 49,465,199, the difference being manifest build
-  metadata. Healthy on the second 6s poll; `/healthcheck` reports
-  `postgresql: healthy`; Jetty up in 4.1s; runs as the base image's uid 185.
-- **Web**: `ubi8/nodejs-18:1` builder, `ubi8/nodejs-18-minimal:1` runtime.
-  **346 MB against upstream's 1.36 GB.** `dist/` is file-for-file the same
-  sixteen names upstream shipped; `bundle.js` serves 11,107,168 bytes; the
-  proxy logs `[HPM] Proxy created: /api/v1 -> http://marquez-api:5000/` and
-  `/api/v1/namespaces` through :13000 returns the API's answer. Runs as uid
-  1001, everything it reads owned root and world-readable, so an arbitrary
-  assigned uid works the way OpenShift needs.
-- **Round trip**: a `COMPLETE` RunEvent POSTed to `/api/v1/lineage` returned
-  201, created the job and both dataset namespaces, and came back out of
-  `/api/v1/lineage?nodeId=dataset:...` as a three-node graph. Deleted again
-  afterwards, so it is not in the graph anyone reads.
-- First `docker compose --profile lineage up -d marquez-api marquez-web` after
-  a clone or a `MARQUEZ_VERSION` change **builds** rather than pulls: the
-  gradle build fetches its own distribution and dependencies, and `npm
-  install` resolves the full web tree, so it needs egress to
-  github.com, services.gradle.org, Maven Central and the npm registry — in the
-  cluster, whatever mirrors front them.
-
-
 ## lineage-is-derived-from-the-dbt-project
 
-The export above emitted a job per task and **no datasets at all** — 41
-disconnected boxes in Marquez, which is a run history drawn as a graph rather
-than a lineage graph. `reporting_platform/lineage` supplies the missing half:
-what each task reads and writes, derived from the dbt project and `feeds.yml`.
+Airflow's OpenLineage export reports JOBS. The datasets, and the edges between
+them, are derived here — from the dbt project — by a custom extractor, because
+neither built-in path can supply them and both reasons are permanent.
 
-### Neither half arrived on its own, and both reasons are structural
+### Neither half arrives on its own, and both reasons are structural
 
 **The ingest DAGs' outlet is not convertible.** Airflow turns a task's outlets
 into OpenLineage datasets only for a URI scheme with a registered converter,
-and this image has three:
-
-```
->>> ProvidersManager().asset_to_openlineage_converters.keys()
-['file', 'gs', 's3']
-```
+and this image registers three — `file`, `gs`, `s3`.
 
 `Feed.asset_uri` is `iceberg://lakehouse/raw/fo_trade`, so
 `translate_airflow_asset` returns `None` and the ingest task reports nothing it
@@ -4524,12 +3684,6 @@ to a source column. The 20 that do not are `dbt_invocation_id`, `nessie_ref`,
 column. So this is complete rather than partial, which is the distinction
 `schemas.py` refuses to blur: every column that HAS a source gets one.
 
-Adding a dependency to this image is the move this repo warns about twice, so
-it was checked the way the warnings say to: `pip install --dry-run` under
-Airflow's constraint file reports `Would install sqlglot-30.18.0` and nothing
-else. No `typing_extensions` downgrade, so it is not the cosmos trap. It goes
-in the UNCONSTRAINED block with dbt and duckdb, because it is not a provider.
-
 **The transformation is reported, not just the dependency.** A rename carries
 no description -- the input field's own name is the whole story -- while a
 computation carries the SQL that performs it. That is the DEEPEST non-trivial
@@ -4545,16 +3699,11 @@ are PRESENT rather than absent; see the next section for why that changed.
 
 ## a-column-with-no-source-says-so
 
-Column lineage reported only the columns it could trace. 116 of 136. The other
-20 were simply not in the facet, and that absence was ambiguous in a way nobody
-could resolve from the outside: a column missing from the map might be a
-literal, an aggregate over rows rather than columns, or a parser failure nobody
-noticed. **Those are three different facts and they were rendered identically,
-as nothing.** An auditor asks which, and the export could not say. Worse, a
-regression that dropped a column's lineage entirely would have failed nothing
-at all — the shape had no way to distinguish "no source" from "not looked at".
-
-So every column of every managed table now carries a **classification**:
+Column lineage that reports only the columns it can TRACE makes a literal, a
+`count(*)` and a parser failure look identical — all three are simply absent
+from the facet, and absence reads as "nothing to say" rather than "this one
+could not be resolved". So every column of every managed table carries a
+**classification**:
 
 | class | what it means |
 |---|---|
@@ -4607,19 +3756,7 @@ is gate-able without inverting the dependency.
 
 ### Marquez carries an empty `inputFields`, and the graph endpoint drops it
 
-The spec does not settle whether a `ColumnLineageDatasetFacet` `Fields` entry
-may have an empty `inputFields`, which is what a sourceless column needs. It
-was **checked against the running Marquez before being relied on**, rather than
-assumed:
-
-- Posting an entry with `inputFields: []` returns **201**, and the entry comes
-  back verbatim from `/api/v1/namespaces/{ns}/datasets/{name}` under
-  `facets.columnLineage`. So it is carried.
-- But `/api/v1/column-lineage` returns an **empty graph** for that column —
-  `datasetField:...:sourceless_col` is not a node. That endpoint is built from
-  edges, and a sourceless column has none.
-
-So the shape is: **every** column goes in `columnLineage`, sourceless ones with
+The shape is therefore: **every** column goes in `columnLineage`, sourceless ones with
 an empty `inputFields` — never with a fabricated input to make the entry look
 well-formed, because a fabricated edge is worse than an absent one. And because
 that facet's per-field vocabulary cannot SAY which kind of sourceless a column
@@ -4630,98 +3767,17 @@ defect nobody has to go looking for is a defect somebody will find.
 
 ### A facet VALUE passes through Airflow's SecretsMasker
 
-The class was called `platform_column`. It arrived in Marquez as
-`***_column`.
-
-The OpenLineage provider redacts facet values through
-`airflow.utils.log.secrets_masker` on the way out, and this deployment's
-Postgres DSN is `postgresql+psycopg2://platform:platform@postgres:5432/airflow`
--- so the literal string `platform` is a REGISTERED SECRET, and every emitted
-value containing it is rewritten. The facet was perfectly well-formed; only its
-content was wrong. Nothing in the emitting code could have shown this, and it
-was found the way this file keeps insisting on: by reading the facet back off
-the running Marquez rather than reasoning about what was sent.
-
-`_producer` and `_schemaURL` are exempt, so the repo URL in the custom facet's
-schema link survives intact -- which is why the corruption was visible in one
-field and not the other, and why a spot check of the wrong field would have
-passed.
-
 The class is `ingest_added` now. The general rule, pinned by
 `tests/test_lineage.py`, is that **no value this package emits may contain a
 word that is also a credential in this estate** -- `platform` being both the
 user and the password in `REPORTING_DSN` and `REGISTRY_DSN`, it is the one that
 bites.
 
-### Verified
-
-- 15 datasets registered across two namespaces — 11 Iceberg tables under
-  `iceberg://lakehouse`, 4 landing prefixes under `s3://lakehouse` — and 11 of
-  41 jobs carrying edges. The other 30 are `resolve_arrival`, `normalize`,
-  `publish`, `open_branch`, `dbt_test` and friends, none of which writes a
-  table.
-- Marquez traverses it end to end: 21 nodes reachable from
-  `dataset:s3://lakehouse:landing/fo_trade`, through raw and prepared to
-  `reporting.exposure_by_country`. `ref_collateral` is correctly absent from
-  that traversal — it feeds no report, which is the same reason
-  `feeds_behind_report()` does not name it.
-- Driven by a real delivery rather than a replay: one new COB date
-  (2026-08-20) landed for all four feeds, ingested by the `ingest_*` DAGs,
-  which cascaded through `prepared_build` to `reporting_build` on their assets
-  and carried 2026-08-20 into `reporting.counterparty_exposure`.
-- All 15 datasets carry their columns: 16-24 per Iceberg table, 5-9 per
-  landing prefix.
-- 144 column-lineage entries across the 11 tables, and Marquez traverses them:
-  `reporting.exposure_by_country.total_mtm` resolves in five hops back to
-  `landing/fo_trade.mtm_value`, through `SUM(counterparty_exposure.total_mtm)`,
-  `SUM(t.mtm_value)` and the `TRY_CAST` that turned a VARCHAR into a
-  DECIMAL(28,4).
-- R-LIN-8, driven by two real deliveries rather than a replay: 2026-08-25 and
-  2026-08-26 landed for all four feeds, ingested by the `ingest_*` DAGs, which
-  cascaded through `prepared_build` to `reporting_build` (both `success`).
-  Read back off Marquez: **all 11 datasets carry `columnClassification` with
-  zero `unresolved`**; `raw.*` shows 5-9 `sourced` and 11 `ingest_added`;
-  `prepared.*` 16-18 `sourced`, 2 `literal`, 1 `build_metadata`;
-  `reporting.counterparty_exposure` additionally 1 `row_aggregate`, which is
-  `trade_count`. `columnLineage` widened from 20 to 24 fields on that table --
-  the sourceless four are carried, with empty `inputFields`.
-- The existing traversal is unaffected by that widening:
-  `reporting.exposure_by_country.total_mtm` still resolves in five hops back to
-  `landing/fo_trade.mtm_value`.
-- **A SKIPPED task emits nothing, so re-triggering an ingest does not re-emit
-  its lineage.** Re-running the four `ingest_*` DAGs against an already-ingested
-  date left the old facet in place: `resolve_arrival` short-circuits, the
-  scheduler marks the rest `skipped` WITHOUT starting a task process, and no
-  process means no extractor. Correcting a dataset facet therefore needs a real
-  delivery, not a re-run -- which is how the `***_column` masking above was
-  confirmed fixed. This is the same fact as "a skipped task shows as `RUNNING`
-  in Marquez forever", seen from the producing side.
-- `AIRFLOW__OPENLINEAGE__EXTRACTORS` is read at process start: the airflow
-  containers must be **recreated**, not restarted. Separately, the LocalExecutor
-  FORKS TASKS FROM THE SCHEDULER, so a module the scheduler has already
-  imported is the one the task runs -- adding `schemas.py` under an
-  `extractor.py` that was already imported changed nothing at all until
-  `docker compose restart airflow`, and it failed silently because the code
-  that would have logged was itself the stale copy. This is CLAUDE.md's
-  long-running-process rule, and the lineage export is subject to it like
-  everything else.
-
 ## a-change-is-a-deployment-event-not-a-run-event
 
-`registry.run.change_ref` was the only change reference the platform had, and
-it arrives as a DAG parameter — supplied by whoever triggered the build. That
-models the wrong thing for a controlled estate.
-
-The real flow is: raise a ticket, commit, build a pipeline, obtain change
-approval, deploy a new version of the transformation project. **Every run then
-executes that version until the next deployment.** A run does not have its own
-change ticket; it inherits the one that put the code there, and hundreds of
-runs share it. Modelled per run, a scheduled overnight build records no change
-at all, and the only way to populate the field is for an operator to re-type
-the ticket — and a re-typed identifier is an unverified one.
-
-So there are two concepts, and they are separate columns because they are
-separate facts:
+One ticket authorises a version, and every run until the next deployment
+inherits it. So a change reference has two scopes, and they are separate
+columns because they are separate facts:
 
 | | Scope | Source |
 |---|---|---|
@@ -4775,42 +3831,7 @@ belong in a startup path. `tests/test_provenance.py` asserts that every
 migrated column is also declared in `SCHEMA`, so a fresh database and a
 migrated one converge.
 
-### Verified
-
-- The migration adds three columns to a `registry.run` that already existed and
-  held rows, on the running Postgres.
-- `provenance` reports `code_ref_kind: tree-digest` and empty deployment fields
-  on a developer machine, and the full set when the variables are supplied.
-- A digest mismatch raises in `prod` naming both sides, and warns and continues
-  in `dev`.
-- A retry under a newer deployment **overwrites** the deployment fields — the
-  version that produced the publication is the one recorded — while the
-  per-run `change_ref` is preserved.
-
-
 ## the-arrivals-view-is-a-join-not-a-record
-
-The feed console could see every stage of the platform except the first one. A
-file was dropped into `inbox/`, and the next thing anybody saw was either a raw
-table with more rows in it or nothing at all. Four questions — *did it arrive*,
-*was it recognised*, *did its control file agree with it*, *did an ingest
-start* — were four different places to look: the inbox container's log, a
-Postgres table, an object prefix and Airflow's UI. Only the first of them said
-anything at all about a file that never got past the door, and it said it in a
-log line that scrolls away.
-
-**The obvious implementation is a table, and it would have been the wrong
-one.** One row per arriving file, updated as it moves — classified, landed,
-checked, ingested — is what every load-control system in this problem space
-has, and `registry/db.py` already argues at length against exactly that shape:
-the delivery registry is an INDEX, not a ledger, it holds no verdicts, and it is
-rebuildable from object storage by the same code that writes it. An arrivals
-table would break both halves. It could not be rebuilt — "this file was
-classified as unroutable at 06:12" is an event, not an observation about stored
-bytes — and it would hold `ingested`/`checked` verdicts that the platform
-deliberately derives, from `_source_file` and from `dedupe_rank`. The first
-time it disagreed with the raw table, the raw table would be right and the
-console would be the thing people had been reading.
 
 So the view is a **join over what already records each leg**, computed per
 request and written nowhere:
@@ -4898,22 +3919,6 @@ therefore labels the two "renamed by the gate" and "own name" rather than
 every feed with no `arrival:` block, and a pill saying so on all fifty rows is
 fifty repetitions of the default dressed up as information.
 
-### Verified
-
-- A file dropped into `inbox/` landed, triggered `ingest_fo_trade`, and
-  appeared on the page with that run's state — matched by the `object_key` in
-  the conf the watcher set.
-- A file matching no pattern was quarantined, wrote a `registry.rejection` row
-  and appeared in the same list with class `unroutable` and `not triggered`.
-- The XCom endpoint's repr encoding was read off the running Airflow 2.10
-  before `_ingested_key` was written against it.
-- A gated delivery (two names), a checksum mismatch and a checksum match were
-  rendered from rows inserted into the registry for the purpose and removed
-  afterwards; the mismatch reads `md5 MISMATCH` and the counts agree with the
-  rows on screen.
-- `trs_position`, a feed no longer in `feeds.yml`, still lists its deliveries
-  and reports `no ingest DAG` rather than 404ing on the config.
-
 ## an-incomplete-keep-set-refuses
 
 `retention/orphan_storage.py` deletes a warehouse prefix that no Nessie
@@ -4921,28 +3926,6 @@ reference points at. Its input is not a list of things to delete — it is a set
 of things **not** to delete, and everything else goes. That inverts the usual
 relationship between an error and its blast radius: a query that fails and
 returns nothing normally does nothing, and here it deletes the warehouse.
-
-The sweep read every reference and, per reference, did this:
-
-```python
-try:
-    entries = nessie.list_entries(name)
-except Exception as e:                      # a ref can vanish mid-sweep
-    log.warning("could not read entries for %s: %s", name, str(e)[:120])
-    continue
-```
-
-The comment is right about the case it names and wrong about every other one.
-A branch deleted between `list_references` and `list_entries` really has taken
-its tables with it, and reclaiming them is the whole point of this module. But
-a Nessie that is down, restarting, rate-limiting or answering 401 fails the
-same way, and then `live` is `set()`, every prefix older than the three-day
-age floor qualifies, and the sweep deletes the entire Iceberg warehouse
-object-by-object — unattended, from step 6 of the nightly
-`platform_housekeeping` chain, with nothing louder than a `warning` per
-reference. `list_references()` failing outright was worse still: it raised out
-of a `try/except` in `retention.run` that exists to stop a sweep failure
-failing the chain, so the traceback landed in a report field.
 
 **So the live set is complete or the sweep does not run.** Three rules, and
 the second is the one that would not have occurred to anybody writing this
@@ -4994,23 +3977,3 @@ changes falls through to `unreadable` — the conservative direction. An unread
 feed also contributes nothing to the inferred calendar, in either state: it is
 not evidence that a date was a business day, and letting a broken read move
 the window would change the verdict for every other feed.
-
-### Verified
-
-- With `NESSIE_URI` pointed at a dead port, `python -m
-  reporting_platform.retention.orphan_storage` (not a dry run) printed
-  `refused: could not list the catalog's references…` and deleted nothing.
-  Before the change the same command raised out of `list_references`.
-- With a live Nessie and `list_entries` patched to raise a 500 for `main`
-  only, the sweep refused with `could not read 1 of the catalog's references`
-  and made no `delete_object` call — asserted by a guard client that raises if
-  one is attempted.
-- The shipped root still resolves: `live_prefixes: 1`, `warehouse_prefixes:
-  1`, `orphans: []` against the one table this environment holds, and the two
-  halves produce the identical string
-  `warehouse/raw/fo_trade_fb646d55-…`.
-- `python -m scripts._spark_task completeness` reported `ref_collateral`,
-  `ref_counterparty` and `ref_rating` as `no table` with
-  `unreadable_feeds: []` — three feeds that have never been ingested in this
-  environment, and that previously read as `no data` with a green
-  `--fail-on-gap`.

@@ -28,9 +28,9 @@ makes every awkward delivery shape cheap.**
 **Pipe-delimited, tab-delimited, unusual quoting, non-UTF-8 encodings are one
 line each.** `delimiter`, `quote_char`, `header` and `file_encoding` are
 per-feed keys with global defaults in `feeds.yml`, they reach Spark's reader
-unchanged (`read_landing`, `ingest_feed.py:105`), and the console exposes all
+unchanged (`read_landing`, `ingest_feed.py`), and the console exposes all
 four on the form with `unescape_char` so `\t` can be typed literally
-(`ui/registry.py:92`). A pipe feed is `delimiter: "|"` and nothing else.
+(`ui/registry.py`). A pipe feed is `delimiter: "|"` and nothing else.
 
 **`.csv.gz` needs no unpacking.** Hadoop's input formats decompress gzip and
 bzip2 transparently, so a single gzipped CSV already reads through the same
@@ -39,7 +39,7 @@ reader for one. That distinction is why archives need a new stage and `.gz`
 does not.
 
 **Re-delivery versioning needs nothing.** `_file_version` is computed from the
-raw table (`next_file_version`, `ingest_feed.py:281`), not from the filename —
+raw table (`next_file_version`, `ingest_feed.py`), not from the filename —
 the `(?:_v(?P<version>\d+))?` group is parsed and then **discarded** by
 `ingest()`. Its only job is to make the pattern match a corrected file at all.
 An archive re-delivered under its original name versions correctly with no new
@@ -50,7 +50,7 @@ mechanism.
 **One landed object is one file, is one delivery, and its NAME carries the
 COB date.**
 
-`Feed.parse_filename` (`common/context.py:283`) does `re.fullmatch` on a
+`Feed.parse_filename` (`common/context.py`) does `re.fullmatch` on a
 filename and returns `(cob_date, version)`. It has **14 call sites across
 7 modules**, and they are not all the ones you would guess:
 
@@ -80,7 +80,7 @@ More regex does not fix this. One concept has to become three: **what arrived**,
 `landing/` currently serves as both the immutable evidence copy **and** the work
 queue. Those have opposite requirements, and the tension is already visible in
 the code: `sweep_landing` will not delete an object whose name it cannot parse
-(`retention/landing.py:94`) because it is evidence, which means anything the
+(`retention/landing.py`) because it is evidence, which means anything the
 platform does not recognise accumulates in the work queue forever.
 
 Split them.
@@ -170,7 +170,7 @@ because `ready/` is a cache.
 **Ingestion status is NOT in the manifest, and must never be.**
 `already_ingested` derives its ledger from `_source_file` in the raw table
 specifically so that it *cannot* drift from reality; its docstring
-(`arrival.py:63`) names the legacy `stg` load-control tables as the failure
+(`arrival.py`) names the legacy `stg` load-control tables as the failure
 being avoided. A manifest carrying `"ingested": true` is that table, rebuilt
 under a new name.
 
@@ -404,15 +404,15 @@ rows with `_source_file = landing/fo_trade/TRADE_20260903.csv`, and the next
 Downstream of the manifest boundary, nothing changes: same reader, same branch
 per delivery, same `_source_file` ledger, same merge. `ingest()` already
 accepts an explicit `cob_date` that takes precedence over the parsed one
-(`ingest_feed.py:248`), so the manifest date flows in through a parameter that
+(`ingest_feed.py`), so the manifest date flows in through a parameter that
 exists today.
 
 ### What this does and does not do to `parse_filename`
 
 It does not delete it, and the count is worth stating honestly: about **4 of
 the 14** call sites go away — the ingest hot path and two in `find_pending`.
-`inbox` still routes by pattern at arrival (`inbox.py:75`), landing retention
-still needs it to decide what is ours (`retention/landing.py:94`), and the
+`inbox` still routes by pattern at arrival (`inbox.py`), landing retention
+still needs it to decide what is ours (`retention/landing.py`), and the
 console, sample-data and seed-landing uses are about local files *before*
 landing and legitimately keep it.
 
@@ -552,7 +552,7 @@ exception distinct from every other normalization failure, and `reconcile()`
 counts it separately in `awaiting_control` rather than `failed`.
 
 The declared row count is an equality check next to `expected_min_rows`
-(`ingest_feed.py:404`), not a replacement for it — the floor still catches a
+(`ingest_feed.py`), not a replacement for it — the floor still catches a
 truncated file on a feed with no control file at all.
 
 **A late control file does not fail the run.** `feed_ingest.py`'s
@@ -590,8 +590,8 @@ The reasoning now lives at
 was built and what was not.
 
 The console already derives the filename pattern from one example
-(`derive_pattern`, `ui/registry.py:278`) and columns from an uploaded CSV
-(`columns_from_csv`, `ui/feeddata.py:136`). `reporting_platform/ingest/sniff.py`
+(`derive_pattern`, `ui/registry.py`) and columns from an uploaded CSV
+(`columns_from_csv`, `ui/feeddata.py`). `reporting_platform/ingest/sniff.py`
 is a **sniffer**: propose mode, not a normalizer that writes anything. Given a
 real delivered file it proposes delimiter, quote, header, encoding and
 per-column types by calling DuckDB's own `sniff_csv()` -- a real, tested CSV
@@ -601,7 +601,7 @@ uniqueness scan on top for business-key candidates. Headers become
 identifiers through the existing `platform_names`.
 
 **Infer types from values, not from column names.** `infer_type`
-(`ui/scaffold.py:59`) guesses from the name, and the repo already documents
+(`ui/scaffold.py`) guesses from the name, and the repo already documents
 what that produces: a column typed `decimal` whose generated sample data is a
 string, `safe_cast` nulls the column, the build goes green, 75 rows and 0
 non-null
@@ -683,7 +683,7 @@ the zip work.
 
 **`find_pending` has to straddle both prefixes.** Candidates come from `ready/`
 manifests, but the retention keep-set must still be computed from the dates
-observed in **`landing/`** (`retention_keep_dates`, `arrival.py:85`) — landing
+observed in **`landing/`** (`retention_keep_dates`, `arrival.py`) — landing
 is the only place holding every date after raw has expired them, which is
 exactly what the `landing:` block in `retention.yml` warns about in its own
 comment. Compute the keep-set from `ready/` and it silently narrows to the
@@ -693,7 +693,7 @@ the control-table-drift trap again, wearing a different hat.
 
 **The sample-data generator has to grow an archive mode.**
 `ui/sampledata.py` builds a filename and then checks it against
-`parse_filename` (`sampledata.py:109`), which is the guard that catches a
+`parse_filename` (`sampledata.py`), which is the guard that catches a
 pattern nobody can route. An archive feed with no generator has nothing to run
 against locally, and per [ADDING-A-FEED.md](ADDING-A-FEED.md) that is the step
 whose omission leaves a feed that looks complete and has never executed.
