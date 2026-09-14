@@ -10,21 +10,49 @@ item that no longer reproduces should be deleted rather than worked.
 
 | | Item | Value | Effort |
 |---|---|---|---|
-| [03](03-keep-years-doc-drift.md) | `keep_years: 8` in the docs; the config says 10 | medium | 15 min |
-| [04](04-conventions-do-not-chain-comment.md) | `_defaults.yml` says conventions do not chain; `parent:` chains them | medium | 10 min |
-| [05](05-test-versions-fails-in-the-container.md) | `python -m tests.run` fails inside the container | medium | 20 min |
 | [06](06-retention-md-restates-decisions.md) | `RETENTION.md` paraphrases `DECISIONS.md` | medium | 2–3 hours |
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
 | [08](08-sniffer-has-no-notion-of-member-control-files.md) | The sniffer cannot propose a zip whose members have control files | low–medium | 2–3 hours |
 
 ## Where to start
 
-**03 + 04 + 05 are one small PR.** Three separately verified wrong things, an
-hour in total, and each is the kind this repo treats as worse than a bug: a
-comment that lies, a number that disagrees with the config it describes, and a
-test suite that fails where its own README says to run it.
+**06 is the biggest remaining piece of doc work**, and 08 is the only code
+item that is not conditional. 07 is a design question before it is a build;
+see the note under "Done".
 
 ## Done
+
+**03 + 04 + 05, the small PR** — one number stated once, one comment that
+lied, and a suite that failed where its README says to run it.
+
+*03:* `landing.keep_years` now has exactly one home, `RETENTION.md`'s landing
+section, naming `retention.yml` as the authority (10 in `local`/`uat`/`prod`,
+7 for `operational`, 1 in `dev`). The five other sites carry a pointer and no
+figure; `PIPELINE.md` no longer disagrees with itself, and its quarantine row
+— a sixth bare figure the item did not list — points at quarantine's own key
+rather than landing's. No test was added: the number is no longer duplicated,
+so there is nothing for one to pin. Two keys in `RETENTION.md`'s config sample
+(`superseded_grace_days`, `latest_version_only`) turned out to be read by
+nothing at all and went with it.
+
+*04:* both sites corrected — `_defaults.yml` and `common/context.py`, where
+the comment contradicted the `CONVENTION_FORBIDDEN` entry two lines below it.
+Each now describes the `parent:` chain, shallow at every link, and the five
+things that are errors at LOAD. Checked against `_chain` and the seven tests
+in `test_conventions.py` that cover the chain and those five errors, not
+against the prose.
+
+*05:* the item named one file and offered a mount. Measured, it was **nine
+paths across three modules** — `test_ci_pins` and `test_doc_claims` fail there
+too, and `test_doc_claims` shells out to `git ls-files` with no `.git` to
+read. Mounting the set would put this repo's docs, CI config and git history
+inside the runtime image of six services to satisfy a test, so they skip
+instead and name the path: the container holds the PACKAGE and these tests
+read the REPO. `support.repo_file()` raises `Skipped` **only where there is no
+checkout** — in one, a missing file is an `AssertionError` — so neither CI
+tier can skip, and a skip never touches the exit code. Verified by moving
+`.env.example` aside and watching it fail rather than skip. Container:
+`512 passed, 0 failed, 14 skipped`.
 
 **02, the console can create a feed whose zip is unpacked at the gate** —
 a member-pattern input in the form's arrival section, `readArrival()` sending
