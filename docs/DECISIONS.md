@@ -2571,6 +2571,20 @@ silently applying the default to a report that declared otherwise. Naming that
 plainly is the point — a guard written against a mechanism that does not exist
 is the failure mode this repo keeps rediscovering.
 
+> **Amended.** `per_report` matches now. The reporting build's `publish` task
+> cuts one `published/<report>/<cob_date>/<run_id>` tag per report when it
+> merges (`context.published_tag`), and `expire_tags` resolves each tag's
+> window from the `report` group `TAG_RE` reads out of it — the tag moved
+> there from the ingest DAG, and why is
+> [#an-ingest-is-not-a-publication](#an-ingest-is-not-a-publication). Every tag
+> still resolves to the default in practice, but because `per_report` is
+> empty — no report has declared a period of its own — not because nothing
+> could match. The two-segment shape called "today's" above is now the legacy
+> one: still matched, and judged by the default because it names no report.
+> Accepting the report segment before anything wrote it is what let retention
+> honour the per-report tags on the day they started appearing, rather than
+> silently giving a report that declared a window the default.
+
 **Age is the commit time**, not the COB date. A retention period runs from
 when the record was made, and a restatement published today for an old COB
 date is a new record that needs its own full window; measuring from the
