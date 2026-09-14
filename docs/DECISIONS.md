@@ -2066,8 +2066,11 @@ file became the member sniffed -- one column named after its first line -- and
 **Recognised by NAME, never by content.** A control member is a name with a
 suffix in `CONTROL_SUFFIXES` (`ctl`, `trl`, `done`, `ok`, as any extension, so
 `POS_A.ctl.csv` and `POS_A.csv.done` count) that is another member's stem plus
-a dot and more. That is the relation `conform.find_control` reads with
-`{stem}`, so recognising it and proposing `{stem}...` are one rule. Content was
+a dot and more. The stem is `conform._stem` itself, not a copy, so an
+extensionless member is its own stem -- `POSA` beside `POSA.ctl`, the mainframe
+shape, which a first version skipped and proposed `.*\.ctl` for. That is the
+relation `conform.find_control` reads with `{stem}`, so recognising it and
+proposing `{stem}...` are one rule. Content was
 considered and refused as a classifier: a short key/value or single-row
 delimited file is also exactly what a one-row data delivery for a quiet day
 looks like, and calling a real member a control file would drop it from the
@@ -2077,7 +2080,10 @@ was.
 
 When pairs are found, the control members leave both the sniffed-member choice
 and `member_pattern_candidate` -- the data members that HAVE a control file are
-the evidence for the pattern -- and `member_control` carries:
+the evidence for the pattern, and having no extension is a shape of its own:
+`[^.]+` for `POSA`/`POSB`, the same guess `.*\.csv` is and unable to claim
+`POSA.ctl`, and None (said in the note) when extensionless and extensioned
+members tie. `member_control` carries:
 
 * **`pattern`**, the one `{stem}...` every pair fits, checked the way the gate
   uses it: each control member fullmatches it with its data member's stem, and
@@ -2085,14 +2091,27 @@ the evidence for the pattern -- and `member_control` carries:
   disagree (`.ctl` for some, `.CTL` for others) -- picking the commoner would
   leave the rest refused at the gate.
 * **`format`**: `delimited` with its delimiter when every file is one header
-  row over one value row with the same header, else the default text reading.
-  A header cell that is all digits is not a header, which is what keeps
-  `ReportingDate|20260801` over `Rows|2` from reading as a table.
+  row over one value row with the same header, the default text reading when
+  every line is `KEY=VALUE` (or `:`/`|`). A header cell that is all digits is
+  not a header, so `ReportingDate|20260801` over `Rows|2` is only text, and
+  `cob_date|row_count` over `20260901|3` is only a table, since `20260901`
+  cannot be a key. **Where both readings hold, nothing is proposed.**
+  `FEED|POSITIONS` over `ROWS|2` is two key/value lines and a two-column table
+  at once, and read as the table, `POSITIONS` "is" the row count. Which the
+  sender means decides what every field names, and the bytes do not say, so
+  `format_ambiguous` is set, `format` and `field_candidates` stay empty, and
+  `field_candidates_by_reading` gives the evidence under each. Only a
+  two-column table can be ambiguous: a key/value line has two cells.
+  Control files are decoded with the proposal's `file_encoding`, as the gate
+  decodes them with the feed's.
 * **`field_candidates`**, evidence rather than choices. `row_count` and `md5`
   only where the value EQUALS the paired member's row count or md5 in every
   pair -- the member's own md5, since under `arrival.archive` each member lands
-  as a plain delivery. `cob_date` wherever every file holds a real yyyyMMdd
-  date. Never `version`, which nothing observable distinguishes from any small
+  as a plain delivery -- each measured once per member. `cob_date` wherever
+  every file holds a real yyyyMMdd date. A text-format field is anchored at the
+  start of a line, allowing the same leading whitespace the reading allows, or
+  `ROWS=` would also read `TOTAL_ROWS=` and an indented file would be
+  recognised and then fail every read-back. Never `version`, which nothing observable distinguishes from any small
   integer. **Every candidate is read back through `ingest/control.py`** over
   every control member and dropped unless it returns the value it came from.
 * `pairs`, `members_without_control` (which the proposed shape would refuse if
@@ -2113,6 +2132,23 @@ every field to the note: which date in a control file is the COB date is the
 business-key problem again, a claim about meaning no measurement makes. The
 pre-filled form is therefore refused until a human types the COB date, and the
 refusal names the date source, not `delivery.control`.
+
+**The upload handler fills only EMPTY fields**, as every other pre-fill in it
+does, because the same upload re-sniffs an existing feed. The control patterns
+are filled only when both are empty; the format moves only with patterns the
+sniff wrote, only while no control field is filled, and never on an ambiguous
+reading. A row count naming the column `RECORD_COUNT` is a regex with no group
+under the text reading, so flipping delimited to text makes the save refused;
+flipping text to delimited is worse, because any string is a legal column name
+and `ROWS=(?P<rows>\d+)` loads, to fail at ingest on a feed nobody meant to
+change. What was kept is listed in the note. A proposal with no pattern fills neither control block.
+
+**`{stem}\.ctl` is filled in when a PERSON ticks Arrival, not whenever the
+arrival section syncs.** It used to run on load and after every sniff, putting
+a control pattern in the arrival block and none in the delivery block -- on an
+existing arrival feed with no control file, and on a sniff that could propose
+no pattern. That form is refused by `check_gates_are_coherent` and nothing on
+it said why.
 
 **The console surfaces `inbox/.rejected/`, not a bucket-wide scan.** A
 general "any unclaimed object anywhere" discovery is an unsolved design

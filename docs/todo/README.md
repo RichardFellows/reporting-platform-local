@@ -27,8 +27,8 @@ that does not wait on another.
 proposes the `arrival.archive` shape's control half as `member_control`:
 the `{stem}...` pattern, the control format, and candidate fields. The
 console fills the arrival section and BOTH control blocks from it and leaves
-`deliveryKind` at plain file. Covered by 12 tests in `tests/test_sniff.py` and
-2 in `tests/test_delivery_form.py`; written up in
+`deliveryKind` at plain file. Covered by 20 tests in `tests/test_sniff.py` and
+6 in `tests/test_delivery_form.py`; written up in
 `DECISIONS.md#the-sniffer`.
 
 *Choices.* Pairs are recognised **by name only**: a `ctl`/`trl`/`done`/`ok`
@@ -68,7 +68,19 @@ gate's own `plan_arrival` over the dropped container. Each `.dat` member was
 paired with its `.ctl` and dated from it, and nothing was landed. The probe was
 deleted, and `git diff main -- reporting_platform/config dbt` is empty. Unpaired
 proposals were compared output for output against `main`'s sniffer and are
-identical.
+identical. The orchestrator re-verified it independently. It used a DATED
+container of `.csv` members with delimited `.ctl.csv` controls, saved a probe
+feed through the console, and planned both members dated from their control
+files. A container missing one member's control file was refused.
+
+*Code review found six issues, all fixed in a second commit on this branch.*
+Extensionless data members (`POSA` beside `POSA.ctl`) were not paired, and got
+`.*\.ctl` back. A two-line KEY|VALUE file was read as a two-column table.
+Control files were decoded as UTF-8, not the proposed encoding, and indented
+lines failed their read-back. Member bytes were held together and re-parsed
+per candidate. Re-sniffing an existing feed overwrote its configured values
+and format. And with no proposable pattern, the form auto-filled an arrival
+control pattern alone, which cannot be saved and said nothing about why.
 
 *Found, not fixed.* **`inbox --dry-run` without `--loop` prints `inbox empty`
 with a file in the inbox.** `STABLE_POLLS = 2` needs three observations and

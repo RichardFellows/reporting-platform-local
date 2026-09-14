@@ -578,11 +578,19 @@ function feedForm(f, creating) {
 
   function syncArrivalVisibility() {
     arrivalFields.style.display = hasArrival.checked ? "" : "none";
-    if (hasArrival.checked && !arrCtlPattern.value.trim())
-      arrCtlPattern.value = AUTO_CTL;
     syncArrivalArchive();
   }
-  hasArrival.addEventListener("change", syncArrivalVisibility);
+  // THE AUTOFILL IS A RESPONSE TO A PERSON TICKING THE BOX, not part of
+  // syncing. When it lived in syncArrivalVisibility() it also ran on load and
+  // after every sniff, so an existing arrival feed with no control file, or a
+  // sniff that could propose no control pattern, got `{stem}\.ctl` in the
+  // arrival block and nothing in the delivery block -- a form refused at load
+  // by check_gates_are_coherent, with nothing on it saying why.
+  hasArrival.addEventListener("change", () => {
+    if (hasArrival.checked && !arrCtlPattern.value.trim())
+      arrCtlPattern.value = AUTO_CTL;
+    syncArrivalVisibility();
+  });
   syncArrivalVisibility();
 
   node.append(
@@ -860,19 +868,41 @@ function feedForm(f, creating) {
       // -- unpacked at the gate -- not `delivery.kind: archive`, which never
       // looks inside the container. Structure is pre-filled (the NAMES say
       // it); what a control field MEANS is not, see memberControlBits.
+      //
+      // ONLY EMPTY FIELDS ARE FILLED, as everywhere else in this handler.
+      // Re-sniffing an EXISTING feed must not replace its configuration: its
+      // row-count and md5 fields name columns or regexes under the format it
+      // has, and swapping the patterns or the format under them makes the
+      // save refused, or silently re-reads a hand-written value.
       const mc = r.member_control;
+      const kept = [];
       hasArrival.checked = true;
       if (!sourcePattern.value.trim()) sourcePattern.value = r.arrival_source_pattern;
-      arrMemberPattern.value = r.member_pattern_candidate || "";
-      deliveryKind.value = "file";
-      memberPattern.value = "";
-      if (mc.pattern) {
+      if (!arrMemberPattern.value.trim()) {
+        if (r.member_pattern_candidate) arrMemberPattern.value = r.member_pattern_candidate;
+      } else kept.push("Members to unpack");
+      if (!memberPattern.value.trim()) deliveryKind.value = "file";
+      else kept.push("the zip-archive delivery shape and its member pattern " +
+                     "(members with their own control files need Members to " +
+                     "unpack instead)");
+      const ctlPatternsEmpty = !arrCtlPattern.value.trim() && !controlPattern.value.trim();
+      const ctlFieldsEmpty = [arrCtlDate, controlRowCount, controlMd5]
+        .every(input => !input.value.trim());
+      if (mc.pattern && ctlPatternsEmpty) {
         // BOTH blocks: arrival.control without delivery.control is refused.
         arrCtlPattern.value = mc.pattern;
         controlPattern.value = mc.pattern;
+        // The format only moves with patterns this sniff wrote, only while no
+        // field is read under the old one, and never on an ambiguous reading.
+        if (ctlFieldsEmpty && !mc.format_ambiguous) {
+          ctlFormat.value = mc.format ? "delimited" : "regex";
+          if (mc.format) ctlDelimiter.value = mc.format.delimiter;
+        }
+      } else if (mc.pattern) {
+        kept.push("the control file patterns and format");
       }
-      ctlFormat.value = mc.format ? "delimited" : "regex";
-      if (mc.format) ctlDelimiter.value = mc.format.delimiter;
+      if (kept.length)
+        bits.push("already set on this form and left as they are: " + kept.join("; "));
       syncArrivalVisibility();
       syncDeliveryVisibility();
       syncControlFormat();
@@ -883,6 +913,7 @@ function feedForm(f, creating) {
       hasArrival.checked = true;
       if (!sourcePattern.value.trim())
         sourcePattern.value = r.arrival_source_pattern;
+      if (!arrCtlPattern.value.trim()) arrCtlPattern.value = AUTO_CTL;
       syncArrivalVisibility();
       bits.push("this filename carries no 8-digit date, so it cannot land " +
         "under it. Turned on Arrival and pre-filled the upstream pattern — " +
@@ -1192,10 +1223,14 @@ const UNDATED_CONTAINER_NOTE =
 function memberControlBits(r) {
   const mc = r.member_control;
   return [
-    "Turned on Arrival for a zip unpacked at the gate: pre-filled the " +
-    "container pattern, Members to unpack" +
-    (mc.pattern ? ", and the control file pattern and format in BOTH control " +
-                  "blocks" : "") +
+    "Turned on Arrival for a zip unpacked at the gate: pre-filled, where " +
+    "empty, the container pattern, Members to unpack" +
+    (mc.pattern
+      ? ", and the control file pattern in BOTH control blocks" +
+        (mc.format_ambiguous ? " (the format is AMBIGUOUS and was left alone)"
+                             : " with its format")
+      : "; NO control pattern could be proposed, so neither control block " +
+        "was filled") +
     ". Set the landing filename pattern to the name each MEMBER lands under " +
     "(e.g. myfeed_(?P<cob_date>\\d{8})\\.csv), not the zip's",
     mc.note,
@@ -1237,6 +1272,9 @@ function newFeed(draft) {
       const fmt = mc.format ? {format: mc.format} : {};
       draft.arrival = {source_pattern: draft.arrival_source_pattern,
                        archive: {member_pattern: draft.member_pattern_candidate || ""}};
+      // No proposed pattern writes NO control block -- and since the autofill
+      // answers only a person ticking Arrival, feedForm will not invent one
+      // on load. The note says to write both by hand.
       if (mc.pattern) {
         draft.arrival.control = {pattern: mc.pattern, ...fmt};
         draft.delivery = {control: {pattern: mc.pattern, ...fmt}};

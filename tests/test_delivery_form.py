@@ -701,3 +701,107 @@ def test_the_payload_a_member_control_proposal_prefills_validates():
     fd = feeds()["cus_gated"]
     assert fd.arrival["archive"]["member_pattern"] == r".*\.dat", fd.arrival
     assert fd.delivery["control"]["pattern"] == r"{stem}\.ctl", fd.delivery
+
+
+def _member_control_handler() -> str:
+    page = _page()
+    handler = page[page.index("if (r.member_control) {"):]
+    return handler[:handler.index("} else if (r.arrival_source_pattern)")]
+
+
+def test_resniffing_an_existing_feed_fills_only_empty_fields():
+    """Review finding: the member_control branch overwrote the member
+    pattern, the delivery shape, both control patterns and the format --
+    forcing text when the proposal had none -- while the row-count, md5 and
+    COB-date fields kept values written under the old format. Every other
+    pre-fill in the handler fills only an empty field."""
+    handler = _member_control_handler()
+    assert "if (!arrMemberPattern.value.trim())" in handler, handler
+    assert 'if (!memberPattern.value.trim()) deliveryKind.value = "file"' in handler, handler
+    assert 'memberPattern.value = ""' not in handler, handler
+    assert "if (mc.pattern && ctlPatternsEmpty)" in handler, handler
+    # the format moves only inside the block guarded by empty fields and an
+    # unambiguous reading -- and nowhere else in the branch
+    guard = handler.index("if (ctlFieldsEmpty && !mc.format_ambiguous)")
+    assert handler.count("ctlFormat.value =") == 1, handler
+    assert handler.index("ctlFormat.value =") > guard, handler
+    for field in ("arrCtlDate", "controlRowCount", "controlMd5"):
+        assert field in handler[:guard], (field, handler)
+    # and what was kept is said, not silent
+    assert "left as they are" in handler, handler
+
+
+def test_why_the_format_must_not_flip_under_filled_fields():
+    """The refusal a clobbered delimited feed would hit: its row count names
+    a COLUMN, which under the text reading is a regex with no group."""
+    _, registry = _setup()
+    flipped = {**DELIMITED_PAYLOAD,
+               "arrival": {**DELIMITED_PAYLOAD["arrival"],
+                           "control": {"pattern": r"{stem}\.ctl",
+                                       "cob_date": "BUSINESS_DATE"}},
+               "delivery": {"control": {"pattern": r"{stem}\.ctl",
+                                        "row_count": "RECORD_COUNT"}}}
+    try:
+        registry.validate(registry.FeedSpec.from_payload(flipped), existing=set())
+    except registry.FeedValidationError as exc:
+        assert "(?P<" in str(exc.errors), exc.errors
+    else:
+        raise AssertionError("expected FeedValidationError")
+
+
+def test_the_arrival_autofill_answers_a_tick_not_a_sync():
+    """Review finding: `syncArrivalVisibility()` filled `{stem}\\.ctl` into the
+    ARRIVAL block whenever it ran -- on load, and after a sniff that could
+    propose no control pattern -- leaving the delivery block empty. That form
+    is refused by check_gates_are_coherent and nothing on it says why."""
+    page = _page()
+    sync = page[page.index("function syncArrivalVisibility"):]
+    sync = sync[:sync.index("\n  }")]
+    assert "AUTO_CTL" not in sync, sync
+    listener = page[page.index('hasArrival.addEventListener("change"'):]
+    listener = listener[:listener.index("});")]
+    assert "arrCtlPattern.value = AUTO_CTL" in listener, listener
+    # a draft with no proposed pattern writes no control block at all
+    draft = page[page.index("if (draft.member_control) {"):]
+    draft = draft[:draft.index("} else if (draft.arrival_source_pattern)")]
+    assert draft.index("if (mc.pattern) {") < draft.index("draft.arrival.control"), draft
+    # the plain undated-file path, which relied on the old autofill, fills it
+    plain = page[page.index("} else if (r.arrival_source_pattern) {"):]
+    plain = plain[:plain.index("\n    }")]
+    assert "if (!arrCtlPattern.value.trim()) arrCtlPattern.value = AUTO_CTL" in plain, plain
+
+
+def test_a_null_pattern_proposal_says_both_blocks_and_does_not_save_silently():
+    """With no proposed pattern the form writes neither control block; the
+    refusal is then about the COB date source, and the note says to write the
+    same pattern into both blocks."""
+    import io
+    import zipfile
+
+    from reporting_platform.ingest import sniff
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, body in (("A.csv", "position_id,quantity\nP1,1\n"),
+                           ("A.ctl", "DATE=20260831\n"),
+                           ("B.csv", "position_id,quantity\nP2,2\n"),
+                           ("B.CTL", "DATE=20260901\n")):
+            zf.writestr(name, body)
+    p = sniff.propose_feed("weekly.zip", buf.getvalue())
+    mc = p["member_control"]
+    assert mc["pattern"] is None, mc
+    assert "`arrival.control.pattern` and `delivery.control.pattern`" in mc["note"], mc
+
+    _, registry = _setup()
+    payload = {"name": "cus_nullpat", "description": "d", "source_system": "CUS",
+               "filename_pattern": r"cus_nullpat_(?P<cob_date>\d{8})\.csv",
+               "business_key": ["position_id"], "columns": p["columns"],
+               "arrival": {"source_pattern": p["arrival_source_pattern"],
+                           "archive": {"member_pattern": p["member_pattern_candidate"]}}}
+    try:
+        registry.validate(registry.FeedSpec.from_payload(payload), existing=set())
+    except registry.FeedValidationError as exc:
+        assert "cob_date" in str(exc.errors), exc.errors
+        assert "delivery.control" not in str(exc.errors), exc.errors
+    else:
+        raise AssertionError("expected FeedValidationError")

@@ -312,9 +312,9 @@ def test_field_candidates_are_measured_not_guessed():
     paired member holds; cob_date wherever every file has a real date."""
     r = sniff.sniff_archive(CON, _zip(KEY_VALUE_ZIP))
     assert r["member_control"]["field_candidates"] == {
-        "cob_date": [r"(?m)^DATE\s*=\s*(?P<cob_date>\d{8})"],
-        "row_count": [r"(?m)^ROWS\s*=\s*(?P<rows>\d+)"],
-        "md5": [r"(?m)^MD5\s*=\s*(?P<md5>[0-9a-fA-F]{32})"],
+        "cob_date": [r"(?m)^\s*DATE\s*=\s*(?P<cob_date>\d{8})"],
+        "row_count": [r"(?m)^\s*ROWS\s*=\s*(?P<rows>\d+)"],
+        "md5": [r"(?m)^\s*MD5\s*=\s*(?P<md5>[0-9a-fA-F]{32})"],
     }, r
     wrong_count = {**KEY_VALUE_ZIP, "POS_B.ctl": "DATE=20260901\nROWS=7\n"}
     got = sniff.sniff_archive(CON, _zip(wrong_count))["member_control"]
@@ -342,7 +342,7 @@ def test_a_key_pipe_value_file_is_not_mistaken_for_a_table():
     got = sniff.sniff_archive(CON, _zip(kv))["member_control"]
     assert got["format"] is None, got
     assert got["field_candidates"]["cob_date"] == [
-        r"(?m)^ReportingDate\s*\|\s*(?P<cob_date>\d{8})"], got
+        r"(?m)^\s*ReportingDate\s*\|\s*(?P<cob_date>\d{8})"], got
 
 
 def test_an_empty_done_file_proposes_the_pattern_and_no_fields():
@@ -372,6 +372,101 @@ def test_an_existing_member_pattern_never_selects_a_control_member():
         pass
     else:
         raise AssertionError("a pattern claiming only control members sniffs nothing")
+
+
+def test_extensionless_data_members_pair_by_the_gates_own_stem():
+    """Review finding: `POSA` beside `POSA.ctl` -- the mainframe shape -- was
+    skipped for having no extension, and the result was `.*\\.ctl`, the very
+    misproposal pairing exists to prevent. `conform._stem` treats a name with
+    no dot as its own stem, and so does the sniffer now."""
+    from reporting_platform.ingest import conform
+
+    mainframe = {"POSA": DAT_A, "POSA.ctl": "DATE=20260831\nROWS=2\n",
+                 "POSB": DAT_B, "POSB.ctl": "DATE=20260901\nROWS=1\n"}
+    r = sniff.sniff_archive(CON, _zip(mainframe))
+    assert r["sniffed_member"] == "POSA", r
+    assert r["member_pattern_candidate"] == r"[^.]+", r
+    mc = r["member_control"]
+    assert mc["pairs"] == {"POSA.ctl": "POSA", "POSB.ctl": "POSB"}, mc
+    assert mc["pattern"] == r"{stem}\.ctl", mc
+    assert "row_count" in mc["field_candidates"], mc
+    assert sniff._stem("POSA") == conform._stem("POSA") == "POSA"
+
+
+def test_extensionless_and_extensioned_data_in_equal_number_propose_no_member_pattern():
+    """No most-common shape to name, so None -- and the note says so rather
+    than leaving an empty box unexplained."""
+    mixed = {"POSA": DAT_A, "POSA.ctl": "DATE=20260831\n",
+             "POSB.csv": DAT_B, "POSB.ctl": "DATE=20260901\n"}
+    r = sniff.propose_feed("w.zip", _zip(mixed))
+    assert r["member_pattern_candidate"] is None, r
+    assert "No member pattern is proposed" in r["member_control"]["note"], r
+
+
+def test_a_key_pipe_value_file_that_also_reads_as_a_table_proposes_no_format():
+    """Review finding: `FEED|POSITIONS` over `ROWS|2` is two KEY|VALUE lines
+    AND a table with columns FEED and POSITIONS -- and read as the table,
+    POSITIONS 'is' the row count. Nothing in the bytes says which the sender
+    means, so neither is proposed; the candidates under each are evidence."""
+    kv = {"A.csv": DAT_A, "A.ctl": "FEED|POSITIONS\nROWS|2\n",
+          "B.csv": DAT_A, "B.ctl": "FEED|POSITIONS\nROWS|2\n"}
+    p = sniff.propose_feed("w.zip", _zip(kv))
+    mc = p["member_control"]
+    assert mc["format"] is None and mc["format_ambiguous"] is True, mc
+    assert mc["field_candidates"] == {}, mc
+    by = mc["field_candidates_by_reading"]
+    assert by["text"]["field_candidates"]["row_count"] == [
+        r"(?m)^\s*ROWS\s*\|\s*(?P<rows>\d+)"], by
+    assert by["delimited"]["format"] == {"kind": "delimited", "delimiter": "|"}, by
+    assert "AMBIGUOUS FORMAT" in mc["note"], mc["note"]
+
+
+def test_a_real_one_row_table_is_still_proposed_as_delimited():
+    """`20260901` cannot be a key, so the text reading fails and the table is
+    the only reading -- the discriminator does not refuse the ordinary case."""
+    table = {"A.csv": DAT_A, "A.ctl": "cob_date|row_count\n20260831|2\n",
+             "B.csv": DAT_B, "B.ctl": "cob_date|row_count\n20260901|1\n"}
+    mc = sniff.sniff_archive(CON, _zip(table))["member_control"]
+    assert mc["format"] == {"kind": "delimited", "delimiter": "|"}, mc
+    assert mc["format_ambiguous"] is False, mc
+    assert mc["field_candidates"] == {"cob_date": ["cob_date"],
+                                      "row_count": ["row_count"]}, mc
+
+
+def test_indented_key_value_lines_still_yield_candidates():
+    """Review finding: `_KEY_VALUE` tolerated leading whitespace and the
+    expression anchored `^KEY`, so an indented file was recognised and then
+    every candidate failed its read-back."""
+    indented = {"A.csv": DAT_A, "A.ctl": "  DATE=20260831\n\tROWS=2\n"}
+    mc = sniff.sniff_archive(CON, _zip(indented))["member_control"]
+    assert mc["field_candidates"] == {
+        "cob_date": [r"(?m)^\s*DATE\s*=\s*(?P<cob_date>\d{8})"],
+        "row_count": [r"(?m)^\s*ROWS\s*=\s*(?P<rows>\d+)"]}, mc
+
+
+def test_control_files_are_decoded_with_the_proposed_encoding():
+    """Review finding: the gate decodes a member's control file with the
+    feed's `file_encoding`, the sniffer decoded UTF-8. A latin-1 key read as
+    UTF-8 is a replacement character, not a word, and the file stopped
+    reading as KEY=VALUE at all."""
+    data = "name,city\nAndre,Bras\xedlia\nJose,Sao Paulo\n".encode("latin-1")
+    ctl = "Soci\xe9t\xe9=ACME\nDATE=20260831\nROWS=2\n".encode("latin-1")
+    r = sniff.sniff_archive(CON, _zip({"A.csv": data, "A.ctl": ctl}))
+    assert r["file_encoding"] == "latin-1", r
+    assert "row_count" in r["member_control"]["field_candidates"], r
+
+
+def test_each_data_member_is_measured_once():
+    """Review finding: the md5 and row count were recomputed per candidate
+    key, with every member's bytes held at once."""
+    calls = []
+    real = sniff._member_facts
+    sniff._member_facts = lambda data, proposal: calls.append(1) or real(data, proposal)
+    try:
+        sniff.sniff_archive(CON, _zip(KEY_VALUE_ZIP))
+    finally:
+        sniff._member_facts = real
+    assert len(calls) == 2, calls
 
 
 # ...and with NO pairs, nothing changes.
@@ -467,3 +562,15 @@ def test_a_delimited_proposal_loads_and_never_lands_its_control_members():
         "weekly.zip!POS_A.csv", "weekly.zip!POS_B.csv"], outcomes
     assert [o.control_landing_filename for o in outcomes] == [
         "cus_pos_20260831.ctl.csv", "cus_pos_20260901.ctl.csv"], outcomes
+
+
+def test_an_extensionless_proposal_loads_and_the_gate_unpacks_with_it():
+    fd, outcomes = _load_and_plan(
+        {"POSA": DAT_A, "POSA.ctl": "DATE=20260831\nROWS=2\n",
+         "POSB": DAT_B, "POSB.ctl": "DATE=20260901\nROWS=1\n"}, "weekly.zip")
+    from reporting_platform.ingest import conform
+    assert all(isinstance(o, conform.Planned) for o in outcomes), outcomes
+    assert [o.source_name for o in outcomes] == [
+        "weekly.zip!POSA", "weekly.zip!POSB"], outcomes
+    assert [o.control_landing_filename for o in outcomes] == [
+        "cus_pos_20260831.ctl", "cus_pos_20260901.ctl"], outcomes
