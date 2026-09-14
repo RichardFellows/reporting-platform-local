@@ -96,7 +96,32 @@ sentences: `ref_counterparty`'s header said a dropped key's version simply
 "carries forward", and the DECISIONS entry's first draft called the stranding
 "not new" — the per-key rank never stranded a version. Both are rewritten.
 
-LIVE-VERIFY-SCD2: the SCD2 retraction merge has not been run on a Nessie branch yet; replace this sentence with what that run showed before merging.
+*The SCD2 retraction verified live* on two throwaway Nessie branches, with
+`raw.ref_counterparty` created on the branch by ingest's own
+`ensure_raw_table`/`ensure_raw_schema`. Four incremental runs: A=a and B=X
+from 2026-08-03; 09-02 changes B to Y and adds C; 09-02 re-delivered with A
+only; 09-03 brings B back as Y. dbt sent the project's merge — `when matched
+and DBT_INTERNAL_SOURCE.effective_to = DATE '0001-01-01' then delete` and the
+conditional insert — and after the re-delivery the table held exactly
+`[A, a, 08-03, open]` and `[B, X, 08-03, open]`: the 09-02 version and C
+retracted, B's earlier version reopened, Iceberg's snapshot recording 4
+records deleted and 2 added. After B's return: `[B, X, 08-03 → 09-02]`,
+`[B, Y, 09-03, open]` — one open version per key, no overlaps, no marker
+rows, and all 9 of `ref_counterparty`'s dbt tests passed, including
+`mutually_exclusive_ranges`. Both states compared IDENTICAL to a full refresh
+over the same raw (the post-retraction one on the second branch). A throwaway
+`merge` model with no `scd2_retractions` got dbt-spark's own
+`when matched then update set *` and the right rows, so the override
+delegates. `main`'s hash was the same before and after, and neither branch
+survived. **Not run live:** `ref_rating` (same macros, host-tested) and the
+three reporting models.
+
+One thing the run found that the host tests could not: the procedure's first
+seeding helper built rows with `createDataFrame`, which needs Python workers
+on the cluster, and those run 3.8 against the driver's 3.11
+(`PYTHON_VERSION_MISMATCH`). SQL `INSERT ... SELECT` literals, which stay in
+the JVM, worked. The platform's own ingest does not hit this; a notebook or
+script that does will.
 
 What the item file got wrong. **Its SCD2 watch-out contradicted the design**:
 it said a key dropped from a snapshot "should close its validity interval",

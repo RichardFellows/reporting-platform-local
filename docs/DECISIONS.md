@@ -4402,3 +4402,13 @@ on Spark against Iceberg on a Nessie branch.
 > every date version 1's 400 keys, and the same var on an incremental run was
 > refused. `main`'s hash was the same before and after. The three reporting
 > models and both SCD2 models were not run live by that verification.
+>
+> A second live run then covered the SCD2 retraction on `ref_counterparty`, on
+> throwaway branches with the raw table created by ingest's own code: the
+> project merge's `then delete` clause reached Spark, a re-delivery that
+> dropped a key's change retracted that version and reopened the one before
+> it (Iceberg: 4 records deleted), the key's return left exactly one open
+> version with no overlaps, all nine of the model's dbt tests passed, both
+> states were identical to a full refresh over the same raw, and a plain
+> `merge` model still got dbt-spark's own SQL. `ref_rating` and the reporting
+> models were not run live.
