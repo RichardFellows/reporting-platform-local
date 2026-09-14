@@ -12,11 +12,18 @@ item that no longer reproduces should be deleted rather than worked.
 |---|---|---|---|
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
 | [08](08-sniffer-has-no-notion-of-member-control-files.md) | The sniffer cannot propose a zip whose members have control files | low–medium | 2–3 hours |
+| [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
+| [10](10-per-report-matches-nothing-is-stale.md) | `DECISIONS.md` says `per_report` matches nothing; the reporting build makes it match | low–medium | 15 min |
+| [11](11-claude-worktrees-are-not-ignored.md) | `.claude/worktrees/` is not ignored | low | 5 min |
 
 ## Where to start
 
-**08 is the only remaining code item that is not conditional.** 07 is a design
-question before it is a build, and the answer changed — see under "Done".
+**09 first.** It is a correctness defect in the one supersession mode that is
+built, and its answer decides what 07 is asking for — do not start 07 before
+it. It opens with a decision, not an edit.
+
+**08** is the other code item. **10 + 11** are small and unrelated to each
+other; either is a reasonable warm-up.
 
 ## Done
 

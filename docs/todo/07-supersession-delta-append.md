@@ -2,6 +2,14 @@
 
 **Value** high, if a delta feed is real · **Effort** multi-day · **Branch** `feat/supersession-delta-append`
 
+> **Read [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) first.** Verified
+> 2026-09-14: `dedupe_rank` partitions by `(_cob_date, business key)`, so it
+> already keeps a key the newest delivery omits — the union-per-COB-date
+> behaviour this item describes building. The failure quoted below, "a delta
+> feed deduped as a snapshot silently loses every key its newest file omits",
+> is not one the macro as written can produce. What this item should ask for
+> depends on what 09 decides; nothing below has been rewritten to match yet.
+
 ## What exists now
 
 ```bash
