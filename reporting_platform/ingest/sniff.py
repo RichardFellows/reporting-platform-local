@@ -614,9 +614,11 @@ def _member_control(zf, names: list[str], pairs: dict[str, str],
         out["field_candidates"] = only["field_candidates"]
     elif len(by_reading) == 2:
         out["format_ambiguous"] = True
-        # Worded from the text reading's OWN separator(s), which need not be
-        # the table's delimiter.
-        out["key_value_separator"] = "".join(sorted(separators))
+        # Worded from the text reading's OWN separators, which need not be
+        # the table's delimiter -- and may be more than one (`A=x|B` over
+        # `C:1|2`), so a list, never a joined string that names a separator
+        # no line in the file uses.
+        out["key_value_separators"] = sorted(separators)
         out["field_candidates_by_reading"] = by_reading
     return out
 
@@ -843,10 +845,11 @@ def _member_control_note(control: dict, member_pattern_candidate: str | None) ->
     if control["format_ambiguous"]:
         readings = control["field_candidates_by_reading"]
         delimiter = readings["delimited"]["format"]["delimiter"]
-        separator = control["key_value_separator"]
+        lines_as = " / ".join(f"KEY{sep}VALUE"
+                              for sep in control["key_value_separators"])
         bits.append(
-            f"AMBIGUOUS FORMAT: every control file reads both as KEY{separator}"
-            f"VALUE lines and as a one-row table delimited by {delimiter!r}, "
+            f"AMBIGUOUS FORMAT: every control file reads both as {lines_as} "
+            f"lines and as a one-row table delimited by {delimiter!r}, "
             f"and which the sender means decides what every field names -- so "
             f"no format is proposed. Choose one; the candidates under each "
             f"reading are:")

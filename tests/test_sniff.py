@@ -502,7 +502,7 @@ def test_a_separator_that_is_not_the_delimiter_is_not_an_ambiguity():
     # ...while the genuine case records the separator it was worded from
     kv = {"A.csv": DAT_A, "A.ctl": "FEED|POSITIONS\nROWS|2\n"}
     genuine = sniff.propose_feed("w.zip", _zip(kv))["member_control"]
-    assert genuine["key_value_separator"] == "|", genuine
+    assert genuine["key_value_separators"] == ["|"], genuine
     assert "KEY|VALUE lines" in genuine["note"], genuine["note"]
 
 
@@ -517,8 +517,19 @@ def test_a_different_separator_stays_ambiguous_when_the_table_reads_a_field():
     assert mc["format_ambiguous"] is True, mc
     assert mc["field_candidates_by_reading"]["delimited"]["field_candidates"] == {
         "row_count": ["Rows"]}, mc
-    assert mc["key_value_separator"] == ":", mc
+    assert mc["key_value_separators"] == [":"], mc
     assert "KEY:VALUE lines" in mc["note"], mc["note"]
+
+
+def test_mixed_separators_are_named_one_by_one_in_the_note():
+    """Fourth review: separators joined into one string named `KEY:=VALUE`,
+    which no line in the file uses."""
+    members = {"A.csv": DAT_A, "A.ctl": "A=x|B\nC:1|2\n"}
+    mc = sniff.propose_feed("w.zip", _zip(members))["member_control"]
+    assert mc["format_ambiguous"] is True, mc
+    assert mc["key_value_separators"] == [":", "="], mc
+    assert "KEY:VALUE / KEY=VALUE lines" in mc["note"], mc["note"]
+    assert ":=" not in mc["note"], mc["note"]
 
 
 # ...and with NO pairs, nothing changes.
