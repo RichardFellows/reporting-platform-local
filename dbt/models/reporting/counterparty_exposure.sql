@@ -1,11 +1,25 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['cob_date', 'counterparty_id'],
+    incremental_strategy='insert_overwrite',
     partition_by=['cob_date'],
     tags=['reporting', 'core']
   )
 }}
+
+{#
+  INSERT_OVERWRITE, NOT MERGE, AND NO unique_key. An incremental run
+  REWRITES every COB date its select returns and leaves every other date
+  alone. A merge never deletes, so a key a re-delivery dropped used to
+  survive every run after the one that first wrote it.
+
+  Correct only if each date the select returns, it returns WHOLE -- a
+  partial date would be truncated to the part. Each date it returns
+  is aggregated from ALL of that date's unmatured trades in `fo_trade` --
+  the lookback window and `is_matured` are the only row filters -- and every
+  other CTE is a lookup joined onto those.
+  See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
+#}
 
 {#
   Counterparty exposure — the shared spine of the reporting layer.
@@ -50,13 +64,28 @@ counterparties as (
   the part nobody wants -- so it is carried forward and FLAGGED.
 
   Narrow and grouped: two columns, no attributes, so this is a cheap scan.
+
+  DELIVERED MEANS IN THE NEWEST DELIVERY FOR THE DATE, AS KNOWN AT THE
+  KNOWLEDGE TIME. This used to group every version of a date together, so a
+  counterparty a re-delivery dropped still counted as delivered and was never
+  flagged -- the same per-key reading `dedupe_rank` had, reached without
+  calling it. Hence the macro and `known_as_of()` here, in the one reporting
+  model that reads raw.
+  See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
 delivered as (
 
     select
         _cob_date                               as cob_date,
         {{ clean_string('counterparty_id') }}   as counterparty_id
-    from {{ source('raw', 'ref_counterparty') }}
+    from (
+        select
+            *,
+            {{ dedupe_rank(['counterparty_id']) }} as _rn
+        from {{ source('raw', 'ref_counterparty') }}
+        where {{ known_as_of() }}
+    ) newest
+    where _rn = 1
     group by 1, 2
 
 ),

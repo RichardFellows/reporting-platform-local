@@ -1,15 +1,18 @@
 """Supersession: how a later delivery relates to an earlier one (REQ-202).
 
-THE BEHAVIOUR IS OLD AND THE DECLARATION IS NEW. `dedupe_rank` has always
-implemented `full_snapshot` -- newest `_file_version` wins within a COB
-date, last row in file order wins within a version -- and no feed said so.
-These tests hold the two halves together: that the default is what the macro
-already does, and that a mode the macro cannot serve is refused at LOAD rather
-than ingested and silently reduced to whatever the newest file happened to
-contain.
+THE DECLARATION CAME FIRST, AND THE MACRO WAS LATER FOUND NOT TO MATCH IT.
+`full_snapshot` means the newest `_file_version` wins within a COB date --
+the whole delivery, last row in file order within it -- and no feed said so.
+This module was written saying `dedupe_rank` had always implemented that; it
+had not, it ranked per KEY, and a key the newest delivery omitted survived.
+That is fixed and pinned against the real SQL in `test_dedupe_rank.py`.
+These tests hold the other half: that the default is `full_snapshot`, and
+that a mode the macro cannot serve is refused at LOAD rather than ingested
+and silently reduced to whatever the newest file happened to contain.
+See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 
-The macro half is verified by grepping the models rather than by compiling
-them: `dbt parse` needs the dbt project and its packages, and CLAUDE.md's rule
+The call-site checks here grep the models rather than compiling them: `dbt
+parse` needs the dbt project and its packages, and CLAUDE.md's rule
 is to grep for the CONSTRUCT rather than trust that fixing a macro reached
 everything. A model that stops calling `known_as_of()` is exactly the drift
 that would otherwise go unnoticed until an as-of query quietly returned

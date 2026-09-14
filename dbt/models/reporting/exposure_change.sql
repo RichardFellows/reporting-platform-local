@@ -1,11 +1,25 @@
 {{
   config(
     materialized='incremental',
-    unique_key=['cob_date', 'counterparty_id'],
+    incremental_strategy='insert_overwrite',
     partition_by=['cob_date'],
     tags=['reporting', 'change-detection']
   )
 }}
+
+{#
+  INSERT_OVERWRITE, NOT MERGE, AND NO unique_key. An incremental run
+  REWRITES every COB date its select returns and leaves every other date
+  alone. A merge never deletes, so a key a re-delivery dropped used to
+  survive every run after the one that first wrote it.
+
+  Correct only if each date the select returns, it returns WHOLE -- a
+  partial date would be truncated to the part. Each date it returns
+  carries ALL of that date's rows in `counterparty_exposure`: the lookback
+  window is the only filter, and `date_sequence` is an inner join that every
+  one of those dates satisfies.
+  See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
+#}
 
 {#
   Day-on-day change in counterparty exposure.

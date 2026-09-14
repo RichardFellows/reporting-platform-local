@@ -11,7 +11,6 @@ item that no longer reproduces should be deleted rather than worked.
 | | Item | Value | Effort |
 |---|---|---|---|
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
-| [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
 | [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
@@ -23,17 +22,63 @@ item that no longer reproduces should be deleted rather than worked.
 
 ## Where to start
 
-**09 first.** It is a correctness defect in the one supersession mode that is
-built, and its answer decides what 07 is asking for — do not start 07 before
-it. It opens with a decision, not an edit.
+**15** is the one to take next. Under 09's decision the newest
+`_file_version` decides a whole COB date, and 15 is how a version gets
+mis-numbered.
+
+**07** is no longer blocked: 09 decided that `full_snapshot` selects the
+newest delivery per COB date, so 07's premise holds as written. It is
+multi-day design work and only worth starting if a delta feed is real; read
+its banner and
+[DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
+first.
 
 **12–19** were found working 08–10 and each was reproduced before it was
-written down. **15** is the one to take next after 09: under 09's decision the
-newest `_file_version` decides a whole COB date, and 15 is how a version gets
-mis-numbered. **16** and **18** should be re-read once 09 merges, since it
-changes the models they describe. The rest are independent.
+written down. **16** and **18** describe models 09 changed, so re-read them
+against the current models before starting. The rest are independent.
 
 ## Done
+
+**09, `dedupe_rank` kept keys a `full_snapshot` re-delivery dropped** — the
+owner's decision was that the macro was wrong and the documented meaning
+stands: the newest delivery for a COB date is that date's population, and a
+key it omits is absent from `prepared`, incrementally. Written down as
+[`#a-snapshot-re-delivery-restates-the-whole-date`](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date),
+with an `> **Amended.**` block on `#supersession-is-declared-not-assumed`,
+which had said the macro "has always implemented" what it did not. Measured
+first: the seed's one re-delivery (`fo_trade` 2026-08-13 `_v2`) has the same
+400 keys as `_v1`, and nothing was published on `main`, so nothing depended on
+the per-key reading.
+
+Three changes, because the rank alone removes nothing. `dedupe_rank` gates on
+the newest `_file_version` per COB date, computed after `known_as_of()`; the
+five `cob_date`-partitioned models are `insert_overwrite` (project default and
+per model, `unique_key` removed), because dbt-spark's MERGE has no delete
+clause; and the two SCD2 models, which stay `merge`, take "newest" from
+`newest_file_version()`, an unjoined aggregate, because a window over their
+`touched`-scoped rows gets it wrong. The scaffold emits the new strategy, and
+its generated comment no longer says uniqueness proves the dedupe works.
+`tests/test_dedupe_rank.py` renders the real macro and models with jinja2 and
+runs them in DuckDB; putting the per-key partition back fails seven of its
+tests. `config.yml` installs `jinja2` for it, and the clean-virtualenv run of
+that dependency set passed.
+
+LIVE-VERIFY: the insert_overwrite materialisation on Iceberg through Nessie has not been run yet; replace this sentence with what the Nessie-branch run showed before merging.
+
+What the item file got wrong. **Its SCD2 watch-out contradicted the design**:
+it said a key dropped from a snapshot "should close its validity interval",
+and the SCD2 models deliberately do not — an absent counterparty is carried
+forward and flagged, and `scd2_exactly_one_current_version` expects it. That
+is unchanged. **Its doc-gate watch-out did not apply**: `test_doc_claims`
+matches a quoted message only in the form `` `"..."` ``, and every doc quoting
+the `supersession:` refusal quotes it as an indented block, which it never
+reads; and its NOT BUILT check exempts any paragraph containing "supersede"
+as history, which is most paragraphs about supersession. The refusal text
+did not change here, but nothing would have caught it if it had. **It missed a site**: `counterparty_exposure.delivered` grouped
+`raw.ref_counterparty` across every version without calling `dedupe_rank`, so
+a dropped counterparty still counted as delivered and was never flagged; it
+ranks through the macro and filters on `known_as_of()` now. And **it asked for
+`seed_clean/` to be checked, which was empty** in the checkout measured.
 
 **08, the sniffer had no notion of member control files** —
 `ingest/sniff.py` recognises members that carry their own control file and

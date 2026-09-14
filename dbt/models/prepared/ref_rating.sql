@@ -1,6 +1,7 @@
 {{
   config(
     materialized='incremental',
+    incremental_strategy='merge',
     unique_key=['counterparty_id', 'agency', 'effective_from'],
     partition_by=['effective_from_month'],
     tags=['prepared', 'reference', 'scd2']
@@ -22,6 +23,9 @@
   they move independently -- Moody's downgrading does not close the S&P
   version. The key columns below are therefore (counterparty_id, agency) and
   getting that wrong would interleave two agencies' histories into one chain.
+
+  MERGE, NOT insert_overwrite, and a key the newest delivery omits does not
+  close its version -- both for the reasons ref_counterparty's header states.
 #}
 
 with
@@ -30,12 +34,18 @@ with
 {{ scd2_incremental_scope(source('raw', 'ref_rating'), ['counterparty_id', 'agency']) }}
 {% endif %}
 
+{{ newest_file_version(source('raw', 'ref_rating')) }}
+
 raw_rows as (
 
+    {# `nv` decides the newest delivery, for the reason ref_counterparty's
+       copy of this states. #}
     select
         r.*,
-        {{ dedupe_rank(['r.counterparty_id', 'r.agency']) }} as _rn
+        {{ dedupe_rank(['r.counterparty_id', 'r.agency'],
+                       newest_version='nv._newest_file_version') }} as _rn
     from {{ source('raw', 'ref_rating') }} r
+    join newest_file_version nv on nv._newest_cob_date = r._cob_date
     {% if is_incremental() %}
     join touched t
       on t.counterparty_id = r.counterparty_id and t.agency = r.agency

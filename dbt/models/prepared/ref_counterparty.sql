@@ -1,6 +1,7 @@
 {{
   config(
     materialized='incremental',
+    incremental_strategy='merge',
     unique_key=['counterparty_id', 'effective_from'],
     partition_by=['effective_from_month'],
     tags=['prepared', 'reference', 'scd2']
@@ -40,6 +41,16 @@
   The unique key is (counterparty_id, effective_from) and NOT effective_to,
   which is what lets the incremental merge UPDATE a previously-open row to
   close it rather than inserting a second one alongside.
+
+  MERGE, NOT insert_overwrite, unlike every date-partitioned model. The
+  partition is `effective_from_month` and an incremental run re-derives only
+  the touched keys, so overwriting the months it returns would truncate
+  them to those keys. And A KEY THE NEWEST DELIVERY OMITS DOES NOT CLOSE ITS
+  VERSION: that delivery's rows simply stop contributing, so the version in
+  force carries forward and `counterparty_exposure` flags it
+  (`reference_carried_forward`). Deliberate -- an absent counterparty is a
+  gap to show, not a retirement to infer.
+  See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
 
 with
@@ -48,12 +59,24 @@ with
 {{ scd2_incremental_scope(source('raw', 'ref_counterparty'), ['counterparty_id']) }}
 {% endif %}
 
+{{ newest_file_version(source('raw', 'ref_counterparty')) }}
+
 raw_rows as (
 
+    {#
+      THE NEWEST DELIVERY IS DECIDED BY `nv`, NOT BY THE ROWS BELOW. On the
+      incremental path this query keeps only the `touched` keys, from each
+      key's own `replay_from` date, so a window over its rows would find the
+      newest version among those keys only -- and a date whose touched keys
+      were all dropped by the newest delivery would keep the older one.
+      See `newest_version` on dedupe_rank.
+    #}
     select
         r.*,
-        {{ dedupe_rank(['r.counterparty_id']) }} as _rn
+        {{ dedupe_rank(['r.counterparty_id'],
+                       newest_version='nv._newest_file_version') }} as _rn
     from {{ source('raw', 'ref_counterparty') }} r
+    join newest_file_version nv on nv._newest_cob_date = r._cob_date
     {% if is_incremental() %}
     join touched t on t.counterparty_id = r.counterparty_id
     left join replay_from p on p.counterparty_id = r.counterparty_id

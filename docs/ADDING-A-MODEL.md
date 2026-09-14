@@ -57,7 +57,7 @@ Copy the nearest existing model rather than starting from blank —
 {{
   config(
     materialized='incremental',
-    unique_key=['cob_date', 'country_code'],
+    incremental_strategy='insert_overwrite',
     partition_by=['cob_date'],
     tags=['reporting']
   )
@@ -85,10 +85,15 @@ Five things that are not optional:
   `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY` — and only on the *incremental*
   path, so a first build against a fresh branch will not show it. The first
   build after publishing to `main` will.
-- **`unique_key` must actually be unique**, and a
-  `dbt_utils.unique_combination_of_columns` test on the same columns is what
-  proves it. `incremental_strategy: merge` is set project-wide; a non-unique
-  key silently merges rows together.
+- **A `cob_date`-partitioned model is `insert_overwrite`, and its select
+  must return each COB date WHOLE.** An incremental run replaces every date
+  the select returns and leaves the rest alone, so a filter that keeps only
+  some rows of a date truncates that date to them. That is what makes a key a
+  re-delivery dropped disappear downstream too — a merge never deletes.
+  Uniqueness is still a TEST: a `dbt_utils.unique_combination_of_columns`
+  over the grain. Only the SCD2 models merge, on a `unique_key`, and
+  `tests/test_dedupe_rank.py` fails a model that pairs the two the other way.
+  See [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 - **Never inline SQL that `macros/engine.sql` already has a macro for**
   (`safe_cast`, `clean_string`, `parse_date`, `dedupe_rank`, `audit_columns`).
   Centralising them is the point — a bare `CAST(x AS VARCHAR)` copy-pasted into

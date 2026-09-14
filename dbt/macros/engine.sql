@@ -140,10 +140,14 @@
   predicate compiles away entirely, so no model changes behaviour on the day
   this lands and the ordinary nightly build is byte-identical to before.
 
-  PREPARED ONLY. Reporting models read `ref()`s, not raw, and carry no
-  arrival clock of their own; an as-of reporting build is a build of the whole
-  chain on one branch with the var set, which is why the var reaches every
-  model rather than being a per-call-site argument.
+  PREPARED ONLY, with one exception. Reporting models read `ref()`s, not raw,
+  and carry no arrival clock of their own; an as-of reporting build is a build
+  of the whole chain on one branch with the var set, which is why the var
+  reaches every model rather than being a per-call-site argument. The
+  exception is `counterparty_exposure`'s `delivered` CTE, which reads
+  `raw.ref_counterparty` directly and so needs this filter as much as a
+  prepared model does -- "the newest delivery for a date" means the newest
+  one KNOWN at the knowledge time.
 #}
 {% macro known_as_of() %}
   {%- set kt = var('knowledge_time', none) -%}
@@ -161,7 +165,10 @@
     {%- if is_incremental() -%}
       {#
         AN AS-OF BUILD MUST NOT WRITE INTO THE PUBLISHED TABLE. On the
-        incremental path dbt MERGEs into `this`, so a build restricted to what
+        incremental path dbt writes into `this` -- a MERGE on the SCD2 models,
+        an overwrite of every COB date it selects on the date-partitioned ones
+        (docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date) --
+        so a build restricted to what
         was known last month would delete or overwrite rows built from
         everything known today -- a silent restatement backwards, in the
         published table, with a green run. Full-refresh on a throwaway branch
@@ -277,30 +284,55 @@
 {% endmacro %}
 
 
-{# Latest file version, and deduplication within it.
+{# The newest delivery for each COB date, and deduplication within it.
 
    Re-deliveries land as a new _file_version rather than overwriting, so every
-   prepared model must select the newest version for each COB date. And
-   within a version, upstream occasionally repeats a business key; we take the
-   last occurrence in file order, which matches the legacy ETL tool's behaviour.
+   prepared model must select the newest DELIVERY for each COB date -- the
+   whole of it, and nothing from the delivery it replaced. And within that
+   delivery, upstream occasionally repeats a business key; we take the last
+   occurrence in file order, which matches the legacy ETL tool's behaviour.
 
    Centralised here so the rule cannot drift between models — this is exactly
    the kind of logic that was copy-pasted across legacy stored procedures and
-   then diverged. #}
-{% macro dedupe_rank(partition_keys, mode='full_snapshot') %}
+   then diverged.
+
+   See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date #}
+{% macro dedupe_rank(partition_keys, mode='full_snapshot', newest_version=none) %}
   {#-
     `mode` IS THE FEED'S DECLARED SUPERSESSION, not a switch with a
     convenient default. `full_snapshot` -- each delivery restates the whole
-    population for its COB date -- is what this macro has always
-    implemented and what every feed does, and it was implemented without ever
-    being stated. Stating it is what lets `supersession:` in feeds.yml refuse
-    a feed this cannot serve, instead of ranking a delta feed as though it
-    were a snapshot and silently dropping every key its newest file omits.
+    population for its COB date -- is the one mode this macro implements and
+    what every feed does. Stating it is what lets `supersession:` in feeds.yml
+    refuse a feed this cannot serve, instead of ranking a delta feed as though
+    it were a snapshot and silently dropping every key its newest file omits.
 
     The other two modes are validated at load in
     `context.resolve_supersession_config` and rejected there with a reason;
     this is the second line of defence, for a model written by hand with a
     mode nothing checked.
+
+    1 FOR EXACTLY ONE ROW PER KEY OF THE NEWEST DELIVERY, NULL FOR EVERY ROW
+    OF AN OLDER ONE. Callers keep `where _rn = 1`.
+
+    THIS USED TO PARTITION BY (_cob_date, <business keys>) alone, which selects
+    the newest version of each KEY rather than the newest FILE: a key the
+    newest delivery omitted kept its row from the delivery that one replaced.
+    Every statement of intent said newest file, so the macro was wrong. The
+    gate on `_file_version` is the fix; the ROW_NUMBER inside it is only the
+    in-file dedupe, which is why it partitions by `_file_version` as well.
+
+    `newest_version` IS WHERE "NEWEST" IS DECIDED, and the default is correct
+    under one condition only: every COB date the enclosing query keeps, it
+    keeps WHOLE. The default is a window over the rows the query's WHERE has
+    already admitted -- so it is computed after `known_as_of()`, which is the
+    point (an as-of build must rank against the deliveries that existed at its
+    knowledge time), and after `incremental_window()`, which admits whole
+    dates. A query that keeps only SOME keys of a date -- the SCD2 models'
+    `touched` join -- would find the newest version among those keys' rows
+    only, and a date whose touched keys were all dropped by the newest
+    delivery would keep the old one. Such a query passes
+    `newest_version='<alias>._newest_file_version'`, joined from
+    `newest_file_version()` below, which reads raw unjoined.
   -#}
   {%- if mode != 'full_snapshot' -%}
     {{ exceptions.raise_compiler_error(
@@ -309,11 +341,43 @@
          ~ "context.SUPERSESSION_NOT_BUILT for what each other mode would "
          ~ "require.") }}
   {%- endif -%}
-  ROW_NUMBER() OVER (
-    PARTITION BY _cob_date,
+  CASE WHEN _file_version = {% if newest_version is none -%}
+      MAX(_file_version) OVER (PARTITION BY _cob_date)
+    {%- else -%}
+      {{ newest_version }}
+    {%- endif %}
+  THEN ROW_NUMBER() OVER (
+    PARTITION BY _cob_date, _file_version,
       {%- for k in partition_keys %} {{ ident(k) }}{{ ',' if not loop.last }}{% endfor %}
-    ORDER BY _file_version DESC, _row_number DESC
-  )
+    ORDER BY _row_number DESC
+  ) END
+{% endmacro %}
+
+
+{% macro newest_file_version(source_relation) %}
+  {#-
+    The newest delivery per COB date, as a CTE named `newest_file_version`
+    with columns `_newest_cob_date` and `_newest_file_version`. Emits a
+    TRAILING COMMA, like `scd2_incremental_scope`.
+
+    For a query whose rows for a date are a SUBSET of that date's keys -- see
+    `newest_version` on `dedupe_rank` above. Filtered by `known_as_of()` and by
+    nothing else: not by the lookback window and not by `touched`, because
+    which delivery is newest for a date does not depend on which keys this run
+    happens to be replaying.
+
+    The columns are prefixed so that joining this cannot make `_cob_date` or
+    `_file_version` ambiguous in the query that ranks.
+  -#}
+  newest_file_version as (
+
+      select _cob_date          as _newest_cob_date,
+             max(_file_version) as _newest_file_version
+      from {{ source_relation }}
+      where {{ known_as_of() }}
+      group by _cob_date
+
+  ),
 {% endmacro %}
 
 {#

@@ -240,6 +240,16 @@ to run something for the first time, expect it to fail and read what it says.
   `correction` raise NOT_BUILT at load. The value is the REFUSAL — a delta feed
   deduped as a snapshot silently loses every key its newest file omits.
   (`#supersession-is-declared-not-assumed`)
+- **`full_snapshot`: the newest DELIVERY restates its whole COB date, so a key
+  it omits is ABSENT.** `dedupe_rank` used to rank per KEY and kept dropped
+  keys, uniqueness test green. It gates on the newest `_file_version` per date
+  now, and the cob_date-partitioned models are `insert_overwrite`, because a
+  MERGE never deletes. That is safe only for a select returning each date
+  WHOLE: a query keeping some keys of a date (SCD2's `touched`) passes
+  `newest_version=` and stays `merge`. The newest file is load-bearing — a
+  truncated re-delivery wipes its date, and `expected_min_rows` and
+  `delivery.control` `row_count` are the guards.
+  (`#a-snapshot-re-delivery-restates-the-whole-date`)
 - **As-of is a var, not a second model**: the same models with `--vars
   '{knowledge_time: ...}'`, filtered by `known_as_of()`. It compiles to
   `1 = 1` when unset and **refuses an incremental run**, because merging as-of
@@ -379,10 +389,10 @@ them.
   `tests/test_value_checks.py` asserts each from both sides.
 - **`.github/workflows/config.yml` is the cheap tier**: `config check` +
   `python -m tests.run` on a bare runner, ~10s.
-  Its dependency set (pyyaml, ruamel.yaml, requests, duckdb) was DERIVED BY
-  RUNNING IT in a clean virtualenv, not read off the imports — `test_sniff`
-  imports duckdb at module level and its absence aborts the whole run with no
-  summary line.
+  Its dependency set (pyyaml, ruamel.yaml, requests, duckdb, jinja2) was
+  DERIVED BY RUNNING IT in a clean virtualenv, not read off the imports —
+  `test_sniff` imports duckdb and `test_dedupe_rank` jinja2 at module level,
+  and either missing aborts the whole run with no summary line.
 - **`.github/workflows/parse.yml` is the tier above, and it is SEPARATE so the
   cheap one stays cheap**: the image's pins installed with pip (~2–3 min),
   then `dbt --version`, `dbt deps`, `dbt parse` and

@@ -183,7 +183,7 @@ Copy the nearest existing model rather than starting blank —
 skeleton is fixed and the three macro calls are not optional:
 
 ```sql
-{{ config(materialized='incremental', unique_key=['cob_date','margin_call_id'],
+{{ config(materialized='incremental', incremental_strategy='insert_overwrite',
           partition_by=['cob_date'], tags=['prepared','reference']) }}
 
 with raw_rows as (
@@ -213,8 +213,14 @@ select * from cleaned
   the build fails with `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY`. It only
   fires on the *incremental* path, so a first build against a fresh branch
   will not show it — the first build after publishing to `main` will.
-- **`dedupe_rank(business_key)` is what picks the latest `_file_version`.**
-  Omit it and a re-delivery doubles the rows.
+- **`dedupe_rank(business_key)` is what picks the newest delivery for each
+  COB date** — all of it, so a key that delivery omits is gone. Omit it and a
+  re-delivery doubles the rows.
+- **`incremental_strategy='insert_overwrite'` is what makes "gone" true on an
+  incremental run.** A merge never deletes a row it merged before. The
+  overwrite replaces each COB date the select returns, whole — so keep the
+  select filtering raw by date only. See
+  [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 - **`partition_by=['cob_date']` is a retention requirement, not a
   performance one.** Without it retention deletes become full-table rewrites.
 - **Use `safe_cast` (`TRY_CAST`), never a bare `CAST`.** A bad value must land
@@ -254,7 +260,9 @@ no tests builds green forever and publishes whatever it is given.
 At minimum: `not_null` on the business key, a
 `unique_combination_of_columns` on `[cob_date, <business_key>]`, and a
 `relationships` test on any foreign key. The uniqueness test is what proves
-`dedupe_rank` is doing its job — without it a broken dedupe is invisible.
+the in-file dedupe is doing its job — without it a repeated key is invisible.
+It cannot see a key a re-delivery dropped surviving, because uniqueness holds
+either way; `tests/test_dedupe_rank.py` is what pins that.
 
 Use `severity: warn` for a test that flags something to investigate rather
 than something that should block publication (see `rating.rating_rank`).

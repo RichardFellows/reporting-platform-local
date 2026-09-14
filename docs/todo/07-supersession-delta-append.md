@@ -2,13 +2,17 @@
 
 **Value** high, if a delta feed is real · **Effort** multi-day · **Branch** `feat/supersession-delta-append`
 
-> **Read [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) first.** Verified
-> 2026-09-14: `dedupe_rank` partitions by `(_cob_date, business key)`, so it
-> already keeps a key the newest delivery omits — the union-per-COB-date
-> behaviour this item describes building. The failure quoted below, "a delta
-> feed deduped as a snapshot silently loses every key its newest file omits",
-> is not one the macro as written can produce. What this item should ask for
-> depends on what 09 decides; nothing below has been rewritten to match yet.
+> **09 decided the macro was wrong, and this item's premise stands.** 09 found
+> `dedupe_rank` partitioning by `(_cob_date, business key)`, which kept a key
+> the newest delivery omitted and made the failure quoted below, "a delta feed
+> deduped as a snapshot silently loses every key its newest file omits",
+> impossible. The owner's decision was that `full_snapshot` means what it
+> says: the rank now selects the newest delivery per COB date, and the
+> date-partitioned models overwrite each date they rebuild, so a delta feed
+> ranked as a snapshot DOES lose those keys again. Read
+> [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
+> before starting: it names the `insert_overwrite` precondition (each date
+> returned whole) that a union ranking would have to keep.
 
 ## What exists now
 

@@ -210,7 +210,6 @@ def _select_expression(column: str, kind: str) -> str:
 
 def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
     key_list = ", ".join(f"'{c}'" for c in spec.business_key)
-    unique_key = ", ".join(f"'{c}'" for c in ["cob_date", *spec.business_key])
     tag = "reference" if len(spec.business_key) == 1 else "transactional"
 
     # `source_provenance()` goes in beside `audit_columns()` below rather than
@@ -239,10 +238,16 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
                      + [_line("_source_file", "source_file"),
                         _line("_file_version", "source_file_version")])
 
+    # `insert_overwrite` and no `unique_key`: an incremental run rewrites each
+    # COB date it selects, whole, so a key a snapshot re-delivery dropped is
+    # gone rather than merged around. The template's select admits raw by date
+    # alone, which is the condition that makes that safe -- a scaffolded model
+    # later given a key-scoped filter must go back to thinking about this.
+    # See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
     return f"""{{{{
   config(
     materialized='incremental',
-    unique_key=[{unique_key}],
+    incremental_strategy='insert_overwrite',
     partition_by=['cob_date'],
     tags=['prepared', '{tag}']
   )
@@ -330,10 +335,12 @@ def write_tests(spec: FeedSpec, existing_models: set[str]) -> Step:
         "columns", indent=4,
         before=("SCAFFOLDED MINIMUM: not_null on the business key, uniqueness\n"
                 "over [cob_date, <business key>], and relationships on any\n"
-                "foreign key. That is enough to prove dedupe_rank works and that\n"
-                "references resolve -- it is NOT enough to prove the values are\n"
-                "right. Add accepted_values / accepted_range for this feed's\n"
-                "domain, or it will publish whatever it is given."))
+                "foreign key. Uniqueness proves the in-file dedupe left one row\n"
+                "per key. It cannot see a key a re-delivery dropped surviving --\n"
+                "uniqueness holds either way; tests/test_dedupe_rank.py pins that.\n"
+                "None of it proves the values are right. Add accepted_values /\n"
+                "accepted_range for this feed's domain, or it will publish\n"
+                "whatever it is given."))
 
     cols = CommentedSeq()
     bd = CommentedMap()
