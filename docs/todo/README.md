@@ -114,7 +114,7 @@ over the same raw (the post-retraction one on the second branch). A throwaway
 `when matched then update set *` and the right rows, so the override
 delegates. `main`'s hash was the same before and after, and neither branch
 survived. **Not run live:** `ref_rating` (same macros, host-tested) and the
-three reporting models. **That run predates the two fixes below** and
+three reporting models. **That run predates the two fixes below** (both re-run live further down) and
 exercised neither.
 
 *A final review then found two medium defects in the SCD2 fix*, both
@@ -177,7 +177,37 @@ first:
 - **`scd2_incremental_scope` was still named** in `_prepared.yml` and two older
   DECISIONS entries; all now say `scd2_replay`.
 
-LIVE-VERIFY-2: the fixes from both reviews above have not been run on a Nessie branch; replace this sentence with what that run showed before merging.
+*Both reviews' fixes verified live* on `a5cc128`, five throwaway Nessie
+branches, `ref_counterparty`, every build incremental unless it says full
+refresh:
+
+- **The first sequence again** (the retraction, B's return): the same states
+  as before, 9/9 dbt tests, IDENTICAL to a full refresh at both steps.
+- **The version before the replay start** (B: V 06-01, W 07-01, X 08-03,
+  Y 09-02; then 08-03 re-delivered without B): W reopened to 07-01 → 08-31,
+  X re-dated to 09-01 → 09-01, V untouched, Y open — IDENTICAL to a full
+  refresh.
+- **A padded key** (`B` on 08-03, ` B` after; 09-02 re-delivered without it;
+  ` B` back on 09-03): only `[A, a, 08-03, open]` and `[B, X, 08-03, open]`
+  at both steps, IDENTICAL to a full refresh.
+- **Two spellings in one file, and a key that cleans to NULL:** 09-02's `B`
+  then ` B` gave ONE 09-02 version, the later row's `Z`, and Spark accepted
+  the MERGE; an `N/A` row on 09-03 appeared as a NULL-key version, was
+  MATCHED rather than re-inserted on 09-04, and closed when a 09-04
+  re-delivery changed its value. dbt's log shows `is not distinct from` in
+  the replay's joins and in the MERGE's `on`. IDENTICAL to a full refresh.
+  `not_null_ref_counterparty_counterparty_id` failed with 2 rows on the
+  incremental table, as intended.
+
+`main`'s hash was the same before and after, and no branch survived.
+
+**One thing the procedure did not predict:** on that last branch
+`mutually_exclusive_ranges` failed too, with 1 row. It is not this change:
+dbt_utils' test defaults to `zero_length_range_allowed: false`, which
+requires `effective_from < effective_to` strictly, and this project's
+`effective_to` is inclusive, so any value in force for exactly one COB date
+(`Q`, 09-03 → 09-03) is refused. The full refresh over the same raw is
+identical, so it fails there too. Filed as its own item.
 
 One thing the run found that the host tests could not: the procedure's first
 seeding helper built rows with `createDataFrame`, which needs Python workers

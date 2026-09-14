@@ -4472,4 +4472,9 @@ on Spark against Iceberg on a Nessie branch.
 >
 > That run predates two fixes the final review then required, to the version
 > before the replay start and to raw-versus-cleaned keys (the SCD2 section
-> above); it did not exercise either.
+> above); it did not exercise either. A third run, on the final code, did:
+> retracting the version the replay starts from reopened the one before it,
+> a padded raw key retracted like a clean one, two spellings of one key in a
+> file gave one version and a MERGE Spark accepted, and a key that cleans to
+> NULL was versioned, matched on the next run and closed -- each state
+> identical to a full refresh over the same raw.
