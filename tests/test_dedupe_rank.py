@@ -126,8 +126,10 @@ def _macro_modules(env, context):
 
 
 def _context(*, incremental=False, this="this_table", knowledge_time=None,
-             config=None, adapter=None, dbt=None):
-    variables = {"knowledge_time": knowledge_time, "lookback_days": 3}
+             config=None, adapter=None, dbt=None,
+             invocation_id="test-invocation", nessie_ref=None):
+    variables = {"knowledge_time": knowledge_time, "lookback_days": 3,
+                 "nessie_ref": nessie_ref}
     return dict(
         var=lambda name, default=None: (variables[name] if name in variables
                                         and variables[name] is not None
@@ -137,7 +139,7 @@ def _context(*, incremental=False, this="this_table", knowledge_time=None,
         exceptions=_Exceptions(),
         modules=_Modules(),
         dbt=dbt or _Dbt(),
-        invocation_id="test-invocation",
+        invocation_id=invocation_id,
         **{"return": _return},
         config=config if config is not None else _Config({}),
         adapter=adapter,
@@ -154,12 +156,15 @@ class _Config(dict):
 
 def _render(template_text: str, *, incremental: bool = False,
             this: str = "this_table", knowledge_time: str | None = None,
-            config: "_Config | None" = None, adapter=None) -> str:
+            config: "_Config | None" = None, adapter=None,
+            invocation_id: str = "test-invocation",
+            nessie_ref: str | None = None) -> str:
     """Render a model (or any text using the project macros) as dbt would."""
     config = config if config is not None else _Config({})
     context = _context(incremental=incremental, this=this,
                        knowledge_time=knowledge_time, config=config,
-                       adapter=adapter)
+                       adapter=adapter, invocation_id=invocation_id,
+                       nessie_ref=nessie_ref)
     env = _environment()
     model_globals = dict(context, **_macro_modules(env, context))
     model_globals.update(
