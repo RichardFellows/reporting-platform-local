@@ -251,7 +251,9 @@ def _inverted(con, table, keys):
 
 
 def _overlaps(con, table, keys):
-    on = " and ".join(f"a.{k} = b.{k}" for k in keys)
+    # NULL-safe, like the models' own key match: a key that cleans to NULL is
+    # one key, and `=` would hide its overlapping versions from this check.
+    on = " and ".join(f"a.{k} is not distinct from b.{k}" for k in keys)
     return con.execute(
         f"select a.{keys[0]}, a.effective_from::varchar, b.effective_from::varchar "
         f"from {table} a join {table} b on {on} and a.effective_from < b.effective_from "
