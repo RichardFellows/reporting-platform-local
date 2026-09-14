@@ -445,41 +445,148 @@
 
 {% macro scd2_incremental_scope(source_relation, key_columns) %}
   {#
-    The two CTEs every SCD2 model needs on its incremental path, so the logic
+    The CTEs every SCD2 model needs on its incremental path, so the logic
     exists once rather than once per reference table.
 
-    `replay_from` IS THE LOAD-BEARING HALF. A touched entity's currently-open
-    version can have begun months or years before the lookback window, and the
-    whole of it must be re-derived for lead() to see the new value and CLOSE
-    it. Replaying only the last few COB dates appends a new version and
-    leaves the previous one still claiming effective_to = 9999-12-31 -- two
-    versions in force at once, which as_of() then matches BOTH of, silently
-    doubling every joined row. The mutually_exclusive_ranges test is what
-    catches that, and is not optional on any table using this.
+    `scd2_window` is where this run's lookback starts: the newest version's
+    effective_from, less `lookback_days`. `touched` is every key raw carries
+    on or after it, in ANY delivery -- deliberately not ranked, so a key the
+    newest delivery dropped is still touched and can have its version
+    retracted.
+
+    `replay_from` IS THE LOAD-BEARING HALF, and it is the version in force
+    when the window STARTS, not the current one. Two things depend on that:
+
+      * CLOSING. A touched entity's version in force can have begun months or
+        years before the window, and the whole of it must be re-derived for
+        lead() to see a new value and close it. Replaying only the last few
+        COB dates appends a new version and leaves the previous one claiming
+        effective_to = 9999-12-31 -- two versions in force at once, which
+        as_of() matches BOTH of, silently doubling every joined row.
+      * REOPENING. Every version that began inside the window came from a
+        delivery that may since have been replaced, and when the newest
+        delivery drops or reverts that change the version must go and the
+        one before it must be open again. So the replay starts at the last
+        version that began BEFORE the window, re-emitting it with its range
+        recomputed; with no such version it starts at the beginning of the
+        key's history in raw. It used to start at the current version, which
+        cannot reopen anything, and a retracted version stayed current.
+
+    Re-deriving is not enough to remove a version, because nothing re-derived
+    matches it. `scd2_retractions` emits a marker row for it, and the merge
+    in macros/merge.sql deletes on the marker.
+    See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
+
+    ASSUMES raw still holds every COB date from each key's replay start
+    onward, as the current-version replay always did.
+
+    The mutually_exclusive_ranges and scd2_exactly_one_current_version tests
+    are what catch a replay that got this wrong, and are not optional on any
+    table using this.
   #}
   {%- set keys = [] -%}
   {%- for c in key_columns %}{%- do keys.append(ident(c)) %}{%- endfor -%}
   {%- set keys = keys | join(', ') -%}
+  scd2_window as (
+
+      select coalesce(max(effective_from), date '1900-01-01')
+             - interval {{ var('lookback_days', 3) }} day as window_start
+      from {{ this }}
+
+  ),
+
   touched as (
 
       select distinct {{ keys }}
       from {{ source_relation }}
-      where _cob_date >= (
-          select coalesce(max(_inc.effective_from), date '1900-01-01')
-                 - interval {{ var('lookback_days', 3) }} day
-          from {{ this }} as _inc
-      )
+      where _cob_date >= (select window_start from scd2_window)
 
   ),
 
   replay_from as (
 
-      select {{ keys }}, min(effective_from) as from_date
-      from {{ this }}
-      where is_current
+      {#- NULL when every version of the key began inside the window: the
+          callers read that as "from the beginning". A CROSS JOIN rather than
+          a scalar subquery inside the aggregate, which is not something to
+          ask of Spark's analyser when a join says the same thing. -#}
+      select {{ keys }},
+             max(case when _v.effective_from < w.window_start
+                      then _v.effective_from end)                  as from_date
+      from {{ this }} as _v
+      cross join scd2_window as w
       group by {{ keys }}
 
   ),
+{% endmacro %}
+
+
+{% macro scd2_retracted() -%}
+  {#- The effective_to that marks a row as a RETRACTION rather than a version:
+      `scd2_retractions` writes it and the merge deletes on it. A date no real
+      range can end on, so it can never be a real version's value. -#}
+  DATE '0001-01-01'
+{%- endmacro %}
+
+
+{% macro scd2_output_columns(business_columns) %}
+  {#-
+    The column ORDER of an SCD2 model's output, defined once: the business
+    columns, the delivery the value first appeared in, the provenance and
+    audit columns, then what `scd2_columns` appends. `ranged` projects it and
+    `scd2_retractions` unions against it POSITIONALLY -- Spark 3.5 has no
+    UNION BY NAME -- so the two must not be able to disagree.
+  -#}
+  {%- set cols = business_columns + ['source_file', 'source_file_version'] -%}
+  {%- for alias, _expression in provenance_pairs() %}{% do cols.append(alias) %}{% endfor -%}
+  {%- do cols.extend(['source_batch_id', 'dbt_invocation_id', 'nessie_ref', 'dbt_updated_at']) -%}
+  {{ return(cols) }}
+{% endmacro %}
+
+
+{% macro scd2_retractions(final_cte, key_columns, business_columns) %}
+  {#-
+    On the incremental path: one MARKER row per version in the target that
+    this run's replay covers and did not re-derive -- a version whose source
+    delivery has since been replaced by one that drops or reverts it. The
+    merge (macros/merge.sql) deletes the matching target row; on a full
+    refresh nothing renders, because nothing is in a target to retract.
+
+    Only the key, effective_from and the `scd2_retracted()` marker are real
+    values. Every other column is NULL, and read from nothing: a column the
+    model has just gained is not in the target yet when this is analysed
+    (on_schema_change adds it after the temporary view exists), so reading
+    one from `this` would fail the first run after it was added.
+
+    The scope is exactly the replay's: touched keys, from `replay_from`
+    onward. A version before a key's replay start is never retracted, and a
+    key not touched is never read.
+  -#}
+  {%- if is_incremental() %}
+  union all
+
+  select
+    {%- for c in scd2_output_columns(business_columns)
+                 + ['effective_from', 'effective_to', 'is_current', 'effective_from_month'] %}
+    {% if c in key_columns or c == 'effective_from' -%}
+      _old.{{ ident(c) }}
+    {%- elif c == 'effective_to' -%}
+      {{ scd2_retracted() }}
+    {%- else -%}
+      null
+    {%- endif %}                                            as {{ ident(c) }}{{ ',' if not loop.last }}
+    {%- endfor %}
+  from {{ this }} as _old
+  join touched as _t
+    on {% for c in key_columns %}_t.{{ ident(c) }} = _old.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor %}
+  left join replay_from as _p
+    on {% for c in key_columns %}_p.{{ ident(c) }} = _old.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor %}
+  where _old.effective_from >= coalesce(_p.from_date, date '1900-01-01')
+    and not exists (
+        select 1 from {{ final_cte }} as _new
+        where {% for c in key_columns %}_new.{{ ident(c) }} = _old.{{ ident(c) }} and {% endfor -%}
+              _new.effective_from = _old.effective_from
+    )
+  {%- endif %}
 {% endmacro %}
 
 

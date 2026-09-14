@@ -2,6 +2,7 @@
   config(
     materialized='incremental',
     incremental_strategy='merge',
+    scd2_retractions=true,
     unique_key=['counterparty_id', 'agency', 'effective_from'],
     partition_by=['effective_from_month'],
     tags=['prepared', 'reference', 'scd2']
@@ -123,29 +124,25 @@ versioned as (
 
 {{ scd2_changes('versioned', ['counterparty_id', 'agency']) }}
 
+{% set business_columns = ['counterparty_id', 'agency', 'rating', 'rating_date', 'outlook', 'rating_rank', 'grade_band'] %}
+
 ranged as (
 
     select
-        counterparty_id,
-        agency,
-        rating,
-        rating_date,
-        outlook,
-        rating_rank,
-        grade_band,
-
-        source_file,
-        source_file_version,
-        {{ source_provenance_columns() }}
-        source_batch_id,
-        dbt_invocation_id,
-        nessie_ref,
-        dbt_updated_at,
-
+        {%- for c in scd2_output_columns(business_columns) %}
+        {{ ident(c) }},
+        {%- endfor %}
         {{ scd2_columns(['counterparty_id', 'agency']) }}
 
     from kept
 
 )
 
+{#
+  On an incremental run, plus one marker row per version this replay
+  covers and no longer derives -- a change a re-delivery dropped or
+  reverted. The merge deletes those (macros/merge.sql); without them it
+  would leave the retracted version current.
+#}
 select * from ranged
+{{ scd2_retractions('ranged', ['counterparty_id', 'agency'], business_columns) }}

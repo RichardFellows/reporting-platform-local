@@ -335,11 +335,13 @@ def test_as_of_after_the_redelivery_matches_the_ordinary_build():
 def _scd2_case(con, keys: list[str]):
     """The shape that defeats a window over the JOINED rows.
 
-    On D1, v1 carries A and B and v2 carries only A. `this` says A's open
-    version began on D2 and B's long before, so `replay_from` excludes A's D1
-    rows and keeps B's: the rows the incremental query sees for D1 are B's v1
-    rows ONLY. The newest version among those is 1, so a rank computed over
-    them keeps B on D1 -- the delivery v2 replaced.
+    On D1, v1 carries A and B and v2 carries only A. `this` holds A from D2
+    and again from 09-10 (current), and B from 06-01, so the lookback window
+    starts 09-07 and each key replays from its last version before that: A
+    from D2, B from 06-01. The rows the incremental query sees for D1 are
+    therefore B's v1 rows ONLY. The newest version among those is 1, so a rank
+    computed over them keeps B on D1 -- the delivery v2 replaced. 09-08 puts
+    both keys inside the window, so both are touched.
     """
     extra_cols = ", ".join(f"'{k}X' as {k}" for k in keys[1:])
     con.execute(f"""
@@ -352,14 +354,17 @@ def _scd2_case(con, keys: list[str]):
           ('{D1}', 1, 2, 'B', '2026-09-02 06:00'),
           ('{D1}', 2, 1, 'A', '2026-09-03 06:00'),
           ('{D2}', 1, 1, 'A', '2026-09-03 06:00'),
-          ('{D2}', 1, 2, 'B', '2026-09-03 06:00')
+          ('{D2}', 1, 2, 'B', '2026-09-03 06:00'),
+          ('2026-09-08', 1, 1, 'A', '2026-09-09 06:00'),
+          ('2026-09-08', 1, 2, 'B', '2026-09-09 06:00')
         ) t(_cob_date, _file_version, _row_number, k, _ingest_ts)
     """)
     con.execute(f"""
         create or replace table this_table as
-        select effective_from::date as effective_from, true as is_current,
+        select effective_from::date as effective_from, is_current,
                k as {keys[0]} {',' if extra_cols else ''} {extra_cols}
-        from (values ('{D2}', 'A'), ('2026-06-01', 'B')) t(effective_from, k)
+        from (values ('{D2}', 'A', false), ('2026-09-10', 'A', true),
+                     ('2026-06-01', 'B', true)) t(effective_from, k, is_current)
     """)
 
 
@@ -376,7 +381,8 @@ def test_scd2_incremental_path_drops_a_key_the_newest_delivery_omitted():
                    f"from deduped order by 1, 2")
         assert (D1, "B", 1) not in got, (name, got)
         # A's D1 rows are before its replay_from, so D1 contributes nothing.
-        assert got == [(D2, "A", 1), (D2, "B", 1)], (name, got)
+        assert got == [(D2, "A", 1), (D2, "B", 1),
+                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
 
 
 def test_scd2_full_refresh_path_agrees():
@@ -389,7 +395,8 @@ def test_scd2_full_refresh_path_agrees():
         got = _run(con, _render(text), "deduped",
                    f"select _cob_date::varchar, {keys[0]}, _file_version "
                    f"from deduped order by 1, 2")
-        assert got == [(D1, "A", 2), (D2, "A", 1), (D2, "B", 1)], (name, got)
+        assert got == [(D1, "A", 2), (D2, "A", 1), (D2, "B", 1),
+                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
 
 
 def test_scd2_as_of_decides_newest_among_what_was_known():
