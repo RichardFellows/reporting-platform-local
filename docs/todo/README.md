@@ -12,13 +12,26 @@ item that no longer reproduces should be deleted rather than worked.
 |---|---|---|---|
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
 | [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
+| [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
+| [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
+| [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
+| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high once 09 lands | 2–4 hours |
+| [16](16-exposure-change-removed-never-fires.md) | `exposure_change`'s `'REMOVED'` category can never be assigned | medium | ½ day |
+| [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
+| [18](18-adding-a-feed-sample-model-is-missing-macros.md) | The sample prepared model in `ADDING-A-FEED.md` misses `known_as_of()` and `source_provenance()` | low–medium | 30 min |
+| [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 
 ## Where to start
 
 **09 first.** It is a correctness defect in the one supersession mode that is
 built, and its answer decides what 07 is asking for — do not start 07 before
-it. It opens with a decision, not an edit. It is also the only item left
-that does not wait on another.
+it. It opens with a decision, not an edit.
+
+**12–19** were found working 08–10 and each was reproduced before it was
+written down. **15** is the one to take next after 09: under 09's decision the
+newest `_file_version` decides a whole COB date, and 15 is how a version gets
+mis-numbered. **16** and **18** should be re-read once 09 merges, since it
+changes the models they describe. The rest are independent.
 
 ## Done
 
