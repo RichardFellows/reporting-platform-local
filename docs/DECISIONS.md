@@ -2082,11 +2082,12 @@ When pairs are found, the control members leave both the sniffed-member choice
 and `member_pattern_candidate` -- the data members that HAVE a control file are
 the evidence for the pattern, and having no extension is a shape of its own:
 `[^.]+` for `POSA`/`POSB`, the same guess `.*\.csv` is and unable to claim
-`POSA.ctl`. Ties are decided by the counts, never by where a name sorts: the
-extensionless shape sharing the top count with anything is None (said in the
-note), because the two patterns claim disjoint members and either would drop
-the rest; two extensions tied get what the unpaired rule gives the same
-members, so pairing cannot change a proposal about something else.
+`POSA.ctl`. The extensionless shape sharing the top count with anything is
+None whatever order the names come in (said in the note), because the two
+patterns claim disjoint members and either would drop the rest. Two
+EXTENSIONS tied get what the unpaired rule gives the same members -- which
+does follow name order, as it always has -- so pairing cannot change a
+proposal about something else.
 `member_control` carries:
 
 * **`pattern`**, the one `{stem}...` every pair fits, checked the way the gate
@@ -2105,12 +2106,14 @@ members, so pairing cannot change a proposal about something else.
   sender means decides what every field names, and the bytes do not say, so
   `format_ambiguous` is set, `format` and `field_candidates` stay empty, and
   `field_candidates_by_reading` gives the evidence under each. Only a
-  two-column table can be ambiguous, since a key/value line has two cells, and
-  only when every line's key/value separator IS the table's delimiter.
-  `A=1,B=2` over `C=3,D=4` is a comma table and `=` lines, not one set of
-  cells read two ways, and the text reading survives: the table's header would
-  be `A=1` and its values `C=3`, under which no field is ever a number or a
-  date.
+  two-column table can be ambiguous, since a key/value line has two cells.
+  Where the key/value separator is not the table's delimiter, the table
+  reading is dropped only if NO field can be read under it -- measured, not
+  inferred from the shape: `A=1,B=2` over `C=3,D=4` has header `A=1` and
+  values `C=3`, nothing readable, so the text reading is the only one; but
+  `Time:UTC|Rows` over `T08:00|3` is a `:` line and a `|` table whose `Rows`
+  is the member's row count, and stays ambiguous, worded from the text
+  reading's own separator.
   Control files are decoded with the proposal's `file_encoding`, as the gate
   decodes them with the feed's.
 * **`field_candidates`**, evidence rather than choices. `row_count` and `md5`

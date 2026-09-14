@@ -439,18 +439,14 @@ def _control_readings(texts: list[str]) -> list[tuple[dict | None, list[dict[str
     ways, which one the sender means decides what every field names, and
     nothing in the files says -- so the caller proposes no format.
 
-    Two narrowings, each because the second "reading" was a regex being
-    permissive rather than the same bytes read another way:
+    Only a TWO-column table can be that. A KEY|VALUE line has exactly two
+    cells, so `FEED|BUSINESS_DATE|RECORD_COUNT` "matching" as key FEED with
+    value `BUSINESS_DATE|RECORD_COUNT` is not a key/value line.
 
-    * Only a TWO-column table. A KEY|VALUE line has exactly two cells, so
-      `FEED|BUSINESS_DATE|RECORD_COUNT` "matching" as key FEED with value
-      `BUSINESS_DATE|RECORD_COUNT` is not a key/value line.
-    * Only where every line's key/value separator IS the table's delimiter.
-      `A=1,B=2` over `C=3,D=4` is a comma table AND `=` lines, but those are
-      not the same cells read two ways -- and the TEXT reading survives: the
-      table's "header" is `A=1` and its values `C=3`, so no field could ever
-      be a number or a date under it, while a text-format regex can read any
-      of the four. A format under which nothing is readable is not a reading.
+    Where the key/value separator is NOT the table's delimiter (`A=1,B=2`
+    over `C=3,D=4`), both readings are still returned: whether the table one
+    is worth anything depends on whether a field can be read under it, which
+    only `_member_control` can measure -- see there.
     """
     lines = [[ln for ln in t.splitlines() if ln.strip()] for t in texts]
     if not all(lines):
@@ -459,9 +455,6 @@ def _control_readings(texts: list[str]) -> list[tuple[dict | None, list[dict[str
     text = _text_reading(lines)
     if table is not None and len(table[1][0]) > 2:
         return [table]
-    if table is not None and text is not None \
-            and _separators(lines) != {table[0]["delimiter"]}:
-        return [text]
     return [r for r in (table, text) if r]
 
 
@@ -597,25 +590,34 @@ def _member_control(zf, names: list[str], pairs: dict[str, str],
     controls = [(c, zf.read(c).decode(encoding, errors="replace"), facts[d])
                 for c, d in sorted(pairs.items())]
     readings = _control_readings([text for _c, text, _f in controls])
-    if len(readings) == 1:
-        fmt, parsed = readings[0]
-        out["format"] = fmt
-        out["field_candidates"] = _control_field_candidates(
-            pattern, fmt, parsed, controls)
-    elif len(readings) == 2:
+    by_reading = {("text" if fmt is None else "delimited"):
+                  {"format": fmt,
+                   "field_candidates": _control_field_candidates(
+                       pattern, fmt, parsed, controls)}
+                  for fmt, parsed in readings}
+    separators = _separators([[ln for ln in text.splitlines() if ln.strip()]
+                              for _c, text, _f in controls])
+    # A SEPARATOR THAT IS NOT THE DELIMITER, AND A TABLE UNDER WHICH NOTHING
+    # IS READABLE, IS NOT A SECOND READING. `A=1,B=2` over `C=3,D=4` "is" a
+    # comma table whose header is `A=1`; no field is a date, a row count or
+    # an md5 under it, so the text reading is the only one. The test is the
+    # measurement, not the shape: `Time:UTC|Rows` over `T08:00|3` is also a
+    # `:` line and a `|` table, and there the table's `Rows` IS the member's
+    # row count -- a real reading, so that one stays ambiguous.
+    if (len(by_reading) == 2
+            and separators != {by_reading["delimited"]["format"]["delimiter"]}
+            and not by_reading["delimited"]["field_candidates"]):
+        del by_reading["delimited"]
+    if len(by_reading) == 1:
+        (only,) = by_reading.values()
+        out["format"] = only["format"]
+        out["field_candidates"] = only["field_candidates"]
+    elif len(by_reading) == 2:
         out["format_ambiguous"] = True
-        # Only ever the same cells read two ways -- see `_control_readings`
-        # -- so the text reading's separator IS the table's delimiter; it is
-        # recorded from the text reading itself, and the note words it so.
-        out["key_value_separator"] = sorted(_separators(
-            [[ln for ln in text.splitlines() if ln.strip()]
-             for _c, text, _f in controls]))[0]
-        out["field_candidates_by_reading"] = {
-            ("text" if fmt is None else "delimited"):
-                {"format": fmt,
-                 "field_candidates": _control_field_candidates(
-                     pattern, fmt, parsed, controls)}
-            for fmt, parsed in readings}
+        # Worded from the text reading's OWN separator(s), which need not be
+        # the table's delimiter.
+        out["key_value_separator"] = "".join(sorted(separators))
+        out["field_candidates_by_reading"] = by_reading
     return out
 
 

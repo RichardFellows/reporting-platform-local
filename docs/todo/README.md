@@ -86,6 +86,13 @@ uploading counted the tick's `{stem}\.ctl` as a pattern already set, so the
 proposed one reached neither control block. Extensionless member-pattern ties
 depended on name order. And `A=1,B=2` over `C=3,D=4` was reported as an
 ambiguous "KEY,VALUE" table, although its separator is not the delimiter.
+A third review caught that fix going too far: it dropped the table reading
+on the SHAPE of the separator, and `Time:UTC|Rows` over `T08:00|3` -- a `|`
+table whose `Rows` is the member's row count -- lost a real reading with no
+warning. The table is now dropped only when no field can be read under it.
+The orchestrator re-verified the extensionless case end to end as well: a
+probe feed from `POSA`/`POSA.ctl` members saved, and `plan_arrival` planned
+both members dated from their indented control files.
 
 *Found, not fixed.* **`inbox --dry-run` without `--loop` prints `inbox empty`
 with a file in the inbox.** `STABLE_POLLS = 2` needs three observations and

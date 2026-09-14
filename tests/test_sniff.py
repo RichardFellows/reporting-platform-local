@@ -506,6 +506,21 @@ def test_a_separator_that_is_not_the_delimiter_is_not_an_ambiguity():
     assert "KEY|VALUE lines" in genuine["note"], genuine["note"]
 
 
+def test_a_different_separator_stays_ambiguous_when_the_table_reads_a_field():
+    """Third review: the rule that let the text reading win for `A=1,B=2`
+    must MEASURE that nothing is readable under the table, not assume it.
+    `Time:UTC|Rows` over `T08:00|3` is a `:` line and a `|` table whose
+    `Rows` is the member's row count -- a real reading, silently discarded
+    by a shape-only rule."""
+    members = {"A.csv": DAT_A, "A.ctl": "Time:UTC|Rows\nT08:00|2\n"}
+    mc = sniff.propose_feed("w.zip", _zip(members))["member_control"]
+    assert mc["format_ambiguous"] is True, mc
+    assert mc["field_candidates_by_reading"]["delimited"]["field_candidates"] == {
+        "row_count": ["Rows"]}, mc
+    assert mc["key_value_separator"] == ":", mc
+    assert "KEY:VALUE lines" in mc["note"], mc["note"]
+
+
 # ...and with NO pairs, nothing changes.
 def test_no_pairs_means_no_member_control_and_the_old_proposal():
     """Checked against `main`'s sniffer when this was written, output for
