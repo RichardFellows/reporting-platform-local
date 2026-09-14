@@ -43,7 +43,7 @@ date, so the refusal arrives with nothing on the page having pointed at it.
 It is the form's own default path producing a feed `check_gates_are_coherent`
 refuses — the same class item 02 fixed for dated members, and item 08 fixed
 for member control files (the `member_control` branch fills BOTH blocks).
-This branch was left as it was because it predates both.
+This branch was NOT untouched old code: item 08's review-fix commit `1a8eafd` moved the tick autofill out of `syncArrivalVisibility()` because it produced forms the loader refuses, then wrote the same arrival-only fill back into this branch explicitly, to keep its behaviour unchanged on a branch that item was not about. `newFeed(draft)`'s arrival-only `control: {pattern: ...}` predates both.
 
 ## What done looks like
 

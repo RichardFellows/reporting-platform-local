@@ -15,7 +15,7 @@ item that no longer reproduces should be deleted rather than worked.
 | [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
-| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high once 09 lands | 1–2 hours |
+| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high once 09 lands | 2–4 hours |
 | [16](16-exposure-change-removed-never-fires.md) | `exposure_change`'s `'REMOVED'` category can never be assigned | medium | ½ day |
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
 | [18](18-adding-a-feed-sample-model-is-missing-macros.md) | The sample prepared model in `ADDING-A-FEED.md` misses `known_as_of()` and `source_provenance()` | low–medium | 30 min |

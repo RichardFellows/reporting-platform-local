@@ -1,6 +1,6 @@
 # `next_file_version` treats an unreadable raw table as version 1
 
-**Value** high once 09 lands · **Effort** 1–2 hours · **Branch** `fix/next-file-version-unreadable`
+**Value** high once 09 lands · **Effort** 2–4 hours · **Branch** `fix/next-file-version-unreadable`
 
 ## What is wrong (verified 2026-09-14)
 
@@ -31,28 +31,37 @@ with the delivery it was meant to replace, and a version 2 that already exists
 outranks it — the correction silently loses. Before 09 it could at worst
 reorder per-key winners; after it, it decides which whole file is the date.
 
-A table that does not exist yet (`TABLE_OR_VIEW_NOT_FOUND`, a feed's first
-delivery) is the one failure that legitimately means "version 1" — the same
-three-way split the completeness check already makes (`no data` / `no table` /
-`unreadable`).
+A MISSING table is not the exception either. The one call site
+(`ingest_feed.py`, in the branch ingest) runs `next_file_version` straight
+after `ensure_raw_table` and `ensure_raw_schema` have created and reconciled
+that table on the branch, so by then a `TABLE_OR_VIEW_NOT_FOUND` means a wrong
+ref or a wrong name — also unreadable, not a first delivery.
 
 ## What done looks like
 
-- [ ] `TABLE_OR_VIEW_NOT_FOUND` → 1; any other exception propagates and fails
-      the ingest, naming the table.
-- [ ] A test for each branch (a stand-in `spark.sql` raising each kind), in
-      `tests/`.
-- [ ] Check the other callers of the `_file_version` sequence while there:
-      `_file_version` is `MAX+1` at ingest time, which is only a safe order
-      because the `lakehouse_write` pool has one slot — write that down where
-      the function is, since the pool size is now load-bearing for
-      supersession.
+- [ ] Every exception propagates and fails the ingest, naming the table and
+      the ref. If a caller is ever added that can run before the table
+      exists, it handles that itself.
+- [ ] A test with a stand-in `spark.sql` that raises, asserting the ingest
+      fails rather than writing version 1.
+- [ ] **Concurrent ingests of one COB date get the same version.** Each
+      ingest reads `MAX(_file_version)` on its OWN branch, forked from main,
+      so two in flight at once both compute the same `MAX+1`. Airflow's
+      `lakehouse_write` pool (one slot) serialises the DAG path, but
+      `scripts/bulk_ingest.py` runs ingests in its own subprocesses outside
+      Airflow, where no pool applies — so the invariant is already not
+      guaranteed. After 09 the two files tie. Either make the version
+      allocation safe at merge time, or make `bulk_ingest` refuse to run
+      alongside the DAGs, and write down which; do NOT add a comment
+      claiming the pool guarantees it.
 
 ## Prompt for a new session
 
 ```text
 Read CLAUDE.md, then docs/todo/15-next-file-version-reads-unreadable-as-version-1.md.
 next_file_version's `except Exception: return 1` turns an unreadable table
-into a first delivery. Split "no table" from "unreadable" the way the
-completeness check does, and test both.
+into a first delivery. Make every read failure fail the ingest (the
+one call site runs after the table is created on the branch), test it, and
+decide how concurrent ingests of one COB date are kept from sharing a version
+-- the lakehouse_write pool does not cover scripts/bulk_ingest.py.
 ```
