@@ -614,7 +614,11 @@ extension when there is no existing feed to have declared one already. Only
 `cob_date_from: container` is ever proposed -- `member`/`path` are
 real, described above, and NOT BUILT, and proposing either would suggest a
 value guaranteed to fail at load; `container_has_date` says plainly when
-the container's own name has nothing to source it from.
+the container's own name has nothing to source it from. A container whose members
+carry their own control files (`POS_A.dat` beside `POS_A.ctl`) is proposed as
+the `arrival.archive` shape instead -- the control pattern and format for both
+control blocks, and candidate fields as evidence, never filled in; see
+[DECISIONS.md#the-sniffer](DECISIONS.md#the-sniffer).
 
 **The console side is built**: `feed-ui`'s "Unclaimed deliveries" panel
 lists whatever `inbox` moved to `.rejected/` (`GET /api/unclaimed`,

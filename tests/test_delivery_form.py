@@ -620,3 +620,84 @@ def test_the_form_offers_a_control_block_for_an_archive():
     # the archive branch must fall through to the control block, not return
     assert read.count("return") <= 2, read
     assert "out.control = control" in read, read
+
+
+# ------------------ a sniffed zip of control-gated members fills the form ---
+# `ingest/sniff.py` recognises members that carry their own control files and
+# proposes the `arrival.archive` shape's control half. The form must put it
+# where the loader reads it -- BOTH control blocks, the arrival section, and
+# NOT `delivery.kind: archive`, which never looks inside a container.
+
+
+def _page() -> str:
+    import pathlib
+
+    return (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
+            / "ui" / "static" / "index.html").read_text()
+
+
+def test_the_form_prefills_both_control_blocks_from_a_member_control_proposal():
+    page = _page()
+    # the upload handler...
+    handler = page[page.index("if (r.member_control) {"):]
+    handler = handler[:handler.index("} else if (r.arrival_source_pattern)")]
+    for line in ("hasArrival.checked = true", "arrMemberPattern.value = r.member_pattern_candidate",
+                 'deliveryKind.value = "file"', "arrCtlPattern.value = mc.pattern",
+                 "controlPattern.value = mc.pattern", "memberControlBits(r)"):
+        assert line in handler, (line, handler)
+    # ...and a draft from the unclaimed queue, which builds feedForm's shape
+    draft = page[page.index("if (draft.member_control) {"):]
+    draft = draft[:draft.index("} else if (draft.arrival_source_pattern)")]
+    assert "draft.arrival.control = {pattern: mc.pattern, ...fmt}" in draft, draft
+    assert "draft.delivery = {control: {pattern: mc.pattern, ...fmt}}" in draft, draft
+    # the delivery.kind: archive pre-fill is skipped for this shape
+    assert "if (r.archive_members && !r.member_control)" in page
+    assert "if (draft.archive_members && !draft.member_control)" in page
+    # fields are candidates in the note, never filled in -- no cob_date write
+    assert "field_candidates" not in handler + draft
+
+
+def test_the_payload_a_member_control_proposal_prefills_validates():
+    """What the form posts from a REAL proposal, with the one field the note
+    leaves to a human typed in from its candidates. Through the console's own
+    validate(), which is the loader's resolvers plus check_gates_are_coherent."""
+    import io
+    import zipfile
+
+    from reporting_platform.ingest import sniff
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("POS_A.dat", "position_id,quantity\nP1,10\nP2,20\n")
+        zf.writestr("POS_A.ctl", "DATE=20260831\nROWS=2\n")
+    p = sniff.propose_feed("weekly.zip", buf.getvalue())
+    mc = p["member_control"]
+
+    d, registry = _setup()
+    payload = {
+        "name": "cus_gated", "description": "d", "source_system": "CUS",
+        "filename_pattern": r"cus_gated_(?P<cob_date>\d{8})\.csv",
+        "business_key": ["position_id"], "columns": p["columns"],
+        "arrival": {"source_pattern": p["arrival_source_pattern"],
+                    "control": {"pattern": mc["pattern"]},
+                    "archive": {"member_pattern": p["member_pattern_candidate"]}},
+        "delivery": {"control": {"pattern": mc["pattern"]}},
+    }
+    # as pre-filled, before the human types the COB date: refused, and the
+    # refusal is about the date source -- not about delivery.control
+    try:
+        registry.validate(registry.FeedSpec.from_payload(payload), existing=set())
+    except registry.FeedValidationError as exc:
+        assert "cob_date" in str(exc.errors), exc.errors
+        assert "delivery.control" not in str(exc.errors), exc.errors
+    else:
+        raise AssertionError("expected FeedValidationError")
+
+    payload["arrival"]["control"]["cob_date"] = mc["field_candidates"]["cob_date"][0]
+    spec = registry.FeedSpec.from_payload(payload)
+    registry.validate(spec, existing=set())
+    registry.add(spec)
+    from reporting_platform.common.context import feeds
+    fd = feeds()["cus_gated"]
+    assert fd.arrival["archive"]["member_pattern"] == r".*\.dat", fd.arrival
+    assert fd.delivery["control"]["pattern"] == r"{stem}\.ctl", fd.delivery

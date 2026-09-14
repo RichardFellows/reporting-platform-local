@@ -2050,6 +2050,70 @@ rejects them at load. `_container_has_a_date` reuses
 8-digit run to anchor a group to? — and `propose_feed` reports the answer as
 `container_has_date` rather than proposing a value guaranteed to fail.
 
+### Members that carry their own control files
+
+A container whose members each ship a control file -- `POS_A.dat` beside
+`POS_A.ctl` -- is the `arrival.archive` shape: unpacked at the gate, each
+member its own delivery, dated by its control file
+([#unpacking-happens-at-the-gate](#unpacking-happens-at-the-gate)).
+`delivery.kind: archive` never looks inside the container, so a control file
+per member means nothing there. The sniffer used to have no notion of this and
+got the member pattern right only ALPHABETICALLY: `.csv` sorts before `.ctl`,
+`.dat` and `.txt` do not, and neither does an upper-case `.CTL`, so the control
+file became the member sniffed -- one column named after its first line -- and
+`.*\.ctl` the member pattern proposed.
+
+**Recognised by NAME, never by content.** A control member is a name with a
+suffix in `CONTROL_SUFFIXES` (`ctl`, `trl`, `done`, `ok`, as any extension, so
+`POS_A.ctl.csv` and `POS_A.csv.done` count) that is another member's stem plus
+a dot and more. That is the relation `conform.find_control` reads with
+`{stem}`, so recognising it and proposing `{stem}...` are one rule. Content was
+considered and refused as a classifier: a short key/value or single-row
+delimited file is also exactly what a one-row data delivery for a quiet day
+looks like, and calling a real member a control file would drop it from the
+proposal without a word. An unpaired control-suffixed name (a container-level
+`BATCH.done`) is not claimed. With no pairs the proposal is exactly what it
+was.
+
+When pairs are found, the control members leave both the sniffed-member choice
+and `member_pattern_candidate` -- the data members that HAVE a control file are
+the evidence for the pattern -- and `member_control` carries:
+
+* **`pattern`**, the one `{stem}...` every pair fits, checked the way the gate
+  uses it: each control member fullmatches it with its data member's stem, and
+  no data member matches its stem-as-wildcard form. None when the pairs
+  disagree (`.ctl` for some, `.CTL` for others) -- picking the commoner would
+  leave the rest refused at the gate.
+* **`format`**: `delimited` with its delimiter when every file is one header
+  row over one value row with the same header, else the default text reading.
+  A header cell that is all digits is not a header, which is what keeps
+  `ReportingDate|20260801` over `Rows|2` from reading as a table.
+* **`field_candidates`**, evidence rather than choices. `row_count` and `md5`
+  only where the value EQUALS the paired member's row count or md5 in every
+  pair -- the member's own md5, since under `arrival.archive` each member lands
+  as a plain delivery. `cob_date` wherever every file holds a real yyyyMMdd
+  date. Never `version`, which nothing observable distinguishes from any small
+  integer. **Every candidate is read back through `ingest/control.py`** over
+  every control member and dropped unless it returns the value it came from.
+* `pairs`, `members_without_control` (which the proposed shape would refuse if
+  the member pattern claims them), and a `note` saying plainly that
+  `delivery.control` is required alongside `arrival.control`.
+
+`propose_feed` then moves the container's name to `arrival_source_pattern` (a
+date in it matched, never read) and withdraws `filename_pattern`: under this
+shape the landing pattern names each MEMBER after renaming, and a `\.zip`
+there matches nothing for ever. As for an undated plain file, the landing name
+is the operator's.
+
+**The console fills in structure and notes meaning.** The upload handler and
+`newFeed(draft)` tick Arrival, fill the container pattern, Members to unpack,
+and the control pattern and format into BOTH control blocks -- which the names
+and the files' shape establish, like the member pattern always was. They leave
+every field to the note: which date in a control file is the COB date is the
+business-key problem again, a claim about meaning no measurement makes. The
+pre-filled form is therefore refused until a human types the COB date, and the
+refusal names the date source, not `delivery.control`.
+
 **The console surfaces `inbox/.rejected/`, not a bucket-wide scan.** A
 general "any unclaimed object anywhere" discovery is an unsolved design
 question; what exists is the inbox's own backlog of files `route()` could not
@@ -2119,7 +2183,10 @@ the key, the same mechanism in the other direction. Both asserted in
 archive sniff's `member_pattern_candidate` sets `deliveryKind` to `archive`
 and pre-fills `memberPattern`, in the upload handler and in `newFeed(draft)`,
 which builds the `f?.delivery` shape `feedForm` expects from the proposal's
-flatter fields.
+flatter fields. A sniff that found members with their own control files fills
+the arrival section and both control blocks instead, and leaves `deliveryKind`
+at plain file -- see
+[#the-sniffer](#the-sniffer)'s section on member control files.
 
 ## the-inbox-is-the-conformance-gate
 
