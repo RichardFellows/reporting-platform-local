@@ -358,7 +358,7 @@
   {#-
     The newest delivery per COB date, as a CTE named `newest_file_version`
     with columns `_newest_cob_date` and `_newest_file_version`. Emits a
-    TRAILING COMMA, like `scd2_incremental_scope`.
+    TRAILING COMMA, like `scd2_replay`.
 
     For a query whose rows for a date are a SUBSET of that date's keys -- see
     `newest_version` on `dedupe_rank` above. Filtered by `known_as_of()` and by
@@ -443,50 +443,82 @@
     DATE '9999-12-31')
 {% endmacro %}
 
-{% macro scd2_incremental_scope(source_relation, key_columns) %}
+{% macro scd2_key_match(left, right, key_columns) -%}
+  {#- `left.k = right.k and ...` over the key columns. -#}
+  {%- for c in key_columns %}{{ left }}.{{ ident(c) }} = {{ right }}.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor -%}
+{%- endmacro %}
+
+
+{% macro scd2_replay(stage_cte, key_columns, business_columns) %}
   {#
-    The CTEs every SCD2 model needs on its incremental path, so the logic
-    exists once rather than once per reference table.
+    THE ROWS AN SCD2 MODEL VERSIONS, as a CTE named `replayed`: `cob_date`
+    then `scd2_output_columns(business_columns)`, one row per key per COB
+    date. Emits a TRAILING COMMA. `stage_cte` is the model's own cleaned
+    stream over EVERY raw row, carrying `_rn` from `dedupe_rank` -- so every
+    key compared below is the model's CLEANED key, by the model's one
+    definition of that cleaning.
 
-    `scd2_window` is where this run's lookback starts: the newest version's
-    effective_from, less `lookback_days`. `touched` is every key raw carries
-    on or after it, in ANY delivery -- deliberately not ranked, so a key the
-    newest delivery dropped is still touched and can have its version
-    retracted.
+    THAT IS WHY IT COMES AFTER CLEANING, not before. The target holds cleaned
+    keys (`clean_string`, and `upper` on `ref_rating`'s agency). The replay
+    scope used to be built from raw keys and joined to the target, and a raw
+    ' B' or a lower-case agency matched nothing: no retraction, a stranded
+    current version, and two open versions at the key's next change.
 
-    `replay_from` IS THE LOAD-BEARING HALF, and it is the version in force
-    when the window STARTS, not the current one. Two things depend on that:
+    FULL REFRESH: the newest delivery's rows for every date.
 
-      * CLOSING. A touched entity's version in force can have begun months or
-        years before the window, and the whole of it must be re-derived for
-        lead() to see a new value and close it. Replaying only the last few
-        COB dates appends a new version and leaves the previous one claiming
-        effective_to = 9999-12-31 -- two versions in force at once, which
-        as_of() matches BOTH of, silently doubling every joined row.
-      * REOPENING. Every version that began inside the window came from a
-        delivery that may since have been replaced, and when the newest
-        delivery drops or reverts that change the version must go and the
-        one before it must be open again. So the replay starts at the last
-        version that began BEFORE the window, re-emitting it with its range
-        recomputed; with no such version it starts at the beginning of the
-        key's history in raw. It used to start at the current version, which
-        cannot reopen anything, and a retracted version stayed current.
+    INCREMENTAL, per key the lookback window touches:
 
-    Re-deriving is not enough to remove a version, because nothing re-derived
-    matches it. `scd2_retractions` emits a marker row for it, and the merge
-    in macros/merge.sql deletes on the marker.
-    See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
+      * `scd2_window` -- where the lookback starts: the newest effective_from,
+        less `lookback_days`.
+      * `touched` -- every key the stage carries on or after it, in ANY
+        delivery (not ranked), so a key the newest delivery dropped is still
+        touched and can have its version retracted.
+      * `replay_from` -- the start of the version in force when the window
+        starts, the last one that began before it; NULL when every version
+        began inside it, which reads as "from the beginning". Raw rows are
+        replayed from this date, so every version from it onward is
+        re-derived or, if its delivery was replaced, retracted
+        (`scd2_retractions`).
+      * `scd2_seed_from` -- the version BEFORE the replay start, when there is
+        one. It is not re-derived from raw: it is taken from the TARGET, as
+        the first row of the replay, so lead() can recompute its end. That is
+        what reopens it when the version after it is retracted, and what lets
+        a re-delivery that REVERTS to its value extend it instead of starting
+        a duplicate beside it. It also means the replay never needs that
+        version's own COB date in raw, which retention may have pruned.
+
+    WHAT IS HONOURED, then: re-deliveries of every COB date from each touched
+    key's replay start onward. A re-delivery of an EARLIER date is outside
+    the replay, exactly as a date outside the lookback window is for the
+    `cob_date`-partitioned models, and needs a full refresh.
 
     ASSUMES raw still holds every COB date from each key's replay start
-    onward, as the current-version replay always did.
+    onward. Where retention has pruned one, the replay cannot re-derive the
+    version that began there; `scd2_retractions` refuses to treat that as a
+    retraction, so the result is two open versions, which the SCD2 tests
+    refuse.
 
     The mutually_exclusive_ranges and scd2_exactly_one_current_version tests
-    are what catch a replay that got this wrong, and are not optional on any
-    table using this.
+    catch a replay that gets this wrong, and are not optional on any table
+    using this.
+    See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
   #}
+  {%- set cols = scd2_output_columns(business_columns) -%}
   {%- set keys = [] -%}
   {%- for c in key_columns %}{%- do keys.append(ident(c)) %}{%- endfor -%}
-  {%- set keys = keys | join(', ') -%}
+  {%- if not is_incremental() %}
+  replayed as (
+
+      select cob_date{% for c in cols %}, {{ ident(c) }}{% endfor %}
+      from {{ stage_cte }}
+      where _rn = 1
+
+  ),
+  {%- else %}
+  {#- Which output columns the target already has. A column the model has
+      just gained is added by on_schema_change AFTER this view is analysed,
+      so the seed reads NULL for it rather than failing on a missing column. -#}
+  {%- set in_target = adapter.get_columns_in_relation(this) | map(attribute='name') | map('lower') | list %}
   scd2_window as (
 
       select coalesce(max(effective_from), date '1900-01-01')
@@ -497,26 +529,58 @@
 
   touched as (
 
-      select distinct {{ keys }}
-      from {{ source_relation }}
-      where _cob_date >= (select window_start from scd2_window)
+      select distinct {{ keys | join(', ') }}
+      from {{ stage_cte }}
+      where cob_date >= (select window_start from scd2_window)
 
   ),
 
   replay_from as (
 
-      {#- NULL when every version of the key began inside the window: the
-          callers read that as "from the beginning". A CROSS JOIN rather than
-          a scalar subquery inside the aggregate, which is not something to
-          ask of Spark's analyser when a join says the same thing. -#}
-      select {{ keys }},
-             max(case when _v.effective_from < w.window_start
+      {#- A CROSS JOIN rather than a scalar subquery inside the aggregate. -#}
+      select {% for k in keys %}_v.{{ k }} as {{ k }}, {% endfor %}
+             max(case when _v.effective_from < _w.window_start
                       then _v.effective_from end)                  as from_date
       from {{ this }} as _v
-      cross join scd2_window as w
-      group by {{ keys }}
+      join touched as _t on {{ scd2_key_match('_t', '_v', key_columns) }}
+      cross join scd2_window as _w
+      group by {% for k in keys %}_v.{{ k }}{{ ', ' if not loop.last }}{% endfor %}
 
   ),
+
+  scd2_seed_from as (
+
+      select {% for k in keys %}_v.{{ k }} as {{ k }}, {% endfor %}
+             max(_v.effective_from)                                as seed_from
+      from {{ this }} as _v
+      join replay_from as _p on {{ scd2_key_match('_p', '_v', key_columns) }}
+      where _v.effective_from < _p.from_date
+      group by {% for k in keys %}_v.{{ k }}{{ ', ' if not loop.last }}{% endfor %}
+
+  ),
+
+  replayed as (
+
+      select _s.cob_date{% for c in cols %}, _s.{{ ident(c) }}{% endfor %}
+      from {{ stage_cte }} as _s
+      join touched as _t on {{ scd2_key_match('_t', '_s', key_columns) }}
+      left join replay_from as _p on {{ scd2_key_match('_p', '_s', key_columns) }}
+      where _s._rn = 1
+        and _s.cob_date >= coalesce(_p.from_date, date '1900-01-01')
+
+      union all
+
+      select _q.effective_from as cob_date
+             {%- for c in cols %},
+             {% if c | lower in in_target %}_q.{{ ident(c) }}{% else %}null{% endif %} as {{ ident(c) }}
+             {%- endfor %}
+      from {{ this }} as _q
+      join scd2_seed_from as _f
+        on {{ scd2_key_match('_f', '_q', key_columns) }}
+       and _q.effective_from = _f.seed_from
+
+  ),
+  {%- endif %}
 {% endmacro %}
 
 
@@ -532,9 +596,10 @@
   {#-
     The column ORDER of an SCD2 model's output, defined once: the business
     columns, the delivery the value first appeared in, the provenance and
-    audit columns, then what `scd2_columns` appends. `ranged` projects it and
-    `scd2_retractions` unions against it POSITIONALLY -- Spark 3.5 has no
-    UNION BY NAME -- so the two must not be able to disagree.
+    audit columns, then what `scd2_columns` appends. `scd2_replay` projects
+    it, `ranged` projects it, and `scd2_retractions` unions against it
+    POSITIONALLY -- Spark 3.5 has no UNION BY NAME -- so they must not be able
+    to disagree.
   -#}
   {%- set cols = business_columns + ['source_file', 'source_file_version'] -%}
   {%- for alias, _expression in provenance_pairs() %}{% do cols.append(alias) %}{% endfor -%}
@@ -560,8 +625,9 @@
     TWO BOUNDS:
 
       * THE REPLAY'S SCOPE: touched keys, from `replay_from` onward -- exactly
-        the versions this run re-derives, so "not re-derived" means something.
-        A version before a key's replay start is never read.
+        the versions this run re-derives from raw, so "not re-derived" means
+        something. The seed version before it is re-emitted, never marked.
+        Both sides are cleaned keys (`scd2_replay`).
       * ONLY WHERE RAW STILL HOLDS A DELIVERY FOR THE VERSION'S COB DATE
         (`newest_file_version`, which the model defines). A retraction means
         "the newest delivery for that date no longer says this"; a date raw
@@ -587,10 +653,7 @@
     {%- endif %}                                            as {{ ident(c) }}{{ ',' if not loop.last }}
     {%- endfor %}
   from {{ this }} as _old
-  join touched as _t
-    on {% for c in key_columns %}_t.{{ ident(c) }} = _old.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor %}
-  left join replay_from as _p
-    on {% for c in key_columns %}_p.{{ ident(c) }} = _old.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor %}
+  join replay_from as _p on {{ scd2_key_match('_p', '_old', key_columns) }}
   where _old.effective_from >= coalesce(_p.from_date, date '1900-01-01')
     and exists (
         select 1 from newest_file_version as _nv
@@ -598,8 +661,8 @@
     )
     and not exists (
         select 1 from {{ final_cte }} as _new
-        where {% for c in key_columns %}_new.{{ ident(c) }} = _old.{{ ident(c) }} and {% endfor -%}
-              _new.effective_from = _old.effective_from
+        where {{ scd2_key_match('_new', '_old', key_columns) }}
+          and _new.effective_from = _old.effective_from
     )
   {%- endif %}
 {% endmacro %}
