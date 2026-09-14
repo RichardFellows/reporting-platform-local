@@ -1292,7 +1292,7 @@ the file**:
 the distinction that matters, and it is not stylistic:
 
 - **Identifier-typed** -- `dedupe_rank`, `scd2_hash`, `scd2_effective_to`,
-  `scd2_incremental_scope`, `scd2_columns` -- are handed a *name* and
+  `scd2_replay`, `scd2_columns` -- are handed a *name* and
   interpolate it into SQL. These quote.
 - **Expression-typed** -- `safe_cast`, `clean_string`, `parse_date` -- are
   handed an *expression* and nest inside one another
@@ -3099,7 +3099,7 @@ so the nightly build is byte-identical to what it was before this existed.
 
 **A WHERE clause rather than a macro every model already calls.** There is no
 such macro: two of the four prepared models do not call `incremental_window` on
-their incremental path at all, they use `scd2_incremental_scope` and their own
+their incremental path at all, they use `scd2_replay` and their own
 predicate. So `known_as_of()` is at each call site, and
 `tests/test_supersession.py` greps every file in `models/prepared/` for it —
 CLAUDE.md's rule that fixing a macro proves nothing about models that do not

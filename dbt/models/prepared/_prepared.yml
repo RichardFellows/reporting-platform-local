@@ -49,7 +49,7 @@ models:
       # THE LOAD-BEARING TEST. The incremental path re-derives each touched
       # entity from the version in force when its lookback window starts, so
       # that lead() can close it and a retracted version's predecessor can be
-      # reopened (engine.sql, scd2_incremental_scope); if
+      # reopened (engine.sql, scd2_replay); if
       # that replay window is ever wrong, the result is two versions in force
       # at once, and as_of() then matches both and silently DOUBLES every
       # exposure row for that counterparty. Nothing inside the model can see
