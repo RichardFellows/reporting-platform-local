@@ -514,10 +514,12 @@ function feedForm(f, creating) {
       arrCtlPattern,
       el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
         "{stem} stands for the delivery's own filename minus its extension. " +
-        "The control file is consumed at the door and never reaches landing; " +
-        "its contents are copied verbatim into the metadata file instead. " +
-        "Until it arrives the delivery is HELD in the inbox — not rejected, " +
-        "and not landed."),
+        "The control file is PROMOTED into landing beside the renamed " +
+        "delivery, byte for byte, so the landing-side control block below " +
+        "must name it too. Until it arrives a plain delivery is HELD in the " +
+        "inbox — not rejected, and not landed; a member's control file " +
+        "missing from its container is refused, because a container arrives " +
+        "complete."),
     ]),
     el("div", {class: "field", style: "margin-top:10px"}, [
       arrCtlDateLabel,
@@ -576,11 +578,19 @@ function feedForm(f, creating) {
 
   function syncArrivalVisibility() {
     arrivalFields.style.display = hasArrival.checked ? "" : "none";
-    if (hasArrival.checked && !arrCtlPattern.value.trim())
-      arrCtlPattern.value = AUTO_CTL;
     syncArrivalArchive();
   }
-  hasArrival.addEventListener("change", syncArrivalVisibility);
+  // THE AUTOFILL IS A RESPONSE TO A PERSON TICKING THE BOX, not part of
+  // syncing. When it lived in syncArrivalVisibility() it also ran on load and
+  // after every sniff, so an existing arrival feed with no control file, or a
+  // sniff that could propose no control pattern, got `{stem}\.ctl` in the
+  // arrival block and nothing in the delivery block -- a form refused at load
+  // by check_gates_are_coherent, with nothing on it saying why.
+  hasArrival.addEventListener("change", () => {
+    if (hasArrival.checked && !arrCtlPattern.value.trim())
+      arrCtlPattern.value = AUTO_CTL;
+    syncArrivalVisibility();
+  });
   syncArrivalVisibility();
 
   node.append(
@@ -853,12 +863,64 @@ function feedForm(f, creating) {
     if (!pattern.value.trim() && r.filename_pattern) pattern.value = r.filename_pattern;
 
     const bits = [];
-    if (r.arrival_source_pattern) {
+    if (r.member_control) {
+      // MEMBERS WITH THEIR OWN CONTROL FILES are the `arrival.archive` shape
+      // -- unpacked at the gate -- not `delivery.kind: archive`, which never
+      // looks inside the container. Structure is pre-filled (the NAMES say
+      // it); what a control field MEANS is not, see memberControlBits.
+      //
+      // ONLY EMPTY FIELDS ARE FILLED, as everywhere else in this handler.
+      // Re-sniffing an EXISTING feed must not replace its configuration: its
+      // row-count and md5 fields name columns or regexes under the format it
+      // has, and swapping the patterns or the format under them makes the
+      // save refused, or silently re-reads a hand-written value.
+      const mc = r.member_control;
+      const kept = [];
+      hasArrival.checked = true;
+      if (!sourcePattern.value.trim()) sourcePattern.value = r.arrival_source_pattern;
+      if (!arrMemberPattern.value.trim()) {
+        if (r.member_pattern_candidate) arrMemberPattern.value = r.member_pattern_candidate;
+      } else kept.push("Members to unpack");
+      if (!memberPattern.value.trim()) deliveryKind.value = "file";
+      else kept.push("the zip-archive delivery shape and its member pattern " +
+                     "(members with their own control files need Members to " +
+                     "unpack instead)");
+      // `{stem}\.ctl` alone in the ARRIVAL box is the tick's autofill, not an
+      // answer -- the same untouched default syncArrivalArchive clears -- so
+      // with the delivery box empty it is replaced like an empty box. Kept,
+      // it would leave the proposed pattern in neither block and an
+      // arrival-only control the loader refuses.
+      const arrCtlUntouched = !arrCtlPattern.value.trim() ||
+                              arrCtlPattern.value === AUTO_CTL;
+      const ctlPatternsEmpty = arrCtlUntouched && !controlPattern.value.trim();
+      const ctlFieldsEmpty = [arrCtlDate, controlRowCount, controlMd5]
+        .every(input => !input.value.trim());
+      if (mc.pattern && ctlPatternsEmpty) {
+        // BOTH blocks: arrival.control without delivery.control is refused.
+        arrCtlPattern.value = mc.pattern;
+        controlPattern.value = mc.pattern;
+        // The format only moves with patterns this sniff wrote, only while no
+        // field is read under the old one, and never on an ambiguous reading.
+        if (ctlFieldsEmpty && !mc.format_ambiguous) {
+          ctlFormat.value = mc.format ? "delimited" : "regex";
+          if (mc.format) ctlDelimiter.value = mc.format.delimiter;
+        }
+      } else if (mc.pattern) {
+        kept.push("the control file patterns and format");
+      }
+      if (kept.length)
+        bits.push("already set on this form and left as they are: " + kept.join("; "));
+      syncArrivalVisibility();
+      syncDeliveryVisibility();
+      syncControlFormat();
+      bits.push(...memberControlBits(r));
+    } else if (r.arrival_source_pattern) {
       // Switch the form into the shape that fits rather than leaving the
       // pattern box empty with no hint about why nothing was derived.
       hasArrival.checked = true;
       if (!sourcePattern.value.trim())
         sourcePattern.value = r.arrival_source_pattern;
+      if (!arrCtlPattern.value.trim()) arrCtlPattern.value = AUTO_CTL;
       syncArrivalVisibility();
       bits.push("this filename carries no 8-digit date, so it cannot land " +
         "under it. Turned on Arrival and pre-filled the upstream pattern — " +
@@ -870,7 +932,7 @@ function feedForm(f, creating) {
       bits.push("business key candidate(s): " + r.business_key_candidates.join(", "));
     if (r.encoding_confidence === "low")
       bits.push(`encoding guessed as ${r.file_encoding} -- low confidence, double-check it`);
-    if (r.archive_members) {
+    if (r.archive_members && !r.member_control) {
       deliveryKind.value = "archive";
       if (r.member_pattern_candidate) memberPattern.value = r.member_pattern_candidate;
       syncDeliveryVisibility();
@@ -880,10 +942,7 @@ function feedForm(f, creating) {
           ? `check it actually picks out the data members, not the whole archive.`
           : `nothing to guess it from, fill it in by hand.`));
       if (!r.container_has_date)
-        bits.push("the container's filename has no 8-digit date -- " +
-          "cob_date_from: container, the only value this platform reads, " +
-          "will not work for it, so this feed cannot be onboarded until it has " +
-          "one");
+        bits.push(UNDATED_CONTAINER_NOTE);
     }
     sniffNote.textContent = "Sniffed from real values." + (bits.length ? " " + bits.join(" · ") : "");
     sniffNote.style.color = "var(--muted)";
@@ -1152,6 +1211,39 @@ function feedForm(f, creating) {
   };
 }
 
+// ------------------------------------------------- sniffed archive notes
+// An undated container cannot be `delivery.kind: archive` (cob_date_from:
+// container is the only source built) -- but it CAN be unpacked at the gate,
+// where the container's name is not a date source at all.
+const UNDATED_CONTAINER_NOTE =
+  "the container's filename has no 8-digit date, so it cannot be a zip " +
+  "archive delivery (cob_date_from: container is the only value built). If " +
+  "each member is a complete delivery for its own day, tick Arrival and fill " +
+  "in Members to unpack instead: the gate unpacks it and never reads the " +
+  "container's name";
+
+// What a sniff of control-gated members pre-filled, and what it did NOT.
+// PROPOSE, NEVER DECIDE: the control pattern and format come from the members'
+// NAMES and the files' SHAPE and are filled in; the FIELDS stay candidates in
+// the note, like business keys -- which date in a control file is the COB date
+// is a claim about meaning. See docs/DECISIONS.md#the-sniffer.
+function memberControlBits(r) {
+  const mc = r.member_control;
+  return [
+    "Turned on Arrival for a zip unpacked at the gate: pre-filled, where " +
+    "empty, the container pattern, Members to unpack" +
+    (mc.pattern
+      ? ", and the control file pattern in BOTH control blocks" +
+        (mc.format_ambiguous ? " (the format is AMBIGUOUS and was left alone)"
+                             : " with its format")
+      : "; NO control pattern could be proposed, so neither control block " +
+        "was filled") +
+    ". Set the landing filename pattern to the name each MEMBER lands under " +
+    "(e.g. myfeed_(?P<cob_date>\\d{8})\\.csv), not the zip's",
+    mc.note,
+  ];
+}
+
 // ------------------------------------------------------------ new feed
 // `draft` pre-fills the form from a sniffed proposal (see showUnclaimed
 // below) -- everything feedForm already reads off `f?.xxx` for an existing
@@ -1179,7 +1271,23 @@ function newFeed(draft) {
       bits.push("business key candidate(s): " + draft.business_key_candidates.join(", "));
     if (draft.encoding_confidence === "low")
       bits.push(`encoding guessed as ${draft.file_encoding} -- low confidence, double-check it`);
-    if (draft.arrival_source_pattern) {
+    if (draft.member_control) {
+      // The shapes readArrival()/readDelivery() build, so feedForm's
+      // f?.arrival?.* and f?.delivery?.* reads pick them up unchanged -- the
+      // same pre-fill the upload handler does field by field.
+      const mc = draft.member_control;
+      const fmt = mc.format ? {format: mc.format} : {};
+      draft.arrival = {source_pattern: draft.arrival_source_pattern,
+                       archive: {member_pattern: draft.member_pattern_candidate || ""}};
+      // No proposed pattern writes NO control block -- and since the autofill
+      // answers only a person ticking Arrival, feedForm will not invent one
+      // on load. The note says to write both by hand.
+      if (mc.pattern) {
+        draft.arrival.control = {pattern: mc.pattern, ...fmt};
+        draft.delivery = {control: {pattern: mc.pattern, ...fmt}};
+      }
+      bits.push(...memberControlBits(draft));
+    } else if (draft.arrival_source_pattern) {
       // Same shape readArrival() builds, so feedForm's f?.arrival?.* reads
       // pick it up unchanged -- see the archive branch below.
       draft.arrival = {source_pattern: draft.arrival_source_pattern,
@@ -1189,7 +1297,7 @@ function newFeed(draft) {
         "upstream pattern — set the landing filename pattern to the name you " +
         "want, and give the COB date pattern found in the control file");
     }
-    if (draft.archive_members) {
+    if (draft.archive_members && !draft.member_control) {
       // feedForm reads f?.delivery?.kind / f?.delivery?.member_pattern --
       // build that shape from the sniff proposal's own fields before handing
       // the draft to it, the same way readDelivery() builds it from the form.
@@ -1200,9 +1308,7 @@ function newFeed(draft) {
           ? "check it actually picks out the data members, not the whole archive."
           : "nothing to guess it from, fill it in by hand."));
       if (!draft.container_has_date)
-        bits.push("the container's filename has no 8-digit date -- " +
-          "cob_date_from: container, the only value this platform reads, " +
-          "will not work for it, so this feed cannot be onboarded until it has one");
+        bits.push(UNDATED_CONTAINER_NOTE);
     }
     d.append(el("div", {class: "note"}, bits.join(" · ")));
   }

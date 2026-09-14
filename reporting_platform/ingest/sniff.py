@@ -281,6 +281,348 @@ def sniff_bytes(con, data: bytes, filename: str) -> dict:
     return sniff_delivery(con, f.name)
 
 
+# ------------------------------------------------ member control files
+# Extensions a sender uses for a file that SAYS SOMETHING ABOUT another file
+# rather than holding rows. Deliberately short: every entry is a name that is
+# a control file in practice and almost never a data file, because a wrong
+# entry would take a real data member out of the proposal.
+CONTROL_SUFFIXES = ("ctl", "trl", "done", "ok")
+
+
+def _stem(name: str) -> str:
+    """THE GATE'S OWN STEM RULE, not a second copy of it: `conform._stem`,
+    which is what `{stem}` is substituted with when a member's control file
+    is looked for. A name with no extension is its own stem -- `POSA` beside
+    `POSA.ctl`, the mainframe shape -- and a sniffer that skipped those
+    proposed `.*\\.ctl` for exactly the containers this exists to read."""
+    from reporting_platform.ingest.conform import _stem as gate_stem
+
+    return gate_stem(name)
+
+
+def _has_control_suffix(name: str) -> bool:
+    """Whether any EXTENSION of `name` -- every dot-component after the first
+    -- is a control suffix. `POS_A.ctl`, `POS_A.ctl.csv` and `POS_A.csv.done`
+    all are; `POS_A.csv` and `POSA` are not."""
+    return any(part.lower() in CONTROL_SUFFIXES for part in name.split(".")[1:])
+
+
+def _pair_control_members(names: list[str]) -> dict[str, str]:
+    """{control member: the data member it belongs to}, recognised BY NAME.
+
+    A control member is a name with a control suffix that is some other
+    member's STEM plus a dot and more -- `POS_A.ctl`, `POS_A.ctl.csv` or
+    `POS_A.csv.ctl` beside `POS_A.csv`, and `POSA.ctl` beside an
+    extensionless `POSA`. That is exactly the relation `conform.find_control`
+    reads with a `{stem}` pattern, so recognising it here and proposing
+    `{stem}...` there are the same rule.
+
+    NAMES ONLY, NEVER CONTENT. "A short key/value or single-row delimited
+    file" is also exactly what a one-row data delivery for a quiet day looks
+    like, so content cannot tell a control file from a small data file -- and
+    classifying a real member as control would drop it from the proposal
+    without a word. Content is read only AFTER a pair is recognised, to say
+    how the control file might be read (`_control_readings`).
+
+    An unpaired name with a control suffix is not claimed: a container-level
+    `BATCH.done` is not a member's control file, and nothing here would know
+    what `{stem}` should be for it. With several candidate stems the LONGEST
+    wins, so `POS.A.ctl` belongs to `POS.A.csv`, not `POS.csv`.
+    """
+    stems = {n: _stem(n) for n in names if not _has_control_suffix(n)}
+    out: dict[str, str] = {}
+    for name in names:
+        if name in stems:
+            continue
+        owners = [d for d, stem in stems.items() if name.startswith(stem + ".")]
+        if owners:
+            out[name] = max(owners, key=lambda d: len(stems[d]))
+    return out
+
+
+def _control_pattern(pairs: dict[str, str]) -> str | None:
+    """The one `{stem}...` pattern every pair fits, in the syntax both
+    control blocks load (`'{stem}\\.ctl'`), or None when the pairs disagree
+    -- `.ctl` for some members and `.CTL` for others is not one pattern, and
+    picking the commoner would leave the rest refused at the gate.
+
+    Checked the way the gate will use it, not assumed: each control member
+    must fullmatch the pattern with its data member's stem substituted
+    (`conform.control_filename_for`), and no data member may match its
+    `{stem}`-as-wildcard form (`conform.is_member_control_file`), which is the
+    test that keeps a data member from being skipped as a control file.
+    """
+    remainders = {c[len(_stem(d)):] for c, d in pairs.items()}
+    if len(remainders) != 1:
+        return None
+    remainder = remainders.pop()
+    if "{" in remainder or "}" in remainder:
+        return None                    # `str.format` would read it as a field
+    pattern = "{stem}" + re.escape(remainder)
+    for control, data in pairs.items():
+        if not re.fullmatch(pattern.format(stem=re.escape(_stem(data))), control):
+            return None
+    wildcard = re.compile(pattern.replace("{stem}", "(?P<stem>.+)"))
+    if any(wildcard.fullmatch(d) for d in set(pairs.values())):
+        return None
+    return pattern
+
+
+# What a control file may declare that the sniffer can offer, and the group
+# each needs under `kind: regex` -- `context.CONTROL_FIELD_GROUPS`, restated as
+# the value shape that group has to capture.
+_FIELD_VALUE = {"cob_date": r"\d{8}", "row_count": r"\d+",
+                "md5": r"[0-9a-fA-F]{32}"}
+_KEY_VALUE = re.compile(r"^\s*([A-Za-z][\w .-]*?)\s*([=:|])\s*(\S.*?)\s*$")
+_CONTROL_DELIMITERS = ("|", ",", "\t", ";")
+
+
+def _table_reading(lines: list[list[str]]) -> tuple[dict, list[dict[str, str]]] | None:
+    """The files read as `kind: delimited`: one header row over exactly one
+    row of values, in one delimiter and under one header every file agrees
+    on -- what `control._read_delimited` reads. A header cell that is all
+    digits is not a column name, which is what rules out
+    `ReportingDate|20260801` over `Rows|2`."""
+    import csv
+    import io
+
+    for delim in _CONTROL_DELIMITERS:
+        parsed = []
+        for ls in lines:
+            rows = list(csv.reader(io.StringIO("\n".join(ls)), delimiter=delim))
+            if len(rows) != 2 or len(rows[0]) < 2 or len(rows[0]) != len(rows[1]):
+                break
+            header = [c.strip() for c in rows[0]]
+            if (not all(header) or len(set(header)) != len(header)
+                    or any(c.isdigit() for c in header)):
+                break
+            parsed.append(dict(zip(header, (v.strip() for v in rows[1]))))
+        else:
+            if len({tuple(p) for p in parsed}) == 1:
+                return {"kind": "delimited", "delimiter": delim}, parsed
+    return None
+
+
+def _separators(lines: list[list[str]]) -> set[str]:
+    """Every key/value separator the text reading found, line by line --
+    counted before `_text_reading` keeps one value per key."""
+    return {m.group(2) for ls in lines for ln in ls
+            if (m := _KEY_VALUE.match(ln))}
+
+
+def _text_reading(lines: list[list[str]]) -> tuple[None, list[dict[str, str]]] | None:
+    """The files read as the default text format: every non-blank line a
+    `KEY=VALUE` (or `:`/`|`) pair, keyed by `KEY=` as written."""
+    parsed = []
+    for ls in lines:
+        fields: dict[str, str] = {}
+        for ln in ls:
+            m = _KEY_VALUE.match(ln)
+            if not m:
+                return None
+            fields.setdefault(m.group(1) + m.group(2), m.group(3))  # "DATE="
+        parsed.append(fields)
+    return None, parsed
+
+
+def _control_readings(texts: list[str]) -> list[tuple[dict | None, list[dict[str, str]]]]:
+    """Every CONSISTENT reading of the control files, as (format, each file's
+    {field name: value}); the format is None for the default text reading.
+
+    Empty when there is none -- including an EMPTY control file, the ordinary
+    `.done`/`.ok`, which says "complete" and declares nothing.
+
+    TWO READINGS IS AN ANSWER, not a tie to break. `FEED|POSITIONS` over
+    `ROWS|2` is two KEY|VALUE lines and also a table with columns FEED and
+    POSITIONS; `cob_date|row_count` over `20260901|3` is only a table,
+    because `20260901` cannot be a key. Where the bytes genuinely read both
+    ways, which one the sender means decides what every field names, and
+    nothing in the files says -- so the caller proposes no format.
+
+    Only a TWO-column table can be that. A KEY|VALUE line has exactly two
+    cells, so `FEED|BUSINESS_DATE|RECORD_COUNT` "matching" as key FEED with
+    value `BUSINESS_DATE|RECORD_COUNT` is not a key/value line.
+
+    Where the key/value separator is NOT the table's delimiter (`A=1,B=2`
+    over `C=3,D=4`), both readings are still returned: whether the table one
+    is worth anything depends on whether a field can be read under it, which
+    only `_member_control` can measure -- see there.
+    """
+    lines = [[ln for ln in t.splitlines() if ln.strip()] for t in texts]
+    if not all(lines):
+        return []
+    table = _table_reading(lines)
+    text = _text_reading(lines)
+    if table is not None and len(table[1][0]) > 2:
+        return [table]
+    return [r for r in (table, text) if r]
+
+
+def _field_expression(fmt: dict | None, key: str, field: str) -> str:
+    """A field as the block declares it: a COLUMN NAME under delimited, a
+    regex with the one named group the loader requires under text. Anchored
+    to the start of a line, or `ROWS=` would also read `TOTAL_ROWS=` -- and
+    allowing the same leading whitespace `_KEY_VALUE` allows, or an indented
+    file is recognised and then every candidate fails its read-back."""
+    if fmt is not None:
+        return key
+    from reporting_platform.common.context import CONTROL_FIELD_GROUPS
+
+    name, sep = key[:-1], key[-1]
+    return (f"(?m)^\\s*{re.escape(name)}\\s*{re.escape(sep)}\\s*"
+            f"(?P<{CONTROL_FIELD_GROUPS[field]}>{_FIELD_VALUE[field]})")
+
+
+def _member_facts(data: bytes, proposal: dict) -> dict:
+    """What a data member's control file could be checked against, measured
+    ONCE per member: its md5, and its rows read the way `conform.count_rows`
+    reads them, with the dialect the sniffer just proposed -- so a quoted
+    newline is one row."""
+    import csv
+    import hashlib
+    import io
+
+    text = data.decode(proposal["file_encoding"], errors="replace")
+    rows = sum(1 for r in csv.reader(io.StringIO(text),
+                                     delimiter=proposal["delimiter"],
+                                     quotechar=proposal["quote_char"]) if r)
+    return {"md5": hashlib.md5(data).hexdigest(),
+            "rows": max(rows - 1, 0) if proposal["header"] else rows}
+
+
+def _control_field_candidates(pattern: str, fmt: dict | None,
+                              parsed: list[dict[str, str]],
+                              controls: list[tuple[str, str, dict]]
+                              ) -> dict[str, list[str]]:
+    """{field: [expression, ...]} -- every key that COULD be each field, as
+    evidence rather than as a choice. `controls` is (control member, its
+    text, its data member's `_member_facts`), in `parsed`'s order.
+
+    * `cob_date`: an 8-digit value that is a real yyyyMMdd date in EVERY
+      control file. Which date in a control file is the COB date -- rather
+      than a run date or a creation date -- is a claim about meaning that no
+      measurement can make, the business-key problem exactly.
+    * `row_count`: a value EQUAL to the paired member's row count, in every
+      pair.
+    * `md5`: a value EQUAL to the paired member's md5, in every pair. The
+      member's own, because under `arrival.archive` each member lands as a
+      plain delivery and that is the object `delivery.control.md5` covers.
+
+    `version` is never offered: nothing observable distinguishes a version
+    number from any other small integer.
+
+    EVERY CANDIDATE IS READ BACK THROUGH `ingest/control.py` -- the only
+    control-file parser -- over every control member, and dropped unless it
+    returns the value it was derived from. The expression offered is one the
+    gate will read, not one that looks right.
+    """
+    from datetime import datetime
+
+    from reporting_platform.common.context import resolve_control_format
+    from reporting_platform.ingest import control as control_mod
+
+    def is_date(v: str) -> bool:
+        try:
+            return bool(re.fullmatch(r"\d{8}", v)) and bool(
+                datetime.strptime(v, "%Y%m%d"))
+        except ValueError:
+            return False
+
+    tests = {
+        "cob_date": lambda v, facts: is_date(v),
+        "row_count": lambda v, facts: v.isdigit() and int(v) == facts["rows"],
+        "md5": lambda v, facts: (bool(re.fullmatch(_FIELD_VALUE["md5"], v))
+                                 and v.lower() == facts["md5"]),
+    }
+    keys = set(parsed[0]).intersection(*parsed[1:])
+    resolved = resolve_control_format("sniff", "control", fmt)
+    out: dict[str, list[str]] = {}
+    for field, test in tests.items():
+        found = []
+        for key in sorted(keys):
+            if not all(test(p[key], facts)
+                       for p, (_c, _t, facts) in zip(parsed, controls)):
+                continue
+            expression = _field_expression(fmt, key, field)
+            block = {"pattern": pattern, "format": resolved, field: expression}
+            try:
+                read_back = [control_mod.read(block, text, fields=(field,),
+                                              feed_name="sniff", filename=c,
+                                              block="control").get(field)
+                             for c, text, _facts in controls]
+            except control_mod.ControlParseError:
+                continue
+            if read_back == [p[key] for p in parsed]:
+                found.append(expression)
+        if found:
+            out[field] = found
+    return out
+
+
+def _member_control(zf, names: list[str], pairs: dict[str, str],
+                    proposal: dict) -> dict:
+    """What a container of control-gated members proposes -- see
+    `sniff_archive`. Never a decision: `pattern` and `format` are what the
+    NAMES and the files' SHAPE say, and every field is a list of candidates.
+
+    Control files are decoded with the proposal's `file_encoding` -- the value
+    the form saves, and what the gate decodes a member's control file with --
+    so the read-back checks the text the gate will read.
+    """
+    pattern = _control_pattern(pairs)
+    paired_data = set(pairs.values())
+    out: dict = {
+        "pattern": pattern,
+        "format": None,
+        "format_ambiguous": False,
+        # {control member: its data member}. Keyed by the CONTROL member,
+        # because a data member may have two (`X.ctl` and `X.done`).
+        "pairs": dict(sorted(pairs.items())),
+        "members_without_control": [n for n in names
+                                    if n not in pairs and n not in paired_data],
+        "field_candidates": {},
+    }
+    if pattern is None:
+        return out
+    encoding = proposal["file_encoding"]
+    # One member's bytes at a time: measured, then released.
+    facts = {d: _member_facts(zf.read(d), proposal) for d in sorted(paired_data)}
+    controls = [(c, zf.read(c).decode(encoding, errors="replace"), facts[d])
+                for c, d in sorted(pairs.items())]
+    readings = _control_readings([text for _c, text, _f in controls])
+    by_reading = {("text" if fmt is None else "delimited"):
+                  {"format": fmt,
+                   "field_candidates": _control_field_candidates(
+                       pattern, fmt, parsed, controls)}
+                  for fmt, parsed in readings}
+    separators = _separators([[ln for ln in text.splitlines() if ln.strip()]
+                              for _c, text, _f in controls])
+    # A SEPARATOR THAT IS NOT THE DELIMITER, AND A TABLE UNDER WHICH NOTHING
+    # IS READABLE, IS NOT A SECOND READING. `A=1,B=2` over `C=3,D=4` "is" a
+    # comma table whose header is `A=1`; no field is a date, a row count or
+    # an md5 under it, so the text reading is the only one. The test is the
+    # measurement, not the shape: `Time:UTC|Rows` over `T08:00|3` is also a
+    # `:` line and a `|` table, and there the table's `Rows` IS the member's
+    # row count -- a real reading, so that one stays ambiguous.
+    if (len(by_reading) == 2
+            and separators != {by_reading["delimited"]["format"]["delimiter"]}
+            and not by_reading["delimited"]["field_candidates"]):
+        del by_reading["delimited"]
+    if len(by_reading) == 1:
+        (only,) = by_reading.values()
+        out["format"] = only["format"]
+        out["field_candidates"] = only["field_candidates"]
+    elif len(by_reading) == 2:
+        out["format_ambiguous"] = True
+        # Worded from the text reading's OWN separators, which need not be
+        # the table's delimiter -- and may be more than one (`A=x|B` over
+        # `C:1|2`), so a list, never a joined string that names a separator
+        # no line in the file uses.
+        out["key_value_separators"] = sorted(separators)
+        out["field_candidates_by_reading"] = by_reading
+    return out
+
+
 def _member_pattern_candidate(names: list[str]) -> str | None:
     """A regex matching the archive's most common member extension, as a
     STARTING GUESS for `delivery.member_pattern` -- a human still decides
@@ -294,6 +636,41 @@ def _member_pattern_candidate(names: list[str]) -> str | None:
         return None
     ext, _count = exts.most_common(1)[0]
     return rf".*\.{re.escape(ext)}"
+
+
+def _paired_member_pattern_candidate(data_names: list[str]) -> str | None:
+    """`_member_pattern_candidate` for the data members that HAVE a control
+    file, where having no extension is a shape of its own.
+
+    `[^.]+` -- every member with no dot in its name -- is the honest analogue
+    of `.*\\.csv` for `POSA`/`POSB`: the same claim, "the members shaped like
+    the ones that came with a control file", and just as much a guess to
+    check. It cannot claim `POSA.ctl`.
+
+    TIES, decided by the counts and never by where a name sorts:
+
+    * the extensionless shape shares the top count with any other shape --
+      None. `[^.]+` and `.*\\.csv` claim disjoint sets of members, so either
+      would silently drop the other half, and nothing says which half the
+      sender means.
+    * two EXTENSIONS share it -- whatever `_member_pattern_candidate` picks
+      for those members, which is the unpaired rule and must stay what it
+      is. The same tie then gets the same answer whether or not the members
+      came with control files; a second tie rule here would make pairing
+      change a proposal that has nothing to do with control files.
+    """
+    from collections import Counter
+
+    names = sorted(data_names)
+    shapes = Counter(n.rsplit(".", 1)[-1] if "." in n else None for n in names)
+    if not shapes:
+        return None
+    top = max(shapes.values())
+    leaders = [shape for shape, count in shapes.items() if count == top]
+    if None in leaders:
+        return r"[^.]+" if len(leaders) == 1 else None
+    return _member_pattern_candidate([n for n in names
+                                      if "." in n and n.rsplit(".", 1)[-1] in leaders])
 
 
 def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> dict:
@@ -315,16 +692,31 @@ def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> d
     Only proposes `cob_date_from: "container"`, the one value this
     platform actually reads (`context.NOT_BUILT` rejects `member`/`path` at
     load) -- see `_container_has_a_date`.
+
+    MEMBERS WITH THEIR OWN CONTROL FILES are a different shape, and one this
+    used to get right only alphabetically: `POS_A.csv` sorts before
+    `POS_A.ctl`, but `POS_A.dat` does not, and the control file was then the
+    member sniffed and `.*\\.ctl` the member pattern proposed. When
+    `_pair_control_members` recognises pairs, the control members are taken
+    out of both, the data members that HAVE a control file are the evidence
+    for the member pattern, and `member_control` carries the proposal for
+    the control half -- see `propose_feed` for what it means. With no pairs
+    the result is exactly what it was.
     """
     import io
     import zipfile as _zipfile
 
     with _zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = sorted(i.filename for i in zf.infolist() if not i.is_dir())
-        candidates = names
+        pairs = _pair_control_members(names)
+        # The members that have a control file are the deliveries; without
+        # pairs every member is a candidate, as it always was.
+        data_names = sorted(set(pairs.values())) if pairs else names
+        candidates = data_names
         if member_pattern:
             rx = re.compile(member_pattern)
-            candidates = [n for n in names if rx.fullmatch(n)]
+            candidates = [n for n in names
+                          if rx.fullmatch(n) and n not in pairs]
         if not candidates:
             raise ValueError(
                 "archive holds no member matching "
@@ -332,10 +724,15 @@ def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> d
         member = candidates[0]
         data = zf.read(member)
 
-    proposal = sniff_bytes(con, data, member)
-    proposal["archive_members"] = names
-    proposal["sniffed_member"] = member
-    proposal["member_pattern_candidate"] = _member_pattern_candidate(names)
+        proposal = sniff_bytes(con, data, member)
+        proposal["archive_members"] = names
+        proposal["sniffed_member"] = member
+        proposal["member_pattern_candidate"] = (
+            _paired_member_pattern_candidate(data_names) if pairs
+            else _member_pattern_candidate(names))
+        if pairs:
+            proposal["member_control"] = _member_control(zf, names, pairs,
+                                                         proposal)
     return proposal
 
 
@@ -344,10 +741,12 @@ def _container_has_a_date(filename: str) -> bool:
     `cob_date` group to -- reusing `ui.registry.derive_pattern`'s own
     check, since that is exactly what decides whether
     `cob_date_from: container` (the only value this platform reads) is
-    even proposable. If not, this platform genuinely cannot onboard the
-    archive yet -- `member`/`path` sourcing is real, described in
-    docs/DELIVERY-SHAPES.md, and NOT BUILT (`context.NOT_BUILT`) -- and the
-    proposal says so rather than suggesting a value that will fail at load.
+    even proposable. If not, it cannot be a `delivery.kind: archive` feed --
+    `member`/`path` sourcing is real, described in docs/DELIVERY-SHAPES.md,
+    and NOT BUILT (`context.NOT_BUILT`) -- and the proposal says so rather
+    than suggesting a value that will fail at load. It can still be an
+    `arrival.archive` feed, unpacked at the gate, where the container's name
+    is not a date source at all.
     """
     from reporting_platform.ui.registry import derive_pattern
 
@@ -381,11 +780,100 @@ def propose_feed(filename: str, data: bytes) -> dict:
     # is left for the operator, who is the only one who knows what this feed
     # should be called.
     #
-    # Only for a plain file. An archive with no date on the container is a
-    # different gap (`cob_date_from: member`, still NOT BUILT), and the inbox
-    # gate does not unpack archives.
+    # Only for a plain file here. A zip is proposed as `delivery.kind:
+    # archive` unless its members carry their own control files, below.
     if dated is None and not filename.lower().endswith(".zip"):
         proposal["arrival_source_pattern"] = re.escape(filename)
     if filename.lower().endswith(".zip"):
         proposal["container_has_date"] = _container_has_a_date(filename)
+
+    # MEMBERS WITH THEIR OWN CONTROL FILES ARE THE `arrival.archive` SHAPE,
+    # whatever the container is called. `delivery.kind: archive` reads a
+    # control file beside the CONTAINER in landing and never looks inside it,
+    # so a control file per member only means something if each member is its
+    # own delivery -- unpacked at the gate, the container never landing.
+    #
+    # Which changes what two fields mean. The container's name becomes the
+    # arrival `source_pattern` (a date in it is matched, never read), and the
+    # derived `filename_pattern` is withdrawn: under this shape it names each
+    # MEMBER after renaming, and a `\.zip` there matches nothing for ever.
+    # Like the undated plain file above, the landing name is the operator's.
+    control = proposal.get("member_control")
+    if control is not None:
+        m = re.search(r"(?<!\d)\d{8}(?!\d)", filename)
+        proposal["arrival_source_pattern"] = (
+            re.escape(filename[:m.start()]) + r"\d{8}(?:_v\d+)?"
+            + re.escape(re.sub(r"^_v\d+", "", filename[m.end():]))
+            if m else re.escape(filename))
+        proposal["filename_pattern"] = None
+        control["note"] = _member_control_note(
+            control, proposal["member_pattern_candidate"])
     return proposal
+
+
+def _member_control_note(control: dict, member_pattern_candidate: str | None) -> str:
+    """The proposal in words, for the console -- including what it is NOT."""
+    pairs = control["pairs"]
+    no_member_pattern = (
+        " No member pattern is proposed: the members with a control file do "
+        "not share one shape to name (some have an extension, as many do not) "
+        "-- write `arrival.archive.member_pattern` by hand."
+        if member_pattern_candidate is None else "")
+    if control["pattern"] is None:
+        return (f"{len(pairs)} member(s) have what looks like their own control "
+                f"file, but the names do not share one `{{stem}}` pattern "
+                f"(e.g. .ctl for some, .CTL for others), so none is proposed "
+                f"and neither control block is filled in. Write the SAME "
+                f"pattern into `arrival.control.pattern` and "
+                f"`delivery.control.pattern` by hand -- one without the other "
+                f"is refused at load -- and give the COB date a source, or the "
+                f"feed will not save." + no_member_pattern)
+    bits = [
+        f"{len(pairs)} member(s) carry their own control file inside the "
+        f"container, which is the `arrival.archive` shape: unpacked at the "
+        f"gate, each member landing as its own delivery. Proposed "
+        f"`arrival.control.pattern: '{control['pattern']}'`. "
+        f"`delivery.control` is REQUIRED alongside it, with the same pattern "
+        f"and format -- `arrival.control` alone is refused at load -- and a "
+        f"member whose control file is missing from a container is refused "
+        f"at the gate. A proposal: confirm it against what the sender "
+        f"actually promises before saving." + no_member_pattern]
+    if control["members_without_control"]:
+        bits.append("Members with no control file, which this shape would "
+                    "refuse if the member pattern claims them: "
+                    + ", ".join(control["members_without_control"]) + ".")
+    if control["format_ambiguous"]:
+        readings = control["field_candidates_by_reading"]
+        delimiter = readings["delimited"]["format"]["delimiter"]
+        lines_as = " / ".join(f"KEY{sep}VALUE"
+                              for sep in control["key_value_separators"])
+        bits.append(
+            f"AMBIGUOUS FORMAT: every control file reads both as {lines_as} "
+            f"lines and as a one-row table delimited by {delimiter!r}, "
+            f"and which the sender means decides what every field names -- so "
+            f"no format is proposed. Choose one; the candidates under each "
+            f"reading are:")
+        for name, label in (("text", "as text"), ("delimited", "as a table")):
+            found = readings[name]["field_candidates"]
+            bits.append(f"{label}: " + ("; ".join(
+                f"{field} {', '.join(v)}" for field, v in found.items())
+                or "none") + ".")
+        return " ".join(bits)
+    candidates = control["field_candidates"]
+    if not candidates:
+        bits.append("No field in the control files could be matched to a "
+                    "date, the member's row count or its md5 in every file -- "
+                    "an empty `.done`/`.ok` declares nothing -- so none is "
+                    "offered, and the COB date has to come from the member "
+                    "pattern or an expression written by hand.")
+    for field, label in (("cob_date", "COB date"), ("row_count", "row count"),
+                         ("md5", "md5")):
+        if field in candidates:
+            block = "arrival.control" if field == "cob_date" else "delivery.control"
+            bits.append(f"{label} candidate(s) for `{block}.{field}`: "
+                        + ", ".join(candidates[field]) + ".")
+    if "cob_date" in candidates:
+        bits.append("Not filled in: which date is the COB date is a claim "
+                    "about meaning, and the member pattern must not capture "
+                    "one as well -- one fact, one source.")
+    return " ".join(bits)

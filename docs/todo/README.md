@@ -11,18 +11,96 @@ item that no longer reproduces should be deleted rather than worked.
 | | Item | Value | Effort |
 |---|---|---|---|
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
-| [08](08-sniffer-has-no-notion-of-member-control-files.md) | The sniffer cannot propose a zip whose members have control files | low–medium | 2–3 hours |
 | [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
 
 ## Where to start
 
 **09 first.** It is a correctness defect in the one supersession mode that is
 built, and its answer decides what 07 is asking for — do not start 07 before
-it. It opens with a decision, not an edit.
-
-**08** is the other code item.
+it. It opens with a decision, not an edit. It is also the only item left
+that does not wait on another.
 
 ## Done
+
+**08, the sniffer had no notion of member control files** —
+`ingest/sniff.py` recognises members that carry their own control file and
+proposes the `arrival.archive` shape's control half as `member_control`:
+the `{stem}...` pattern, the control format, and candidate fields. The
+console fills the arrival section and BOTH control blocks from it and leaves
+`deliveryKind` at plain file. Covered by 23 tests in `tests/test_sniff.py` and
+7 in `tests/test_delivery_form.py`; written up in
+`DECISIONS.md#the-sniffer`.
+
+*Choices.* Pairs are recognised **by name only**: a `ctl`/`trl`/`done`/`ok`
+extension anywhere after the stem of another member (`POS_A.ctl`,
+`POS_A.ctl.csv`, `POS_A.csv.done`). The item offered content detection too, and
+it was refused as a classifier. A short key/value or one-row delimited file is
+also what a one-row data delivery for a quiet day looks like, so treating it as
+a control file would drop a real member without a word. Content is read only
+once a pair is found, to propose how the file is read. `row_count` and `md5`
+are offered only where the value **equals** the paired member's row count or
+md5. `cob_date` is offered wherever every file holds a real date. Every
+candidate is read back through `ingest/control.py` before it is offered.
+Fields stay in the note and are never filled in, because which date is the COB
+date is the business-key problem again. So a pre-filled form is refused until a
+human types one, and the refusal names the date source.
+
+*What the item got wrong.* **It said the current proposal was "right — but by
+luck".** It is right only alphabetically. `.csv` sorts before `.ctl`; `.dat`,
+`.txt`, `.done` and an upper-case `.CTL` do not. For those, the CONTROL file
+was the member sniffed (one column named `date_20260901`) and `.*\.ctl` the
+member pattern proposed. **It asked for `arrival.control.pattern` alongside
+`member_pattern`, and that is not enough to load.** The container's derived
+`filename_pattern` (`…\.zip`) is the landing pattern of `delivery.kind:
+archive`; under `arrival.archive` it has to name each member, and a `\.zip`
+there matches nothing for ever. The console also forced `deliveryKind:
+archive`, which never reads a control file inside the container. So the
+container's name now becomes `arrival_source_pattern` and `filename_pattern`
+is withdrawn. The item also missed three stale statements on this path:
+`propose_feed`'s comment that the gate does not unpack archives, the console's
+claim that an undated container "cannot be onboarded", and the arrival
+section's help saying the control file is "consumed at the door" (it is
+PROMOTED). All three were corrected.
+
+*Verified live.* Through `POST /api/sniff` on the console, a probe feed saved
+with the form's payload, `config check` and `config show --origin`, and the
+gate's own `plan_arrival` over the dropped container. Each `.dat` member was
+paired with its `.ctl` and dated from it, and nothing was landed. The probe was
+deleted, and `git diff main -- reporting_platform/config dbt` is empty. Unpaired
+proposals were compared output for output against `main`'s sniffer and are
+identical. The orchestrator re-verified it independently. It used a DATED
+container of `.csv` members with delimited `.ctl.csv` controls, saved a probe
+feed through the console, and planned both members dated from their control
+files. A container missing one member's control file was refused.
+
+*Code review found six issues, all fixed in a second commit on this branch.*
+Extensionless data members (`POSA` beside `POSA.ctl`) were not paired, and got
+`.*\.ctl` back. A two-line KEY|VALUE file was read as a two-column table.
+Control files were decoded as UTF-8, not the proposed encoding, and indented
+lines failed their read-back. Member bytes were held together and re-parsed
+per candidate. Re-sniffing an existing feed overwrote its configured values
+and format. And with no proposable pattern, the form auto-filled an arrival
+control pattern alone, which cannot be saved and said nothing about why. A second
+review found three more, fixed in a third commit. Ticking Arrival before
+uploading counted the tick's `{stem}\.ctl` as a pattern already set, so the
+proposed one reached neither control block. Extensionless member-pattern ties
+depended on name order. And `A=1,B=2` over `C=3,D=4` was reported as an
+ambiguous "KEY,VALUE" table, although its separator is not the delimiter.
+A third review caught that fix going too far: it dropped the table reading
+on the SHAPE of the separator, and `Time:UTC|Rows` over `T08:00|3` -- a `|`
+table whose `Rows` is the member's row count -- lost a real reading with no
+warning. The table is now dropped only when no field can be read under it.
+The orchestrator re-verified the extensionless case end to end as well: a
+probe feed from `POSA`/`POSA.ctl` members saved, and `plan_arrival` planned
+both members dated from their indented control files.
+
+*Found, not fixed.* **`inbox --dry-run` without `--loop` prints `inbox empty`
+with a file in the inbox.** `STABLE_POLLS = 2` needs three observations and
+once-off mode sweeps twice. To reproduce, stop the watcher, drop any file in
+`./inbox`, then run `docker compose run --rm --no-deps -T inbox python -m
+reporting_platform.ingest.inbox --dry-run`. Even with the file routed, its
+dry run reports `would conform` for a container and never lists the members
+or their control files.
 
 **10, `DECISIONS.md` said `per_report` matches nothing** — an
 `> **Amended.**` block on that paragraph of
