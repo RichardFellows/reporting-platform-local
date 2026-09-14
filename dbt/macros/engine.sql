@@ -557,9 +557,20 @@
     (on_schema_change adds it after the temporary view exists), so reading
     one from `this` would fail the first run after it was added.
 
-    The scope is exactly the replay's: touched keys, from `replay_from`
-    onward. A version before a key's replay start is never retracted, and a
-    key not touched is never read.
+    TWO BOUNDS:
+
+      * THE REPLAY'S SCOPE: touched keys, from `replay_from` onward -- exactly
+        the versions this run re-derives, so "not re-derived" means something.
+        A version before a key's replay start is never read.
+      * ONLY WHERE RAW STILL HOLDS A DELIVERY FOR THE VERSION'S COB DATE
+        (`newest_file_version`, which the model defines). A retraction means
+        "the newest delivery for that date no longer says this"; a date raw
+        no longer holds at all -- retention prunes raw to month-ends -- says
+        nothing, and is not evidence the version was wrong. Without this, a
+        pruned date would silently delete the version and re-date the key to
+        the next delivery raw still holds. With it, a replay that cannot
+        re-derive from pruned raw fails the way it always did: two open
+        versions, which the SCD2 tests refuse.
   -#}
   {%- if is_incremental() %}
   union all
@@ -581,6 +592,10 @@
   left join replay_from as _p
     on {% for c in key_columns %}_p.{{ ident(c) }} = _old.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor %}
   where _old.effective_from >= coalesce(_p.from_date, date '1900-01-01')
+    and exists (
+        select 1 from newest_file_version as _nv
+        where _nv._newest_cob_date = _old.effective_from
+    )
     and not exists (
         select 1 from {{ final_cte }} as _new
         where {% for c in key_columns %}_new.{{ ident(c) }} = _old.{{ ident(c) }} and {% endfor -%}

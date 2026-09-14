@@ -269,3 +269,56 @@ def test_the_full_rebuild_itself_is_the_expected_history():
         b = [r[len(keys):] for r in _state(con, FULL, keys, attr) if r[0] == "B"]
         assert b == [("X", "2026-08-03", "2026-09-02", False),
                      ("Y", "2026-09-03", "9999-12-31", True)], (name, b)
+
+
+def test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too():
+    """The version the replay starts from is in scope as well. After step 2,
+    08-03 -- B's first version, before the window -- is re-delivered without
+    B. Keeping that version on the grounds that it predates the window would
+    leave it overlapping the X version re-derived from 09-01; the full rebuild
+    has no 08-03 version at all, and neither may the incremental one."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        steps = _scenario("2026-08-03")[:2] + [
+            ("08-03 re-delivered without B",
+             [("2026-08-03", 2, {"A": "a"}, "2026-09-03 09:00")])]
+        for step, deliveries in steps:
+            for cob_date, version, rows, ts in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+            _build(con, name, INC, incremental=True)
+        _build(con, name, FULL, incremental=False)
+        inc, full = _state(con, INC, keys, attr), _state(con, FULL, keys, attr)
+        assert inc == full, (name, inc, full)
+        assert not _open_versions(con, INC, keys) and not _overlaps(con, INC, keys)
+
+
+def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
+    """Absence of evidence is not a retraction.
+
+    Retention prunes raw to month-ends, so a version's COB date can vanish
+    from raw while the version is still right. The replay then cannot
+    re-derive it -- and a retraction keyed on "not re-derived" alone would
+    delete it and silently re-date the key to the next delivery raw still
+    holds. After step 2, both of B's version dates are pruned from raw
+    (08-03, where the replay starts, and 09-02, inside the window) and 09-03
+    is delivered. Both versions must still be in the target.
+
+    What the build does instead is the pre-existing failure of replaying from
+    pruned raw, which is LOUD: a second open version, which the SCD2 tests
+    refuse. Pinned too, so a later change cannot make it quiet by accident.
+    """
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for _, deliveries in _scenario("2026-08-03")[:2]:
+            for cob_date, version, rows, ts in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+            _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date in "
+                    "(date '2026-08-03', date '2026-09-02')")
+        _deliver(con, keys, attr, constants, "2026-09-03", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-04 06:00")
+        _build(con, name, INC, incremental=True)
+        b = {(r[len(keys)], r[len(keys) + 1]) for r in _state(con, INC, keys, attr)
+             if r[0] == "B"}
+        assert {("X", "2026-08-03"), ("Y", "2026-09-02")} <= b, (name, sorted(b))
+        assert _open_versions(con, INC, keys), (name, sorted(b))
