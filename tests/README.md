@@ -94,7 +94,9 @@ there -- `skip  test_versions.test_...: .env.example is not here`. A subject
 that could not be READ is not a subject that is EMPTY, and a repo-text test
 with no repo has to say which one it was rather than pass vacuously. In the
 container the run is `512 passed, 0 failed, 14 skipped`; on the host and in
-both CI tiers it is `526 passed, 0 failed` and nothing skips.
+CI it is `526 passed, 0 failed` and nothing skips. (`config.yml` is the tier
+that runs this suite. `parse.yml` runs `dbt parse` and `check_dag_imports`
+and never invokes it.)
 
 **That last clause is the guard, and it is not decoration.** `repo_file()`
 raises `Skipped` only when there is no checkout to read; in one, a missing
@@ -104,6 +106,14 @@ would be a gate that cannot fail
 and every one of these tests exists to catch drift only a checkout can see.
 Skips never affect the exit code. Confirm it the way this README asks below --
 move `.env.example` aside and watch `test_versions` FAIL rather than skip.
+
+**What decides "is this a checkout" is `support._CHECKOUT_MARKERS`, and none
+of them is a file any test reads.** That is the requirement, not an accident:
+the first version used `docker-compose.yml`, which `test_versions` reads and
+one of its cases is entirely about, so renaming it to `compose.yaml` would
+have turned all fourteen into skips and left CI green on a rename that should
+have failed five assertions loudly. A sentinel that is also a subject cannot
+notice its own subject going missing.
 
 Everything else in this repo is verified by running it against the live stack,
 which is the habit `CLAUDE.md` opens with. These tests do not replace that and

@@ -57,7 +57,16 @@ DAGS = next((d for d in (REPO / "airflow" / "dags",
 # not a subject that is EMPTY -- see CLAUDE.md, "The one habit that matters" --
 # and a repo-text test with no repo must say which one it was rather than pass
 # vacuously.
-IN_CHECKOUT = (REPO / "docker-compose.yml").is_file()
+# NONE OF THESE IS READ BY ANY TEST, AND THAT IS THE WHOLE REQUIREMENT. The
+# first version of this used `docker-compose.yml`, which `test_versions` reads
+# and one of its cases is entirely about -- so renaming it to `compose.yaml`,
+# the modern default name, would have turned all fourteen of these into skips
+# and left CI green on a rename that should have failed five assertions. A
+# sentinel that is also a subject cannot detect its own subject going missing.
+# `any`, not `all`, for the same reason: one of them being renamed must not
+# decide this on its own.
+_CHECKOUT_MARKERS = (".gitignore", "README.md", ".git")
+IN_CHECKOUT = any((REPO / m).exists() for m in _CHECKOUT_MARKERS)
 
 
 class Skipped(Exception):
@@ -75,10 +84,11 @@ def repo_file(relative: str | pathlib.Path) -> pathlib.Path:
     SKIP, and collapsing the two is the whole trap: a skip that can fire on
     the host is a gate that cannot fail
     (`docs/DECISIONS.md#a-gate-that-cannot-fail`), and every one of these
-    tests exists to catch drift that only a checkout can see. Both CI tiers
-    check the repo out in full, so `IN_CHECKOUT` is true there and nothing
-    can skip -- if one ever does, the checkout is broken and that is a
-    failure worth having.
+    tests exists to catch drift that only a checkout can see. `config.yml` is
+    the tier that runs this suite -- `parse.yml` runs `dbt parse` and
+    `check_dag_imports` and never invokes it -- and it checks the repo out in
+    full, so `IN_CHECKOUT` is true there and nothing can skip. If one ever
+    does, the checkout is broken and that is a failure worth having.
 
     Call it INSIDE the test, never at module scope: `run.py` imports a module
     before it can attribute anything to it.
