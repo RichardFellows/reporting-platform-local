@@ -446,8 +446,28 @@
 {% endmacro %}
 
 {% macro scd2_key_match(left, right, key_columns) -%}
-  {#- `left.k = right.k and ...` over the key columns. -#}
-  {%- for c in key_columns %}{{ left }}.{{ ident(c) }} = {{ right }}.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor -%}
+  {#-
+    `left.k IS NOT DISTINCT FROM right.k and ...` over the key columns: the
+    ONE comparison of a cleaned SCD2 key, used by every join in
+    `scd2_replay`, by the markers in `scd2_retractions`, and by the MERGE's
+    `on` in macros/merge.sql.
+
+    NULL-SAFE, DELIBERATELY. `clean_string` turns '', 'NULL' and 'N/A' into
+    NULL, and a full rebuild versions the NULL-key rows like any other key:
+    window partitions group NULLs together. With `=` the incremental path
+    matched nothing for them -- the rows silently vanished from incremental
+    builds while a full rebuild kept them, so the `not_null` test on the key
+    passed on exactly the builds that publish -- and the merge's `on` would
+    re-insert a NULL-key version every run. A NULL key is still a defect
+    `not_null` exists to fail; the point is that incremental and full builds
+    agree, so the test sees it on both.
+
+    NOT ENGINE-SPECIFIC. `IS NOT DISTINCT FROM` is in Spark 3.5.3's grammar
+    (SqlBaseParser.g4, `predicate`: `IS NOT? kind=DISTINCT FROM`) and
+    AstBuilder turns it into `EqualNullSafe`, the same expression as `<=>`;
+    DuckDB accepts it and rejects `<=>`. So the standard spelling is used.
+  -#}
+  {%- for c in key_columns %}{{ left }}.{{ ident(c) }} is not distinct from {{ right }}.{{ ident(c) }}{{ ' and ' if not loop.last }}{% endfor -%}
 {%- endmacro %}
 
 
@@ -456,9 +476,11 @@
     THE ROWS AN SCD2 MODEL VERSIONS, as a CTE named `replayed`: `cob_date`
     then `scd2_output_columns(business_columns)`, one row per key per COB
     date. Emits a TRAILING COMMA. `stage_cte` is the model's own cleaned
-    stream over EVERY raw row, carrying `_rn` from `dedupe_rank` -- so every
-    key compared below is the model's CLEANED key, by the model's one
-    definition of that cleaning.
+    stream over EVERY raw row, carrying `_rn` from `dedupe_rank` ranked on
+    that CLEANED key -- so every key compared below, and the in-file dedupe
+    before it, is the model's cleaned key, by the model's one definition of
+    that cleaning. (Ranked on the raw key, ' B' and 'B' in one file were both
+    "last in file" for one cleaned key: two versions with one effective_from.)
 
     THAT IS WHY IT COMES AFTER CLEANING, not before. The target holds cleaned
     keys (`clean_string`, and `upper` on `ref_rating`'s agency). The replay
@@ -506,6 +528,11 @@
     See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
   #}
   {%- set cols = scd2_output_columns(business_columns) -%}
+  {%- if cols[-4:] != ['source_batch_id', 'dbt_invocation_id', 'nessie_ref', 'dbt_updated_at'] -%}
+    {{ exceptions.raise_compiler_error(
+         "scd2_replay renders the seed's last four columns with audit_columns(), "
+         ~ "so scd2_output_columns() must end with its four, got " ~ cols[-4:]) }}
+  {%- endif -%}
   {%- set keys = [] -%}
   {%- for c in key_columns %}{%- do keys.append(ident(c)) %}{%- endfor -%}
   {%- if not is_incremental() %}
@@ -572,10 +599,15 @@
 
       union all
 
+      {# The seed's own columns come from the target, except the four audit
+          columns: the merge CHANGES this row (its effective_to), so it names
+          this run and branch, as every re-derived row does. source_batch_id
+          stays the target's -- the delivery that began the version. #}
       select _q.effective_from as cob_date
-             {%- for c in cols %},
+             {%- for c in cols[:-4] %},
              {% if c | lower in in_target %}_q.{{ ident(c) }}{% else %}null{% endif %} as {{ ident(c) }}
-             {%- endfor %}
+             {%- endfor %},
+             {{ audit_columns('_q.source_batch_id' if 'source_batch_id' in in_target else 'null') }}
       from {{ this }} as _q
       join scd2_seed_from as _f
         on {{ scd2_key_match('_f', '_q', key_columns) }}

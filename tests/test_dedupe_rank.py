@@ -443,4 +443,4 @@ def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():
     for path in scd2:
         text = _model(path)
         assert "newest_file_version(" in text, path.name
-        assert "newest_version='nv._newest_file_version'" in text, path.name
+        assert "newest_version='_newest_file_version'" in text, path.name

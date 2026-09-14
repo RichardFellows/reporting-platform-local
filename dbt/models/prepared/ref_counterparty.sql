@@ -76,11 +76,11 @@ with
 raw_rows as (
 
     {#
-      EVERY raw row, ranked. The replay scope is applied after cleaning
-      (`scd2_replay`), so that its keys are compared to the target's CLEANED
-      keys. `nv` decides the newest delivery per COB date from raw unjoined;
-      see `newest_version` on dedupe_rank. The retraction guard reads the
-      same CTE.
+      EVERY raw row, unranked. Ranking, the replay scope and the retraction
+      markers all happen after cleaning, so that every one of them uses the
+      CLEANED key -- see `ranked_rows` and `scd2_replay`. `nv` decides the
+      newest delivery per COB date from raw unjoined; see `newest_version` on
+      dedupe_rank. The retraction guard reads the same CTE.
 
       known_as_of() applies on the FULL-REFRESH path, which is the only path
       an as-of build is allowed to take (the macro refuses an incremental
@@ -88,8 +88,7 @@ raw_rows as (
     #}
     select
         r.*,
-        {{ dedupe_rank(['r.counterparty_id'],
-                       newest_version='nv._newest_file_version') }} as _rn
+        nv._newest_file_version
     from {{ source('raw', 'ref_counterparty') }} r
     join newest_file_version nv on nv._newest_cob_date = r._cob_date
     where {{ known_as_of() }}
@@ -118,13 +117,33 @@ cleaned as (
         _file_version                                               as source_file_version,
         {{ source_provenance() }}
         {{ audit_columns() }},
-        _rn
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number,
+        _newest_file_version
 
     from raw_rows
 
 ),
 
-{{ scd2_replay('cleaned', ['counterparty_id'], business_columns) }}
+ranked_rows as (
+
+    {#
+      THE IN-FILE DEDUPE IS ON THE CLEANED KEY. Ranked on the raw key, ' B'
+      and 'B' (or 'moodys' and 'MOODYS') in one file were each "last in file"
+      and both survived as one cleaned key: two versions with one
+      effective_from, one ending before it began.
+    #}
+    select
+        *,
+        {{ dedupe_rank(['counterparty_id'],
+                       newest_version='_newest_file_version') }} as _rn
+    from cleaned
+
+),
+
+{{ scd2_replay('ranked_rows', ['counterparty_id'], business_columns) }}
 
 {#
   Business attributes only -- see the scd2_hash macro for what including an

@@ -39,12 +39,11 @@ with
 
 raw_rows as (
 
-    {# Every raw row, ranked, for the reasons ref_counterparty's copy of this
-       states. #}
+    {# Every raw row, unranked, for the reasons ref_counterparty's copy of
+       this states. #}
     select
         r.*,
-        {{ dedupe_rank(['r.counterparty_id', 'r.agency'],
-                       newest_version='nv._newest_file_version') }} as _rn
+        nv._newest_file_version
     from {{ source('raw', 'ref_rating') }} r
     join newest_file_version nv on nv._newest_cob_date = r._cob_date
     where {{ known_as_of() }}
@@ -64,7 +63,11 @@ cleaned as (
         _file_version                                   as source_file_version,
         {{ source_provenance() }}
         {{ audit_columns() }},
-        _rn
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number,
+        _newest_file_version
 
     from raw_rows
 
@@ -94,7 +97,23 @@ ranked as (
 
 ),
 
-{{ scd2_replay('ranked', ['counterparty_id', 'agency'], business_columns) }}
+ranked_rows as (
+
+    {#
+      THE IN-FILE DEDUPE IS ON THE CLEANED KEY. Ranked on the raw key, ' B'
+      and 'B' (or 'moodys' and 'MOODYS') in one file were each "last in file"
+      and both survived as one cleaned key: two versions with one
+      effective_from, one ending before it began.
+    #}
+    select
+        *,
+        {{ dedupe_rank(['counterparty_id', 'agency'],
+                       newest_version='_newest_file_version') }} as _rn
+    from ranked
+
+),
+
+{{ scd2_replay('ranked_rows', ['counterparty_id', 'agency'], business_columns) }}
 
 {#
   rating_rank and grade_band are DERIVED from `rating` and are deliberately

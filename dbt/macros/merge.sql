@@ -41,9 +41,11 @@
   {%- endif -%}
 
   {%- set predicates = [] if incremental_predicates is none else [] + incremental_predicates -%}
-  {%- for key in unique_key -%}
-    {%- do predicates.append('DBT_INTERNAL_SOURCE.' ~ key ~ ' = DBT_INTERNAL_DEST.' ~ key) -%}
-  {%- endfor -%}
+  {#- NULL-SAFE, with the same comparison every other join of an SCD2 key uses
+      (`scd2_key_match` in engine.sql): a key that cleans to NULL is versioned
+      by a full rebuild, and an `=` here would never match its version and
+      insert another on every incremental run. -#}
+  {%- do predicates.append(scd2_key_match('DBT_INTERNAL_SOURCE', 'DBT_INTERNAL_DEST', unique_key)) -%}
   {%- set update_columns = adapter.get_columns_in_relation(target) | map(attribute='quoted') | list -%}
 
   merge into {{ target }} as DBT_INTERNAL_DEST
