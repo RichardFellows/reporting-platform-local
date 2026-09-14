@@ -31,7 +31,10 @@ schema_drift: warn
 retention_class: standard
 
 # A middle tier between `defaults:` above and a feed block below:
-# defaults -> convention -> feed, each layer overriding the last.
+# defaults -> convention -> feed, each layer overriding the last -- and a
+# convention may itself name a `parent:`, so the middle tier is a CHAIN
+# rather than a single link: global -> vendor -> system, outermost first,
+# the nearest link winning.
 #
 # The variation between feeds is mostly PER SOURCE SYSTEM, not per feed. One
 # system sends pipe-delimited files, another sends zips with a control file,
@@ -40,6 +43,13 @@ retention_class: standard
 # and its second and fortieth feeds are a name, a key and a column list.
 #
 # A convention may set anything a feed block may except `name` and
-# `convention` itself, and conventions DO NOT CHAIN. Naming one that does not
-# exist is an error at load, not a silent fall back to `defaults:`, and so is
-# a misspelled key inside one. See docs/DECISIONS.md#feed-conventions
+# `convention` itself -- `convention:` is how a FEED names one, so a
+# convention chains by naming `parent:` instead. Shallow at every link: a
+# dict-valued key such as `column_types` is replaced by the nearer layer,
+# never merged into it.
+#
+# FIVE THINGS ARE ERRORS AT LOAD, none of them a silent fall back to
+# `defaults:`: naming a convention that does not exist, naming a `parent:`
+# that does not, a cycle among those parents, a misspelled key inside a
+# convention, and setting `name` or `convention` in one.
+# See docs/DECISIONS.md#feed-conventions

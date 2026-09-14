@@ -36,9 +36,13 @@ import re
 
 import yaml
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
-DOCKERFILE = REPO / "Dockerfile.airflow"
-WORKFLOW = REPO / ".github" / "workflows" / "parse.yml"
+from tests.support import repo_file
+
+# REPO-RELATIVE, and resolved through `support.repo_file` at CALL time. Neither
+# file is mounted into the container -- the image is built FROM the Dockerfile
+# and does not carry it -- so in one this module skips rather than failing.
+DOCKERFILE = pathlib.Path("Dockerfile.airflow")
+WORKFLOW = pathlib.Path(".github/workflows/parse.yml")
 
 # A pip requirement as either file writes one: always double-quoted, extras
 # optional, `==` only. Neither uses a range anywhere, and a range would be the
@@ -61,7 +65,8 @@ def _dockerfile() -> str:
     --build-arg` can move it; the default is still a literal in the file and
     comparable with the workflow's.
     """
-    text = "\n".join(ln for ln in DOCKERFILE.read_text(encoding="utf-8").splitlines()
+    text = "\n".join(ln for ln in repo_file(DOCKERFILE).read_text(
+                         encoding="utf-8").splitlines()
                      if not ln.lstrip().startswith("#"))
     for name, value in re.findall(r"^ARG\s+([A-Za-z0-9_]+)=(\S+)", text,
                                   re.MULTILINE):
@@ -70,7 +75,7 @@ def _dockerfile() -> str:
 
 
 def _steps() -> list[dict]:
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    workflow = yaml.safe_load(repo_file(WORKFLOW).read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
     assert len(jobs) == 1, (
         f"{WORKFLOW.name} has grown a second job ({', '.join(sorted(jobs))}); "

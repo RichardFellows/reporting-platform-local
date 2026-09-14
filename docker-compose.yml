@@ -140,6 +140,12 @@ x-airflow-common: &airflow-common
     # The config-level tests, so `python -m tests.run` works in the container
     # as tests/README.md says. Read-only: they must never be able to edit the
     # thing they are testing.
+    #
+    # THE REPO IS DELIBERATELY NOT MOUNTED BESIDE THEM. Three modules read
+    # `.env.example`, this file, both Dockerfiles, `CLAUDE.md`, `docs/` and
+    # `.github/` -- adding those mounts would put this repo's docs, CI config
+    # and git history inside the runtime image of six services to satisfy a
+    # test. They skip instead, naming the path, through `support.repo_file`.
     - ./tests:/opt/platform/tests:ro
     - ./dbt:/opt/platform/dbt
     - ./seed:/opt/platform/seed

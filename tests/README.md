@@ -6,7 +6,9 @@ python -m tests.run test_conventions   # one module
 ```
 
 Runs on the host (needs `pyyaml`, `ruamel.yaml` and `duckdb`) or inside the
-stack with no rebuild:
+stack with no rebuild -- where the three modules that read the repo rather
+than the package skip, and say so ("And where the rest of the repo is not",
+below):
 
 ```powershell
 docker compose exec -T airflow python -m tests.run
@@ -72,6 +74,46 @@ it must keep doing. `docker-compose.yml` mounts `./airflow/dags` at
 `REPO / "airflow" / "dags"` resolves on the host and not in the container --
 which is where this README says the suite runs. `support.DAGS` resolves it
 either way.
+
+**And where the rest of the repo is not.** Three modules read files that are
+not under `/opt/platform` at all and cannot be resolved to anywhere, because
+the container holds the PACKAGE and they read the REPO:
+
+| Module | Reads |
+|---|---|
+| `test_versions.py` | `.env.example`, `docker-compose.yml`, `Dockerfile.spark`, `Dockerfile.airflow` |
+| `test_ci_pins.py` | `Dockerfile.airflow`, `.github/workflows/parse.yml` |
+| `test_doc_claims.py` | `CLAUDE.md`, `docs/*.md`, and `git ls-files` for the source |
+
+Mounting them is the other answer and it was rejected: it means bind-mounting
+this repo's docs, CI config and git history into the runtime image of six
+services so that a test can open them.
+
+So they **skip**, through `support.repo_file()`, naming the path that is not
+there -- `skip  test_versions.test_...: .env.example is not here`. A subject
+that could not be READ is not a subject that is EMPTY, and a repo-text test
+with no repo has to say which one it was rather than pass vacuously. In the
+container the run is `512 passed, 0 failed, 14 skipped`; on the host and in
+CI it is `526 passed, 0 failed` and nothing skips. (`config.yml` is the tier
+that runs this suite. `parse.yml` runs `dbt parse` and `check_dag_imports`
+and never invokes it.)
+
+**That last clause is the guard, and it is not decoration.** `repo_file()`
+raises `Skipped` only when there is no checkout to read; in one, a missing
+file is an ordinary `AssertionError`. A skip that could fire on the host
+would be a gate that cannot fail
+([DECISIONS.md#a-gate-that-cannot-fail](../docs/DECISIONS.md#a-gate-that-cannot-fail)),
+and every one of these tests exists to catch drift only a checkout can see.
+Skips never affect the exit code. Confirm it the way this README asks below --
+move `.env.example` aside and watch `test_versions` FAIL rather than skip.
+
+**What decides "is this a checkout" is `support._CHECKOUT_MARKERS`, and none
+of them is a file any test reads.** That is the requirement, not an accident:
+the first version used `docker-compose.yml`, which `test_versions` reads and
+one of its cases is entirely about, so renaming it to `compose.yaml` would
+have turned all fourteen into skips and left CI green on a rename that should
+have failed five assertions loudly. A sentinel that is also a subject cannot
+notice its own subject going missing.
 
 Everything else in this repo is verified by running it against the live stack,
 which is the habit `CLAUDE.md` opens with. These tests do not replace that and

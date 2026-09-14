@@ -22,10 +22,9 @@ No stack, no network. See docs/DECISIONS.md#jar-versions
 """
 from __future__ import annotations
 
-import pathlib
 import re
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
+from tests.support import repo_file
 
 # EVERY DECLARATION SITE, with the pattern that finds the version in it. Each
 # is a real second copy, not a reference: `common/spark.py` and
@@ -71,7 +70,11 @@ VALIDATED_PAIRS = {
 
 
 def _version(relative: str, pattern: str) -> str:
-    text = (REPO / relative).read_text(encoding="utf-8")
+    # `repo_file`, not `REPO / relative`: four of these sites -- `.env.example`,
+    # `docker-compose.yml` and both Dockerfiles -- describe the DEPLOYMENT and
+    # are not mounted into it, so in a container this skips rather than
+    # reporting the drift it exists to catch as absent.
+    text = repo_file(relative).read_text(encoding="utf-8")
     found = re.findall(pattern, text, re.M)
     assert found, f"{relative}: nothing matched {pattern!r} -- the version " \
                   f"moved, or this site no longer declares one"
@@ -148,7 +151,7 @@ def test_the_quarkus_json_logging_keys_match_the_server_they_need():
     `quarkus.log.console.json.*` lines must go with it -- left behind they are
     inert config that reads as working, which is this repo's most-repeated
     failure shape. Nothing enforced the pairing."""
-    compose = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+    compose = repo_file("docker-compose.yml").read_text(encoding="utf-8")
     has_keys = "quarkus.log.console.json" in compose
     server = _parts(_agree(SERVER_SITES, "NESSIE_SERVER_VERSION"))
     if has_keys:

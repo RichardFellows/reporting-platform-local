@@ -39,7 +39,7 @@ def modules(only: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     sys.path.insert(0, str(HERE.parent))
-    passed, failed = 0, []
+    passed, failed, skipped = 0, [], []
 
     from tests import support
 
@@ -49,7 +49,15 @@ def main(argv: list[str] | None = None) -> int:
         # left in the environment and in `sys.modules`, and the suite would
         # depend on the order `modules()` happens to return.
         support.reset()
-        mod = importlib.import_module(f"tests.{name}")
+        try:
+            mod = importlib.import_module(f"tests.{name}")
+        except support.Skipped as why:
+            # A module that cannot even import here. Caught because the import
+            # is outside the per-test `try` below, so a `repo_file()` at module
+            # scope would otherwise take the whole run down with it.
+            skipped.append((name, str(why)))
+            print(f"skip  {name}: {why}")
+            continue
         for attr in sorted(vars(mod)):
             if not attr.startswith("test_"):
                 continue
@@ -58,6 +66,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             try:
                 fn()
+            except support.Skipped as why:
+                # NOT a pass and NOT a failure: something this test reads is
+                # not present here at all. `support.repo_file` raises this
+                # only when there is no checkout to read -- in one, a missing
+                # file is an AssertionError and lands below.
+                skipped.append((f"{name}.{attr}", str(why)))
+                print(f"skip  {name}.{attr}: {why}")
             except Exception:                                  # noqa: BLE001
                 failed.append((f"{name}.{attr}", traceback.format_exc()))
                 print(f"FAIL  {name}.{attr}")
@@ -65,9 +80,14 @@ def main(argv: list[str] | None = None) -> int:
                 passed += 1
                 print(f"ok    {name}.{attr}")
 
-    print(f"\n{passed} passed, {len(failed)} failed")
+    tail = f", {len(skipped)} skipped" if skipped else ""
+    print(f"\n{passed} passed, {len(failed)} failed{tail}")
+    for label, why in skipped:
+        print(f"  skipped  {label}: {why}")
     for label, tb in failed:
         print(f"\n--- {label} ---\n{tb}")
+    # SKIPS DO NOT AFFECT THE EXIT CODE. They cannot fire in a checkout, so
+    # in CI this is the same gate it always was.
     return 1 if failed else 0
 
 

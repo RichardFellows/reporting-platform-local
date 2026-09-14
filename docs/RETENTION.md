@@ -94,10 +94,9 @@ shortened separately.
 environments:
   local:   &full
     landing:
-      keep_business_days: 10
-      keep_month_ends_years: 8
-      latest_version_only: true
-      superseded_grace_days: 5
+      keep_years: 10                 # the default retention class
+      classes:
+        operational: {keep_years: 7}
 
     raw:
       keep_business_days: 10
@@ -119,12 +118,13 @@ environments:
 
   uat: *full
   prod: *full
-  dev:  # shortened — see "Non-prod"
+  dev:  # shortened throughout — `landing.keep_years: 1`
 ```
 
 `snapshot_retain_last` is a floor that applies regardless of age, so an idle
-table always keeps a rollback point. `superseded_grace_days` delays removal of
-a superseded `_file_version` so a bad re-delivery can still be investigated.
+table always keeps a rollback point. `landing:` is the odd one out — a flat
+age in years rather than a keep-set, with per-class windows under it. See
+*Landing* below, which is where the figure lives.
 
 Nessie reference retention lives in the same file under a separate top-level
 `references:` key — `published_tags`, `snapshot_tags` and `working_branches`.
@@ -167,25 +167,35 @@ is again the safer choice.
 The stated desire to extend to 8 years of *all* dates is a separate,
 much larger commitment — see "Open question: extended retention" below.
 
-### Landing: everything, for ten years — or for its retention class
+### Landing: everything, for its retention class
 
 **The evidence copy, and it does not follow the table rule.** Every CSV every
 feed has ever delivered is kept for its retention class's window and then
 removed — including superseded re-deliveries. `TRADE_20260813.csv` and
 `TRADE_20260813_v2.csv` both live out that window.
 
-Raised from eight when the published-tag window was corrected: landing must
-outlast the pins, or a published run stays reproducible after the evidence it
-was built from is gone. `retention.py` refuses to sweep if it does not — see
-*The reproducibility window*.
+**`reporting_platform/config/retention.yml` is the authority on the window,
+and this is the one section of the docs that repeats the figure.** Today
+`landing.keep_years` is **10** in `local`, `uat` and `prod`, **7** for the
+`operational` class, and **1** throughout the `dev` profile. Everywhere else
+points here, or straight at `retention.yml`, rather than carrying a number of
+its own — four copies of one policy value is how the docs came to say eight
+while the sweep was running on ten.
 
-That is deliberate, and it is the opposite of what an earlier draft of this
-document specified. Landing exists to answer *"what did the file we actually
-received say?"* — a question normally asked after a restatement, about a
-COB date the table layers expired years ago. Sampling it by keep-set, or
-dropping superseded versions, destroys exactly the evidence it exists to
-preserve, and saves the cheapest bytes in the estate: flat CSV on object
-storage.
+Ten, raised from eight when the published-tag window was corrected: landing
+must outlast the pins, or a published run stays reproducible after the
+evidence it was built from has gone. `landing.keep_years` must be ≥ the
+longest `references.published_tags` window and `retention.py` refuses to sweep
+if it is not — see *The reproducibility window* below and
+[DECISIONS.md#published-tags-are-the-reproducibility-window](DECISIONS.md#published-tags-are-the-reproducibility-window).
+
+Keeping everything, by flat age, is deliberate, and it is the opposite of what
+an earlier draft of this document specified. Landing exists to answer *"what
+did the file we actually received say?"* — a question normally asked after a
+restatement, about a COB date the table layers expired years ago. Sampling it
+by keep-set, or dropping superseded versions, destroys exactly the evidence it
+exists to preserve, and saves the cheapest bytes in the estate: flat CSV on
+object storage.
 
 `reporting_platform/retention/landing.py`, run as the last step of
 `retention.run()` and therefore nightly:

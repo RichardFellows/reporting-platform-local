@@ -87,7 +87,7 @@ Split them.
 
 | Prefix | Job | Lifetime | Deletion rule |
 |---|---|---|---|
-| `landing/<feed>/` | **evidence** — exactly what the upstream sent, byte for byte | `keep_years: 8` | never on a guess; unparseable means keep |
+| `landing/<feed>/` | **evidence** — exactly what the upstream sent, byte for byte | `keep_years`, in years ([RETENTION.md](RETENTION.md#landing-everything-for-its-retention-class)) | never on a guess; unparseable means keep |
 | `ready/<feed>/` | **work queue** — a manifest per delivery, plus any derived parts | days | freely, once ingested; rebuildable from landing |
 
 `landing/` keeps its current semantics and its current retention sweep

@@ -20,7 +20,7 @@ flowchart TB
     end
 
     subgraph store["Object storage — MinIO"]
-        LAND["<b>landing/&lt;feed&gt;/</b><br/><i>evidence copy · keep_years: 8</i><br/>correctly named, always"]
+        LAND["<b>landing/&lt;feed&gt;/</b><br/><i>evidence copy · years, per retention class</i><br/>correctly named, always"]
         READY["<b>ready/&lt;feed&gt;/</b><br/><i>work queue · days</i><br/>one manifest per delivery"]
     end
 
@@ -100,9 +100,11 @@ something Spark can read directly.
 
 ## 2. `landing/` — the evidence copy
 
-Immutable, kept for `keep_years` (8 in the default profile, 1 in `dev`), swept by
-`reporting_platform/retention/landing.py`. Three kinds of object live here, and
-retention dates each differently:
+Immutable, kept for the `keep_years` of its retention class — the windows are
+in `retention.yml` and written out in
+[RETENTION.md](RETENTION.md#landing-everything-for-its-retention-class) —
+and swept by `reporting_platform/retention/landing.py`. Three kinds of object
+live here, and retention dates each differently:
 
 | Object | Dated by |
 |---|---|
@@ -227,8 +229,8 @@ to `keep_failed_branch` instead, so the branch survives for inspection.
 | Prefix / layer | Kept | Rebuildable from |
 |---|---|---|
 | `inbox/.processed/` | until removed by hand | — |
-| `landing/` | `keep_years` — 10 by default, and ≥ the longest published-tag window | nothing — this is the evidence |
-| `quarantine/` | `keep_years` — 10 by default | nothing — what was refused, kept |
+| `landing/` | `keep_years`, per retention class, and ≥ the longest published-tag window — figures in [RETENTION.md](RETENTION.md#landing-everything-for-its-retention-class) | nothing — this is the evidence |
+| `quarantine/` | `keep_years` — its own key in `retention.yml`, not a reference to landing's | nothing — what was refused, kept |
 | `ready/` | days | `landing/`, by re-running normalize |
 | `raw` | recent business days + month-ends | `landing/` |
 | `prepared` / `reporting` | per `retention.yml` | the layer below, by rebuilding |
