@@ -157,13 +157,15 @@ def _build(con, name: str, target: str, incremental: bool):
 
 
 # -------------------------------------------------------------------- data
-def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts):
-    """Append one delivery to `raw_src`. `rows` maps the first key to the
-    changing attribute; any second key is a constant."""
+def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts,
+             second_key="AGENCY1"):
+    """Append one delivery to `raw_src`. `rows` maps the first key AS RAW HAS
+    IT (padding included) to the changing attribute; any second key is
+    `second_key`, also as raw has it."""
     cols = keys + [attr] + list(constants)
     values = []
     for n, (key, value) in enumerate(rows.items(), 1):
-        record = [key] + [f"{k.upper()}1" for k in keys[1:]] + [value] + list(constants.values())
+        record = [key] + [second_key for _ in keys[1:]] + [value] + list(constants.values())
         lits = ", ".join("null" if v is None else f"'{v}'" for v in record)
         values.append(f"(date '{cob_date}', {version}, {n}, {lits}, "
                       f"'landing/x_{cob_date}_v{version}.csv', 'b{version}', "
@@ -224,12 +226,19 @@ def _scenario(first_date: str):
 
 
 def _run_scenario(first_date: str):
+    return _run_steps(first_date, _scenario(first_date))
+
+
+def _run_steps(label, steps, models=MODELS):
+    """Build incrementally after every step, beside a full rebuild; report
+    every step where they differ or the incremental table is malformed.
+    A delivery is (cob_date, version, rows, ingest_ts[, second key])."""
     failures = []
-    for name, keys, attr, constants in MODELS:
+    for name, keys, attr, constants in models:
         con = _connect()
-        for step, deliveries in _scenario(first_date):
-            for cob_date, version, rows, ts in deliveries:
-                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+        for step, deliveries in steps:
+            for cob_date, version, rows, ts, *second in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts, *second)
             _build(con, name, INC, incremental=True)
             _build(con, name, FULL, incremental=False)
             inc, full = _state(con, INC, keys, attr), _state(con, FULL, keys, attr)
@@ -242,7 +251,7 @@ def _run_scenario(first_date: str):
             if _overlaps(con, INC, keys):
                 problems.append(f"overlapping versions: {_overlaps(con, INC, keys)}")
             if problems:
-                failures.append(f"{name} [{first_date}] after '{step}':\n    "
+                failures.append(f"{name} [{label}] after '{step}':\n    "
                                 + "\n    ".join(problems))
     return failures
 
@@ -322,3 +331,85 @@ def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
              if r[0] == "B"}
         assert {("X", "2026-08-03"), ("Y", "2026-09-02")} <= b, (name, sorted(b))
         assert _open_versions(con, INC, keys), (name, sorted(b))
+
+
+# ------------------------------------------- the final review's two findings
+# Reproduced by the reviewer's probe before the fix; every case below printed
+# DIFF on 2ae6052 except the unpadded control.
+
+def _history_before_the_replay_start(third):
+    """B is W from 07-01, X from 08-03, Y from 09-02 -- so when 08-03 is
+    re-delivered, the lookback window starts 08-30 and the replay starts at
+    08-03 (X, the version in force then). W, the version BEFORE it, is outside
+    the replay, and is the one the full rebuild extends."""
+    return [
+        ("W, then X", [("2026-07-01", 1, {"A": "a", "B": "W"}, "2026-07-02 06:00"),
+                       ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
+                       ("2026-09-01", 1, {"A": "a", "B": "X"}, "2026-09-02 06:00")]),
+        ("09-02 changes B to Y", [("2026-09-02", 1, {"A": "a", "B": "Y"}, "2026-09-03 06:00")]),
+        third,
+    ]
+
+
+def test_dropping_the_replay_start_version_reopens_the_one_before_it():
+    """Finding 1, C-drop. Before the fix the X version was retracted and W
+    stayed closed at 08-02: a gap in which `as_of()` matches nothing."""
+    failures = _run_steps("C-drop", _history_before_the_replay_start(
+        ("08-03 re-delivered without B",
+         [("2026-08-03", 2, {"A": "a"}, "2026-09-03 09:00")])))
+    assert not failures, "\n".join(failures)
+
+
+def test_reverting_the_replay_start_version_extends_the_one_before_it():
+    """Finding 1, C-revert. Before the fix the re-delivery's W became a second
+    W version back to back with the first; the full rebuild has one."""
+    failures = _run_steps("C-revert", _history_before_the_replay_start(
+        ("08-03 re-delivered reverting B to W",
+         [("2026-08-03", 2, {"A": "a", "B": "W"}, "2026-09-03 09:00")])))
+    assert not failures, "\n".join(failures)
+
+
+def test_a_padded_raw_key_is_matched_to_the_cleaned_target_key():
+    """Finding 2. The target holds `clean_string` keys; a replay scope built
+    from raw keys never matched ' B' to 'B', so no marker was emitted, the
+    retracted version stayed current, and B's next change opened a second."""
+    failures = _run_steps("padded", [
+        ("B clean, then padded", [("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-09-01 06:00"),
+                                  ("2026-09-01", 1, {"A": "a", " B": "X"}, "2026-09-02 06:00")]),
+        ("09-02 changes B", [("2026-09-02", 1, {"A": "a", " B": "Y"}, "2026-09-03 06:00")]),
+        ("09-02 re-delivered without B", [("2026-09-02", 2, {"A": "a"}, "2026-09-03 09:00")]),
+        ("09-03", [("2026-09-03", 1, {"A": "a", " B": "X"}, "2026-09-04 06:00")]),
+    ])
+    assert not failures, "\n".join(failures)
+
+
+def _padded_consistently(pad):
+    return [
+        ("first build", [("2026-08-03", 1, {"A": "a", pad + "B": "X"}, "2026-09-01 06:00"),
+                         ("2026-09-01", 1, {"A": "a", pad + "B": "X"}, "2026-09-02 06:00")]),
+        ("09-02 changes B", [("2026-09-02", 1, {"A": "a", pad + "B": "Y"}, "2026-09-03 06:00")]),
+        ("09-02 re-delivered without B", [("2026-09-02", 2, {"A": "a"}, "2026-09-03 09:00")]),
+        ("09-03", [("2026-09-03", 1, {"A": "a", pad + "B": "Y"}, "2026-09-04 06:00")]),
+    ]
+
+
+def test_a_key_padded_in_every_delivery_is_retracted_like_a_clean_one():
+    """Finding 2, the review's padded-consistent case, beside its control."""
+    failures = (_run_steps("padded-consistent", _padded_consistently(" "))
+                + _run_steps("unpadded-control", _padded_consistently("")))
+    assert not failures, "\n".join(failures)
+
+
+def test_an_agency_in_another_case_is_matched_to_the_cleaned_target_agency():
+    """Finding 2 on `ref_rating`'s second key, which the model cleans with
+    `upper(clean_string(...))`: raw sends ' agency1' where the target holds
+    'AGENCY1'."""
+    rating = [m for m in MODELS if m[0] == "ref_rating"]
+    failures = _run_steps("agency case", [
+        ("first build", [("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-09-01 06:00", "AGENCY1"),
+                         ("2026-09-01", 1, {"A": "a", "B": "X"}, "2026-09-02 06:00", " agency1")]),
+        ("09-02 changes B", [("2026-09-02", 1, {"A": "a", "B": "Y"}, "2026-09-03 06:00", " agency1")]),
+        ("09-02 re-delivered without B", [("2026-09-02", 2, {"A": "a"}, "2026-09-03 09:00", " agency1")]),
+        ("09-03", [("2026-09-03", 1, {"A": "a", "B": "X"}, "2026-09-04 06:00", "agency1")]),
+    ], models=rating)
+    assert not failures, "\n".join(failures)
