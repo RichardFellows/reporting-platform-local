@@ -404,6 +404,26 @@ function feedForm(f, creating) {
     patternResult.style.color = r.ok ? "var(--ok)" : "var(--bad)";
   }
 
+  // Built up here rather than inline in node.append() below, because the note
+  // that follows rides on it.
+  const patternField = field("filename_pattern", "Filename pattern (in landing)", pattern,
+      "Matched with re.fullmatch, so it must cover the whole filename, and must contain " +
+      "a (?P<cob_date>\\d{8}) group. This is the name the file has IN LANDING. If the " +
+      "upstream sends something else — no date, a wrong prefix — leave this as the name you " +
+      "want and describe the real one under Arrival below; the inbox renames it on the way in. " +
+      "A pattern that matches nothing is silent: the feed simply never has anything pending.");
+  // THE SINGLE MOST CONFUSABLE THING ABOUT A ZIP UNPACKED AT THE DOOR: the
+  // container never lands, so the pattern above names each MEMBER after
+  // renaming. Shown only once the arrival member pattern is filled in, or it
+  // is a paragraph about zips on the form of every feed that has none.
+  const membersNotTheZipNote = el("div",
+    {class: "sub", style: "font-size:12px;margin-top:4px;color:var(--warn)"},
+    "This feed's container is unpacked AT THE DOOR, so the name above is the " +
+    "one each MEMBER lands under — never the zip's. landing/ never holds an " +
+    "archive for this shape, and a pattern ending .zip here would match " +
+    "nothing for ever.");
+  patternField.insertBefore(membersNotTheZipNote, patternField.lastChild);
+
   node.append(
     field("name", "Name", name,
       "Lowercase with underscores. Becomes lakehouse.raw.<name>, DAG ingest_<name> and landing/<name>/."),
@@ -430,12 +450,7 @@ function feedForm(f, creating) {
       ]),
       patternResult,
     ]),
-    field("filename_pattern", "Filename pattern (in landing)", pattern,
-      "Matched with re.fullmatch, so it must cover the whole filename, and must contain " +
-      "a (?P<cob_date>\\d{8}) group. This is the name the file has IN LANDING. If the " +
-      "upstream sends something else — no date, a wrong prefix — leave this as the name you " +
-      "want and describe the real one under Arrival below; the inbox renames it on the way in. " +
-      "A pattern that matches nothing is silent: the feed simply never has anything pending."),
+    patternField,
   );
 
   // ------------------------------------------------------------- arrival
@@ -451,9 +466,19 @@ function feedForm(f, creating) {
     value: f?.arrival?.source_pattern ?? "", placeholder: "positions\\.csv"});
   const arrCtlPattern = el("input", {class: "mono",
     value: f?.arrival?.control?.pattern ?? "", placeholder: "{stem}\\.ctl"});
+  const AUTO_CTL = "{stem}\\.ctl";       // what ticking the box fills in
   const arrCtlDate = el("input", {class: "mono",
     value: f?.arrival?.control?.cob_date ?? "",
     placeholder: "ReportingDate\\|(?P<cob_date>\\d{8})"});
+  // A ZIP UNPACKED AT THE GATE (`arrival.archive`): the container is a
+  // transport wrapper, its members land as ordinary deliveries, and it never
+  // reaches landing/. Distinct from `delivery.kind: archive` below, where the
+  // zip DOES land and is one delivery in several parts. The COB date is what
+  // tells them apart -- per member here, on the container there.
+  // See docs/DECISIONS.md#unpacking-happens-at-the-gate.
+  const arrMemberPattern = el("input", {class: "mono",
+    value: f?.arrival?.archive?.member_pattern ?? "",
+    placeholder: "POS_(?P<cob_date>\\d{8})\\.csv"});
   // Retitled by syncControlFormat() below: under a delimited control file
   // this names a COLUMN, and a label still saying "pattern" beside a
   // placeholder showing a regex is worse than no help at all.
@@ -464,16 +489,25 @@ function feedForm(f, creating) {
     "'ReportingDate\\|(?P<cob_date>\\d{8})'. Required unless the " +
     "upstream filename above already captures the date.");
 
+  const sourcePatternHelp = el("div", {class: "sub", style: "font-size:12px;margin-top:4px"});
+  const memberPatternHelp = el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
+    "Leave blank unless the upstream sends a ZIP the door should unpack. " +
+    "A regex, fullmatched against each member's name inside the container, " +
+    "picking out the ones that belong to this feed — a zip routinely carries " +
+    "a checksum, a manifest or another feed's file beside the data, and a " +
+    "wrong guess would silently land the wrong files. The container itself " +
+    "never lands: every matching member is landed as ITS OWN delivery, " +
+    "renamed to the landing pattern above.");
   const arrivalFields = el("div", {}, [
     el("div", {class: "field", style: "margin-top:10px"}, [
       el("label", {}, "Filename as the upstream sends it"),
       sourcePattern,
-      el("div", {class: "sub", style: "font-size:12px;margin-top:4px"},
-        "A regex, fullmatched against the name in the inbox — a different " +
-        "string from the landing pattern above. It may capture " +
-        "(?P<cob_date>\\d{8}) if the sender's name has a date but is " +
-        "otherwise wrong; if it does not, the control file below must supply " +
-        "the date. Exactly one of the two, never both."),
+      sourcePatternHelp,
+    ]),
+    el("div", {class: "field", style: "margin-top:10px"}, [
+      el("label", {}, "Members to unpack (zip only)"),
+      arrMemberPattern,
+      memberPatternHelp,
     ]),
     el("div", {class: "field", style: "margin-top:10px"}, [
       el("label", {}, "Control file pattern"),
@@ -498,10 +532,53 @@ function feedForm(f, creating) {
       "ingestion verifies content."),
   ]);
 
+  // EXACTLY ONE SOURCE FOR THE COB DATE, and unpacking moves which name is
+  // asked. For a plain delivery it is the upstream's own filename or the
+  // control file; for a container it is the MEMBER's name or the control
+  // file packed beside that member -- and the container's name is not a
+  // source at all, even when it carries a date. Saying so only while a
+  // member pattern is set keeps the ordinary feed's help ordinary.
+  // context.resolve_arrival_config is where this is enforced.
+  function syncArrivalArchive() {
+    const mp = arrMemberPattern.value.trim();
+    const unpacking = hasArrival.checked && !!mp;
+    // Ticking the box fills in a control pattern, because a legacy sender
+    // that needs the door usually has one. A member pattern carrying its own
+    // date does NOT -- and an `arrival.control` with no `delivery.control` is
+    // refused by check_gates_are_coherent, so leaving the autofill in would
+    // make the form's own default path for this shape unsaveable. Only the
+    // UNTOUCHED default is dropped; anything typed is somebody's answer.
+    if (unpacking && mp.includes("(?P<cob_date>") && arrCtlPattern.value === AUTO_CTL)
+      arrCtlPattern.value = "";
+    membersNotTheZipNote.style.display = unpacking ? "" : "none";
+    sourcePatternHelp.textContent = unpacking
+      ? "A regex, fullmatched against the CONTAINER's name in the inbox. " +
+        "A date here is NOT read — the container is a transport wrapper, and " +
+        "each member lands as its own delivery for its own day. Give the " +
+        "date in the member pattern below, or in a control file packed " +
+        "beside each member; exactly one of the two, never both."
+      : "A regex, fullmatched against the name in the inbox — a different " +
+        "string from the landing pattern above. It may capture " +
+        "(?P<cob_date>\\d{8}) if the sender's name has a date but is " +
+        "otherwise wrong; if it does not, the control file below must supply " +
+        "the date. Exactly one of the two, never both.";
+    arrCtlDateHelp.textContent = unpacking
+      ? "Read from a control file packed INSIDE the container beside its " +
+        "member — which is how a statically named member gets dated. " +
+        "Required unless the member pattern above already captures the date, " +
+        "and refused if it does: one fact, one source."
+      : "Read from the control file's contents. For a line like " +
+        "ReportingDate|20260801 that is " +
+        "'ReportingDate\\|(?P<cob_date>\\d{8})'. Required unless the " +
+        "upstream filename above already captures the date.";
+  }
+  arrMemberPattern.addEventListener("input", syncArrivalArchive);
+
   function syncArrivalVisibility() {
     arrivalFields.style.display = hasArrival.checked ? "" : "none";
     if (hasArrival.checked && !arrCtlPattern.value.trim())
-      arrCtlPattern.value = "{stem}\\.ctl";
+      arrCtlPattern.value = AUTO_CTL;
+    syncArrivalArchive();
   }
   hasArrival.addEventListener("change", syncArrivalVisibility);
   syncArrivalVisibility();
@@ -1007,6 +1084,11 @@ function feedForm(f, creating) {
     const fmt = readControlFormat();
     if (fmt && Object.keys(control).length) control.format = fmt;
     if (Object.keys(control).length) out.control = control;
+    // Blank means no container, not an empty one: an `arrival.archive:` block
+    // with no member_pattern is refused at load, and _arrival_from_payload
+    // drops it the same way rather than sending a half-filled block.
+    const mp = arrMemberPattern.value.trim();
+    if (mp) out.archive = {member_pattern: mp};
     return out;
   };
 
