@@ -4348,11 +4348,30 @@ weighed.**
   cleaned keys (`clean_string`, and `upper` on `ref_rating`'s agency); the
   replay scope was first built from RAW keys before cleaning, and the final
   review found a raw ` B` or a lower-case agency never matched: no marker, the
-  retracted version current, two open versions at the next change. The rank
-  now reads every raw row, the model cleans them all, and `scd2_replay` takes
-  that cleaned stream (`cleaned`, or `ranked` for `ref_rating`) — so `touched`,
-  `replay_from`, the seed and the markers all compare what the model's single
-  cleaning produced, with no second copy of it.
+  retracted version current, two open versions at the next change. The model
+  now cleans every raw row, ranks them in `ranked_rows` ON THE CLEANED KEY,
+  and `scd2_replay` takes that stream — so the in-file dedupe, `touched`,
+  `replay_from`, the seed and the markers all use what the model's single
+  cleaning produced, with no second copy of it. (A second review found the
+  rank still on the raw key at first: ` B` and `B` in one file were both "last
+  in file", two versions with one `effective_from`, one ending before it
+  began — and a MERGE cardinality violation on Spark.)
+- **And the comparison is NULL-SAFE, `IS NOT DISTINCT FROM`, in every join of
+  the cleaned key and in the MERGE's `on`** (`scd2_key_match`, one
+  definition). `clean_string` maps `''`, `'NULL'` and `'N/A'` to NULL, and a
+  full rebuild versions those rows as one key; with `=` the incremental path
+  matched nothing for them and silently dropped them, so the `not_null` test on
+  the key passed on incremental builds — the ones that publish — and failed
+  only on a full refresh, while the merge's `on` would have inserted a fresh
+  NULL-key version every run. A NULL key is still a defect for `not_null` to
+  refuse; what matters is that both paths produce it. Spark 3.5.3's grammar
+  has `IS NOT? DISTINCT FROM` (`SqlBaseParser.g4`, `predicate`), which
+  `AstBuilder` turns into `EqualNullSafe` exactly as `<=>`; DuckDB accepts it
+  and rejects `<=>` — so no engine-specific spelling is needed.
+- **The seed row carries THIS run's audit columns.** It is copied from the
+  target and then changed by the merge, so `dbt_invocation_id`, `nessie_ref`
+  and `dbt_updated_at` come from `audit_columns()` like every re-derived row;
+  `source_batch_id` stays the target's, the delivery that began the version.
 - **The markers never read a non-key column from `this`.** A column the model
   has just gained is not in the target when the temporary view is analysed —
   `on_schema_change` adds it afterwards — so they are NULL literals, in an
@@ -4416,7 +4435,12 @@ the project resolves — beside a full rebuild, including the final review's
 cases: a dropped and a reverted replay-start version, a padded key, a
 lower-case agency. Reverting the replay start, the markers, the delete clause,
 the config, the seed or the markers' lower bound each fails it; so does the
-rank on the SCD2 replay and its as-of case, which it also holds.
+rank on the SCD2 replay and its as-of case, which it also holds. The second
+review's cases are there too — a key that cleans to NULL, two spellings of one
+key in one file, the reopened seed row's audit columns, a seed column the
+target lacks — and the harness enforces two things DuckDB would not: Spark's
+refusal of a MERGE matching one target row with several source rows, and
+dbt-spark's `append_new_columns` step between the view and the merge.
 
 What a host test cannot prove is the materialisation — dbt-spark's statements
 on Spark against Iceberg on a Nessie branch.

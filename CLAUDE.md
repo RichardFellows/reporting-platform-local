@@ -256,10 +256,12 @@ to run something for the first time, expect it to fail and read what it says.
   (`scd2_retractions`, `effective_to = scd2_retracted()`) and set
   `scd2_retractions=true`, which gives them the project's
   `spark__get_merge_sql` in `macros/merge.sql` — delete on the marker, update,
-  insert. Every other merge is dbt-spark's. `scd2_replay` scopes the replay
-  AFTER the model's cleaning — a raw ` B` never matches the target's `B` — and
-  heads it with the target's version before the replay start, so retracting
-  the start version reopens that one. A key absent from a delivery still
+  insert. Every other merge is dbt-spark's. The SCD2 models rank and scope
+  the replay AFTER their cleaning — a raw ` B` never matches the target's `B`
+  — comparing keys NULL-safely (`scd2_key_match`, merge `on` included, or an
+  `'N/A'` key vanishes from incremental builds only), and `scd2_replay` heads
+  the replay with the target's version before its start, so retracting the
+  start version reopens that one. A key absent from a delivery still
   never CLOSES the version in force; and a date raw no longer holds is never
   a retraction. (`#a-snapshot-re-delivery-restates-the-whole-date`)
 - **As-of is a var, not a second model**: the same models with `--vars

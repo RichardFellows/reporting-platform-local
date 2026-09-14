@@ -144,7 +144,40 @@ third, low finding is recorded as a risk in the DECISIONS entry, not fixed: a
 delivery with no rows cannot supersede anything, because "newest" is read
 off raw rows.
 
-LIVE-VERIFY-2: the two fixes above have not been run on a Nessie branch; replace this sentence with what that run showed before merging.
+*A second review of those fixes confirmed the seed and cleaned-key logic*
+through the harness against six further cases (two retractions in one run,
+several dates reverted at once, a replay-start drop plus a new day, a longer
+drop/revert chain, the newest version retracted with a seed present, a new key
+added then dropped), and found five more issues, each now a test that failed
+first:
+
+- **A key that cleans to NULL was dropped by incremental builds only**
+  (medium, a regression of the cleaned-key fix). `clean_string` maps `''`,
+  `'NULL'` and `'N/A'` to NULL, and every join of the cleaned key used `=`,
+  so an `'N/A'` row vanished from incremental builds while a full rebuild kept
+  it — hiding it from the `not_null` test on exactly the builds that publish.
+  Every join of the cleaned key, and the SCD2 merge's `on`, is now
+  `IS NOT DISTINCT FROM` through one macro, `scd2_key_match`; Spark 3.5.3
+  parses it to `EqualNullSafe`, and DuckDB accepts it where it rejects `<=>`.
+- **The in-file dedupe ranked the RAW key** (low, pre-existing): ` B` and
+  `B` in one file gave two versions with one `effective_from`, one inverted.
+  The SCD2 models rank in `ranked_rows`, after cleaning, on the cleaned key.
+  **Found, not fixed:** `fo_trade` and `ref_collateral` rank raw `trade_id`
+  and `collateral_id` the same way, so ` T1` and `T1` in one file would both
+  survive; their uniqueness tests would fail that build rather than publish
+  it. Left for a separate item — their path is live-verified as it stands.
+- **A reopened seed row kept an earlier run's audit columns** (low): it now
+  takes this run's `dbt_invocation_id`, `nessie_ref` and `dbt_updated_at`
+  through `audit_columns()`, and keeps the target's `source_batch_id`.
+- **The harness trusted DuckDB where Spark differs** (low): it now refuses a
+  MERGE in which one target row matches several source rows, as Spark/Iceberg
+  does and DuckDB 1.5.5 does not; runs dbt-spark's `append_new_columns` step
+  before the merge; and runs `insert *` by name, as Spark means it. A test
+  pins the seed's NULL for a column the target does not have yet.
+- **`scd2_incremental_scope` was still named** in `_prepared.yml` and two older
+  DECISIONS entries; all now say `scd2_replay`.
+
+LIVE-VERIFY-2: the fixes from both reviews above have not been run on a Nessie branch; replace this sentence with what that run showed before merging.
 
 One thing the run found that the host tests could not: the procedure's first
 seeding helper built rows with `createDataFrame`, which needs Python workers
