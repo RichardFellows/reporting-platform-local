@@ -1323,10 +1323,13 @@ def check_control_patterns_are_distinguishable(registry: dict[str, Any]) -> None
 # `name`: sharing one across feeds would silently collapse them into a single
 # registry entry -- last one wins, the others vanish, with no error anywhere.
 #
-# `convention`: conventions DO NOT CHAIN. Resolution reads the name from the
-# feed block only, so a convention naming another one would overwrite the
-# resolved Feed's `convention` field with a name that had no effect -- a lie
-# told by the field that exists to explain where a value came from.
+# `convention`: CONVENTIONS CHAIN, BUT THROUGH `parent:` BELOW, NOT THROUGH
+# THIS KEY. `convention:` is how a FEED names the one link it points at, and
+# resolution reads it from the feed block only -- so a convention naming
+# another one would overwrite the resolved Feed's `convention` field with a
+# name that had no effect, a lie told by the field that exists to explain
+# where a value came from. `_chain` applies `parent:` and strips it before
+# the merge, so the chain never reaches a `Feed` field at all.
 CONVENTION_FORBIDDEN = {
     "name": "that is per-feed identity, and sharing one would collapse two "
             "feeds into a single registry entry",

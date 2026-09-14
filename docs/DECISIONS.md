@@ -1601,7 +1601,7 @@ So the two are separate prefixes with separate lifetimes:
 
 | Prefix | Job | Lifetime | Deletion rule |
 |---|---|---|---|
-| `landing/<feed>/` | evidence, byte for byte | `keep_years: 8` | never on a guess |
+| `landing/<feed>/` | evidence, byte for byte | `keep_years`, per retention class ([RETENTION.md](RETENTION.md#landing-everything-for-its-retention-class)) | never on a guess |
 | `ready/<feed>/` | work queue: a manifest per delivery, plus derived parts | `keep_days: 7` | freely, once ingested |
 
 **`ready/` is a DERIVED INDEX of `landing/`, not a queue somebody fills.**
