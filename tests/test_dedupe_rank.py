@@ -16,11 +16,11 @@ macro to the per-key partition and these fail.
 
 What is emulated, and it is deliberately little:
 
-  * dbt's context: `source()`/`ref()` name a DuckDB table, `config()` renders
-    nothing, `is_incremental()`/`this`/`var()` are set per test. The three
-    provenance/audit macros are stubbed to nothing -- `provenance_pairs` uses
-    dbt's `return()`, which plain jinja2 lacks -- and they only appear in the
-    CTEs AFTER `deduped`, which are never run.
+  * dbt's context: `source()`/`ref()` name a DuckDB table, `config()` records
+    its arguments and renders nothing, `is_incremental()`/`this`/`var()` are
+    set per test. The two provenance macros are stubbed to nothing --
+    `provenance_pairs` uses dbt's `return()`, which plain jinja2 lacks -- and
+    nothing under test reads the columns they project.
   * Spark's identifier quote. `ident()` emits backticks and DuckDB reads
     double quotes; the rendered SQL has its backticks swapped, and nothing
     else is rewritten.
@@ -67,11 +67,27 @@ class _Dbt:
         return "current_timestamp"
 
 
-def _render(template_text: str, *, incremental: bool = False,
-            this: str = "this_table", knowledge_time: str | None = None) -> str:
-    """Render a model (or any text using the engine macros) as dbt would."""
+def _macro_modules(env, context):
+    """Every project macro file the models call into, as jinja2 modules.
+
+    `engine.sql` first; any other file (`merge.sql`) is rendered with the
+    engine's macros already in its globals, the way dbt puts every project
+    macro in one namespace.
+    """
+    macros: dict = {}
+    for path in [ENGINE] + sorted(p for p in (DBT / "macros").glob("*.sql")
+                                  if p.name not in ("engine.sql", "naming.sql")):
+        module = env.from_string(path.read_text(encoding="utf-8"),
+                                 globals=dict(context, **macros)).module
+        macros.update({name: getattr(module, name)
+                       for name in dir(module) if not name.startswith("_")})
+    return macros
+
+
+def _context(*, incremental=False, this="this_table", knowledge_time=None,
+             config=None, adapter=None, dbt=None):
     variables = {"knowledge_time": knowledge_time, "lookback_days": 3}
-    context = dict(
+    return dict(
         var=lambda name, default=None: (variables[name] if name in variables
                                         and variables[name] is not None
                                         else default),
@@ -79,22 +95,40 @@ def _render(template_text: str, *, incremental: bool = False,
         this=this,
         exceptions=_Exceptions(),
         modules=_Modules(),
-        dbt=_Dbt(),
+        dbt=dbt or _Dbt(),
         invocation_id="test-invocation",
+        config=config if config is not None else _Config({}),
+        adapter=adapter,
     )
+
+
+class _Config(dict):
+    """`config` as a model sees it: callable in the model, `.get` in a macro."""
+
+    def __call__(self, **kwargs):
+        self.update(kwargs)
+        return ""
+
+
+def _render(template_text: str, *, incremental: bool = False,
+            this: str = "this_table", knowledge_time: str | None = None,
+            config: "_Config | None" = None, adapter=None) -> str:
+    """Render a model (or any text using the project macros) as dbt would."""
+    config = config if config is not None else _Config({})
+    context = _context(incremental=incremental, this=this,
+                       knowledge_time=knowledge_time, config=config,
+                       adapter=adapter)
     env = jinja2.Environment(extensions=["jinja2.ext.do"])
-    engine = env.from_string(ENGINE.read_text(encoding="utf-8"), globals=context)
-    macros = {name: getattr(engine.module, name)
-              for name in dir(engine.module) if not name.startswith("_")}
-    model_globals = dict(context, **macros)
+    model_globals = dict(context, **_macro_modules(env, context))
     model_globals.update(
         source=lambda schema, table: f"{schema}_{table}",
         ref=lambda name: f"prepared_{name}",
-        config=lambda **_: "",
-        # Only reached in CTEs after `deduped`, which are never executed.
+        config=config,
+        # `provenance_pairs` returns through dbt's `return()`, which plain
+        # jinja2 lacks. Nothing under test reads the provenance columns, and
+        # both halves -- projection and column list -- are stubbed together.
         source_provenance=lambda: "",
         source_provenance_columns=lambda: "",
-        audit_columns=lambda *a, **k: "",
     )
     sql = env.from_string(template_text, globals=model_globals).render()
     return sql.replace("`", '"')
