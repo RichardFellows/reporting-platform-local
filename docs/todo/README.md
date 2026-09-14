@@ -14,7 +14,6 @@ item that no longer reproduces should be deleted rather than worked.
 | [08](08-sniffer-has-no-notion-of-member-control-files.md) | The sniffer cannot propose a zip whose members have control files | low–medium | 2–3 hours |
 | [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
 | [10](10-per-report-matches-nothing-is-stale.md) | `DECISIONS.md` says `per_report` matches nothing; the reporting build makes it match | low–medium | 15 min |
-| [11](11-claude-worktrees-are-not-ignored.md) | `.claude/worktrees/` is not ignored | low | 5 min |
 
 ## Where to start
 
@@ -22,10 +21,18 @@ item that no longer reproduces should be deleted rather than worked.
 built, and its answer decides what 07 is asking for — do not start 07 before
 it. It opens with a decision, not an edit.
 
-**08** is the other code item. **10 + 11** are small and unrelated to each
-other; either is a reasonable warm-up.
+**08** is the other code item. **10** is small and unrelated to either; a
+reasonable warm-up.
 
 ## Done
+
+**11, `.claude/worktrees/` was not ignored** — `.gitignore` gains
+`.claude/worktrees/`, with a comment saying what creates it and why it is not
+`.claude/`. The item's command now prints nothing. Verified more strongly than
+it asked: with two worktree agents checked out under `.claude/worktrees/` at
+the time, `git status --porcelain` showed only the `.gitignore` edit, and
+`git check-ignore` matches `.claude/worktrees/x` but not
+`.claude/settings.json`. The item file was accurate; nothing else was found.
 
 **06, `RETENTION.md` restated `DECISIONS.md` in paraphrase** — measured at 9
 paragraph pairs and 2,683 characters by the detector in the item file, **now
