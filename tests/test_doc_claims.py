@@ -30,8 +30,21 @@ import pathlib
 import re
 import subprocess
 
+from tests.support import repo_file
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
-DOCS = [REPO / "CLAUDE.md"] + sorted((REPO / "docs").glob("*.md"))
+
+
+def _docs() -> list[pathlib.Path]:
+    """`CLAUDE.md` and every `docs/*.md`, or `Skipped` if they are not here.
+
+    A FUNCTION, not a module-level list: neither the docs nor `.git` is
+    mounted into the container, and `run.py` imports a module before it can
+    attribute a skip to it. Resolved when a test asks, so the skip lands on
+    the test that needed it.
+    """
+    claude = repo_file("CLAUDE.md")
+    return [claude] + sorted(repo_file("docs").glob("*.md"))
 
 # Written as history rather than as current fact. A paragraph carrying one of
 # these is describing what the platform USED to refuse, which is exactly what
@@ -95,9 +108,10 @@ def test_every_not_built_claim_names_something_still_unbuilt():
     all -- prose about the mechanism ("unbuilt values raise NOT BUILT, not
     unknown") rather than a claim about a feature.
     """
+    docs = _docs()
     tokens = _unbuilt_tokens()
     stale = []
-    for path in DOCS:
+    for path in docs:
         for line, para in _paragraphs(path):
             if not CLAIM.search(para) or HISTORICAL.search(para):
                 continue
@@ -123,6 +137,13 @@ def test_every_quoted_error_message_is_one_the_code_can_emit():
     paragraph quoting it. Leading/trailing ellipses are the docs' own mark for
     "quoted in part" and are stripped.
     """
+    # BOTH resolved before anything is read: the docs, and the `.git` that
+    # `git ls-files` needs to enumerate the source. Neither is in the
+    # container, and a `git ls-files` with no repository returns an empty
+    # list quietly -- which would make every quoted message "missing" and
+    # this test fail for a reason that has nothing to do with the docs.
+    docs = _docs()
+    repo_file(".git")
     files = subprocess.run(["git", "ls-files"], cwd=REPO,
                            capture_output=True, text=True).stdout.split()
     source = " ".join(
@@ -130,7 +151,7 @@ def test_every_quoted_error_message_is_one_the_code_can_emit():
         for f in files if f.endswith(".py"))
 
     missing = []
-    for path in DOCS:
+    for path in docs:
         for i, text in enumerate(path.read_text().split("\n"), 1):
             for m in re.finditer(r'`"([^"`]{20,240})"`', text):
                 quoted = re.sub(r"^\.\.\.|\.\.\.$|[`*]", "", m.group(1))

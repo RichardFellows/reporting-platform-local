@@ -42,6 +42,58 @@ DAGS = next((d for d in (REPO / "airflow" / "dags",
                          pathlib.Path("/opt/airflow/dags")) if d.is_dir()),
             REPO / "airflow" / "dags")
 
+# ...AND NEITHER IS THE REST OF THE REPO. `DAGS` above solved this one prefix
+# at a time; three modules read files that are not under `/opt/platform` at
+# all and cannot be resolved to anywhere, because the container holds the
+# PACKAGE and they read the REPO: `.env.example`, `docker-compose.yml`, both
+# Dockerfiles, `CLAUDE.md`, `docs/` and `.github/` are not mounted, and
+# `test_doc_claims` shells out to `git ls-files` with no `.git` to read.
+#
+# Mounting them is the other answer and it was rejected: it means bind-mounting
+# this repo's docs, CI config and git history into the runtime image of six
+# services so that a test can open them.
+#
+# So they report SKIPPED, naming the path. A subject that could not be READ is
+# not a subject that is EMPTY -- see CLAUDE.md, "The one habit that matters" --
+# and a repo-text test with no repo must say which one it was rather than pass
+# vacuously.
+IN_CHECKOUT = (REPO / "docker-compose.yml").is_file()
+
+
+class Skipped(Exception):
+    """A test that cannot run HERE. Not a pass, and not a failure.
+
+    `tests/run.py` counts these separately and they never affect its exit
+    code, so nothing downstream can read a skip as a success.
+    """
+
+
+def repo_file(relative: str | pathlib.Path) -> pathlib.Path:
+    """`REPO / relative`, or `Skipped` when there is no repo to read.
+
+    MISSING FROM A CHECKOUT IS A FAILURE AND MISSING FROM THE CONTAINER IS A
+    SKIP, and collapsing the two is the whole trap: a skip that can fire on
+    the host is a gate that cannot fail
+    (`docs/DECISIONS.md#a-gate-that-cannot-fail`), and every one of these
+    tests exists to catch drift that only a checkout can see. Both CI tiers
+    check the repo out in full, so `IN_CHECKOUT` is true there and nothing
+    can skip -- if one ever does, the checkout is broken and that is a
+    failure worth having.
+
+    Call it INSIDE the test, never at module scope: `run.py` imports a module
+    before it can attribute anything to it.
+    """
+    path = REPO / relative
+    if path.exists():
+        return path
+    if IN_CHECKOUT:
+        raise AssertionError(
+            f"{relative} is missing from the checkout at {REPO}. This is a "
+            f"checkout, so the file is meant to be here -- it was moved or "
+            f"deleted and this test reads it.")
+    raise Skipped(f"{relative} is not here: /opt/platform holds the package, "
+                  f"not the repo")
+
 # What these variables were before any test touched them, captured once at
 # import. `None` means "was not set", which is a different thing to restore to
 # than any value.
