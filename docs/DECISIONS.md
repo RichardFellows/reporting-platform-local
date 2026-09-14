@@ -4198,15 +4198,18 @@ at its knowledge time: before the re-delivery arrived, the first delivery is
 the newest and its whole population is the answer.
 
 **That default is right only for a query that keeps each date WHOLE**, and
-the SCD2 models' incremental path does not. It joins `touched` and admits each
-key from its own `replay_from` date, so a window over its rows finds the newest
-version among those keys only, and a date whose admitted keys were all dropped
-by the newest delivery keeps the old delivery — shown in DuckDB before any of
-this was written. So `newest_file_version(source)` emits a CTE with the newest
-version per date computed from raw, filtered by `known_as_of()` and by nothing
-else, and `ref_counterparty` and `ref_rating` join it and pass
-`newest_version=` to the rank — on the full-refresh path as well, so each has
-one shape.
+the SCD2 models' incremental path first did not. It joined `touched` and
+admitted each key from its own `replay_from` date before ranking, so a window
+over its rows found the newest version among those keys only, and a date whose
+admitted keys were all dropped by the newest delivery kept the old delivery —
+shown in DuckDB before any of this was written. So `newest_file_version(source)`
+emits a CTE with the newest version per date computed from raw, filtered by
+`known_as_of()` and by nothing else, and `ref_counterparty` and `ref_rating`
+join it and pass `newest_version=` to the rank. They now rank every raw row
+and apply the replay scope after cleaning (below), so the default would see
+whole dates too; they keep the aggregate because the retraction guard reads
+it, and so that a key filter reintroduced before the rank cannot quietly make
+the default wrong again.
 
 ### A MERGE never deletes
 
@@ -4237,8 +4240,8 @@ the select does not return is never touched — which is what keeps every date
 outside the lookback window intact. Two edges follow from "the select decides"
 and are accepted: a date with no rows in the select at all keeps its previous
 rows (every trade on it since matured, in `counterparty_exposure`); and a
-delivery with no rows never reaches raw to be the newest, though
-`expected_min_rows` refuses one first anyway.
+delivery with no rows never reaches raw to be the newest (see the risks
+below).
 
 `tests/test_dedupe_rank.py` pins the pairing — a `cob_date` partition declares
 `insert_overwrite`, anything else declares `merge` — because the failure in
@@ -4328,8 +4331,28 @@ weighed.**
 
 - **The replay starts at the version in force when the window STARTS**, not
   the current one: the last version that began before the window, or the
-  beginning of the key's raw history if there is none. Only a replay that
-  covers the retracted version's predecessor can re-open it.
+  beginning of the key's raw history if there is none.
+- **And its chain begins one version EARLIER, taken from the target.** A
+  re-delivery of the replay-start date itself can retract the start version,
+  and the version before THAT was outside the replay: the final review found
+  it left closed (a drop — a gap `as_of()` matches nothing in) or doubled (a
+  revert — two back-to-back versions of the same value). So `scd2_replay`
+  puts the target's version before the replay start at the head of the
+  replayed rows. lead() recomputes its end, which reopens or extends it, and
+  it is never re-derived from raw, so its own COB date need not still be
+  there. It is never a retraction candidate either — the markers' scope
+  starts at the replay start. Re-deliveries are honoured for every COB date
+  from the replay start onward; an earlier one is outside the replay, as a
+  date outside the lookback is for the date-partitioned models.
+- **Every key comparison uses the CLEANED key.** The target holds the model's
+  cleaned keys (`clean_string`, and `upper` on `ref_rating`'s agency); the
+  replay scope was first built from RAW keys before cleaning, and the final
+  review found a raw ` B` or a lower-case agency never matched: no marker, the
+  retracted version current, two open versions at the next change. The rank
+  now reads every raw row, the model cleans them all, and `scd2_replay` takes
+  that cleaned stream (`cleaned`, or `ranked` for `ref_rating`) — so `touched`,
+  `replay_from`, the seed and the markers all compare what the model's single
+  cleaning produced, with no second copy of it.
 - **The markers never read a non-key column from `this`.** A column the model
   has just gained is not in the target when the temporary view is analysed —
   `on_schema_change` adds it afterwards — so they are NULL literals, in an
@@ -4347,8 +4370,10 @@ removed the date a replay starts from, the replay re-derives the key from its
 first retained delivery as a NEW version, beside the one it could not
 re-derive: two open versions, and the build refuses. The guard above keeps
 that failure loud rather than turning it into a deletion;
-`tests/test_scd2_incremental.py` pins both. Fixing it means seeding the replay
-from the target's own version instead of from raw, and it is not done here.
+`tests/test_scd2_incremental.py` pins both. The seed removes the dependency on
+raw for the version BEFORE the replay start, not for the start version
+itself; seeding that one from the target too would change which re-deliveries
+can retract it, and is not done here.
 
 ### counterparty_exposure read raw with the same mistake
 
@@ -4372,18 +4397,26 @@ its sender counted. A feed whose re-deliveries can be partial and that has
 neither is exposed — which is a property of that feed to fix in `feeds.yml`,
 not a reason to return to the union.
 
+**A delivery with NO rows cannot supersede anything under this mechanism.**
+"Newest" is computed from raw rows, and an empty delivery writes none, so the
+delivery before it stays newest: `insert_overwrite` rewrites the date from it
+and SCD2 retracts nothing. `expected_min_rows` defaults to 0, so nothing
+refuses the empty file either. Honouring one needs a record of the delivery
+that is not a raw row.
+
 ### What proves it
 
 `tests/test_dedupe_rank.py` renders `dbt/macros/engine.sql` and the model
 files with jinja2 and runs every CTE up to `deduped` against DuckDB: the
 two-delivery case per prepared date model and through the scaffold's template,
-the as-of cases, the SCD2 touched path, the SCD2 as-of case and `delivered`.
-Put the per-key partition back and seven of them fail; drop `newest_version`
-from the SCD2 models and the touched-path test fails.
+the as-of cases and `delivered`. Put the per-key partition back and they fail.
 `tests/test_scd2_incremental.py` runs the two SCD2 models end to end through
 dbt-spark's incremental flow — the model as a view over `this`, then the MERGE
-the project resolves — beside a full rebuild. Reverting the replay start, the
-markers, the delete clause or the config each fails it.
+the project resolves — beside a full rebuild, including the final review's
+cases: a dropped and a reverted replay-start version, a padded key, a
+lower-case agency. Reverting the replay start, the markers, the delete clause,
+the config, the seed or the markers' lower bound each fails it; so does the
+rank on the SCD2 replay and its as-of case, which it also holds.
 
 What a host test cannot prove is the materialisation — dbt-spark's statements
 on Spark against Iceberg on a Nessie branch.
@@ -4412,3 +4445,7 @@ on Spark against Iceberg on a Nessie branch.
 > states were identical to a full refresh over the same raw, and a plain
 > `merge` model still got dbt-spark's own SQL. `ref_rating` and the reporting
 > models were not run live.
+>
+> That run predates two fixes the final review then required, to the version
+> before the replay start and to raw-versus-cleaned keys (the SCD2 section
+> above); it did not exercise either.

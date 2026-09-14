@@ -327,12 +327,14 @@
     already admitted -- so it is computed after `known_as_of()`, which is the
     point (an as-of build must rank against the deliveries that existed at its
     knowledge time), and after `incremental_window()`, which admits whole
-    dates. A query that keeps only SOME keys of a date -- the SCD2 models'
-    `touched` join -- would find the newest version among those keys' rows
-    only, and a date whose touched keys were all dropped by the newest
-    delivery would keep the old one. Such a query passes
-    `newest_version='<alias>._newest_file_version'`, joined from
-    `newest_file_version()` below, which reads raw unjoined.
+    dates. A query that keeps only SOME keys of a date -- as the SCD2 models'
+    `touched` join once did, before the rank -- would find the newest version
+    among those keys' rows only, and a date whose touched keys were all
+    dropped by the newest delivery would keep the old one. Such a query
+    passes `newest_version='<alias>._newest_file_version'`, joined from
+    `newest_file_version()` below, which reads raw unjoined. The SCD2 models
+    still do: they rank every raw row now and scope the replay after
+    cleaning, but the retraction guard reads the same CTE.
   -#}
   {%- if mode != 'full_snapshot' -%}
     {{ exceptions.raise_compiler_error(

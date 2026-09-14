@@ -114,7 +114,37 @@ over the same raw (the post-retraction one on the second branch). A throwaway
 `when matched then update set *` and the right rows, so the override
 delegates. `main`'s hash was the same before and after, and neither branch
 survived. **Not run live:** `ref_rating` (same macros, host-tested) and the
-three reporting models.
+three reporting models. **That run predates the two fixes below** and
+exercised neither.
+
+*A final review then found two medium defects in the SCD2 fix*, both
+reproduced by the reviewer's probe and by the orchestrator, and both now
+tests in `tests/test_scd2_incremental.py` that failed on `2ae6052`:
+
+- **The version before the replay start was never reopened.** The replay
+  started at the version in force when the lookback window starts, and a
+  re-delivery of THAT date could retract it — but the version before it was
+  outside the replay, so it stayed closed (a drop left a gap no `as_of()`
+  matches) or doubled (a revert left two back-to-back versions). Fixed in
+  `scd2_replay`: the target's version before the replay start heads the
+  replayed rows, so lead() reopens or extends it, and it is never read from
+  raw, whose copy of its date retention may have pruned. The tests' history
+  carries a version before that one too, whose raw date is still there, so
+  a retraction scope that reached past the seed would be caught deleting it.
+- **The replay scope compared RAW keys to the target's CLEANED keys**, in
+  the markers and in the `replay_from` join, on both models: a raw ` B`, or
+  `ref_rating`'s agency in another case, matched nothing, nothing was
+  retracted, and a second open version followed. Fixed by ranking every raw
+  row and applying the whole replay scope to the model's own cleaned stream
+  (`cleaned`, or `ranked` for `ref_rating`), so there is one cleaning and no
+  copy of it. Nothing else joins `touched` to the target.
+
+The probe prints EQUAL for every case, padded and control. The review's
+third, low finding is recorded as a risk in the DECISIONS entry, not fixed: a
+delivery with no rows cannot supersede anything, because "newest" is read
+off raw rows.
+
+LIVE-VERIFY-2: the two fixes above have not been run on a Nessie branch; replace this sentence with what that run showed before merging.
 
 One thing the run found that the host tests could not: the procedure's first
 seeding helper built rows with `createDataFrame`, which needs Python workers

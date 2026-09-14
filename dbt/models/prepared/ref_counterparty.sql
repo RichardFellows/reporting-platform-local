@@ -61,6 +61,9 @@
       marker rows and `scd2_retractions=true` gives this model the merge in
       macros/merge.sql that deletes on them. Without both, the retracted
       version stays current, and the key's next change opens a second one.
+      `scd2_replay` compares keys only after this model's cleaning, and
+      starts the replay with the version before its start, so that one can
+      be reopened or extended when the start version itself is retracted.
   See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
 

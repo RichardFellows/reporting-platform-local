@@ -245,8 +245,8 @@ to run something for the first time, expect it to fail and read what it says.
   keys, uniqueness test green. It gates on the newest `_file_version` per date
   now, and the cob_date-partitioned models are `insert_overwrite`, because a
   MERGE never deletes. That is safe only for a select returning each date
-  WHOLE: a query keeping some keys of a date (SCD2's `touched`) passes
-  `newest_version=` and stays `merge`. The newest file is load-bearing — a
+  WHOLE: a query keeping some keys of a date passes `newest_version=`, and
+  the SCD2 models stay `merge`. The newest file is load-bearing — a
   truncated re-delivery wipes its date, and `expected_min_rows` and
   `delivery.control` `row_count` are the guards.
   (`#a-snapshot-re-delivery-restates-the-whole-date`)
@@ -256,7 +256,10 @@ to run something for the first time, expect it to fail and read what it says.
   (`scd2_retractions`, `effective_to = scd2_retracted()`) and set
   `scd2_retractions=true`, which gives them the project's
   `spark__get_merge_sql` in `macros/merge.sql` — delete on the marker, update,
-  insert. Every other merge is dbt-spark's. A key absent from a delivery still
+  insert. Every other merge is dbt-spark's. `scd2_replay` scopes the replay
+  AFTER the model's cleaning — a raw ` B` never matches the target's `B` — and
+  heads it with the target's version before the replay start, so retracting
+  the start version reopens that one. A key absent from a delivery still
   never CLOSES the version in force; and a date raw no longer holds is never
   a retraction. (`#a-snapshot-re-delivery-restates-the-whole-date`)
 - **As-of is a var, not a second model**: the same models with `--vars
