@@ -331,90 +331,6 @@ def test_as_of_after_the_redelivery_matches_the_ordinary_build():
     assert as_of == now
 
 
-# ------------------------------------------------ (c) SCD2, the touched path
-def _scd2_case(con, keys: list[str]):
-    """The shape that defeats a window over the JOINED rows.
-
-    On D1, v1 carries A and B and v2 carries only A. `this` holds A from D2
-    and again from 09-10 (current), and B from 06-01, so the lookback window
-    starts 09-07 and each key replays from its last version before that: A
-    from D2, B from 06-01. The rows the incremental query sees for D1 are
-    therefore B's v1 rows ONLY. The newest version among those is 1, so a rank
-    computed over them keeps B on D1 -- the delivery v2 replaced. 09-08 puts
-    both keys inside the window, so both are touched.
-    """
-    extra_cols = ", ".join(f"'{k}X' as {k}" for k in keys[1:])
-    con.execute(f"""
-        create or replace table raw_src as
-        select _cob_date::date as _cob_date, _file_version::int as _file_version,
-               _row_number::bigint as _row_number, k as {keys[0]} {',' if extra_cols else ''} {extra_cols},
-               null::timestamp as _received_at, _ingest_ts::timestamp as _ingest_ts
-        from (values
-          ('{D1}', 1, 1, 'A', '2026-09-02 06:00'),
-          ('{D1}', 1, 2, 'B', '2026-09-02 06:00'),
-          ('{D1}', 2, 1, 'A', '2026-09-03 06:00'),
-          ('{D2}', 1, 1, 'A', '2026-09-03 06:00'),
-          ('{D2}', 1, 2, 'B', '2026-09-03 06:00'),
-          ('2026-09-08', 1, 1, 'A', '2026-09-09 06:00'),
-          ('2026-09-08', 1, 2, 'B', '2026-09-09 06:00')
-        ) t(_cob_date, _file_version, _row_number, k, _ingest_ts)
-    """)
-    con.execute(f"""
-        create or replace table this_table as
-        select effective_from::date as effective_from, is_current,
-               k as {keys[0]} {',' if extra_cols else ''} {extra_cols}
-        from (values ('{D2}', 'A', false), ('2026-09-10', 'A', true),
-                     ('2026-06-01', 'B', true)) t(effective_from, k, is_current)
-    """)
-
-
-def test_scd2_incremental_path_drops_a_key_the_newest_delivery_omitted():
-    for name, keys in (("ref_counterparty", ["counterparty_id"]),
-                       ("ref_rating", ["counterparty_id", "agency"])):
-        con = duckdb.connect()
-        _scd2_case(con, keys)
-        text = _model(PREPARED / f"{name}.sql").replace(
-            f"source('raw', '{name}')", "source('raw', 'src')")
-        sql = _render(text, incremental=True)
-        got = _run(con, sql, "deduped",
-                   f"select _cob_date::varchar, {keys[0]}, _file_version "
-                   f"from deduped order by 1, 2")
-        assert (D1, "B", 1) not in got, (name, got)
-        # A's D1 rows are before its replay_from, so D1 contributes nothing.
-        assert got == [(D2, "A", 1), (D2, "B", 1),
-                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
-
-
-def test_scd2_full_refresh_path_agrees():
-    for name, keys in (("ref_counterparty", ["counterparty_id"]),
-                       ("ref_rating", ["counterparty_id", "agency"])):
-        con = duckdb.connect()
-        _scd2_case(con, keys)
-        text = _model(PREPARED / f"{name}.sql").replace(
-            f"source('raw', '{name}')", "source('raw', 'src')")
-        got = _run(con, _render(text), "deduped",
-                   f"select _cob_date::varchar, {keys[0]}, _file_version "
-                   f"from deduped order by 1, 2")
-        assert got == [(D1, "A", 2), (D2, "A", 1), (D2, "B", 1),
-                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
-
-
-def test_scd2_as_of_decides_newest_among_what_was_known():
-    """`newest_file_version()` must filter on `known_as_of()` too. Without it
-    the aggregate names v2 as newest for D1 while the model's own WHERE has
-    already removed v2's rows -- and D1 loses A and B both."""
-    for name, keys in (("ref_counterparty", ["counterparty_id"]),
-                       ("ref_rating", ["counterparty_id", "agency"])):
-        con = duckdb.connect()
-        _scd2_case(con, keys)
-        text = _model(PREPARED / f"{name}.sql").replace(
-            f"source('raw', '{name}')", "source('raw', 'src')")
-        got = _run(con, _render(text, knowledge_time="2026-09-02 12:00"), "deduped",
-                   f"select _cob_date::varchar, {keys[0]}, _file_version "
-                   f"from deduped order by 1, 2")
-        assert got == [(D1, "A", 1), (D1, "B", 1)], (name, got)
-
-
 # ------------------------------- counterparty_exposure's own read of raw
 def test_delivered_means_in_the_newest_delivery_for_the_date():
     """`counterparty_exposure.delivered` reads raw directly and used to group
@@ -510,12 +426,16 @@ def test_the_project_default_is_insert_overwrite():
         assert models[layer]["+partition_by"] == ["cob_date"]
 
 
-def test_a_key_scoped_query_decides_newest_from_the_unjoined_aggregate():
-    """Any model that joins `touched` ranks a subset of each date's keys, and
-    the default window would decide "newest" over that subset."""
-    for path in sorted(PREPARED.glob("*.sql")):
+def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():
+    """The SCD2 models rank every raw row now -- the replay scope is applied
+    after cleaning (`scd2_replay`) -- so a window would see whole dates too.
+    They still decide "newest" from `newest_file_version()`, because the
+    retraction guard reads that CTE and a key-scoped filter reintroduced
+    before the rank must not quietly make the default window wrong again.
+    Their replay is tested end to end in `test_scd2_incremental.py`."""
+    scd2 = [p for p in sorted(PREPARED.glob("*.sql")) if "scd2_replay(" in _model(p)]
+    assert len(scd2) == 2, scd2
+    for path in scd2:
         text = _model(path)
-        if "join touched" not in text:
-            continue
         assert "newest_file_version(" in text, path.name
         assert "newest_version='nv._newest_file_version'" in text, path.name

@@ -64,23 +64,24 @@
   See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
 
-with
+{% set business_columns = ['counterparty_id', 'legal_name', 'country_code', 'sector', 'parent_counterparty_id', 'is_active'] %}
 
-{% if is_incremental() %}
-{{ scd2_incremental_scope(source('raw', 'ref_counterparty'), ['counterparty_id']) }}
-{% endif %}
+with
 
 {{ newest_file_version(source('raw', 'ref_counterparty')) }}
 
 raw_rows as (
 
     {#
-      THE NEWEST DELIVERY IS DECIDED BY `nv`, NOT BY THE ROWS BELOW. On the
-      incremental path this query keeps only the `touched` keys, from each
-      key's own `replay_from` date, so a window over its rows would find the
-      newest version among those keys only -- and a date whose touched keys
-      were all dropped by the newest delivery would keep the older one.
-      See `newest_version` on dedupe_rank.
+      EVERY raw row, ranked. The replay scope is applied after cleaning
+      (`scd2_replay`), so that its keys are compared to the target's CLEANED
+      keys. `nv` decides the newest delivery per COB date from raw unjoined;
+      see `newest_version` on dedupe_rank. The retraction guard reads the
+      same CTE.
+
+      known_as_of() applies on the FULL-REFRESH path, which is the only path
+      an as-of build is allowed to take (the macro refuses an incremental
+      one). It compiles to `1 = 1` when no knowledge_time is set.
     #}
     select
         r.*,
@@ -88,26 +89,8 @@ raw_rows as (
                        newest_version='nv._newest_file_version') }} as _rn
     from {{ source('raw', 'ref_counterparty') }} r
     join newest_file_version nv on nv._newest_cob_date = r._cob_date
-    {% if is_incremental() %}
-    join touched t on t.counterparty_id = r.counterparty_id
-    left join replay_from p on p.counterparty_id = r.counterparty_id
-    {% endif %}
-    {#
-      known_as_of() is unconditional, unlike the join predicates above: the
-      as-of filter has to apply on the FULL-REFRESH path, which is the only
-      path an as-of build is allowed to take (the macro refuses an incremental
-      one). It compiles to `1 = 1` when no knowledge_time is set, so the
-      ordinary incremental build is unchanged.
-    #}
     where {{ known_as_of() }}
-    {% if is_incremental() %}
-      and r._cob_date >= coalesce(p.from_date, date '1900-01-01')
-    {% endif %}
 
-),
-
-deduped as (
-    select * from raw_rows where _rn = 1
 ),
 
 cleaned as (
@@ -131,11 +114,14 @@ cleaned as (
         _source_file                                                as source_file,
         _file_version                                               as source_file_version,
         {{ source_provenance() }}
-        {{ audit_columns() }}
+        {{ audit_columns() }},
+        _rn
 
-    from deduped
+    from raw_rows
 
 ),
+
+{{ scd2_replay('cleaned', ['counterparty_id'], business_columns) }}
 
 {#
   Business attributes only -- see the scd2_hash macro for what including an
@@ -147,13 +133,11 @@ versioned as (
         *,
         {{ scd2_hash(['legal_name', 'country_code', 'sector',
                       'parent_counterparty_id', 'is_active']) }}    as _row_hash
-    from cleaned
+    from replayed
 
 ),
 
 {{ scd2_changes('versioned', ['counterparty_id']) }}
-
-{% set business_columns = ['counterparty_id', 'legal_name', 'country_code', 'sector', 'parent_counterparty_id', 'is_active'] %}
 
 ranged as (
 

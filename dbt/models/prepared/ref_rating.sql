@@ -31,40 +31,24 @@
   states.
 #}
 
-with
+{% set business_columns = ['counterparty_id', 'agency', 'rating', 'rating_date', 'outlook', 'rating_rank', 'grade_band'] %}
 
-{% if is_incremental() %}
-{{ scd2_incremental_scope(source('raw', 'ref_rating'), ['counterparty_id', 'agency']) }}
-{% endif %}
+with
 
 {{ newest_file_version(source('raw', 'ref_rating')) }}
 
 raw_rows as (
 
-    {# `nv` decides the newest delivery, for the reason ref_counterparty's
-       copy of this states. #}
+    {# Every raw row, ranked, for the reasons ref_counterparty's copy of this
+       states. #}
     select
         r.*,
         {{ dedupe_rank(['r.counterparty_id', 'r.agency'],
                        newest_version='nv._newest_file_version') }} as _rn
     from {{ source('raw', 'ref_rating') }} r
     join newest_file_version nv on nv._newest_cob_date = r._cob_date
-    {% if is_incremental() %}
-    join touched t
-      on t.counterparty_id = r.counterparty_id and t.agency = r.agency
-    left join replay_from p
-      on p.counterparty_id = r.counterparty_id and p.agency = r.agency
-    {% endif %}
-    {# Unconditional, for the reason ref_counterparty's copy of this states. #}
     where {{ known_as_of() }}
-    {% if is_incremental() %}
-      and r._cob_date >= coalesce(p.from_date, date '1900-01-01')
-    {% endif %}
 
-),
-
-deduped as (
-    select * from raw_rows where _rn = 1
 ),
 
 cleaned as (
@@ -79,9 +63,10 @@ cleaned as (
         _source_file                                    as source_file,
         _file_version                                   as source_file_version,
         {{ source_provenance() }}
-        {{ audit_columns() }}
+        {{ audit_columns() }},
+        _rn
 
-    from deduped
+    from raw_rows
 
 ),
 
@@ -109,6 +94,8 @@ ranked as (
 
 ),
 
+{{ scd2_replay('ranked', ['counterparty_id', 'agency'], business_columns) }}
+
 {#
   rating_rank and grade_band are DERIVED from `rating` and are deliberately
   not hashed -- they cannot change without it changing, and hashing them would
@@ -120,13 +107,11 @@ versioned as (
     select
         *,
         {{ scd2_hash(['rating', 'rating_date', 'outlook']) }}     as _row_hash
-    from ranked
+    from replayed
 
 ),
 
 {{ scd2_changes('versioned', ['counterparty_id', 'agency']) }}
-
-{% set business_columns = ['counterparty_id', 'agency', 'rating', 'rating_date', 'outlook', 'rating_rank', 'grade_band'] %}
 
 ranged as (
 

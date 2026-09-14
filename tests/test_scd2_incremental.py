@@ -36,7 +36,7 @@ import re
 
 import duckdb
 
-from tests.test_dedupe_rank import DBT, PREPARED, _Config, _render
+from tests.test_dedupe_rank import D1, D2, DBT, PREPARED, _Config, _render, _run
 
 # (model, key columns, the attribute that changes, constant attributes)
 MODELS = (
@@ -413,3 +413,64 @@ def test_an_agency_in_another_case_is_matched_to_the_cleaned_target_agency():
         ("09-03", [("2026-09-03", 1, {"A": "a", "B": "X"}, "2026-09-04 06:00", "agency1")]),
     ], models=rating)
     assert not failures, "\n".join(failures)
+
+
+# ------------------------------------- the rank on the SCD2 replay, in place
+def _replay_case(con, name, keys, attr, constants):
+    """On D1, v1 carries A and B and v2 carries only A. `this` holds A from D2
+    and again from 09-10 (current), and B from 06-01, so the lookback window
+    starts 09-07 and each key replays from its last version before that: A
+    from D2, B from 06-01. D1's replayed rows must therefore be nothing at
+    all -- A's are before its replay start and B's are the delivery v2
+    replaced. 09-08 puts both keys inside the window, so both are touched."""
+    for cob_date, version, rows, ts in [
+            (D1, 1, {"A": "a", "B": "b"}, "2026-09-02 06:00"),
+            (D1, 2, {"A": "a"}, "2026-09-03 06:00"),
+            (D2, 1, {"A": "a", "B": "b"}, "2026-09-03 06:00"),
+            ("2026-09-08", 1, {"A": "a", "B": "b"}, "2026-09-09 06:00")]:
+        _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+    second = ", 'AGENCY1' as agency" if len(keys) > 1 else ""
+    con.execute(f"""
+        create table this_table as
+        select effective_from::date as effective_from, is_current,
+               k as counterparty_id {second}
+        from (values ('{D2}', 'A', false), ('2026-09-10', 'A', true),
+                     ('2026-06-01', 'B', true)) t(effective_from, k, is_current)
+    """)
+    return (PREPARED / f"{name}.sql").read_text(encoding="utf-8").replace(
+        f"source('raw', '{name}')", "source('raw', 'src')")
+
+
+REPLAYED = "select cob_date::varchar, counterparty_id, source_file_version from replayed order by 1, 2"
+
+
+def test_scd2_incremental_replay_drops_a_key_the_newest_delivery_omitted():
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        text = _replay_case(con, name, keys, attr, constants)
+        sql = _duck(_render(text, incremental=True, adapter=_Adapter(con)))
+        got = _run(con, sql, "replayed", REPLAYED)
+        assert (D1, "B", 1) not in got, (name, got)
+        assert got == [(D2, "A", 1), (D2, "B", 1),
+                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
+
+
+def test_scd2_full_refresh_replay_agrees():
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        text = _replay_case(con, name, keys, attr, constants)
+        got = _run(con, _duck(_render(text)), "replayed", REPLAYED)
+        assert got == [(D1, "A", 2), (D2, "A", 1), (D2, "B", 1),
+                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
+
+
+def test_scd2_as_of_decides_newest_among_what_was_known():
+    """`newest_file_version()` must filter on `known_as_of()` too. Without it
+    the aggregate names v2 as newest for D1 while the model's own WHERE has
+    already removed v2's rows -- and D1 loses A and B both."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        text = _replay_case(con, name, keys, attr, constants)
+        got = _run(con, _duck(_render(text, knowledge_time="2026-09-02 12:00")),
+                   "replayed", REPLAYED)
+        assert got == [(D1, "A", 1), (D1, "B", 1)], (name, got)
