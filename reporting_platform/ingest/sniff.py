@@ -403,6 +403,13 @@ def _table_reading(lines: list[list[str]]) -> tuple[dict, list[dict[str, str]]] 
     return None
 
 
+def _separators(lines: list[list[str]]) -> set[str]:
+    """Every key/value separator the text reading found, line by line --
+    counted before `_text_reading` keeps one value per key."""
+    return {m.group(2) for ls in lines for ln in ls
+            if (m := _KEY_VALUE.match(ln))}
+
+
 def _text_reading(lines: list[list[str]]) -> tuple[None, list[dict[str, str]]] | None:
     """The files read as the default text format: every non-blank line a
     `KEY=VALUE` (or `:`/`|`) pair, keyed by `KEY=` as written."""
@@ -432,18 +439,30 @@ def _control_readings(texts: list[str]) -> list[tuple[dict | None, list[dict[str
     ways, which one the sender means decides what every field names, and
     nothing in the files says -- so the caller proposes no format.
 
-    Only a TWO-column table can be that. A KEY|VALUE line has exactly two
-    cells, so `FEED|BUSINESS_DATE|RECORD_COUNT` "matching" as key FEED with
-    value `BUSINESS_DATE|RECORD_COUNT` is not a second reading, it is a
-    regex being permissive.
+    Two narrowings, each because the second "reading" was a regex being
+    permissive rather than the same bytes read another way:
+
+    * Only a TWO-column table. A KEY|VALUE line has exactly two cells, so
+      `FEED|BUSINESS_DATE|RECORD_COUNT` "matching" as key FEED with value
+      `BUSINESS_DATE|RECORD_COUNT` is not a key/value line.
+    * Only where every line's key/value separator IS the table's delimiter.
+      `A=1,B=2` over `C=3,D=4` is a comma table AND `=` lines, but those are
+      not the same cells read two ways -- and the TEXT reading survives: the
+      table's "header" is `A=1` and its values `C=3`, so no field could ever
+      be a number or a date under it, while a text-format regex can read any
+      of the four. A format under which nothing is readable is not a reading.
     """
     lines = [[ln for ln in t.splitlines() if ln.strip()] for t in texts]
     if not all(lines):
         return []
     table = _table_reading(lines)
+    text = _text_reading(lines)
     if table is not None and len(table[1][0]) > 2:
         return [table]
-    return [r for r in (table, _text_reading(lines)) if r]
+    if table is not None and text is not None \
+            and _separators(lines) != {table[0]["delimiter"]}:
+        return [text]
+    return [r for r in (table, text) if r]
 
 
 def _field_expression(fmt: dict | None, key: str, field: str) -> str:
@@ -585,6 +604,12 @@ def _member_control(zf, names: list[str], pairs: dict[str, str],
             pattern, fmt, parsed, controls)
     elif len(readings) == 2:
         out["format_ambiguous"] = True
+        # Only ever the same cells read two ways -- see `_control_readings`
+        # -- so the text reading's separator IS the table's delimiter; it is
+        # recorded from the text reading itself, and the note words it so.
+        out["key_value_separator"] = sorted(_separators(
+            [[ln for ln in text.splitlines() if ln.strip()]
+             for _c, text, _f in controls]))[0]
         out["field_candidates_by_reading"] = {
             ("text" if fmt is None else "delimited"):
                 {"format": fmt,
@@ -611,24 +636,37 @@ def _member_pattern_candidate(names: list[str]) -> str | None:
 
 def _paired_member_pattern_candidate(data_names: list[str]) -> str | None:
     """`_member_pattern_candidate` for the data members that HAVE a control
-    file, where having no extension is a group of its own.
+    file, where having no extension is a shape of its own.
 
     `[^.]+` -- every member with no dot in its name -- is the honest analogue
     of `.*\\.csv` for `POSA`/`POSB`: the same claim, "the members shaped like
     the ones that came with a control file", and just as much a guess to
-    check. It cannot claim `POSA.ctl`. With extensionless and extensioned data
-    members in equal number there is no most-common shape to name, so None.
+    check. It cannot claim `POSA.ctl`.
+
+    TIES, decided by the counts and never by where a name sorts:
+
+    * the extensionless shape shares the top count with any other shape --
+      None. `[^.]+` and `.*\\.csv` claim disjoint sets of members, so either
+      would silently drop the other half, and nothing says which half the
+      sender means.
+    * two EXTENSIONS share it -- whatever `_member_pattern_candidate` picks
+      for those members, which is the unpaired rule and must stay what it
+      is. The same tie then gets the same answer whether or not the members
+      came with control files; a second tie rule here would make pairing
+      change a proposal that has nothing to do with control files.
     """
     from collections import Counter
 
-    shapes = Counter(n.rsplit(".", 1)[-1] if "." in n else None
-                     for n in data_names)
-    ranked = shapes.most_common()
-    if not ranked or (len(ranked) > 1 and ranked[0][1] == ranked[1][1]
-                      and None in (ranked[0][0], ranked[1][0])):
+    names = sorted(data_names)
+    shapes = Counter(n.rsplit(".", 1)[-1] if "." in n else None for n in names)
+    if not shapes:
         return None
-    ext = ranked[0][0]
-    return r"[^.]+" if ext is None else rf".*\.{re.escape(ext)}"
+    top = max(shapes.values())
+    leaders = [shape for shape, count in shapes.items() if count == top]
+    if None in leaders:
+        return r"[^.]+" if len(leaders) == 1 else None
+    return _member_pattern_candidate([n for n in names
+                                      if "." in n and n.rsplit(".", 1)[-1] in leaders])
 
 
 def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> dict:
@@ -803,8 +841,9 @@ def _member_control_note(control: dict, member_pattern_candidate: str | None) ->
     if control["format_ambiguous"]:
         readings = control["field_candidates_by_reading"]
         delimiter = readings["delimited"]["format"]["delimiter"]
+        separator = control["key_value_separator"]
         bits.append(
-            f"AMBIGUOUS FORMAT: every control file reads both as KEY{delimiter}"
+            f"AMBIGUOUS FORMAT: every control file reads both as KEY{separator}"
             f"VALUE lines and as a one-row table delimited by {delimiter!r}, "
             f"and which the sender means decides what every field names -- so "
             f"no format is proposed. Choose one; the candidates under each "
@@ -817,9 +856,11 @@ def _member_control_note(control: dict, member_pattern_candidate: str | None) ->
         return " ".join(bits)
     candidates = control["field_candidates"]
     if not candidates:
-        bits.append("Nothing readable was found in the control files (an empty "
-                    "`.done`/`.ok` declares nothing), so the COB date has to "
-                    "come from the member pattern.")
+        bits.append("No field in the control files could be matched to a "
+                    "date, the member's row count or its md5 in every file -- "
+                    "an empty `.done`/`.ok` declares nothing -- so none is "
+                    "offered, and the COB date has to come from the member "
+                    "pattern or an expression written by hand.")
     for field, label in (("cob_date", "COB date"), ("row_count", "row count"),
                          ("md5", "md5")):
         if field in candidates:

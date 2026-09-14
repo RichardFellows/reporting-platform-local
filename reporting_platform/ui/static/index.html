@@ -885,7 +885,14 @@ function feedForm(f, creating) {
       else kept.push("the zip-archive delivery shape and its member pattern " +
                      "(members with their own control files need Members to " +
                      "unpack instead)");
-      const ctlPatternsEmpty = !arrCtlPattern.value.trim() && !controlPattern.value.trim();
+      // `{stem}\.ctl` alone in the ARRIVAL box is the tick's autofill, not an
+      // answer -- the same untouched default syncArrivalArchive clears -- so
+      // with the delivery box empty it is replaced like an empty box. Kept,
+      // it would leave the proposed pattern in neither block and an
+      // arrival-only control the loader refuses.
+      const arrCtlUntouched = !arrCtlPattern.value.trim() ||
+                              arrCtlPattern.value === AUTO_CTL;
+      const ctlPatternsEmpty = arrCtlUntouched && !controlPattern.value.trim();
       const ctlFieldsEmpty = [arrCtlDate, controlRowCount, controlMd5]
         .every(input => !input.value.trim());
       if (mc.pattern && ctlPatternsEmpty) {

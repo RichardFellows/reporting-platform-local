@@ -2082,8 +2082,12 @@ When pairs are found, the control members leave both the sniffed-member choice
 and `member_pattern_candidate` -- the data members that HAVE a control file are
 the evidence for the pattern, and having no extension is a shape of its own:
 `[^.]+` for `POSA`/`POSB`, the same guess `.*\.csv` is and unable to claim
-`POSA.ctl`, and None (said in the note) when extensionless and extensioned
-members tie. `member_control` carries:
+`POSA.ctl`. Ties are decided by the counts, never by where a name sorts: the
+extensionless shape sharing the top count with anything is None (said in the
+note), because the two patterns claim disjoint members and either would drop
+the rest; two extensions tied get what the unpaired rule gives the same
+members, so pairing cannot change a proposal about something else.
+`member_control` carries:
 
 * **`pattern`**, the one `{stem}...` every pair fits, checked the way the gate
   uses it: each control member fullmatches it with its data member's stem, and
@@ -2101,7 +2105,12 @@ members tie. `member_control` carries:
   sender means decides what every field names, and the bytes do not say, so
   `format_ambiguous` is set, `format` and `field_candidates` stay empty, and
   `field_candidates_by_reading` gives the evidence under each. Only a
-  two-column table can be ambiguous: a key/value line has two cells.
+  two-column table can be ambiguous, since a key/value line has two cells, and
+  only when every line's key/value separator IS the table's delimiter.
+  `A=1,B=2` over `C=3,D=4` is a comma table and `=` lines, not one set of
+  cells read two ways, and the text reading survives: the table's header would
+  be `A=1` and its values `C=3`, under which no field is ever a number or a
+  date.
   Control files are decoded with the proposal's `file_encoding`, as the gate
   decodes them with the feed's.
 * **`field_candidates`**, evidence rather than choices. `row_count` and `md5`

@@ -469,6 +469,43 @@ def test_each_data_member_is_measured_once():
     assert len(calls) == 2, calls
 
 
+def test_paired_member_pattern_ties_do_not_depend_on_name_order():
+    """Second review: only the first two ranked shapes were compared, so
+    `A.csv,B.dat,C` proposed `.*\\.csv` and `A,B.dat,C.csv` proposed None.
+    Extensionless tied with anything is None, in every order."""
+    for names in (["A.csv", "B.dat", "C"], ["A", "B.dat", "C.csv"],
+                  ["C", "A.csv", "B.dat"], ["POSA", "POSB.csv"]):
+        assert sniff._paired_member_pattern_candidate(names) is None, names
+    assert sniff._paired_member_pattern_candidate(["POSA", "POSB", "POSC.csv"]) == r"[^.]+"
+    assert sniff._paired_member_pattern_candidate(["A.csv", "B.csv", "C"]) == r".*\.csv"
+
+
+def test_a_tie_between_extensions_follows_the_unpaired_rule():
+    """Two extensions tied get what `_member_pattern_candidate` -- unchanged
+    from main -- gives the same members, whatever order they arrive in."""
+    for names in (["A.csv", "B.dat"], ["B.dat", "A.csv"]):
+        assert sniff._paired_member_pattern_candidate(names) == \
+            sniff._member_pattern_candidate(sorted(names)) == r".*\.csv", names
+
+
+def test_a_separator_that_is_not_the_delimiter_is_not_an_ambiguity():
+    """Second review: `A=1,B=2` over `C=3,D=4` is a comma table and `=` lines,
+    and the note called them "KEY,VALUE lines". Not the same cells read two
+    ways; the table's header would be `A=1`, under which nothing is readable,
+    so the text reading is the one that survives."""
+    eq = {"A.csv": DAT_A, "A.ctl": "A=1,B=2\nC=3,D=4\n",
+          "B.csv": DAT_A, "B.ctl": "A=1,B=2\nC=3,D=4\n"}
+    mc = sniff.propose_feed("w.zip", _zip(eq))["member_control"]
+    assert mc["format_ambiguous"] is False, mc
+    assert mc["format"] is None, mc
+    assert "AMBIGUOUS" not in mc["note"] and "KEY," not in mc["note"], mc["note"]
+    # ...while the genuine case records the separator it was worded from
+    kv = {"A.csv": DAT_A, "A.ctl": "FEED|POSITIONS\nROWS|2\n"}
+    genuine = sniff.propose_feed("w.zip", _zip(kv))["member_control"]
+    assert genuine["key_value_separator"] == "|", genuine
+    assert "KEY|VALUE lines" in genuine["note"], genuine["note"]
+
+
 # ...and with NO pairs, nothing changes.
 def test_no_pairs_means_no_member_control_and_the_old_proposal():
     """Checked against `main`'s sniffer when this was written, output for

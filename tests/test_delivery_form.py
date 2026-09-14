@@ -805,3 +805,16 @@ def test_a_null_pattern_proposal_says_both_blocks_and_does_not_save_silently():
         assert "delivery.control" not in str(exc.errors), exc.errors
     else:
         raise AssertionError("expected FeedValidationError")
+
+
+def test_the_tick_autofill_does_not_block_a_member_control_sniff():
+    """Second review: ticking Arrival puts `{stem}\\.ctl` in the arrival box,
+    and the sniff then counted the patterns as "already set" -- the proposed
+    `{stem}\\.done` landed in neither block, the form kept an arrival-only
+    control the loader refuses, and the note said it had left them alone.
+    That autofill is an untouched default, as syncArrivalArchive treats it."""
+    handler = _member_control_handler()
+    decl = handler[handler.index("const arrCtlUntouched"):]
+    decl = decl[:decl.index("if (mc.pattern && ctlPatternsEmpty)")]
+    assert "arrCtlPattern.value === AUTO_CTL" in decl, decl
+    assert "arrCtlUntouched && !controlPattern.value.trim()" in decl, decl

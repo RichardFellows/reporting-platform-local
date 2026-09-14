@@ -27,8 +27,8 @@ that does not wait on another.
 proposes the `arrival.archive` shape's control half as `member_control`:
 the `{stem}...` pattern, the control format, and candidate fields. The
 console fills the arrival section and BOTH control blocks from it and leaves
-`deliveryKind` at plain file. Covered by 20 tests in `tests/test_sniff.py` and
-6 in `tests/test_delivery_form.py`; written up in
+`deliveryKind` at plain file. Covered by 23 tests in `tests/test_sniff.py` and
+7 in `tests/test_delivery_form.py`; written up in
 `DECISIONS.md#the-sniffer`.
 
 *Choices.* Pairs are recognised **by name only**: a `ctl`/`trl`/`done`/`ok`
@@ -80,7 +80,12 @@ Control files were decoded as UTF-8, not the proposed encoding, and indented
 lines failed their read-back. Member bytes were held together and re-parsed
 per candidate. Re-sniffing an existing feed overwrote its configured values
 and format. And with no proposable pattern, the form auto-filled an arrival
-control pattern alone, which cannot be saved and said nothing about why.
+control pattern alone, which cannot be saved and said nothing about why. A second
+review found three more, fixed in a third commit. Ticking Arrival before
+uploading counted the tick's `{stem}\.ctl` as a pattern already set, so the
+proposed one reached neither control block. Extensionless member-pattern ties
+depended on name order. And `A=1,B=2` over `C=3,D=4` was reported as an
+ambiguous "KEY,VALUE" table, although its separator is not the delimiter.
 
 *Found, not fixed.* **`inbox --dry-run` without `--loop` prints `inbox empty`
 with a file in the inbox.** `STABLE_POLLS = 2` needs three observations and
