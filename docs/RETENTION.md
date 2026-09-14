@@ -646,13 +646,25 @@ partition pruning, given typical feed volumes.
 ## Non-prod
 
 Today non-prod holds production data, on-prem, restricted to prod-authorised
-users. Retention policy is therefore currently *identical* across environments.
+users, so `uat` is `*full` — the same anchor `prod` uses, not a copy of it.
 
-When masking/subsetting arrives, retention should shorten in non-prod
-(`keep_business_days: 5`, `keep_month_ends: 3`) — but note that shortening
-retention in non-prod removes your ability to reproduce a production month-end
-issue in a lower environment. Budget for a "restore a month-end into non-prod"
-procedure rather than assuming the data will be there.
+**`dev` is already shortened**, and has been since the `environments:` block
+was written: `keep_business_days: 5` and `keep_month_ends: 3` on every table
+layer, `landing.keep_years: 1`, `ready.keep_days: 2`. This section used to say
+retention was *identical* across environments and propose those same two
+numbers as what should happen "when masking/subsetting arrives" — both went
+stale the moment the profile landed.
+
+`landing.keep_years` shortens with it deliberately, and
+`references.published_tags.default_keep_years` carries a matching `dev: 1`:
+a globally fixed pin window would leave `dev` pinning published runs for a
+decade whose evidence it discarded after a year, and the interlock above would
+then refuse every `dev` sweep.
+
+The caution the section was written to give still stands, and is the reason to
+read it: shortening retention in a lower environment removes your ability to
+reproduce a production month-end issue there. Budget for a "restore a
+month-end into non-prod" procedure rather than assuming the data will be there.
 
 ## Open question: extended retention
 
