@@ -46,11 +46,21 @@
   MERGE, NOT insert_overwrite, unlike every date-partitioned model. The
   partition is `effective_from_month` and an incremental run re-derives only
   the touched keys, so overwriting the months it returns would truncate
-  them to those keys. And A KEY THE NEWEST DELIVERY OMITS DOES NOT CLOSE ITS
-  VERSION: that delivery's rows simply stop contributing, so the version in
-  force carries forward and `counterparty_exposure` flags it
-  (`reference_carried_forward`). Deliberate -- an absent counterparty is a
-  gap to show, not a retirement to infer.
+  them to those keys.
+
+  A KEY ABSENT FROM A DATE'S NEWEST DELIVERY IS TWO DIFFERENT THINGS, and
+  they are treated differently:
+
+    * It does not CLOSE the version in force. An absent counterparty is a
+      gap to show, not a retirement to infer: the version carries forward
+      and `counterparty_exposure` flags it (`reference_carried_forward`).
+    * It does RETRACT a version that the replaced delivery itself began. If
+      the 09-02 delivery changed a name and its re-delivery omits the
+      counterparty, the change never happened: the 09-02 version goes and
+      the one before it is open again. `scd2_retractions` below emits the
+      marker rows and `scd2_retractions=true` gives this model the merge in
+      macros/merge.sql that deletes on them. Without both, the retracted
+      version stays current, and the key's next change opens a second one.
   See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
 

@@ -177,7 +177,7 @@
       {{ exceptions.raise_compiler_error(
            "knowledge_time=" ~ kt ~ " on an INCREMENTAL run of " ~ this ~
            ". An as-of build must be --full-refresh on a throwaway Nessie "
-           ~ "branch: merging as-of rows into the published table would "
+           ~ "branch: writing as-of rows into the published table would "
            ~ "restate it backwards. Add --full-refresh, or drop the var.") }}
     {%- endif -%}
     coalesce(_received_at, _ingest_ts) <= TIMESTAMP '{{ kt }}'

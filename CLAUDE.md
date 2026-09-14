@@ -250,9 +250,18 @@ to run something for the first time, expect it to fail and read what it says.
   truncated re-delivery wipes its date, and `expected_min_rows` and
   `delivery.control` `row_count` are the guards.
   (`#a-snapshot-re-delivery-restates-the-whole-date`)
+- **An SCD2 version a replaced delivery began must be RETRACTED, and a MERGE
+  cannot delete.** Without it the version stays current and the key's next
+  change opens a second one. The SCD2 models emit marker rows
+  (`scd2_retractions`, `effective_to = scd2_retracted()`) and set
+  `scd2_retractions=true`, which gives them the project's
+  `spark__get_merge_sql` in `macros/merge.sql` — delete on the marker, update,
+  insert. Every other merge is dbt-spark's. A key absent from a delivery still
+  never CLOSES the version in force; and a date raw no longer holds is never
+  a retraction. (`#a-snapshot-re-delivery-restates-the-whole-date`)
 - **As-of is a var, not a second model**: the same models with `--vars
   '{knowledge_time: ...}'`, filtered by `known_as_of()`. It compiles to
-  `1 = 1` when unset and **refuses an incremental run**, because merging as-of
+  `1 = 1` when unset and **refuses an incremental run**, because writing as-of
   rows into the published table restates it backwards.
   (`#as-of-is-a-var-not-a-second-model`,
   `#delivery-ref-is-the-fallback-with-the-prefix-stripped`)

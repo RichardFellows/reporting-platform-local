@@ -63,13 +63,46 @@ runs them in DuckDB; putting the per-key partition back fails seven of its
 tests. `config.yml` installs `jinja2` for it, and the clean-virtualenv run of
 that dependency set passed.
 
-LIVE-VERIFY: the insert_overwrite materialisation on Iceberg through Nessie has not been run yet; replace this sentence with what the Nessie-branch run showed before merging.
+*Verified live, `prepared.fo_trade` only*, by the orchestrator on a throwaway
+Nessie branch from `main` (deleted afterwards; `main`'s hash unchanged). An
+extra COB date inside the lookback window (08-18) and one outside it (08-10)
+were added to raw on the branch, the model built, and a synthetic
+`_file_version` 2 for 2026-08-19 omitting 49 of its 400 keys appended. The
+INCREMENTAL run's log showed `set spark.sql.sources.partitionOverwriteMode =
+DYNAMIC` then `insert overwrite prepared.fo_trade`, no `merge into`.
+Afterwards 08-19 held 351 rows, all version 2, with none of the 49 keys; 08-18
+was rewritten whole (400 rows, the second run's invocation id); 08-10 was
+untouched (the first run's); and the only new snapshot was one `overwrite`
+with `replace-partitions=true`, `changed-partition-count=2`, 751 added, 800
+deleted. A full-refresh as-of build at a knowledge time before version 2 gave
+all three dates version 1's 400 keys; the same var on an incremental run was
+refused with the compiler error. **The three reporting models were not run
+live**; they use the same materialisation.
+
+*Code review then found a HIGH defect in the SCD2 half, fixed in later commits
+on this branch.* With the rank selecting the newest delivery, an incremental
+run of `ref_counterparty`/`ref_rating` could no longer retract a version a
+replaced delivery had begun: the replay started at the current version, found
+nothing, and dbt-spark's merge cannot delete — so the retracted version stayed
+current, and the key's next change opened a second one. Reproduced first in
+`tests/test_scd2_incremental.py` (rendered models through dbt-spark's
+incremental flow in DuckDB, beside a full rebuild; it failed on the rank
+change alone). Fixed with marker rows in the model and a project
+`spark__get_merge_sql` that deletes on them in the same MERGE, a replay that
+starts at the version in force when the window starts, and a guard that a
+date raw no longer holds is never a retraction; options (a)–(c) and why each
+was rejected are in the DECISIONS entry. The review was also right about two
+sentences: `ref_counterparty`'s header said a dropped key's version simply
+"carries forward", and the DECISIONS entry's first draft called the stranding
+"not new" — the per-key rank never stranded a version. Both are rewritten.
+
+LIVE-VERIFY-SCD2: the SCD2 retraction merge has not been run on a Nessie branch yet; replace this sentence with what that run showed before merging.
 
 What the item file got wrong. **Its SCD2 watch-out contradicted the design**:
 it said a key dropped from a snapshot "should close its validity interval",
 and the SCD2 models deliberately do not — an absent counterparty is carried
 forward and flagged, and `scd2_exactly_one_current_version` expects it. That
-is unchanged. **Its doc-gate watch-out did not apply**: `test_doc_claims`
+is unchanged (retracting a version is a different thing; see above). **Its doc-gate watch-out did not apply**: `test_doc_claims`
 matches a quoted message only in the form `` `"..."` ``, and every doc quoting
 the `supersession:` refusal quotes it as an indented block, which it never
 reads; and its NOT BUILT check exempts any paragraph containing "supersede"
@@ -245,8 +278,8 @@ instead and name the path: the container holds the PACKAGE and these tests
 read the REPO. `support.repo_file()` raises `Skipped` **only where there is no
 checkout** — in one, a missing file is an `AssertionError` — so neither CI
 tier can skip, and a skip never touches the exit code. Verified by moving
-`.env.example` aside and watching it fail rather than skip. Container:
-`512 passed, 0 failed, 14 skipped`.
+`.env.example` aside and watching it fail rather than skip. Container, at the
+time: `512 passed, 0 failed, 14 skipped`.
 
 **02, the console can create a feed whose zip is unpacked at the gate** —
 a member-pattern input in the form's arrival section, `readArrival()` sending

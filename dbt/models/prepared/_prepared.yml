@@ -47,7 +47,9 @@ models:
           combination_of_columns: [counterparty_id, effective_from]
 
       # THE LOAD-BEARING TEST. The incremental path re-derives each touched
-      # entity from its currently-open version so that lead() can close it; if
+      # entity from the version in force when its lookback window starts, so
+      # that lead() can close it and a retracted version's predecessor can be
+      # reopened (engine.sql, scd2_incremental_scope); if
       # that replay window is ever wrong, the result is two versions in force
       # at once, and as_of() then matches both and silently DOUBLES every
       # exposure row for that counterparty. Nothing inside the model can see

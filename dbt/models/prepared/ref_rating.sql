@@ -25,8 +25,10 @@
   version. The key columns below are therefore (counterparty_id, agency) and
   getting that wrong would interleave two agencies' histories into one chain.
 
-  MERGE, NOT insert_overwrite, and a key the newest delivery omits does not
-  close its version -- both for the reasons ref_counterparty's header states.
+  MERGE, NOT insert_overwrite; a key the newest delivery omits does not close
+  the version in force, but does retract a version the replaced delivery
+  began (`scd2_retractions`) -- all for the reasons ref_counterparty's header
+  states.
 #}
 
 with
