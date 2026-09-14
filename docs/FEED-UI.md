@@ -173,8 +173,9 @@ tests. The generated test block carries a comment saying to add them.
 
 What it does generate is the minimum from `ADDING-A-FEED.md`: `not_null` on
 the business key, `unique_combination_of_columns` over
-`[cob_date, <business key>]` — which is what proves `dedupe_rank` works —
-and a `relationships` test on `counterparty_id` when the `counterparty` model
+`[cob_date, <business key>]` — which proves the dedupe left one row per key,
+though not that a key a re-delivery dropped is gone (uniqueness holds either
+way; `tests/test_dedupe_rank.py` pins that) — and a `relationships` test on `counterparty_id` when the `counterparty` model
 exists.
 
 ### Does dbt accept what was written?

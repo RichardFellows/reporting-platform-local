@@ -253,8 +253,11 @@ and gets its own manifest and its own raw rows.
 `_file_version` is **not** read from the filename: `next_file_version()` takes
 `MAX(_file_version) + 1` for that COB date from the raw table itself, so the
 second delivery is version 2 whether or not its name says so. `prepared` then
-keeps the newest version per business key (`dedupe_rank`, which is what
-`supersession: full_snapshot` means).
+keeps the newest DELIVERY for the COB date, whole (`dedupe_rank`, which is what
+`supersession: full_snapshot` means): a key version 2 omits is gone from
+`prepared`, and from every report built on it, on the next incremental run.
+See
+[DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 
 ---
 

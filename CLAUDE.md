@@ -240,9 +240,33 @@ to run something for the first time, expect it to fail and read what it says.
   `correction` raise NOT_BUILT at load. The value is the REFUSAL — a delta feed
   deduped as a snapshot silently loses every key its newest file omits.
   (`#supersession-is-declared-not-assumed`)
+- **`full_snapshot`: the newest DELIVERY restates its whole COB date, so a key
+  it omits is ABSENT.** `dedupe_rank` used to rank per KEY and kept dropped
+  keys, uniqueness test green. It gates on the newest `_file_version` per date
+  now, and the cob_date-partitioned models are `insert_overwrite`, because a
+  MERGE never deletes. That is safe only for a select returning each date
+  WHOLE: a query keeping some keys of a date passes `newest_version=`, and
+  the SCD2 models stay `merge`. The newest file is load-bearing — a
+  truncated re-delivery wipes its date, and `expected_min_rows` and
+  `delivery.control` `row_count` are the guards.
+  (`#a-snapshot-re-delivery-restates-the-whole-date`)
+- **An SCD2 version a replaced delivery began must be RETRACTED, and a MERGE
+  cannot delete.** Without it the version stays current and the key's next
+  change opens a second one. The SCD2 models emit marker rows
+  (`scd2_retractions`, `effective_to = scd2_retracted()`) and set
+  `scd2_retractions=true`, which gives them the project's
+  `spark__get_merge_sql` in `macros/merge.sql` — delete on the marker, update,
+  insert. Every other merge is dbt-spark's. The SCD2 models rank and scope
+  the replay AFTER their cleaning — a raw ` B` never matches the target's `B`
+  — comparing keys NULL-safely (`scd2_key_match`, merge `on` included, or an
+  `'N/A'` key vanishes from incremental builds only), and `scd2_replay` heads
+  the replay with the target's version before its start, so retracting the
+  start version reopens that one. A key absent from a delivery still
+  never CLOSES the version in force; and a date raw no longer holds is never
+  a retraction. (`#a-snapshot-re-delivery-restates-the-whole-date`)
 - **As-of is a var, not a second model**: the same models with `--vars
   '{knowledge_time: ...}'`, filtered by `known_as_of()`. It compiles to
-  `1 = 1` when unset and **refuses an incremental run**, because merging as-of
+  `1 = 1` when unset and **refuses an incremental run**, because writing as-of
   rows into the published table restates it backwards.
   (`#as-of-is-a-var-not-a-second-model`,
   `#delivery-ref-is-the-fallback-with-the-prefix-stripped`)
@@ -379,10 +403,10 @@ them.
   `tests/test_value_checks.py` asserts each from both sides.
 - **`.github/workflows/config.yml` is the cheap tier**: `config check` +
   `python -m tests.run` on a bare runner, ~10s.
-  Its dependency set (pyyaml, ruamel.yaml, requests, duckdb) was DERIVED BY
-  RUNNING IT in a clean virtualenv, not read off the imports — `test_sniff`
-  imports duckdb at module level and its absence aborts the whole run with no
-  summary line.
+  Its dependency set (pyyaml, ruamel.yaml, requests, duckdb, jinja2) was
+  DERIVED BY RUNNING IT in a clean virtualenv, not read off the imports —
+  `test_sniff` imports duckdb and `test_dedupe_rank` jinja2 at module level,
+  and either missing aborts the whole run with no summary line.
 - **`.github/workflows/parse.yml` is the tier above, and it is SEPARATE so the
   cheap one stays cheap**: the image's pins installed with pip (~2–3 min),
   then `dbt --version`, `dbt deps`, `dbt parse` and

@@ -11,7 +11,6 @@ item that no longer reproduces should be deleted rather than worked.
 | | Item | Value | Effort |
 |---|---|---|---|
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
-| [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
 | [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
@@ -23,17 +22,214 @@ item that no longer reproduces should be deleted rather than worked.
 
 ## Where to start
 
-**09 first.** It is a correctness defect in the one supersession mode that is
-built, and its answer decides what 07 is asking for — do not start 07 before
-it. It opens with a decision, not an edit.
+**15** is the one to take next. Under 09's decision the newest
+`_file_version` decides a whole COB date, and 15 is how a version gets
+mis-numbered.
+
+**07** is no longer blocked: 09 decided that `full_snapshot` selects the
+newest delivery per COB date, so 07's premise holds as written. It is
+multi-day design work and only worth starting if a delta feed is real; read
+its banner and
+[DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
+first.
 
 **12–19** were found working 08–10 and each was reproduced before it was
-written down. **15** is the one to take next after 09: under 09's decision the
-newest `_file_version` decides a whole COB date, and 15 is how a version gets
-mis-numbered. **16** and **18** should be re-read once 09 merges, since it
-changes the models they describe. The rest are independent.
+written down. **16** and **18** describe models 09 changed, so re-read them
+against the current models before starting. The rest are independent.
 
 ## Done
+
+**09, `dedupe_rank` kept keys a `full_snapshot` re-delivery dropped** — the
+owner's decision was that the macro was wrong and the documented meaning
+stands: the newest delivery for a COB date is that date's population, and a
+key it omits is absent from `prepared`, incrementally. Written down as
+[`#a-snapshot-re-delivery-restates-the-whole-date`](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date),
+with an `> **Amended.**` block on `#supersession-is-declared-not-assumed`,
+which had said the macro "has always implemented" what it did not. Measured
+first: the seed's one re-delivery (`fo_trade` 2026-08-13 `_v2`) has the same
+400 keys as `_v1`, and nothing was published on `main`, so nothing depended on
+the per-key reading.
+
+Three changes, because the rank alone removes nothing. `dedupe_rank` gates on
+the newest `_file_version` per COB date, computed after `known_as_of()`; the
+five `cob_date`-partitioned models are `insert_overwrite` (project default and
+per model, `unique_key` removed), because dbt-spark's MERGE has no delete
+clause; and the two SCD2 models, which stay `merge`, take "newest" from
+`newest_file_version()`, an unjoined aggregate, because a window over their
+`touched`-scoped rows gets it wrong. The scaffold emits the new strategy, and
+its generated comment no longer says uniqueness proves the dedupe works.
+`tests/test_dedupe_rank.py` renders the real macro and models with jinja2 and
+runs them in DuckDB; putting the per-key partition back fails seven of its
+tests. `config.yml` installs `jinja2` for it, and the clean-virtualenv run of
+that dependency set passed.
+
+*Verified live, `prepared.fo_trade` only*, by the orchestrator on a throwaway
+Nessie branch from `main` (deleted afterwards; `main`'s hash unchanged). An
+extra COB date inside the lookback window (08-18) and one outside it (08-10)
+were added to raw on the branch, the model built, and a synthetic
+`_file_version` 2 for 2026-08-19 omitting 49 of its 400 keys appended. The
+INCREMENTAL run's log showed `set spark.sql.sources.partitionOverwriteMode =
+DYNAMIC` then `insert overwrite prepared.fo_trade`, no `merge into`.
+Afterwards 08-19 held 351 rows, all version 2, with none of the 49 keys; 08-18
+was rewritten whole (400 rows, the second run's invocation id); 08-10 was
+untouched (the first run's); and the only new snapshot was one `overwrite`
+with `replace-partitions=true`, `changed-partition-count=2`, 751 added, 800
+deleted. A full-refresh as-of build at a knowledge time before version 2 gave
+all three dates version 1's 400 keys; the same var on an incremental run was
+refused with the compiler error. **The three reporting models were not run
+live**; they use the same materialisation.
+
+*Code review then found a HIGH defect in the SCD2 half, fixed in later commits
+on this branch.* With the rank selecting the newest delivery, an incremental
+run of `ref_counterparty`/`ref_rating` could no longer retract a version a
+replaced delivery had begun: the replay started at the current version, found
+nothing, and dbt-spark's merge cannot delete — so the retracted version stayed
+current, and the key's next change opened a second one. Reproduced first in
+`tests/test_scd2_incremental.py` (rendered models through dbt-spark's
+incremental flow in DuckDB, beside a full rebuild; it failed on the rank
+change alone). Fixed with marker rows in the model and a project
+`spark__get_merge_sql` that deletes on them in the same MERGE, a replay that
+starts at the version in force when the window starts, and a guard that a
+date raw no longer holds is never a retraction; options (a)–(c) and why each
+was rejected are in the DECISIONS entry. The review was also right about two
+sentences: `ref_counterparty`'s header said a dropped key's version simply
+"carries forward", and the DECISIONS entry's first draft called the stranding
+"not new" — the per-key rank never stranded a version. Both are rewritten.
+
+*The SCD2 retraction verified live* on two throwaway Nessie branches, with
+`raw.ref_counterparty` created on the branch by ingest's own
+`ensure_raw_table`/`ensure_raw_schema`. Four incremental runs: A=a and B=X
+from 2026-08-03; 09-02 changes B to Y and adds C; 09-02 re-delivered with A
+only; 09-03 brings B back as Y. dbt sent the project's merge — `when matched
+and DBT_INTERNAL_SOURCE.effective_to = DATE '0001-01-01' then delete` and the
+conditional insert — and after the re-delivery the table held exactly
+`[A, a, 08-03, open]` and `[B, X, 08-03, open]`: the 09-02 version and C
+retracted, B's earlier version reopened, Iceberg's snapshot recording 4
+records deleted and 2 added. After B's return: `[B, X, 08-03 → 09-02]`,
+`[B, Y, 09-03, open]` — one open version per key, no overlaps, no marker
+rows, and all 9 of `ref_counterparty`'s dbt tests passed, including
+`mutually_exclusive_ranges`. Both states compared IDENTICAL to a full refresh
+over the same raw (the post-retraction one on the second branch). A throwaway
+`merge` model with no `scd2_retractions` got dbt-spark's own
+`when matched then update set *` and the right rows, so the override
+delegates. `main`'s hash was the same before and after, and neither branch
+survived. **Not run live:** `ref_rating` (same macros, host-tested) and the
+three reporting models. **That run predates the two fixes below** (both re-run live further down) and
+exercised neither.
+
+*A final review then found two medium defects in the SCD2 fix*, both
+reproduced by the reviewer's probe and by the orchestrator, and both now
+tests in `tests/test_scd2_incremental.py` that failed on `2ae6052`:
+
+- **The version before the replay start was never reopened.** The replay
+  started at the version in force when the lookback window starts, and a
+  re-delivery of THAT date could retract it — but the version before it was
+  outside the replay, so it stayed closed (a drop left a gap no `as_of()`
+  matches) or doubled (a revert left two back-to-back versions). Fixed in
+  `scd2_replay`: the target's version before the replay start heads the
+  replayed rows, so lead() reopens or extends it, and it is never read from
+  raw, whose copy of its date retention may have pruned. The tests' history
+  carries a version before that one too, whose raw date is still there, so
+  a retraction scope that reached past the seed would be caught deleting it.
+- **The replay scope compared RAW keys to the target's CLEANED keys**, in
+  the markers and in the `replay_from` join, on both models: a raw ` B`, or
+  `ref_rating`'s agency in another case, matched nothing, nothing was
+  retracted, and a second open version followed. Fixed by ranking every raw
+  row and applying the whole replay scope to the model's own cleaned stream
+  (`cleaned`, or `ranked` for `ref_rating`), so there is one cleaning and no
+  copy of it. Nothing else joins `touched` to the target.
+
+The probe prints EQUAL for every case, padded and control. The review's
+third, low finding is recorded as a risk in the DECISIONS entry, not fixed: a
+delivery with no rows cannot supersede anything, because "newest" is read
+off raw rows.
+
+*A second review of those fixes confirmed the seed and cleaned-key logic*
+through the harness against six further cases (two retractions in one run,
+several dates reverted at once, a replay-start drop plus a new day, a longer
+drop/revert chain, the newest version retracted with a seed present, a new key
+added then dropped), and found five more issues, each now a test that failed
+first:
+
+- **A key that cleans to NULL was dropped by incremental builds only**
+  (medium, a regression of the cleaned-key fix). `clean_string` maps `''`,
+  `'NULL'` and `'N/A'` to NULL, and every join of the cleaned key used `=`,
+  so an `'N/A'` row vanished from incremental builds while a full rebuild kept
+  it — hiding it from the `not_null` test on exactly the builds that publish.
+  Every join of the cleaned key, and the SCD2 merge's `on`, is now
+  `IS NOT DISTINCT FROM` through one macro, `scd2_key_match`; Spark 3.5.3
+  parses it to `EqualNullSafe`, and DuckDB accepts it where it rejects `<=>`.
+- **The in-file dedupe ranked the RAW key** (low, pre-existing): ` B` and
+  `B` in one file gave two versions with one `effective_from`, one inverted.
+  The SCD2 models rank in `ranked_rows`, after cleaning, on the cleaned key.
+  **Found, not fixed:** `fo_trade` and `ref_collateral` rank raw `trade_id`
+  and `collateral_id` the same way, so ` T1` and `T1` in one file would both
+  survive; their uniqueness tests would fail that build rather than publish
+  it. Left for a separate item — their path is live-verified as it stands.
+- **A reopened seed row kept an earlier run's audit columns** (low): it now
+  takes this run's `dbt_invocation_id`, `nessie_ref` and `dbt_updated_at`
+  through `audit_columns()`, and keeps the target's `source_batch_id`.
+- **The harness trusted DuckDB where Spark differs** (low): it now refuses a
+  MERGE in which one target row matches several source rows, as Spark/Iceberg
+  does and DuckDB 1.5.5 does not; runs dbt-spark's `append_new_columns` step
+  before the merge; and runs `insert *` by name, as Spark means it. A test
+  pins the seed's NULL for a column the target does not have yet.
+- **`scd2_incremental_scope` was still named** in `_prepared.yml` and two older
+  DECISIONS entries; all now say `scd2_replay`.
+
+*Both reviews' fixes verified live* on `a5cc128`, five throwaway Nessie
+branches, `ref_counterparty`, every build incremental unless it says full
+refresh:
+
+- **The first sequence again** (the retraction, B's return): the same states
+  as before, 9/9 dbt tests, IDENTICAL to a full refresh at both steps.
+- **The version before the replay start** (B: V 06-01, W 07-01, X 08-03,
+  Y 09-02; then 08-03 re-delivered without B): W reopened to 07-01 → 08-31,
+  X re-dated to 09-01 → 09-01, V untouched, Y open — IDENTICAL to a full
+  refresh.
+- **A padded key** (`B` on 08-03, ` B` after; 09-02 re-delivered without it;
+  ` B` back on 09-03): only `[A, a, 08-03, open]` and `[B, X, 08-03, open]`
+  at both steps, IDENTICAL to a full refresh.
+- **Two spellings in one file, and a key that cleans to NULL:** 09-02's `B`
+  then ` B` gave ONE 09-02 version, the later row's `Z`, and Spark accepted
+  the MERGE; an `N/A` row on 09-03 appeared as a NULL-key version, was
+  MATCHED rather than re-inserted on 09-04, and closed when a 09-04
+  re-delivery changed its value. dbt's log shows `is not distinct from` in
+  the replay's joins and in the MERGE's `on`. IDENTICAL to a full refresh.
+  `not_null_ref_counterparty_counterparty_id` failed with 2 rows on the
+  incremental table, as intended.
+
+`main`'s hash was the same before and after, and no branch survived.
+
+**One thing the procedure did not predict:** on that last branch
+`mutually_exclusive_ranges` failed too, with 1 row. It is not this change:
+dbt_utils' test defaults to `zero_length_range_allowed: false`, which
+requires `effective_from < effective_to` strictly, and this project's
+`effective_to` is inclusive, so any value in force for exactly one COB date
+(`Q`, 09-03 → 09-03) is refused. The full refresh over the same raw is
+identical, so it fails there too. Filed as its own item.
+
+One thing the run found that the host tests could not: the procedure's first
+seeding helper built rows with `createDataFrame`, which needs Python workers
+on the cluster, and those run 3.8 against the driver's 3.11
+(`PYTHON_VERSION_MISMATCH`). SQL `INSERT ... SELECT` literals, which stay in
+the JVM, worked. The platform's own ingest does not hit this; a notebook or
+script that does will.
+
+What the item file got wrong. **Its SCD2 watch-out contradicted the design**:
+it said a key dropped from a snapshot "should close its validity interval",
+and the SCD2 models deliberately do not — an absent counterparty is carried
+forward and flagged, and `scd2_exactly_one_current_version` expects it. That
+is unchanged (retracting a version is a different thing; see above). **Its doc-gate watch-out did not apply**: `test_doc_claims`
+matches a quoted message only in the form `` `"..."` ``, and every doc quoting
+the `supersession:` refusal quotes it as an indented block, which it never
+reads; and its NOT BUILT check exempts any paragraph containing "supersede"
+as history, which is most paragraphs about supersession. The refusal text
+did not change here, but nothing would have caught it if it had. **It missed a site**: `counterparty_exposure.delivered` grouped
+`raw.ref_counterparty` across every version without calling `dedupe_rank`, so
+a dropped counterparty still counted as delivered and was never flagged; it
+ranks through the macro and filters on `known_as_of()` now. And **it asked for
+`seed_clean/` to be checked, which was empty** in the checkout measured.
 
 **08, the sniffer had no notion of member control files** —
 `ingest/sniff.py` recognises members that carry their own control file and
@@ -200,8 +396,8 @@ instead and name the path: the container holds the PACKAGE and these tests
 read the REPO. `support.repo_file()` raises `Skipped` **only where there is no
 checkout** — in one, a missing file is an `AssertionError` — so neither CI
 tier can skip, and a skip never touches the exit code. Verified by moving
-`.env.example` aside and watching it fail rather than skip. Container:
-`512 passed, 0 failed, 14 skipped`.
+`.env.example` aside and watching it fail rather than skip. Container, at the
+time: `512 passed, 0 failed, 14 skipped`.
 
 **02, the console can create a feed whose zip is unpacked at the gate** —
 a member-pattern input in the form's arrival section, `readArrival()` sending

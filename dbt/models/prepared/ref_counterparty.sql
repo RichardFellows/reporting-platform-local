@@ -1,6 +1,8 @@
 {{
   config(
     materialized='incremental',
+    incremental_strategy='merge',
+    scd2_retractions=true,
     unique_key=['counterparty_id', 'effective_from'],
     partition_by=['effective_from_month'],
     tags=['prepared', 'reference', 'scd2']
@@ -40,40 +42,57 @@
   The unique key is (counterparty_id, effective_from) and NOT effective_to,
   which is what lets the incremental merge UPDATE a previously-open row to
   close it rather than inserting a second one alongside.
+
+  MERGE, NOT insert_overwrite, unlike every date-partitioned model. The
+  partition is `effective_from_month` and an incremental run re-derives only
+  the touched keys, so overwriting the months it returns would truncate
+  them to those keys.
+
+  A KEY ABSENT FROM A DATE'S NEWEST DELIVERY IS TWO DIFFERENT THINGS, and
+  they are treated differently:
+
+    * It does not CLOSE the version in force. An absent counterparty is a
+      gap to show, not a retirement to infer: the version carries forward
+      and `counterparty_exposure` flags it (`reference_carried_forward`).
+    * It does RETRACT a version that the replaced delivery itself began. If
+      the 09-02 delivery changed a name and its re-delivery omits the
+      counterparty, the change never happened: the 09-02 version goes and
+      the one before it is open again. `scd2_retractions` below emits the
+      marker rows and `scd2_retractions=true` gives this model the merge in
+      macros/merge.sql that deletes on them. Without both, the retracted
+      version stays current, and the key's next change opens a second one.
+      `scd2_replay` compares keys only after this model's cleaning, and
+      starts the replay with the version before its start, so that one can
+      be reopened or extended when the start version itself is retracted.
+  See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
+
+{% set business_columns = ['counterparty_id', 'legal_name', 'country_code', 'sector', 'parent_counterparty_id', 'is_active'] %}
 
 with
 
-{% if is_incremental() %}
-{{ scd2_incremental_scope(source('raw', 'ref_counterparty'), ['counterparty_id']) }}
-{% endif %}
+{{ newest_file_version(source('raw', 'ref_counterparty')) }}
 
 raw_rows as (
 
+    {#
+      EVERY raw row, unranked. Ranking, the replay scope and the retraction
+      markers all happen after cleaning, so that every one of them uses the
+      CLEANED key -- see `ranked_rows` and `scd2_replay`. `nv` decides the
+      newest delivery per COB date from raw unjoined; see `newest_version` on
+      dedupe_rank. The retraction guard reads the same CTE.
+
+      known_as_of() applies on the FULL-REFRESH path, which is the only path
+      an as-of build is allowed to take (the macro refuses an incremental
+      one). It compiles to `1 = 1` when no knowledge_time is set.
+    #}
     select
         r.*,
-        {{ dedupe_rank(['r.counterparty_id']) }} as _rn
+        nv._newest_file_version
     from {{ source('raw', 'ref_counterparty') }} r
-    {% if is_incremental() %}
-    join touched t on t.counterparty_id = r.counterparty_id
-    left join replay_from p on p.counterparty_id = r.counterparty_id
-    {% endif %}
-    {#
-      known_as_of() is unconditional, unlike the join predicates above: the
-      as-of filter has to apply on the FULL-REFRESH path, which is the only
-      path an as-of build is allowed to take (the macro refuses an incremental
-      one). It compiles to `1 = 1` when no knowledge_time is set, so the
-      ordinary incremental build is unchanged.
-    #}
+    join newest_file_version nv on nv._newest_cob_date = r._cob_date
     where {{ known_as_of() }}
-    {% if is_incremental() %}
-      and r._cob_date >= coalesce(p.from_date, date '1900-01-01')
-    {% endif %}
 
-),
-
-deduped as (
-    select * from raw_rows where _rn = 1
 ),
 
 cleaned as (
@@ -97,11 +116,34 @@ cleaned as (
         _source_file                                                as source_file,
         _file_version                                               as source_file_version,
         {{ source_provenance() }}
-        {{ audit_columns() }}
+        {{ audit_columns() }},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number,
+        _newest_file_version
 
-    from deduped
+    from raw_rows
 
 ),
+
+ranked_rows as (
+
+    {#
+      THE IN-FILE DEDUPE IS ON THE CLEANED KEY. Ranked on the raw key, ' B'
+      and 'B' (or 'moodys' and 'MOODYS') in one file were each "last in file"
+      and both survived as one cleaned key: two versions with one
+      effective_from, one ending before it began.
+    #}
+    select
+        *,
+        {{ dedupe_rank(['counterparty_id'],
+                       newest_version='_newest_file_version') }} as _rn
+    from cleaned
+
+),
+
+{{ scd2_replay('ranked_rows', ['counterparty_id'], business_columns) }}
 
 {#
   Business attributes only -- see the scd2_hash macro for what including an
@@ -113,7 +155,7 @@ versioned as (
         *,
         {{ scd2_hash(['legal_name', 'country_code', 'sector',
                       'parent_counterparty_id', 'is_active']) }}    as _row_hash
-    from cleaned
+    from replayed
 
 ),
 
@@ -121,31 +163,26 @@ versioned as (
 
 ranged as (
 
+    {#
+      `source_file` is the delivery on which this value FIRST appeared, not
+      the most recent one to repeat it. That is the more useful question,
+      and the restatements are still in raw.
+    #}
     select
-        counterparty_id,
-        legal_name,
-        country_code,
-        sector,
-        parent_counterparty_id,
-        is_active,
-
-        {#
-          The delivery on which this value FIRST appeared, not the most recent
-          one to repeat it. That is the more useful question, and the
-          restatements are still in raw.
-        #}
-        source_file,
-        source_file_version,
-        {{ source_provenance_columns() }}
-        source_batch_id,
-        dbt_invocation_id,
-        nessie_ref,
-        dbt_updated_at,
-
+        {%- for c in scd2_output_columns(business_columns) %}
+        {{ ident(c) }},
+        {%- endfor %}
         {{ scd2_columns(['counterparty_id']) }}
 
     from kept
 
 )
 
+{#
+  On an incremental run, plus one marker row per version this replay
+  covers and no longer derives -- a change a re-delivery dropped or
+  reverted. The merge deletes those (macros/merge.sql); without them it
+  would leave the retracted version current.
+#}
 select * from ranged
+{{ scd2_retractions('ranged', ['counterparty_id'], business_columns) }}

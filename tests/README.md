@@ -5,7 +5,7 @@ python -m tests.run                    # everything
 python -m tests.run test_conventions   # one module
 ```
 
-Runs on the host (needs `pyyaml`, `ruamel.yaml` and `duckdb`) or inside the
+Runs on the host (needs `pyyaml`, `ruamel.yaml`, `duckdb` and `jinja2`) or inside the
 stack with no rebuild -- where the three modules that read the repo rather
 than the package skip, and say so ("And where the rest of the repo is not",
 below):
@@ -34,6 +34,30 @@ service to fake, and sniffing is the one thing here worth testing against the
 genuine engine rather than a stand-in of it. What it cannot tell you is
 whether `s3://lakehouse/...` reads work the same way over `httpfs` against
 real MinIO -- that is verified by running it, same as everything else.
+
+`test_dedupe_rank.py` uses the same real DuckDB for SQL the platform runs on
+Spark, and says exactly how far that goes. It renders `dbt/macros/engine.sql`
+and the model files with `jinja2` -- dbt's template engine, not dbt -- cuts
+the CTEs up to `deduped` out of the result and runs them, so what is tested
+is the rank the models actually compile to rather than a copy of it that
+agrees with itself: a key the newest delivery omits must be absent, per
+prepared model, through the scaffold's template, as-of, and on the SCD2
+touched path. The only rewrite is Spark's backtick quote to DuckDB's double
+quote. What it cannot tell you is whether dbt-spark's `insert_overwrite`
+replaces exactly the COB dates that select returns on Iceberg -- that is
+dbt-spark on Spark, verified by running it on a Nessie branch and claimed by
+nothing here. It pins the precondition (each date returned whole) and the
+config instead.
+
+`test_scd2_incremental.py` goes one step further with the same renderer: it
+runs the two SCD2 models WHOLE, through dbt-spark's incremental flow -- the
+model over `this`, then the MERGE the project resolves for it, rendered from
+`dbt/macros/merge.sql` -- beside a full rebuild, delivery after delivery, and
+requires the two to agree. Five Spark functions DuckDB spells differently are
+renamed to DuckDB macros; dbt-spark's own merge, for the models that do not
+override it, is written out from its 1.8.0 source. It is what caught a
+retracted version staying current, which a test of `deduped` alone could not
+see.
 
 `test_raw_schema.py` is the same split applied to a Spark migration:
 `plan_raw_schema` decides what an existing raw table is missing and what it
@@ -92,9 +116,11 @@ services so that a test can open them.
 So they **skip**, through `support.repo_file()`, naming the path that is not
 there -- `skip  test_versions.test_...: .env.example is not here`. A subject
 that could not be READ is not a subject that is EMPTY, and a repo-text test
-with no repo has to say which one it was rather than pass vacuously. In the
-container the run is `512 passed, 0 failed, 14 skipped`; on the host and in
-CI it is `526 passed, 0 failed` and nothing skips. (`config.yml` is the tier
+with no repo has to say which one it was rather than pass vacuously. **What
+holds, whatever the pass count has grown to:** on the host and in CI, `0
+failed` and nothing skipped; in the container, `0 failed` and exactly the 14
+skips of these three modules. A count written here goes stale with the next
+test anyone adds, so none is. (`config.yml` is the tier
 that runs this suite. `parse.yml` runs `dbt parse` and `check_dag_imports`
 and never invokes it.)
 

@@ -33,7 +33,20 @@ models:
   reporting_platform:
     +file_format: iceberg
     +materialized: incremental
-    +incremental_strategy: merge
+    # REWRITE THE COB DATE, DO NOT MERGE INTO IT. A snapshot re-delivery
+    # restates the whole population of its date, and a MERGE with no delete
+    # clause -- dbt-spark's -- never removes a row already in the target, so
+    # a key the newest delivery dropped survived every incremental run.
+    # `insert_overwrite` with `partition_by` makes dbt-spark set
+    # partitionOverwriteMode=DYNAMIC, so a run replaces exactly the cob_date
+    # partitions its select returns and no others -- which is right ONLY for a
+    # model whose select returns each date WHOLE. Paired with the cob_date
+    # partition default below, and every model states its own strategy as
+    # well: the two SCD2 models (partitioned by effective_from_month, and
+    # replaying only touched keys) say `merge`, and must.
+    # tests/test_dedupe_rank.py pins the pairing.
+    # See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
+    +incremental_strategy: insert_overwrite
 
     # A COLUMN ADDED TO A MODEL REACHES THE TABLE IT MERGES INTO. dbt's
     # default here is `ignore`, and on an incremental model that means a new

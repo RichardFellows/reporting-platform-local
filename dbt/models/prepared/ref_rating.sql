@@ -1,6 +1,8 @@
 {{
   config(
     materialized='incremental',
+    incremental_strategy='merge',
+    scd2_retractions=true,
     unique_key=['counterparty_id', 'agency', 'effective_from'],
     partition_by=['effective_from_month'],
     tags=['prepared', 'reference', 'scd2']
@@ -22,36 +24,30 @@
   they move independently -- Moody's downgrading does not close the S&P
   version. The key columns below are therefore (counterparty_id, agency) and
   getting that wrong would interleave two agencies' histories into one chain.
+
+  MERGE, NOT insert_overwrite; a key the newest delivery omits does not close
+  the version in force, but does retract a version the replaced delivery
+  began (`scd2_retractions`) -- all for the reasons ref_counterparty's header
+  states.
 #}
+
+{% set business_columns = ['counterparty_id', 'agency', 'rating', 'rating_date', 'outlook', 'rating_rank', 'grade_band'] %}
 
 with
 
-{% if is_incremental() %}
-{{ scd2_incremental_scope(source('raw', 'ref_rating'), ['counterparty_id', 'agency']) }}
-{% endif %}
+{{ newest_file_version(source('raw', 'ref_rating')) }}
 
 raw_rows as (
 
+    {# Every raw row, unranked, for the reasons ref_counterparty's copy of
+       this states. #}
     select
         r.*,
-        {{ dedupe_rank(['r.counterparty_id', 'r.agency']) }} as _rn
+        nv._newest_file_version
     from {{ source('raw', 'ref_rating') }} r
-    {% if is_incremental() %}
-    join touched t
-      on t.counterparty_id = r.counterparty_id and t.agency = r.agency
-    left join replay_from p
-      on p.counterparty_id = r.counterparty_id and p.agency = r.agency
-    {% endif %}
-    {# Unconditional, for the reason ref_counterparty's copy of this states. #}
+    join newest_file_version nv on nv._newest_cob_date = r._cob_date
     where {{ known_as_of() }}
-    {% if is_incremental() %}
-      and r._cob_date >= coalesce(p.from_date, date '1900-01-01')
-    {% endif %}
 
-),
-
-deduped as (
-    select * from raw_rows where _rn = 1
 ),
 
 cleaned as (
@@ -66,9 +62,14 @@ cleaned as (
         _source_file                                    as source_file,
         _file_version                                   as source_file_version,
         {{ source_provenance() }}
-        {{ audit_columns() }}
+        {{ audit_columns() }},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number,
+        _newest_file_version
 
-    from deduped
+    from raw_rows
 
 ),
 
@@ -96,6 +97,24 @@ ranked as (
 
 ),
 
+ranked_rows as (
+
+    {#
+      THE IN-FILE DEDUPE IS ON THE CLEANED KEY. Ranked on the raw key, ' B'
+      and 'B' (or 'moodys' and 'MOODYS') in one file were each "last in file"
+      and both survived as one cleaned key: two versions with one
+      effective_from, one ending before it began.
+    #}
+    select
+        *,
+        {{ dedupe_rank(['counterparty_id', 'agency'],
+                       newest_version='_newest_file_version') }} as _rn
+    from ranked
+
+),
+
+{{ scd2_replay('ranked_rows', ['counterparty_id', 'agency'], business_columns) }}
+
 {#
   rating_rank and grade_band are DERIVED from `rating` and are deliberately
   not hashed -- they cannot change without it changing, and hashing them would
@@ -107,7 +126,7 @@ versioned as (
     select
         *,
         {{ scd2_hash(['rating', 'rating_date', 'outlook']) }}     as _row_hash
-    from ranked
+    from replayed
 
 ),
 
@@ -116,26 +135,20 @@ versioned as (
 ranged as (
 
     select
-        counterparty_id,
-        agency,
-        rating,
-        rating_date,
-        outlook,
-        rating_rank,
-        grade_band,
-
-        source_file,
-        source_file_version,
-        {{ source_provenance_columns() }}
-        source_batch_id,
-        dbt_invocation_id,
-        nessie_ref,
-        dbt_updated_at,
-
+        {%- for c in scd2_output_columns(business_columns) %}
+        {{ ident(c) }},
+        {%- endfor %}
         {{ scd2_columns(['counterparty_id', 'agency']) }}
 
     from kept
 
 )
 
+{#
+  On an incremental run, plus one marker row per version this replay
+  covers and no longer derives -- a change a re-delivery dropped or
+  reverted. The merge deletes those (macros/merge.sql); without them it
+  would leave the retracted version current.
+#}
 select * from ranged
+{{ scd2_retractions('ranged', ['counterparty_id', 'agency'], business_columns) }}

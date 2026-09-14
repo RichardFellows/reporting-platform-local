@@ -63,7 +63,7 @@ Reasoning: [`DECISIONS.md#the-registry-records-observations-not-verdicts`](DECIS
 | ID | Requirement | Where it lives | Proved by | Confidence |
 |---|---|---|---|---|
 | **REQ-201** | A feed may declare the **wall-clock time** by which its upstream has committed to deliver. Deliveries that arrived after it are reported. The deadline is that time on the day *after* the COB date. A feed that has made no promise is skipped, not defaulted to midnight. | `common/context.py::Feed.expected_by`, `monitoring/lateness.py` | `test_retention_classes.py` | stated |
-| **REQ-202** | How a later delivery relates to an earlier one is **declared, not assumed**. `full_snapshot` is the only built mode and the default; `delta_append` and `correction` are named in the requirement and refused at load with the reason. | `common/context.py` (`supersession:`, `NOT_BUILT` set), `dedupe_rank` | `test_supersession.py` | stated |
+| **REQ-202** | How a later delivery relates to an earlier one is **declared, not assumed**. `full_snapshot` is the only built mode and the default; `delta_append` and `correction` are named in the requirement and refused at load with the reason. | `common/context.py` (`supersession:`, `NOT_BUILT` set), `dedupe_rank` | `test_supersession.py`, `test_dedupe_rank.py` | stated |
 
 The refusal *is* the deliverable for the unbuilt modes: a delta feed deduped as
 a snapshot silently loses every key its newest file omits, and the row counts

@@ -4,7 +4,7 @@
 # WHY THIS IS THE CHEAP TIER AND WHAT IT DELIBERATELY OMITS. The stack is six
 # services, an Iceberg catalog and a Spark cluster; a gate that needs them
 # runs in tens of minutes and so runs rarely, and a gate that runs rarely is
-# not a gate. All this tier needs is Python plus four packages -- no Spark,
+# not a gate. All this tier needs is Python plus five packages -- no Spark,
 # no dbt, no Docker, no catalog -- and answers in about ten seconds.
 #
 # What it therefore does NOT cover, so nobody reads a green tick as more than
@@ -64,10 +64,17 @@ jobs:
       # line at all. The exit code is still right, which is what a gate needs.
       # Pinned to the image's duckdb for the reason the image pins it:
       # 1.1.3 cannot ATTACH an Iceberg catalog.
+      #
+      # `jinja2` because `test_dedupe_rank` renders `dbt/macros/engine.sql`
+      # and the model files with it and runs the result in duckdb -- the
+      # template engine dbt is built on, not dbt, which this tier still does
+      # not install. Also a MODULE-LEVEL import, so the same whole-run abort
+      # as duckdb without it. Pinned to what Airflow's constraint file gives
+      # the image.
       - name: Install the config layer's dependencies
         run: |
           pip install --quiet \
-            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5"
+            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5" "jinja2==3.1.5"
 
       # The registry has to load before anything else is worth asking. Its own
       # step rather than relying on the suite, so a broken feed file reports

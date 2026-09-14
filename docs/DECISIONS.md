@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-98 entries. They are grouped here by subject; the file itself is in the order
+99 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -151,6 +151,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [a-declared-column-migrates-itself](#a-declared-column-migrates-itself) | **The directions are not symmetrical**: declared columns are added, undeclared ones are never dropped |
 | [provenance-is-added-not-backfilled](#provenance-is-added-not-backfilled) | The migration is lazy, and one un-migrated feed fails *every* prepared model |
 | [supersession-is-declared-not-assumed](#supersession-is-declared-not-assumed) | The value is the refusal: a delta feed deduped as a snapshot loses keys silently |
+| [a-snapshot-re-delivery-restates-the-whole-date](#a-snapshot-re-delivery-restates-the-whole-date) | **A key the newest delivery omits is absent** — the rank was per key, a MERGE never deletes, and an SCD2 version the replaced delivery began is retracted in the merge |
 | [as-of-is-a-var-not-a-second-model](#as-of-is-a-var-not-a-second-model) | Same models, a dbt var, and a refusal to run incrementally |
 | [delivery-ref-is-the-fallback-with-the-prefix-stripped](#delivery-ref-is-the-fallback-with-the-prefix-stripped) | `_delivery_id` is a basename; `_source_file` is a key |
 | [generated-data-must-hold-still](#generated-data-must-hold-still) | Generated data is a function of (entity, epoch), not (entity, date) |
@@ -792,10 +793,11 @@ invocation) looks attractive because it is fast and touches no adapter -- but on
 this project it emits **every test twice**, once under a bare id and once under
 a `test.dbt.` one, which would collide as Airflow task ids, and it misses
 model-level tests entirely: the `dbt_utils.unique_combination_of_columns` blocks
-that prove `dedupe_rank` works never appear. Verified by loading the graph both
-ways. `DBT_LS` shells out to real dbt, finds all 51 tests, and does not connect
-to Spark -- `dbt ls` resolves the profile without opening a session. It costs
-~5s per DAG parse, which Cosmos caches against a hash of the project files.
+that prove the dedupe leaves one row per key never appear. Verified by loading
+the graph both ways. `DBT_LS` shells out to real dbt, finds all 51 tests, and
+does not connect to Spark -- `dbt ls` resolves the profile without opening a
+session. It costs ~5s per DAG parse, which Cosmos caches against a hash of the
+project files.
 
 **`TestBehavior.AFTER_ALL`**, not the `AFTER_EACH` default and not `BUILD`.
 Every rendered task is a separate dbt invocation and therefore a separate Spark
@@ -1290,7 +1292,7 @@ the file**:
 the distinction that matters, and it is not stylistic:
 
 - **Identifier-typed** -- `dedupe_rank`, `scd2_hash`, `scd2_effective_to`,
-  `scd2_incremental_scope`, `scd2_columns` -- are handed a *name* and
+  `scd2_replay`, `scd2_columns` -- are handed a *name* and
   interpolate it into SQL. These quote.
 - **Expression-typed** -- `safe_cast`, `clean_string`, `parse_date` -- are
   handed an *expression* and nest inside one another
@@ -3057,6 +3059,16 @@ nothing raising anywhere. Declaring the mode does not make the other shapes
 work; it makes the platform REFUSE a feed whose supersession it cannot
 implement. The value IS the refusal.
 
+> **Amended.** "Has always implemented" was not true until
+> [#a-snapshot-re-delivery-restates-the-whole-date](#a-snapshot-re-delivery-restates-the-whole-date).
+> The macro partitioned by `(_cob_date, <business keys>)`, which is the newest
+> version of each KEY rather than the newest file, so a delta feed run through
+> it kept every key any of its deliveries carried: the loss described above
+> could not happen, and the refusal guarded against a failure the built mode
+> did not have. The rank selects the newest delivery per COB date now, so the
+> paragraph above describes the code again and the reason the other modes are
+> refused is true again.
+
     feeds.yml: feed 'x' `supersession.mode: delta_append` is described in the
     requirements (REQ-202) but NOT BUILT -- each delivery carries only what
     changed, so a COB date's population is the UNION of its deliveries
@@ -3087,7 +3099,7 @@ so the nightly build is byte-identical to what it was before this existed.
 
 **A WHERE clause rather than a macro every model already calls.** There is no
 such macro: two of the four prepared models do not call `incremental_window` on
-their incremental path at all, they use `scd2_incremental_scope` and their own
+their incremental path at all, they use `scd2_replay` and their own
 predicate. So `known_as_of()` is at each call site, and
 `tests/test_supersession.py` greps every file in `models/prepared/` for it —
 CLAUDE.md's rule that fixing a macro proves nothing about models that do not
@@ -3106,7 +3118,13 @@ have shown.
 
 **It refuses to run incrementally.** On the incremental path dbt MERGEs into
 the target, so an as-of build would restate the published table backwards —
-silently, with a green run. `known_as_of()` raises a compiler error when
+silently, with a green run.
+
+> **Amended.** Only the SCD2 models MERGE now; the `cob_date`-partitioned ones
+> overwrite each COB date their select returns
+> ([#a-snapshot-re-delivery-restates-the-whole-date](#a-snapshot-re-delivery-restates-the-whole-date)).
+> The refusal holds for the same reason either way, and its message says
+> "writing" rather than "merging". `known_as_of()` raises a compiler error when
 `knowledge_time` is set and `is_incremental()` is true; full-refresh on a
 throwaway branch is the only way to materialise one.
 
@@ -4126,3 +4144,337 @@ changes falls through to `unreadable` — the conservative direction. An unread
 feed also contributes nothing to the inferred calendar, in either state: it is
 not evidence that a date was a business day, and letting a broken read move
 the window would change the verdict for every other feed.
+
+## a-snapshot-re-delivery-restates-the-whole-date
+
+REQ-202, for the one supersession mode that is built. **Under
+`full_snapshot` the newest delivery for a COB date IS that date's
+population, and a key it omits is ABSENT from `prepared` — on an incremental
+run, not only after `--full-refresh`.** That is what every statement of the
+mode already said. The code did something else.
+
+**The macro ranked per KEY, from the first commit.** `dedupe_rank`
+partitioned `ROW_NUMBER()` by `(_cob_date, <business keys>)`, ordered by
+`_file_version DESC`: the newest version of each key, not the newest file. A
+key the newest delivery omitted kept its row from the delivery that replaced
+it. Every statement of intent said newest file — the macro's own header
+("select the newest version for each COB date"),
+[#supersession-is-declared-not-assumed](#supersession-is-declared-not-assumed),
+the `Feed.supersession` comment in `common/context.py` — and nothing could
+see the difference: the scaffolded `unique_combination_of_columns` over
+`[cob_date, <business key>]` holds under either reading, and was described,
+in the scaffold and in four docs, as what proves `dedupe_rank` works.
+
+**Measured before deciding, and nothing depended on the per-key reading.**
+The seed's only re-delivery, `fo_trade` for 2026-08-13, carries the same 400
+keys in `_v2` as in `_v1` — every `mtm_value` changed, no key omitted or
+added — so the two readings build identical tables from it. `seed_clean/` was
+empty in the checkout measured. `main` held `raw.fo_trade` for a single date
+and no `prepared` or `reporting` table, so nothing had been published under
+either reading.
+
+**The macro was wrong, not the documented meaning.** The union reading makes
+`full_snapshot` indistinguishable from a delta feed within a date: every key
+any delivery carried survives, and only values are superseded. That empties
+REQ-202's declaration of its content — the refusal of the other modes was
+guarding against a failure the built mode could not produce — and it leaves a
+snapshot upstream no way to say a trade was cancelled or a counterparty
+closed, because the only way a snapshot says that is by not sending it. With
+the macro fixed, the reason the other modes are refused is true again: a
+delta feed ranked as a snapshot DOES lose every key its newest file omits.
+
+### The rank
+
+`dedupe_rank` now returns the in-file `ROW_NUMBER()` only for rows of the
+newest `_file_version` of their COB date, and NULL for every row of an older
+delivery, so each caller keeps `where _rn = 1`. The inner `ROW_NUMBER()`
+partitions by `(_cob_date, _file_version, <keys>)` ordered by
+`_row_number DESC` — last occurrence in file order, as before.
+
+**"Newest" defaults to `MAX(_file_version) OVER (PARTITION BY _cob_date)`**,
+a window, so it is evaluated after the query's WHERE — after `known_as_of()`,
+which is the point. An as-of build ranks against the deliveries that existed
+at its knowledge time: before the re-delivery arrived, the first delivery is
+the newest and its whole population is the answer.
+
+**That default is right only for a query that keeps each date WHOLE**, and
+the SCD2 models' incremental path first did not. It joined `touched` and
+admitted each key from its own `replay_from` date before ranking, so a window
+over its rows found the newest version among those keys only, and a date whose
+admitted keys were all dropped by the newest delivery kept the old delivery —
+shown in DuckDB before any of this was written. So `newest_file_version(source)`
+emits a CTE with the newest version per date computed from raw, filtered by
+`known_as_of()` and by nothing else, and `ref_counterparty` and `ref_rating`
+join it and pass `newest_version=` to the rank. They now rank every raw row
+and apply the replay scope after cleaning (below), so the default would see
+whole dates too; they keep the aggregate because the retraction guard reads
+it, and so that a key filter reintroduced before the rank cannot quietly make
+the default wrong again.
+
+### A MERGE never deletes
+
+**A corrected rank alone removes nothing.** dbt-spark's merge is
+`when matched then update` / `when not matched then insert` — no delete
+clause, and no configuration that adds one — so a key an earlier incremental
+run merged in stays whatever the rank now says.
+
+**So the date-partitioned models are `insert_overwrite`**: `fo_trade`,
+`ref_collateral`, `counterparty_exposure`, `exposure_by_country` and
+`exposure_change`, each stating it in its config, with the `unique_key` that
+only the merge read removed. With `partition_by` set, dbt-spark 1.8 runs
+`set spark.sql.sources.partitionOverwriteMode = DYNAMIC` before the write and,
+for a relation it identifies as Iceberg, emits `insert overwrite <table>
+select ...` over its temporary view — replacing exactly the `cob_date`
+partitions the select returns and leaving every other partition alone. It is
+also the default for both layers in `dbt_project.yml`, next to the `cob_date`
+partition default it belongs with, and the scaffold writes it.
+
+**Correct only if every date the select returns, it returns whole.** A
+partial date would be truncated to the part, which is worse than the failure
+being fixed, so it was checked per model and each model's config comment says
+why it holds there: the two prepared models admit raw by `_cob_date` alone
+(`incremental_window`, `known_as_of`); `counterparty_exposure` aggregates all
+of a date's unmatured trades and joins lookups onto them; `exposure_by_country`
+and `exposure_change` take all of a date's `counterparty_exposure` rows. A date
+the select does not return is never touched — which is what keeps every date
+outside the lookback window intact. Two edges follow from "the select decides"
+and are accepted: a date with no rows in the select at all keeps its previous
+rows (every trade on it since matured, in `counterparty_exposure`); and a
+delivery with no rows never reaches raw to be the newest (see the risks
+below).
+
+`tests/test_dedupe_rank.py` pins the pairing — a `cob_date` partition declares
+`insert_overwrite`, anything else declares `merge` — because the failure in
+either direction is silent.
+
+### The SCD2 models
+
+**They stay `merge`.** They are partitioned by `effective_from_month` and an
+incremental run re-derives only the touched keys, so overwriting the months it
+returns would truncate each to those keys.
+
+**A key absent from a date's newest delivery does not close the version in
+force**, and that is deliberate, not an omission of this change. Absence from a
+reference snapshot is a gap to show, not a retirement to infer:
+`scd2_exactly_one_current_version` expects an open version per entity, and
+`counterparty_exposure` carries the last version forward and flags it with
+`reference_carried_forward`.
+
+**But it does RETRACT a version the replaced delivery itself began, and a
+merge cannot.** B is X from 08-03; the 09-02 delivery changes it to Y and an
+incremental run writes `(B, 08-03, X, to 09-01)` and `(B, 09-02, Y, current)`;
+then 09-02 is re-delivered without B. The full rebuild's answer is `(B, 08-03,
+X, current)`. The incremental run replayed B from its current version, 09-02,
+where the rank now finds nothing — so it emitted nothing for B, the merge
+touched nothing, and `(B, 09-02, Y)` stayed current. When B reappeared on
+09-03 the replay inserted `(B, 09-03, Y)` beside it: two open versions,
+overlapping, `as_of()` doubling B's rows in `counterparty_exposure`, and both
+SCD2 tests failing every run until a `--full-refresh`. A key whose only
+version came from the replaced delivery stayed for ever.
+
+This entry's first draft said that limit was "not new". It was: the per-key
+rank kept B's 09-02 row, so the merge updated that version in place and never
+stranded it. The draft reasoned from the merge's shape instead of running two
+incremental builds, which is what `tests/test_scd2_incremental.py` now does —
+the rendered model through dbt-spark's incremental flow in DuckDB, beside a
+full rebuild, after every delivery. On the rank change alone it reproduced
+exactly the states above for both models.
+
+**Four ways to make the incremental build agree with a full rebuild were
+weighed.**
+
+- **(a) A `pre_hook` that DELETEs the touched keys' versions before the merge.**
+  Possible in principle: `profiles.yml` loads `IcebergSparkSessionExtensions`,
+  which Iceberg 1.6.1's `spark-writes.md` names as the requirement for a
+  row-level DELETE; in session mode the hooks run in the build's one
+  SparkSession; and `{{ this }}` resolves on the branch through the catalog's
+  `ref`. Rejected on ordering. dbt-spark's incremental materialization runs
+  `run_hooks(pre_hooks)` before it creates the model's temporary view, and the
+  model reads `this` for its own scope — the window's start is the newest
+  `effective_from`, and each key's replay start is one of its versions — so
+  the delete moves the scope it was computed from. It is also a separate
+  commit on the branch, and it cannot know which versions the replay will
+  fail to re-derive without running the model twice.
+- **(b) `WHEN NOT MATCHED BY SOURCE ... THEN DELETE`.** Spark 3.5's grammar has
+  it; Iceberg 1.6.1's `spark-writes.md` documents `WHEN MATCHED [AND ...]`
+  and `WHEN NOT MATCHED [AND ...]` and not `BY SOURCE`, so its support on this
+  runtime is unproven. Its condition also sees only the target row, while the
+  scope that makes a delete safe — touched keys, from each key's replay start
+  — lives in the source query.
+- **(c) Rebuild both dimensions in full every run.** Correct by construction
+  against a full refresh, and the reason it is wrong here is the finding worth
+  keeping: **a full refresh of an SCD2 model is not a safe reference once raw
+  retention has run.** `retention.yml` keeps raw at 10 business days plus 80
+  month-ends; `RETENTION.md` keeps an SCD2 version until its whole range
+  predates the oldest retained COB date. A rebuild from raw would re-date
+  every version that began mid-month more than ten business days ago to the
+  next retained month-end, every night. It would also rewrite the whole table
+  on every run.
+- **(d) Chosen: the retraction travels in the merge's own source.** The model
+  emits a marker row — key, `effective_from`, `effective_to =
+  scd2_retracted()` (`DATE '0001-01-01'`), every other column NULL — for each
+  version in its replay scope that it no longer derives, and a project
+  `spark__get_merge_sql` (`macros/merge.sql`), for a model configured
+  `scd2_retractions=true`, emits `when matched and <marker> then delete`,
+  `when matched then update set ...`, `when not matched and not <marker> then
+  insert *`. One statement: the deletion is decided against the same snapshot
+  of the target as everything else and commits with it. Every clause is one
+  `spark-writes.md` documents for Iceberg's MERGE INTO. The override reaches
+  dispatch because dbt-core 1.8.7 searches the root project before the
+  adapter's macros (`BaseDatabaseWrapper._get_search_packages` returns the
+  unscoped namespace for `dbt`, and `MacroNamespace._search_order` yields the
+  root package before the internal ones) — the same mechanism `naming.sql`
+  relies on — and every other merge still gets dbt-spark's SQL through
+  `dbt.spark__get_merge_sql`.
+
+**What (d) needed besides the merge.**
+
+- **The replay starts at the version in force when the window STARTS**, not
+  the current one: the last version that began before the window, or the
+  beginning of the key's raw history if there is none.
+- **And its chain begins one version EARLIER, taken from the target.** A
+  re-delivery of the replay-start date itself can retract the start version,
+  and the version before THAT was outside the replay: the final review found
+  it left closed (a drop — a gap `as_of()` matches nothing in) or doubled (a
+  revert — two back-to-back versions of the same value). So `scd2_replay`
+  puts the target's version before the replay start at the head of the
+  replayed rows. lead() recomputes its end, which reopens or extends it, and
+  it is never re-derived from raw, so its own COB date need not still be
+  there. It is never a retraction candidate either — the markers' scope
+  starts at the replay start. Re-deliveries are honoured for every COB date
+  from the replay start onward; an earlier one is outside the replay, as a
+  date outside the lookback is for the date-partitioned models.
+- **Every key comparison uses the CLEANED key.** The target holds the model's
+  cleaned keys (`clean_string`, and `upper` on `ref_rating`'s agency); the
+  replay scope was first built from RAW keys before cleaning, and the final
+  review found a raw ` B` or a lower-case agency never matched: no marker, the
+  retracted version current, two open versions at the next change. The model
+  now cleans every raw row, ranks them in `ranked_rows` ON THE CLEANED KEY,
+  and `scd2_replay` takes that stream — so the in-file dedupe, `touched`,
+  `replay_from`, the seed and the markers all use what the model's single
+  cleaning produced, with no second copy of it. (A second review found the
+  rank still on the raw key at first: ` B` and `B` in one file were both "last
+  in file", two versions with one `effective_from`, one ending before it
+  began — and a MERGE cardinality violation on Spark.)
+- **And the comparison is NULL-SAFE, `IS NOT DISTINCT FROM`, in every join of
+  the cleaned key and in the MERGE's `on`** (`scd2_key_match`, one
+  definition). `clean_string` maps `''`, `'NULL'` and `'N/A'` to NULL, and a
+  full rebuild versions those rows as one key; with `=` the incremental path
+  matched nothing for them and silently dropped them, so the `not_null` test on
+  the key passed on incremental builds — the ones that publish — and failed
+  only on a full refresh, while the merge's `on` would have inserted a fresh
+  NULL-key version every run. A NULL key is still a defect for `not_null` to
+  refuse; what matters is that both paths produce it. Spark 3.5.3's grammar
+  has `IS NOT? DISTINCT FROM` (`SqlBaseParser.g4`, `predicate`), which
+  `AstBuilder` turns into `EqualNullSafe` exactly as `<=>`; DuckDB accepts it
+  and rejects `<=>` — so no engine-specific spelling is needed.
+- **The seed row carries THIS run's audit columns.** It is copied from the
+  target and then changed by the merge, so `dbt_invocation_id`, `nessie_ref`
+  and `dbt_updated_at` come from `audit_columns()` like every re-derived row;
+  `source_batch_id` stays the target's, the delivery that began the version.
+- **The markers never read a non-key column from `this`.** A column the model
+  has just gained is not in the target when the temporary view is analysed —
+  `on_schema_change` adds it afterwards — so they are NULL literals, in an
+  order `scd2_output_columns()` defines once for `ranged` and the markers
+  both, because Spark 3.5 has no `UNION BY NAME`.
+- **A marker only where raw still holds a delivery for the version's COB
+  date.** A retraction means "the newest delivery for that date no longer says
+  this". A date retention has pruned says nothing — and without this guard
+  its version was deleted and the key silently re-dated to the next retained
+  delivery, every SCD2 test green (measured, by removing it).
+
+**The limit that remains, and it predates this change:** the replay reads
+raw from each key's replay start, and raw is pruned. Once retention has
+removed the date a replay starts from, the replay re-derives the key from its
+first retained delivery as a NEW version, beside the one it could not
+re-derive: two open versions, and the build refuses. The guard above keeps
+that failure loud rather than turning it into a deletion;
+`tests/test_scd2_incremental.py` pins both. The seed removes the dependency on
+raw for the version BEFORE the replay start, not for the start version
+itself; seeding that one from the target too would change which re-deliveries
+can retract it, and is not done here.
+
+### counterparty_exposure read raw with the same mistake
+
+**`delivered` had the per-key reading without calling the macro.** It grouped
+`raw.ref_counterparty` by `(_cob_date, counterparty_id)` across every version,
+so a counterparty a re-delivery dropped still counted as delivered and
+`reference_carried_forward` never fired for it. It ranks through
+`dedupe_rank` now, and calls `known_as_of()` — the one reporting model that
+reads raw, so the one where "the newest delivery" must also mean "as known at
+the knowledge time". That also means an incremental reporting run with
+`knowledge_time` set is refused at that model, as it already was in `prepared`.
+
+### The new risk: the newest file is load-bearing
+
+**A truncated re-delivery now wipes its date down to what it holds**, where
+the per-key reading would have quietly kept the rest. A half-written extract
+sent as `_v2` replaces the population. The guards are at ingest, before a row
+reaches raw: `expected_min_rows` refuses a delivery below the feed's floor,
+and `delivery.control` with a `row_count` refuses one that disagrees with what
+its sender counted. A feed whose re-deliveries can be partial and that has
+neither is exposed — which is a property of that feed to fix in `feeds.yml`,
+not a reason to return to the union.
+
+**A delivery with NO rows cannot supersede anything under this mechanism.**
+"Newest" is computed from raw rows, and an empty delivery writes none, so the
+delivery before it stays newest: `insert_overwrite` rewrites the date from it
+and SCD2 retracts nothing. `expected_min_rows` defaults to 0, so nothing
+refuses the empty file either. Honouring one needs a record of the delivery
+that is not a raw row.
+
+### What proves it
+
+`tests/test_dedupe_rank.py` renders `dbt/macros/engine.sql` and the model
+files with jinja2 and runs every CTE up to `deduped` against DuckDB: the
+two-delivery case per prepared date model and through the scaffold's template,
+the as-of cases and `delivered`. Put the per-key partition back and they fail.
+`tests/test_scd2_incremental.py` runs the two SCD2 models end to end through
+dbt-spark's incremental flow — the model as a view over `this`, then the MERGE
+the project resolves — beside a full rebuild, including the final review's
+cases: a dropped and a reverted replay-start version, a padded key, a
+lower-case agency. Reverting the replay start, the markers, the delete clause,
+the config, the seed or the markers' lower bound each fails it; so does the
+rank on the SCD2 replay and its as-of case, which it also holds. The second
+review's cases are there too — a key that cleans to NULL, two spellings of one
+key in one file, the reopened seed row's audit columns, a seed column the
+target lacks — and the harness enforces two things DuckDB would not: Spark's
+refusal of a MERGE matching one target row with several source rows, and
+dbt-spark's `append_new_columns` step between the view and the merge.
+
+What a host test cannot prove is the materialisation — dbt-spark's statements
+on Spark against Iceberg on a Nessie branch.
+
+> **Amended.** `prepared.fo_trade`'s was verified that way, on a throwaway
+> Nessie branch from `main`, never merged. After an INCREMENTAL run over a
+> synthetic `_file_version` 2 for 2026-08-19 that dropped 49 of 400 keys, the
+> dbt log showed `set spark.sql.sources.partitionOverwriteMode = DYNAMIC` and
+> `insert overwrite prepared.fo_trade` with no `merge into`; 2026-08-19 held
+> 351 rows, all version 2, none of the dropped keys; 2026-08-18, inside the
+> lookback window, was rewritten whole (400 rows, the second run's invocation
+> id); 2026-08-10, outside it, was untouched (the first run's); and Iceberg
+> recorded one `overwrite` snapshot with `replace-partitions=true`,
+> `changed-partition-count=2`, 751 records added and 800 deleted. A
+> full-refresh as-of build at a knowledge time before version 2 arrived gave
+> every date version 1's 400 keys, and the same var on an incremental run was
+> refused. `main`'s hash was the same before and after. The three reporting
+> models and both SCD2 models were not run live by that verification.
+>
+> A second live run then covered the SCD2 retraction on `ref_counterparty`, on
+> throwaway branches with the raw table created by ingest's own code: the
+> project merge's `then delete` clause reached Spark, a re-delivery that
+> dropped a key's change retracted that version and reopened the one before
+> it (Iceberg: 4 records deleted), the key's return left exactly one open
+> version with no overlaps, all nine of the model's dbt tests passed, both
+> states were identical to a full refresh over the same raw, and a plain
+> `merge` model still got dbt-spark's own SQL. `ref_rating` and the reporting
+> models were not run live.
+>
+> That run predates two fixes the final review then required, to the version
+> before the replay start and to raw-versus-cleaned keys (the SCD2 section
+> above); it did not exercise either. A third run, on the final code, did:
+> retracting the version the replay starts from reopened the one before it,
+> a padded raw key retracted like a clean one, two spellings of one key in a
+> file gave one version and a MERGE Spark accepted, and a key that cleans to
+> NULL was versioned, matched on the next run and closed -- each state
+> identical to a full refresh over the same raw.
