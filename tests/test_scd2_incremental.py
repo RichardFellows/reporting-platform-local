@@ -8,6 +8,12 @@ incremental run already wrote. Nothing re-derives that version's row, so the
 merge never touches it: it stays current, the version before it stays closed,
 and when the key next changes a second open version is inserted beside it.
 `as_of()` then matches both and doubles the key's rows downstream.
+
+The fix had two defects of its own, both found by the final review and both
+pinned below: retracting the version the replay STARTS from left the one
+before it closed or doubled, because that one was outside the replay; and the
+replay scope compared RAW keys to the target's CLEANED keys, so a padded key
+or a lower-case agency was never retracted.
 See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 
 HOW IT IS RUN. Each step renders the REAL model file with jinja2 (the
@@ -338,14 +344,17 @@ def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
 # DIFF on 2ae6052 except the unpadded control.
 
 def _history_before_the_replay_start(third):
-    """B is W from 07-01, X from 08-03, Y from 09-02 -- so when 08-03 is
-    re-delivered, the lookback window starts 08-30 and the replay starts at
-    08-03 (X, the version in force then). W, the version BEFORE it, is outside
-    the replay, and is the one the full rebuild extends."""
+    """B is V from 06-01, W from 07-01, X from 08-03, Y from 09-02 -- so when
+    08-03 is re-delivered, the lookback window starts 08-30 and the replay
+    starts at 08-03 (X, the version in force then). W, the version BEFORE it,
+    is outside the replay, and is the one the full rebuild extends. V, before
+    that, is out of every scope: its raw date is still there, so a retraction
+    scope that reached past the seed would delete it."""
     return [
-        ("W, then X", [("2026-07-01", 1, {"A": "a", "B": "W"}, "2026-07-02 06:00"),
-                       ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
-                       ("2026-09-01", 1, {"A": "a", "B": "X"}, "2026-09-02 06:00")]),
+        ("V, W, then X", [("2026-06-01", 1, {"A": "a", "B": "V"}, "2026-06-02 06:00"),
+                          ("2026-07-01", 1, {"A": "a", "B": "W"}, "2026-07-02 06:00"),
+                          ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
+                          ("2026-09-01", 1, {"A": "a", "B": "X"}, "2026-09-02 06:00")]),
         ("09-02 changes B to Y", [("2026-09-02", 1, {"A": "a", "B": "Y"}, "2026-09-03 06:00")]),
         third,
     ]
