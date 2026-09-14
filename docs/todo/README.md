@@ -13,7 +13,6 @@ item that no longer reproduces should be deleted rather than worked.
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
 | [08](08-sniffer-has-no-notion-of-member-control-files.md) | The sniffer cannot propose a zip whose members have control files | low–medium | 2–3 hours |
 | [09](09-dedupe-rank-keeps-keys-a-snapshot-dropped.md) | `dedupe_rank` keeps keys a `full_snapshot` re-delivery dropped | high | ½–2 days |
-| [10](10-per-report-matches-nothing-is-stale.md) | `DECISIONS.md` says `per_report` matches nothing; the reporting build makes it match | low–medium | 15 min |
 
 ## Where to start
 
@@ -21,10 +20,31 @@ item that no longer reproduces should be deleted rather than worked.
 built, and its answer decides what 07 is asking for — do not start 07 before
 it. It opens with a decision, not an edit.
 
-**08** is the other code item. **10** is small and unrelated to either; a
-reasonable warm-up.
+**08** is the other code item.
 
 ## Done
+
+**10, `DECISIONS.md` said `per_report` matches nothing** — an
+`> **Amended.**` block on that paragraph of
+`#published-tags-are-the-reproducibility-window`, not a rewrite: the reporting
+build's `publish` cuts `published/<report>/<cob_date>/<run_id>` per report,
+`expire_tags` reads the window out of `TAG_RE`'s `report` group through
+`tag_retention_years`, and the block points at
+`#an-ingest-is-not-a-publication`. It keeps why accepting the report segment
+early mattered, and says why every tag still gets the default in practice:
+`per_report` is empty, not unmatched. Checked in the code, not the prose —
+`check_reproducibility_window` sizes the interlock per report through the
+same resolver.
+
+The item's line numbers all still held. Its **scope** did not: its grep
+covered `docs/` and `CLAUDE.md` only, and the same claim was live in
+`config/retention.yml`, in the comment on `default_keep_years` ("nothing
+cutting a tag yet knows which report it is for") — in the same block as the
+`per_report` comment, which already said it matches. Corrected the same way,
+minimally. Every other hit is either history written as history
+(`feed_ingest.record_snapshot`'s docstring, the comment on `TAG_RE`,
+`#an-ingest-is-not-a-publication`'s own "could never match") or an unrelated
+"matches nothing" about filename patterns. `RETENTION.md` was already right.
 
 **11, `.claude/worktrees/` was not ignored** — `.gitignore` gains
 `.claude/worktrees/`, with a comment saying what creates it and why it is not

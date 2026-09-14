@@ -220,8 +220,9 @@ references:
   # that decides whether a published run can still be reproduced.
   # See docs/DECISIONS.md#published-tags-are-the-reproducibility-window.
   published_tags:
-    # Applies to every tag with no `per_report` entry, which today is all of
-    # them — nothing cutting a tag yet knows which report it is for.
+    # Applies to every tag with no `per_report` entry — today all of them,
+    # because `per_report` below is empty — and to the older two-segment
+    # `published/<bd>/<run>` tags, which name no report.
     #
     # TEN YEARS IS PROVISIONAL. The regulatory period is not confirmed, and
     # over-retaining tags costs storage while under-retaining costs the
