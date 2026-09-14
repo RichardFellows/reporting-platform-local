@@ -38,9 +38,11 @@ __marimo__/
 
 # Claude Code agent sessions run with worktree isolation check the repo out
 # under .claude/worktrees/<id>/, INSIDE this checkout. Unignored, every
-# `git status` is dirty while one runs, `git add -A` stages a nested checkout,
-# and a repo-root `grep -r` returns hits from their copies. Only the worktrees:
-# project settings, agents and skills under .claude/ are meant to be committable.
+# `git status` is dirty while one runs and `git add -A` stages a nested
+# checkout. This does NOT stop a plain repo-root `grep -r` finding their copies
+# -- grep does not read .gitignore; pass `--exclude-dir=.claude`, or use
+# `git grep`. Only the worktrees: project settings, agents and skills under
+# .claude/ are meant to be committable.
 .claude/worktrees/
 
 # editor

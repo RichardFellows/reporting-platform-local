@@ -32,7 +32,11 @@ reasonable warm-up.
 it asked: with two worktree agents checked out under `.claude/worktrees/` at
 the time, `git status --porcelain` showed only the `.gitignore` edit, and
 `git check-ignore` matches `.claude/worktrees/x` but not
-`.claude/settings.json`. The item file was accurate; nothing else was found.
+`.claude/settings.json`. One thing the item got wrong: it listed repo-root
+`grep -r` hits among the symptoms, and ignoring the directory does not fix
+that one — `grep` never reads `.gitignore`, and with a worktree live
+`grep -rl keep_years .claude` still returns its copy of `CLAUDE.md`. The
+comment says so and names `--exclude-dir=.claude` or `git grep` instead.
 
 **06, `RETENTION.md` restated `DECISIONS.md` in paraphrase** — measured at 9
 paragraph pairs and 2,683 characters by the detector in the item file, **now
