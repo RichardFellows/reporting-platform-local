@@ -18,9 +18,8 @@ What is emulated, and it is deliberately little:
 
   * dbt's context: `source()`/`ref()` name a DuckDB table, `config()` records
     its arguments and renders nothing, `is_incremental()`/`this`/`var()` are
-    set per test. The two provenance macros are stubbed to nothing --
-    `provenance_pairs` uses dbt's `return()`, which plain jinja2 lacks -- and
-    nothing under test reads the columns they project.
+    set per test, and `return()` hands a macro's value back to its caller the
+    way dbt's `MacroGenerator` does (`_DbtContext`).
   * Spark's identifier quote. `ident()` emits backticks and DuckDB reads
     double quotes; the rendered SQL has its backticks swapped, and nothing
     else is rewritten.
@@ -67,6 +66,48 @@ class _Dbt:
         return "current_timestamp"
 
 
+class _Return(Exception):
+    """dbt's `return()`: a macro hands back a value instead of its text."""
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+
+def _return(value):
+    raise _Return(value)
+
+
+class _DbtContext(jinja2.runtime.Context):
+    """Every macro call goes through `Context.call`, so this is where a
+    `return()` raised inside one becomes that call's value -- what dbt's
+    `MacroGenerator` does."""
+
+    def call(__self, __obj, *args, **kwargs):  # noqa: N805 -- jinja2's signature
+        if __obj is _return:
+            # `{{ return(x) }}` is itself a call through here; catching it at
+            # this level would render x as the macro's text instead.
+            raise _Return(args[0])
+        try:
+            return super().call(__obj, *args, **kwargs)
+        except _Return as returned:
+            return returned.value
+
+
+def _environment():
+    env = jinja2.Environment(extensions=["jinja2.ext.do"])
+    env.context_class = _DbtContext
+    return env
+
+
+def call_macro(macro, *args, **kwargs):
+    """Call a macro from Python the way dbt does, honouring `return()`."""
+    try:
+        return macro(*args, **kwargs)
+    except _Return as returned:
+        return returned.value
+
+
 def _macro_modules(env, context):
     """Every project macro file the models call into, as jinja2 modules.
 
@@ -97,6 +138,7 @@ def _context(*, incremental=False, this="this_table", knowledge_time=None,
         modules=_Modules(),
         dbt=dbt or _Dbt(),
         invocation_id="test-invocation",
+        **{"return": _return},
         config=config if config is not None else _Config({}),
         adapter=adapter,
     )
@@ -118,17 +160,12 @@ def _render(template_text: str, *, incremental: bool = False,
     context = _context(incremental=incremental, this=this,
                        knowledge_time=knowledge_time, config=config,
                        adapter=adapter)
-    env = jinja2.Environment(extensions=["jinja2.ext.do"])
+    env = _environment()
     model_globals = dict(context, **_macro_modules(env, context))
     model_globals.update(
         source=lambda schema, table: f"{schema}_{table}",
         ref=lambda name: f"prepared_{name}",
         config=config,
-        # `provenance_pairs` returns through dbt's `return()`, which plain
-        # jinja2 lacks. Nothing under test reads the provenance columns, and
-        # both halves -- projection and column list -- are stubbed together.
-        source_provenance=lambda: "",
-        source_provenance_columns=lambda: "",
     )
     sql = env.from_string(template_text, globals=model_globals).render()
     return sql.replace("`", '"')

@@ -22,9 +22,10 @@ otherwise is dbt-spark 1.8.0's own, written out below from its
 `unique_key`, no predicates, no merge_update/exclude columns). DuckDB runs
 Spark's MERGE text as written, conditional clauses and `insert *` included.
 
-What is shimmed, beyond `test_dedupe_rank.py`'s list: four Spark functions
+What is shimmed, beyond `test_dedupe_rank.py`'s list: five Spark functions
 DuckDB spells differently, renamed at call sites and defined as DuckDB macros
-(`sha2`, `date_sub`, `trunc`, `to_date`). Nothing else is rewritten.
+(`sha2`, `date_sub`, `trunc`, `to_date`, `element_at`). Nothing else is
+rewritten.
 
 What this cannot prove: that Iceberg on Spark executes the same MERGE the
 same way on a Nessie branch. That is a live run.
@@ -58,6 +59,7 @@ _SHIMS = {
     "to_date": ("create macro spark_to_date(s, fmt) as (case fmt "
                 "when 'yyyy-MM-dd' then try_strptime(s, '%Y-%m-%d') "
                 "else try_strptime(s, '%Y%m%d') end)::date"),
+    "element_at": "create macro spark_element_at(l, i) as list_extract(l, i)",
 }
 
 
@@ -125,13 +127,12 @@ def _merge_sql(con, config, target, source):
     if "macro spark__get_merge_sql" not in project:
         sql = dbt.spark__get_merge_sql(target, source, config["unique_key"], None, None)
     else:
-        import jinja2
-        from tests.test_dedupe_rank import _context, _macro_modules
+        from tests.test_dedupe_rank import (_context, _environment,
+                                            _macro_modules, call_macro)
         context = _context(incremental=True, this=target, config=config,
                            adapter=_Adapter(con), dbt=dbt)
-        env = jinja2.Environment(extensions=["jinja2.ext.do"])
-        macro = _macro_modules(env, context)["spark__get_merge_sql"]
-        sql = str(macro(target, source, config["unique_key"], None, None))
+        macro = _macro_modules(_environment(), context)["spark__get_merge_sql"]
+        sql = str(call_macro(macro, target, source, config["unique_key"], None, None))
     return sql.replace("`", '"')
 
 
@@ -166,14 +167,17 @@ def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts):
         lits = ", ".join("null" if v is None else f"'{v}'" for v in record)
         values.append(f"(date '{cob_date}', {version}, {n}, {lits}, "
                       f"'landing/x_{cob_date}_v{version}.csv', 'b{version}', "
-                      f"null::timestamp, timestamp '{ingest_ts}')")
+                      f"null::timestamp, timestamp '{ingest_ts}', "
+                      f"'x_{cob_date}_v{version}.csv', 'sv1', 'X')")
     exists = con.execute("select count(*) from information_schema.tables "
                          "where table_name = 'raw_src'").fetchone()[0]
     if not exists:
         con.execute("create table raw_src (_cob_date date, _file_version int, "
                     "_row_number bigint, " + ", ".join(f"{c} varchar" for c in cols)
                     + ", _source_file varchar, _batch_id varchar, "
-                    "_received_at timestamp, _ingest_ts timestamp)")
+                    "_received_at timestamp, _ingest_ts timestamp, "
+                    "_delivery_id varchar, _schema_version varchar, "
+                    "_source_system varchar)")
     con.execute("insert into raw_src values " + ", ".join(values))
 
 
@@ -202,6 +206,9 @@ def _overlaps(con, table, keys):
 def _scenario(first_date: str):
     """The review's sequence. B is X from `first_date`; the 09-02 delivery
     changes it to Y; a re-delivery of 09-02 drops B; on 09-03 B is back as Y.
+    C appears for the first time on 09-02 and the re-delivery drops it too, so
+    its ONLY version is retracted -- nothing is left to re-derive for it at
+    all, and a fix that works by rewriting what it re-derives cannot see it.
 
     `first_date` far from 09-02 keeps B's first version outside the lookback
     window of every later run (the replay has to start from it); near puts
@@ -209,7 +216,8 @@ def _scenario(first_date: str):
     return [
         ("first build", [(first_date, 1, {"A": "a", "B": "X"}, "2026-09-01 06:00"),
                          ("2026-09-01", 1, {"A": "a", "B": "X"}, "2026-09-02 06:00")]),
-        ("09-02 changes B", [("2026-09-02", 1, {"A": "a", "B": "Y"}, "2026-09-03 06:00")]),
+        ("09-02 changes B", [("2026-09-02", 1, {"A": "a", "B": "Y", "C": "Z"},
+                              "2026-09-03 06:00")]),
         ("09-02 re-delivered without B", [("2026-09-02", 2, {"A": "a"}, "2026-09-03 09:00")]),
         ("09-03 has B again", [("2026-09-03", 1, {"A": "a", "B": "Y"}, "2026-09-04 06:00")]),
     ]
