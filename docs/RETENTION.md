@@ -136,13 +136,11 @@ place where the shape of the policy differs from everything else in this file.
 See *The reproducibility window* below.
 
 **`snapshot_tags` is a different window for a different object.**
-`published/<report>/<bd>/<run_id>` is cut by the reporting build for a report
-it published; `snapshot/<feed>/<bd>/<run_id>` is cut by an ingest, and pins the
-raw state that ingest left so a COB date stays readable after retention
-removes it from the live table. Nothing is REPRODUCED from a snapshot, so its
-window is a storage decision rather than an evidence one — it is not bound by
-the landing interlock, and it is set shorter than the published window on
-purpose. See
+`published/<report>/<bd>/<run_id>` is cut by the reporting build;
+`snapshot/<feed>/<bd>/<run_id>` is cut by an ingest, and pins the raw state
+that ingest left so a COB date stays readable after retention removes it from
+the live table. It is shorter than the published window and is **not** bound by
+the landing interlock, because nothing is reproduced from a snapshot. See
 [`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication).
 
 ### `keep_business_days`
@@ -239,24 +237,22 @@ flowchart TB
   LK -->|"find_pending derives<br/>its keep-set from here"| RY
 ```
 
-**Only one of these refuses.** A landing window shorter than a pin it must
-honour aborts the sweep outright, because landing is the only copy of what the
-upstream sent and a pin outliving its evidence cannot be honoured. A landing
-window shorter than the *raw* window only warns: the failure is gradual — live
-month-ends start looking expired — and an operator shortening landing in a
-sandbox should not be blocked.
+**Only one of these refuses.** Landing shorter than a pin it must honour
+aborts the sweep; landing shorter than the *raw* window only warns, because
+that failure is gradual and recoverable. What each looks like, and what it
+costs, is under *The interlock* below.
 
-**The pin interlock is per `(report, feed)`, not global.** `feeds_behind_report()`
-walks the exposure's `ref()` closure, so a feed behind no published report is
-bound by no pin — which is the point. Under the old global rule, no retention
-class could be shorter than the longest pin anywhere in the estate.
-`snapshot_tags` stays outside this entirely: an ingest is not a publication.
+**The pin interlock is per `(report, feed)`, not global** — a feed behind no
+published report is bound by no pin, and `snapshot_tags` is outside the
+interlock altogether.
 
 #### Retention classes
 
-A feed's window is chosen by its **retention class**. The class is named in
-`feeds.yml` (and is inheritable through `conventions:`); the windows live in
-`retention.yml`, per environment:
+A feed's window is chosen by its **retention class** (REQ-600/601). The class
+is named in `feeds.yml` (and is inheritable through `conventions:`); the
+windows live in `retention.yml`, per environment. Two files because they are
+two decisions with two owners — see
+[`DECISIONS.md`](DECISIONS.md#retention-classes-name-the-obligation):
 
 ```yaml
 # retention.yml — declared once, environment-independently
@@ -330,15 +326,17 @@ keep-set from `ready/`, and it has no correctness floor either. What protects
 a delivery waiting on a late control file is the rule below, not this number.
 
 **One rule, and it is the reason this is its own module: a manifest whose parts
-are not yet in the raw table is never swept, at any age.** That is a read of
-`already_ingested`, not a status flag in the manifest — the manifest never
-records derived state. Sweeping an un-ingested delivery is not data loss, since
-landing still holds the object, but nothing would re-normalize it on its own,
-so it is a *silent* drop, which is worse than a loud one. The sweep reports
-those as `held_uningested`.
+are not yet in the raw table is never swept, at any age.** The sweep reports
+those as `held_uningested`. The rule is a read of `already_ingested` rather
+than a flag in the manifest, which never records derived state — see
+[DECISIONS.md#ready-is-a-derived-index](DECISIONS.md#ready-is-a-derived-index).
 
 A part that points back into `landing/` is the evidence copy and is never
-deleted here; only parts under `ready/` are.
+deleted here; only parts under `ready/` are. The window bounds those derived
+parts and orphaned manifests, **not manifests generally**, or this sweep and
+the nightly reconcile undo each other — see
+[DECISIONS.md#the-ready-window-bounds-the-parts-not-the-manifests](DECISIONS.md#the-ready-window-bounds-the-parts-not-the-manifests)
+for what it actually reclaims.
 
 Until session 5 none of this existed: the `landing:` block was four keys no
 code read, and this section described behaviour that had never run. The policy it
@@ -403,8 +401,8 @@ layers use. In practice that meant:
   the keep-set, two of them scheduled for deletion.
 
 The policy is now **flat age in years, resolved per report**, on the same
-reasoning `landing:` already uses — sampling evidence by keep-set destroys
-exactly what it exists to preserve:
+reasoning `landing:` carries
+([`DECISIONS.md`](DECISIONS.md#published-tags-are-the-reproducibility-window)):
 
 ```yaml
 references:
@@ -417,18 +415,17 @@ references:
     per_report: {}               # <report>: <years>
 ```
 
-Ten years is **provisional**: the regulatory period is not confirmed, and
-over-retaining costs storage while under-retaining costs the evidence
-permanently, so it is set to the longest plausible value rather than the
-assumed seven.
+Ten years is **provisional** — the regulatory period is not confirmed, and the
+value is deliberately the longest plausible one rather than the assumed
+seven.
 
 `per_report` **now matches something.** A reporting build cuts one tag per
-report — `published/<report>/<cob_date>/<run_id>` — so naming a report
-here gives it its own window. It is left empty because no report has yet
-declared a period different from the default, and inventing one would be a
-policy nobody made. `TAG_RE` still accepts the two-segment shape as well: tags
-cut before publication knew its report are real pins, and a sweep that fails
-to recognise something skips it forever rather than judging it.
+report — `published/<report>/<cob_date>/<run_id>` — so naming a report here
+gives it its own window. It is left empty: no report has declared a period
+different from the default. `TAG_RE` still accepts the older two-segment
+shape, so tags cut before a publication named its report are judged by the
+default window rather than skipped forever
+([`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication)).
 
 The `published/<cob_date>/<run_id>` shape was cut by the INGEST DAGs, and
 that is what the third defect above describes. Ingests now cut
@@ -437,59 +434,49 @@ that is what the third defect above describes. Ingests now cut
 from a snapshot. See
 [`DECISIONS.md`](DECISIONS.md#an-ingest-is-not-a-publication).
 
-**Age is measured from the commit time**, not the COB date: a retention
-period runs from when the record was made, and a restatement published today
-for an old COB date is a new record that must survive its own full
-window. The COB date is the fallback when a tag carries no readable
-commit time, and it is conservative by construction — a publication cannot
-precede the date it reports on.
+**Age is measured from the commit time**, not the COB date, with the COB date
+as the fallback for a tag whose commit time cannot be read — a fallback that
+can only ever over-retain. Why that way round, and why dating a restatement by
+its COB date would expire it on arrival, is under
+[`DECISIONS.md`](DECISIONS.md#published-tags-are-the-reproducibility-window).
 
 #### The interlock
 
 `check_reproducibility_window()` **refuses** to run retention when a feed keeps
 its landing evidence for less time than a report built from it keeps its pins.
-A tag pins the *tables*; reproducing a published run also means showing its
-inputs, and `landing/` is the only copy of what the upstream actually sent.
+It aborts the whole chain, runs first in `run()`, and runs *before* the dry-run
+branch — so a dry run hits it too, which is the point: it refuses on
+configuration, not on what a sweep would have deleted. Raise the feed's
+retention class, or shorten the report's window, and re-run.
 
-**It is asked per (report, feed), via the lineage.** It used to compare one
-landing window against the longest window any report resolved to. With
-retention classes there is no single landing window — and under the old rule no
-class could ever be shorter than the longest pin, which would have made classes
-decoration. So for each report it walks the exposure's `ref()` closure
-(`feeds_behind_report()`, the same derivation `reports()` and `managed_tables()`
-already use) and checks every feed behind it.
+It refuses where `landing.keep_years()`'s own raw-window check only warns. Both
+comparisons, and why they differ, are argued in
+[`DECISIONS.md`](DECISIONS.md#published-tags-are-the-reproducibility-window).
 
-**That is a deliberate relaxation**, and its cost is stated plainly: a feed's
-window is now only as protected as the lineage walk is correct, which is why
-`feeds_behind_report` raises on a ref it cannot resolve rather than returning a
-short list. A feed behind no published report — `ref_collateral` here — is bound
-by no pin, because nothing published is reproduced from it. If a report ever
-`ref()`s it, the nightly sweep refuses until its class is raised.
+Three properties an operator meets in the output:
 
-**A `per_report` entry naming no live exposure binds every feed.** A report
-removed from the project keeps the tags it already cut and `expire_tags` still
-resolves their window by the name in the tag, so the entry is in force — while
-the lineage that would say which feeds were behind it is gone.
+- **It is asked per `(report, feed)`, via the lineage.** `feeds_behind_report()`
+  walks the exposure's `ref()` closure, so a feed behind no published report —
+  `ref_collateral` here — is bound by no pin. If a report ever `ref()`s it, the
+  nightly sweep refuses until that feed's class is raised.
+- **An unresolvable `ref()` raises rather than shortening the list**, so the
+  sweep stops instead of quietly checking fewer feeds. That is the price of
+  resolving the interlock per feed, and it is deliberate —
+  [#retention-classes-name-the-obligation](DECISIONS.md#retention-classes-name-the-obligation).
+- **A `per_report` entry naming no live exposure binds every feed** — the tags
+  it governs outlive the exposure, so the entry stays in force, and constrains
+  every retention class, until somebody removes it
+  ([why the conservative answer is the only available one](DECISIONS.md#retention-classes-name-the-obligation)).
 
-**`snapshot_tags` is deliberately outside this**, and must stay outside it.
-Nothing is reproduced from a snapshot tag: it buys the ability to read a raw
-COB date back after retention removed it, which is a storage decision
-rather than an evidence one. Binding it here would impose the published window
-on every feed again.
+`snapshot_tags` is outside the interlock and must stay outside it:
+[an ingest is not a publication](DECISIONS.md#an-ingest-is-not-a-publication).
 
-It refuses where `landing.keep_years()`'s own interlock only warns, and the
-difference is what the failure costs: landing running short of the raw window
-degrades `find_pending` gradually and is fixed by raising it, whereas deleting
-landing evidence a live pin depends on is not recoverable, and the sweep that
-would do it runs nightly and unattended.
-
-**This is not the full REQ-602 interlock**, and the gap is worth stating. The
-complete rule is "retention must not delete anything a published *run* depends
-on". This compares *windows*, so it catches the configuration that guarantees
-the loss and cannot catch one delivery expiring early inside an otherwise
-coherent one. `monitoring/evidence.py` is the per-delivery half, and it runs
-*after* this chain rather than before it, because it has to observe what the
-sweep left behind.
+**This is not the full REQ-602 interlock.** It compares *windows*, so it
+catches the configuration that guarantees the loss and cannot catch one
+delivery expiring early inside an otherwise coherent one.
+`monitoring/evidence.py` is the per-delivery half and runs *after* this chain,
+because it has to observe what the sweep left behind — see
+[#the-evidence-interlock-is-two-halves](DECISIONS.md#the-evidence-interlock-is-two-halves).
 
 #### Verified
 
@@ -659,13 +646,25 @@ partition pruning, given typical feed volumes.
 ## Non-prod
 
 Today non-prod holds production data, on-prem, restricted to prod-authorised
-users. Retention policy is therefore currently *identical* across environments.
+users, so `uat` is `*full` — the same anchor `prod` uses, not a copy of it.
 
-When masking/subsetting arrives, retention should shorten in non-prod
-(`keep_business_days: 5`, `keep_month_ends: 3`) — but note that shortening
-retention in non-prod removes your ability to reproduce a production month-end
-issue in a lower environment. Budget for a "restore a month-end into non-prod"
-procedure rather than assuming the data will be there.
+**`dev` is already shortened**, and has been since the `environments:` block
+was written: `keep_business_days: 5` and `keep_month_ends: 3` on every table
+layer, `landing.keep_years: 1`, `ready.keep_days: 2`. This section used to say
+retention was *identical* across environments and propose those same two
+numbers as what should happen "when masking/subsetting arrives" — both went
+stale the moment the profile landed.
+
+`landing.keep_years` shortens with it deliberately, and
+`references.published_tags.default_keep_years` carries a matching `dev: 1`:
+a globally fixed pin window would leave `dev` pinning published runs for a
+decade whose evidence it discarded after a year, and the interlock above would
+then refuse every `dev` sweep.
+
+The caution the section was written to give still stands, and is the reason to
+read it: shortening retention in a lower environment removes your ability to
+reproduce a production month-end issue there. Budget for a "restore a
+month-end into non-prod" procedure rather than assuming the data will be there.
 
 ## Open question: extended retention
 

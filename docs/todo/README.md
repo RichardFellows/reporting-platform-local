@@ -10,17 +10,37 @@ item that no longer reproduces should be deleted rather than worked.
 
 | | Item | Value | Effort |
 |---|---|---|---|
-| [06](06-retention-md-restates-decisions.md) | `RETENTION.md` paraphrases `DECISIONS.md` | medium | 2–3 hours |
 | [07](07-supersession-delta-append.md) | `supersession: delta_append` | high, if a delta feed is real | multi-day |
 | [08](08-sniffer-has-no-notion-of-member-control-files.md) | The sniffer cannot propose a zip whose members have control files | low–medium | 2–3 hours |
 
 ## Where to start
 
-**06 is the biggest remaining piece of doc work**, and 08 is the only code
-item that is not conditional. 07 is a design question before it is a build;
-see the note under "Done".
+**08 is the only remaining code item that is not conditional.** 07 is a design
+question before it is a build, and the answer changed — see under "Done".
 
 ## Done
+
+**06, `RETENTION.md` restated `DECISIONS.md` in paraphrase** — measured at 9
+paragraph pairs and 2,683 characters by the detector in the item file, **now
+0 and 0**. The operational half stays: the windows, which command sweeps what,
+what a dry run prints, and the refusals an operator actually hits. The
+argument moved to eight `DECISIONS.md` anchors, every one verified to exist.
+
+Conclusions an operator cannot act on without the why kept a one-line why and
+then the link — what `check_reproducibility_window()` refuses on and what to
+change, why an unresolvable `ref()` raises rather than shortening the list,
+why a `per_report` entry naming no live exposure binds every feed. The
+interlock section became three properties an operator meets in the output
+rather than three paragraphs re-arguing the design.
+
+Two things were fixed rather than moved, both verified against the code and
+not the prose: the interlock runs *before* the dry-run branch, so a dry run
+hits it too (`retention.py:1072`); and the **Non-prod** section claimed
+retention was "identical across environments" while proposing
+`keep_business_days: 5`/`keep_month_ends: 3` as a future aspiration — `dev`
+has had exactly those values, plus `landing.keep_years: 1` and a matching
+`published_tags.dev: 1`, since the `environments:` block was written. The
+caution that section exists to give is kept.
 
 **03 + 04 + 05, the small PR** — one number stated once, one comment that
 lied, and a suite that failed where its README says to run it.
