@@ -10,7 +10,6 @@ item that no longer reproduces should be deleted rather than worked.
 
 | | Item | Value | Effort |
 |---|---|---|---|
-| [02](02-console-cannot-create-an-unpacked-archive-feed.md) | The console cannot create a feed whose zip is unpacked at the gate | high | 2–3 hours |
 | [03](03-keep-years-doc-drift.md) | `keep_years: 8` in the docs; the config says 10 | medium | 15 min |
 | [04](04-conventions-do-not-chain-comment.md) | `_defaults.yml` says conventions do not chain; `parent:` chains them | medium | 10 min |
 | [05](05-test-versions-fails-in-the-container.md) | `python -m tests.run` fails inside the container | medium | 20 min |
@@ -25,10 +24,16 @@ hour in total, and each is the kind this repo treats as worse than a bug: a
 comment that lies, a number that disagrees with the config it describes, and a
 test suite that fails where its own README says to run it.
 
-**02** is a half-shipped feature rather than a defect: the loader, the
-validator and the YAML writer all accept a feed shape the form cannot express.
-
 ## Done
+
+**02, the console can create a feed whose zip is unpacked at the gate** —
+a member-pattern input in the form's arrival section, `readArrival()` sending
+`archive: {member_pattern: ...}`, and the guidance saying what that makes
+`filename_pattern` mean (each MEMBER after renaming, never the zip). Ticking
+Arrival no longer manufactures an `arrival.control` when the members carry
+their own dates, which was the form's own default path producing a feed
+`check_gates_are_coherent` refuses. Covered by `tests/test_delivery_form.py`;
+verified by creating one through the real form and routing a container to it.
 
 **01, CI: a second tier that runs `dbt parse` and imports the DAGs** —
 `.github/workflows/parse.yml`, with `scripts/check_dag_imports.py` and

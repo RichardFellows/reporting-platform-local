@@ -374,6 +374,142 @@ def test_a_zip_of_control_gated_members_round_trips():
     assert fd.delivery["control"]["row_count"] == r"ROWS=(?P<rows>\d+)"
 
 
+# --------------------------------- ...and the FORM can now create one -------
+# The blocks above went in with the loader, the validator and the YAML writer
+# all handling `arrival.archive` -- and the form with no input for it, so the
+# CREATE direction was reachable only by hand-editing a feed file. These are
+# the payload the form now sends, and the page source that sends it.
+
+
+def test_the_create_direction_round_trips_from_the_form_payload():
+    """Payload -> FeedSpec -> written YAML -> loaded Feed, keeping the block.
+
+    `test_editing_an_archive_feed_keeps_its_archive_block` covers the edit
+    direction; this is the one the console could not reach at all.
+    """
+    d, registry = _setup()
+    spec = registry.FeedSpec.from_payload(GATE_ARCHIVE_PAYLOAD)
+    assert spec.arrival["archive"] == {
+        "member_pattern": r"POS_(?P<cob_date>\d{8})\.csv"}
+    registry.validate(spec, existing=set())
+    registry.add(spec)
+
+    from reporting_platform.common.context import feeds
+    fd = feeds()["cus_weekly"]
+    assert fd.arrival["archive"]["member_pattern"] == r"POS_(?P<cob_date>\d{8})\.csv"
+    assert fd.needs_conforming is True
+
+
+def test_a_blank_member_pattern_is_no_archive_block_at_all():
+    """The form sends `archive` only when the input has something in it.
+
+    An `arrival.archive:` with no `member_pattern` is refused at load, so a
+    form that sent an empty one every time would make every ordinary inbox
+    feed unsaveable -- the same reason blanks are dropped everywhere else
+    in `_arrival_from_payload`.
+    """
+    d, registry = _setup()
+    spec = registry.FeedSpec.from_payload({
+        **GATE_ARCHIVE_PAYLOAD,
+        "name": "cus_plain",
+        "filename_pattern": r"cus_plain_(?P<cob_date>\d{8})\.csv",
+        "arrival": {"source_pattern": r"weekly_(?P<cob_date>\d{8})\.csv",
+                    "archive": {"member_pattern": "  "}},
+    })
+    assert "archive" not in spec.arrival
+    registry.validate(spec, existing=set())
+
+
+def test_the_form_has_a_member_pattern_input_that_it_sends():
+    """The FORM must be able to create what the loader accepts.
+
+    `ui/registry._arrival_from_payload` has read `archive.member_pattern`
+    since the zip work landed and `_arrival_block` has written it back, but
+    nothing ever put one in the payload. Asserted against the page source
+    because that is where the gap was; there is no JS runtime in this suite.
+    """
+    import pathlib
+
+    page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
+            / "ui" / "static" / "index.html").read_text()
+
+    # the input exists, and is pre-filled from an existing feed's block, or
+    # editing an archive feed through the form would blank it on every save
+    assert "f?.arrival?.archive?.member_pattern" in page
+
+    # ...and readArrival() -- not readDelivery() -- puts it in the payload.
+    # The two zip mechanisms are different shapes and the COB date picks one.
+    read = page[page.index("const readArrival"):]
+    read = read[:read.index("\n  };")]
+    assert "out.archive = {member_pattern:" in read, read
+    assert "arrMemberPattern.value.trim()" in read, read
+
+
+def test_the_form_says_the_landing_pattern_names_the_members():
+    """The single most confusable thing about the shape, so the form says it.
+
+    `filename_pattern` for an `arrival.archive` feed describes each MEMBER
+    after renaming -- the container never lands. A form offering both a
+    member pattern and a landing pattern with nothing distinguishing them
+    invites a `\\.zip` in the second, which then matches nothing for ever
+    and reports as a feed that simply never has anything pending.
+    """
+    import pathlib
+
+    page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
+            / "ui" / "static" / "index.html").read_text()
+    note = page[page.index("const membersNotTheZipNote"):]
+    note = note[:note.index("});")]
+    assert "MEMBER" in note, note
+    # shown only while a member pattern is set, or it is a paragraph about
+    # zips on the form of every feed that has nothing to do with one
+    sync = page[page.index("function syncArrivalArchive"):]
+    sync = sync[:sync.index("\n  }")]
+    assert "membersNotTheZipNote.style.display = unpacking" in sync, sync
+    assert "arrMemberPattern.value.trim()" in sync, sync
+
+
+def test_the_form_does_not_manufacture_an_arrival_control_for_dated_members():
+    """The form's own default path for this shape must be SAVEABLE.
+
+    Ticking Arrival fills in `{stem}\\.ctl`, because a legacy sender that
+    needs the door usually has a control file. A member pattern carrying its
+    own date does not -- and `arrival.control` with no `delivery.control` is
+    refused by `check_gates_are_coherent`, so the autofill would make the
+    commonest way to reach this shape produce a feed the loader rejects, with
+    the message landing on a section the person never touched. Pinned here
+    because the payload below is what the browser was observed to POST.
+    """
+    import pathlib
+
+    page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
+            / "ui" / "static" / "index.html").read_text()
+    sync = page[page.index("function syncArrivalArchive"):]
+    sync = sync[:sync.index("\n  }")]
+    assert 'arrCtlPattern.value === AUTO_CTL' in sync, sync
+    assert 'arrCtlPattern.value = ""' in sync, sync
+
+    # ...and that payload loads.
+    d, registry = _setup()
+    spec = registry.FeedSpec.from_payload(GATE_ARCHIVE_PAYLOAD)
+    registry.validate(spec, existing=set())
+
+    # while the same payload WITH the autofill left in is exactly the refusal
+    # the clearing avoids -- and it names `delivery.control`, not the archive.
+    from reporting_platform.ui.registry import FeedValidationError
+    with_control = registry.FeedSpec.from_payload({
+        **GATE_ARCHIVE_PAYLOAD,
+        "arrival": {**GATE_ARCHIVE_PAYLOAD["arrival"],
+                    "control": {"pattern": r"{stem}\.ctl"}},
+    })
+    try:
+        registry.validate(with_control, existing=set())
+    except FeedValidationError as exc:
+        assert "delivery.control" in str(exc.errors), exc.errors
+    else:
+        raise AssertionError("expected FeedValidationError")
+
+
 # ------------------------- the console cannot write an unloadable registry ---
 # A control-pattern collision is refused at LOAD, and load is the WHOLE
 # registry -- so a feed saved with one does not break itself, it stops
