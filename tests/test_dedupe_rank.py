@@ -429,14 +429,18 @@ def test_delivered_means_in_the_newest_delivery_for_the_date():
 
 
 # ------------------------------------------------------------ (d) scaffold
-def _scaffolded(name: str, key: str) -> str:
+def _scaffolded(name: str, key: str, columns=None, types=None) -> str:
+    """Defaults to a plain-string key + `mtm`; pass `columns`/`types` for a
+    key the scaffold TYPES (e.g. `account_num` -> `integer`)."""
     from reporting_platform.ui.registry import FeedSpec
     from reporting_platform.ui.scaffold import render_model
 
+    columns = columns if columns is not None else [key, "mtm"]
+    types = types if types is not None else {key: "string", "mtm": "string"}
     spec = FeedSpec(name=name, description="Test feed.", source_system="t",
                     filename_pattern=r"X_(?P<cob_date>\d{8})\.csv",
-                    business_key=[key], columns=[key, "mtm"])
-    return render_model(spec, {key: "string", "mtm": "string"})
+                    business_key=[key], columns=columns)
+    return render_model(spec, types)
 
 
 def test_the_scaffold_emits_the_strategy_and_no_unique_key():
@@ -544,6 +548,63 @@ def test_c_scaffold_padded_key_collides_only_after_cleaning():
         got = _run(con, _render(_scaffolded("t_new", "trade_id")), "deduped",
                    "select trade_id, mtm from deduped")
         assert got == [("T1", "2")], (first_key, second_key, got)
+
+
+# ------------------------- (f) review follow-up: a TYPED scaffolded key
+def test_c_scaffold_lossy_cast_key_does_not_collapse_two_deliveries():
+    """A scaffolded key can be TYPED, unlike fo_trade's/ref_collateral's own
+    (`clean_string` only) -- `account_num` infers `integer`
+    (`scaffold.infer_type`). '00123' and '123' are one INT but two distinct
+    STRINGS, so ranking on the cast value (as ranking on `key_list` would)
+    silently keeps one -- the later row wins and the scaffolded
+    `unique_combination_of_columns` test never sees the second row to refuse
+    the build over. Ranking on `_dedupe_account_num` (cleaned, never cast)
+    must not collapse them: both survive to `deduped` with the SAME typed
+    `account_num`, which is exactly what that test is for.
+
+    On 8fcaefa (ranked on the typed `key_list`) this fails: only `('123',
+    'b')`'s row survives -- `[(123, 'b')]`, not the two rows asserted here."""
+    con = _connect()
+    table = "raw_t_lossy"
+    _create_raw(con, table, "account_num")
+    con.execute(f"""
+        insert into {table}
+            (_cob_date, _file_version, _row_number, account_num, mtm, _received_at, _ingest_ts)
+        values
+            (DATE '{D1}', 1, 1, '00123', 'a', TIMESTAMP '2026-09-02 06:00', TIMESTAMP '2026-09-02 06:05'),
+            (DATE '{D1}', 1, 2, '123',   'b', TIMESTAMP '2026-09-02 06:00', TIMESTAMP '2026-09-02 06:05')
+    """)
+    text = _scaffolded("t_lossy", "account_num",
+                       columns=["account_num", "mtm"],
+                       types={"account_num": "integer", "mtm": "string"})
+    got = _run(con, _render(text), "deduped",
+               "select account_num, mtm from deduped order by mtm")
+    assert got == [(123, "a"), (123, "b")], got
+
+
+def test_c_scaffold_padded_key_still_dedupes_when_typed():
+    """The same TYPED key, padded rather than lossy-cast: ' 123' and '123'
+    are the same cleaned STRING (`clean_string` trims), so exactly one row
+    survives -- the later one -- same as a plain-string key. Ranking on the
+    cast INT would also collapse this correctly, so this alone would not
+    have told the two rank strategies apart; it pairs with the test above to
+    show `_dedupe_<key>` dedupes exactly whitespace and nothing more."""
+    con = _connect()
+    table = "raw_t_pad_int"
+    _create_raw(con, table, "account_num")
+    con.execute(f"""
+        insert into {table}
+            (_cob_date, _file_version, _row_number, account_num, mtm, _received_at, _ingest_ts)
+        values
+            (DATE '{D1}', 1, 1, ' 123', 'a', TIMESTAMP '2026-09-02 06:00', TIMESTAMP '2026-09-02 06:05'),
+            (DATE '{D1}', 1, 2, '123',  'b', TIMESTAMP '2026-09-02 06:00', TIMESTAMP '2026-09-02 06:05')
+    """)
+    text = _scaffolded("t_pad_int", "account_num",
+                       columns=["account_num", "mtm"],
+                       types={"account_num": "integer", "mtm": "string"})
+    got = _run(con, _render(text), "deduped",
+               "select account_num, mtm from deduped order by mtm")
+    assert got == [(123, "b")], got
 
 
 def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():

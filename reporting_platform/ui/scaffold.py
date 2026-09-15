@@ -209,8 +209,23 @@ def _select_expression(column: str, kind: str) -> str:
 
 
 def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
-    key_list = ", ".join(f"'{c}'" for c in spec.business_key)
     tag = "reference" if len(spec.business_key) == 1 else "transactional"
+
+    # THE RANK RUNS ON A CLEANED STRING, NEVER THE TYPED BUSINESS COLUMN.
+    # Unlike the hand-written date-partitioned models, whose business keys
+    # are declared `clean_string` only, a scaffolded key can be typed to
+    # anything (`account_num` infers `integer`, a price infers `decimal`),
+    # and casting is lossy: '00123' and '123' are one INT, 100.121 and
+    # 100.124 are one DECIMAL(18,2). Ranking on the cast value would collapse
+    # those silently -- the later row wins and the scaffolded
+    # `unique_combination_of_columns` test never sees two rows to complain
+    # about, trading a loud failure for a silent one. A dedicated
+    # `_dedupe_<key>` column, cleaned but never cast, still collapses
+    # whitespace (item 23's own case) while leaving a genuinely ambiguous
+    # cast collision as two rows for that test to catch, as it always did.
+    dedupe_key_list = ", ".join(f"'_dedupe_{c}'" for c in spec.business_key)
+    dedupe_carry = ",\n        ".join(
+        f"{{{{ clean_string('{c}') }}}} as _dedupe_{c}" for c in spec.business_key)
 
     # `source_provenance()` goes in beside `audit_columns()` below rather than
     # being rendered column by column here. Both are macros for the same
@@ -292,10 +307,15 @@ cleaned as (
 {body}
         {{{{ source_provenance() }}}}
         {{{{ audit_columns() }}}},
-        -- carried for the rank below, which needs the cleaned key
+        -- carried for the rank below: _cob_date/_file_version/_row_number
+        -- for the window, and one _dedupe_<key> per business key -- a
+        -- CLEANED STRING, never the typed column above, so a lossy cast
+        -- cannot silently collapse two distinct deliveries (see this
+        -- function's docstring in ui/scaffold.py).
         _cob_date,
         _file_version,
-        _row_number
+        _row_number,
+        {dedupe_carry}
 
     from raw_rows
 
@@ -307,11 +327,19 @@ ranked_rows as (
       THE IN-FILE DEDUPE IS ON THE CLEANED KEY -- see ref_counterparty's
       `ranked_rows` comment: ranked on the raw key, two spellings of one
       cleaned key would each be "last in file" for themselves and both
-      survive as two rows with the same (cob_date, cleaned key).
+      survive as two rows with the same (cob_date, cleaned key). Ranked on
+      the CAST key it would go the other way -- two distinct deliveries
+      that a lossy cast happens to equate would collapse instead of failing
+      the uniqueness test as they should. `_dedupe_<key>` is cleaned but
+      never cast, so it dedupes exactly whitespace and nothing more. (Where
+      a key is `clean_string` only -- as fo_trade's and ref_collateral's
+      always are -- this is the same value as the typed column; those two
+      hand-written models rank on the column directly rather than through
+      this indirection, since they have no cast to diverge from.)
     #}}
     select
         *,
-        {{{{ dedupe_rank([{key_list}]) }}}} as _rn
+        {{{{ dedupe_rank([{dedupe_key_list}]) }}}} as _rn
     from cleaned
 
 ),
