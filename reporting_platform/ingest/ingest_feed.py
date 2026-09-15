@@ -339,14 +339,36 @@ def reconcile_schema(df, fd) -> tuple:
 
 def next_file_version(spark, fd, cob_date: date,
                       table: str | None = None) -> int:
+    """The version to give a new delivery of `cob_date`: MAX(_file_version)+1.
+
+    No fallback on a read failure, deliberately. The one call site (`ingest`,
+    below) runs this straight after `ensure_raw_table` and `ensure_raw_schema`
+    have already created and reconciled `table` ON THIS BRANCH, so by the
+    time this runs, ANY failure reading it -- `TABLE_OR_VIEW_NOT_FOUND`
+    included -- means a wrong ref or a wrong table name, never "this COB date
+    has never been delivered". Swallowing that here used to return `1`, tying
+    with (or losing to, per `dedupe_rank`'s newest-`_file_version` rule) a
+    version that already exists for the date: a subject that could not be
+    READ reported as a subject that is EMPTY (CLAUDE.md). The genuinely empty
+    case is already handled correctly, inside the query, by
+    `COALESCE(MAX(_file_version), 0)`.
+
+    A future caller that can run BEFORE the table exists is not this one, and
+    has to decide its own answer for "no table yet" -- this function does not
+    try to tell that case apart from an unreadable one.
+    """
+    resolved = table or fd.raw_table
     try:
         row = spark.sql(
-            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {table or fd.raw_table} "
+            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {resolved} "
             f"WHERE _cob_date = DATE '{cob_date:%Y-%m-%d}'"
         ).collect()[0]
-        return int(row["v"]) + 1
-    except Exception:
-        return 1
+    except Exception as e:
+        raise RuntimeError(
+            f"{fd.name}: could not read _file_version from {resolved} for "
+            f"cob_date {cob_date:%Y-%m-%d}: {e}"
+        ) from e
+    return int(row["v"]) + 1
 
 
 def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
