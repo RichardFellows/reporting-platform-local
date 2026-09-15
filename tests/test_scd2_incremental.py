@@ -484,6 +484,43 @@ def test_a_key_unchanged_for_weeks_survives_daily_pruning():
         assert not _markers(con, INC), (name, "marker row left in target")
 
 
+def test_a_pruned_version_subsumed_by_a_retained_redelivery_is_retracted():
+    """A pruned-date version that `scd2_pruned_seed` re-emits can still be
+    made redundant by a RETAINED date's re-delivery, and that must retract
+    it -- not strand it as a second current row.
+
+    B is X from 08-03 (08-31 also delivers X, unchanged); 09-02 changes B to
+    Y. Retention then prunes 08-03 and 09-02, keeping only the month-end
+    08-31. 08-31 is re-delivered (v2) restating B as Y -- upstream's own
+    correction, arriving at a date raw still holds -- and 09-04 repeats Y.
+    The 09-02 version is now identical to what 08-31 v2 says: it must merge
+    away, leaving X[08-03..08-30] then Y[08-31..] current, not a stranded
+    third row at 09-02."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for cob_date, version, rows, ts in [
+                ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
+                ("2026-08-31", 1, {"A": "a", "B": "X"}, "2026-09-01 06:00")]:
+            _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+        _build(con, name, INC, incremental=True)
+        _deliver(con, keys, attr, constants, "2026-09-02", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-03 06:00")
+        _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date in "
+                    "(date '2026-08-03', date '2026-09-02')")
+        _deliver(con, keys, attr, constants, "2026-08-31", 2,
+                 {"A": "a", "B": "Y"}, "2026-09-05 06:00")
+        _deliver(con, keys, attr, constants, "2026-09-04", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-05 06:05")
+        _build(con, name, INC, incremental=True)
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-03", "2026-08-30", False),
+                     ("Y", "2026-08-31", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
 # ------------------------------------------- the final review's two findings
 # Reproduced by the reviewer's probe before the fix; every case below printed
 # DIFF on 2ae6052 except the unpadded control.
