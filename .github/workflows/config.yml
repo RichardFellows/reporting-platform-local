@@ -74,7 +74,7 @@ jobs:
       - name: Install the config layer's dependencies
         run: |
           pip install --quiet \
-            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5" "jinja2==3.1.5"
+            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5" "jinja2==3.1.5" boto3
 
       # The registry has to load before anything else is worth asking. Its own
       # step rather than relying on the suite, so a broken feed file reports
