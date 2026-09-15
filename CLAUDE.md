@@ -96,6 +96,15 @@ to run something for the first time, expect it to fail and read what it says.
   `NESSIE_SERVER_VERSION` sets the server image and the `nessie-gc` jar and may
   be newer than the extensions. `tests/test_versions.py` pins all three.
   (`#jar-versions`)
+- **`PYTHON_MINOR` pins a fourth value beside the jar triple**: the driver
+  decides which `python3` an executor runs, resolved on the WORKER's PATH, so
+  spark-worker's base image (Ubuntu Focal, apt `python3` = 3.8) must actually
+  install the drivers' minor (3.11) rather than merely agree with it on paper.
+  Diverge them and Python work on an executor — `createDataFrame` from Python
+  objects, a UDF, `rdd.map`, a pandas UDF — fails with
+  `PYTHON_VERSION_MISMATCH`; the platform's own ingest and dbt never trigger
+  that path, which is why nothing had shown it.
+  (`#executor-python-matches-the-driver`)
 - **Fixing a macro proves nothing about models that don't call it.** Grep for
   the construct, not the macro. (`dbt/macros/engine.sql` holds engine-specific
   SQL; `naming.sql` overrides `generate_schema_name` so layers land in

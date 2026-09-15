@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-99 entries. They are grouped here by subject; the file itself is in the order
+100 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -65,6 +65,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 |---|---|
 | [jar-versions](#jar-versions) | Three version values in `.env` reaching six consumers, and why the split is the finding rather than pedantry |
 | [spark-jars-prebaked](#spark-jars-prebaked) | The Spark image bakes its jars instead of resolving `--packages` at submit |
+| [executor-python-matches-the-driver](#executor-python-matches-the-driver) | The driver decides which `python3` an executor runs, resolved on the WORKER's PATH — a Focal base and a 3.11 driver disagree, silently, until a UDF runs |
 | [nessie-gc-jar](#nessie-gc-jar) | There is no server-side GC endpoint; collecting content needs the CLI jar |
 | [nessie-iceberg-rest](#nessie-iceberg-rest) | Nessie serves an Iceberg REST catalog, and what that does and does not replace |
 | [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) | Nessie logs Elastic Common Schema field names, which is why its logs read oddly |
@@ -258,6 +259,77 @@ egress at runtime.
 The drivers still resolve via Ivy (see [jar-versions](#jar-versions)) because
 they run pip-installed pyspark, which has none of these jars — the first
 Iceberg SQL statement would fail with `ClassNotFoundException` before it ran.
+
+## executor-python-matches-the-driver
+
+Every driver in this repo — `airflow`, `notebook`, `feed-ui`, `inbox`,
+`watchdog` — runs `apache/airflow:2.10.5-python3.11`, so its Python minor is
+3.11. `spark-worker`'s base image, `apache/spark:3.5.3-python3`, is
+`eclipse-temurin:11-jre-focal` (Ubuntu 20.04) with apt's `python3` and
+`python3-pip` installed on top — Focal's `python3` is 3.8. Nothing in the
+platform's own ingest or dbt paths ever showed this: they read files and run
+SQL entirely inside the JVM. Found while verifying
+[docs/todo/24](../todo/24-spark-workers-run-python-3-8.md) — the first live
+code doing Python work on an executor (`SparkSession.createDataFrame` from a
+Python list) failed outright.
+
+**The mechanism, read from pyspark 3.5.3's own source
+(`pip download pyspark==3.5.3 --no-deps` and read the sdist).** The driver's
+`SparkContext._do_init` sets `self.pythonExec = os.environ.get("PYSPARK_PYTHON",
+"python3")` (`pyspark/context.py:320`) — so the string sent to every executor
+defaults to the literal `"python3"`, resolved on the **executor's own PATH**,
+not the driver's. Each executor's worker process (`pyspark/worker.py`, the
+`main()` at the top of the file, ~line 1096) reads back the *driver's*
+`"%d.%d" % sys.version_info[:2]` over the socket and compares it to its own
+`sys.version_info`, raising `PySparkRuntimeError` with error class
+`PYTHON_VERSION_MISMATCH` — the same error class docs/todo/24 measured live —
+the moment they disagree. (The Scala-side `PythonWorkerFactory` that actually
+spawns that subprocess ships only as compiled classes in `pyspark/jars/*.jar`
+in the wheel, not as source in the sdist, so its exact resolution order is
+Spark's own configuration reference rather than something read here; the
+Python-side contract above is what is directly verifiable and it is
+sufficient to explain the observed error and fix.) **Consequence: fix the
+WORKER's `python3`, not the driver.** Setting `PYSPARK_PYTHON` on every
+driver (`spark_session()`, `dbt/profiles.yml`, the notebook) would also work,
+but is three places that can drift instead of one image.
+
+**Why `update-alternatives` is not the fix.** Focal's own `apt`/`dpkg`
+tooling on this image is built against `/usr/bin/python3` being 3.8;
+repointing it system-wide risks breaking package management inside the image
+build itself. Instead `Dockerfile.spark` installs 3.11 **alongside** the
+system Python via the deadsnakes PPA and symlinks it to
+`/usr/local/bin/python3` — every Debian-derived image (confirmed against this
+one's own upstream Dockerfile chain,
+[apache/spark-docker](https://github.com/apache/spark-docker)'s
+`3.5.3/scala2.12-java11-ubuntu` → `eclipse-temurin:11-jre-focal`, neither of
+which sets a custom `PATH`) puts `/usr/local/bin` ahead of `/usr/bin`, so the
+symlink wins the `python3` lookup without touching the apt-owned path.
+
+**One pin, not two.** `PYTHON_MINOR` lives in `.env.example` beside the jar
+triple, flows into `docker-compose.yml`'s `x-versions` anchor (so both Spark
+builds' `args:` get it automatically) and directly into
+`x-airflow-common`'s own `args:` (kept a plain literal there rather than
+merged from the anchor, so `Dockerfile.airflow` is never handed
+`ICEBERG_VERSION`/`NESSIE_SPARK_EXT_VERSION` build args it declares no `ARG`
+for). `Dockerfile.airflow` takes it as an `ARG` **before** its `FROM` line —
+the one place Docker lets a Dockerfile parameterise its own base image tag —
+so the driver's own Python and the pin `Dockerfile.spark` installs can never
+independently drift. `tests/test_versions.py` checks all four declaration
+sites agree, in the same style as the jar triple, and separately parses
+`Dockerfile.spark`'s `apt-get install` line and `Dockerfile.airflow`'s `FROM`
+line to confirm each actually *spends* the ARG rather than a stale literal
+sitting next to an unused one.
+
+The `pip install pyyaml boto3 pynessie` line that used to target the base
+image's 3.8 now targets `python3` post-symlink (3.11): `common/context.py` —
+mounted onto `spark-master`/`spark-worker` and put on `PYTHONPATH` for
+exactly this reason, so a future executor-side closure can import platform
+code — imports `yaml` at module level, and several `reporting_platform`
+modules import `boto3` directly. `pynessie` was dropped rather than carried
+onto the new interpreter unread: grepping the repo for `pynessie` finds
+nothing but the one `pip install` line, and its own `|| pip install pyyaml
+boto3` fallback already treated a failed pynessie install as an accepted
+outcome.
 
 ## nessie-logs-are-ecs-json
 
