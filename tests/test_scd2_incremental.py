@@ -260,6 +260,14 @@ def _overlaps(con, table, keys):
         f"and a.effective_to >= b.effective_from").fetchall()
 
 
+def _markers(con, table):
+    """A retraction marker (`scd2_retracted()`, DATE '0001-01-01') left behind
+    in the target -- the MERGE is supposed to delete every one it emits, in
+    the same statement, so none should ever be visible afterwards."""
+    return con.execute(
+        f"select * from {table} where effective_to = date '{DELETED}'").fetchall()
+
+
 # -------------------------------------------------------------------- tests
 def _scenario(first_date: str):
     """The review's sequence. B is X from `first_date`; the 09-02 delivery
@@ -361,21 +369,20 @@ def test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too():
         assert not _open_versions(con, INC, keys) and not _overlaps(con, INC, keys)
 
 
-def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
-    """Absence of evidence is not a retraction.
+def test_a_version_whose_cob_date_raw_no_longer_holds_is_seeded_from_the_target():
+    """RENAMED from `..._is_never_retracted`: that name described the LOUD
+    failure this pinned before the fix (a second open version, which the SCD2
+    tests refuse) -- true, but not the point any more. `scd2_pruned_seed` now
+    carries such a version forward from the target instead of leaving the
+    replay unable to re-derive it, so the build is CORRECT, not merely loud.
 
     Retention prunes raw to month-ends, so a version's COB date can vanish
-    from raw while the version is still right. The replay then cannot
-    re-derive it -- and a retraction keyed on "not re-derived" alone would
-    delete it and silently re-date the key to the next delivery raw still
-    holds. After step 2, both of B's version dates are pruned from raw
-    (08-03, where the replay starts, and 09-02, inside the window) and 09-03
-    is delivered. Both versions must still be in the target.
-
-    What the build does instead is the pre-existing failure of replaying from
-    pruned raw, which is LOUD: a second open version, which the SCD2 tests
-    refuse. Pinned too, so a later change cannot make it quiet by accident.
-    """
+    from raw while the version is still right. After step 2, both of B's
+    version dates are pruned from raw (08-03, where the replay starts, and
+    09-02, inside the window) and 09-03 re-delivers B UNCHANGED (still Y).
+    Both of B's versions must survive with their original values and
+    boundaries, exactly one current, and the unchanged re-delivery must not
+    open a third."""
     for name, keys, attr, constants in MODELS:
         con = _connect()
         for _, deliveries in _scenario("2026-08-03")[:2]:
@@ -387,10 +394,94 @@ def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
         _deliver(con, keys, attr, constants, "2026-09-03", 1,
                  {"A": "a", "B": "Y"}, "2026-09-04 06:00")
         _build(con, name, INC, incremental=True)
-        b = {(r[len(keys)], r[len(keys) + 1]) for r in _state(con, INC, keys, attr)
-             if r[0] == "B"}
-        assert {("X", "2026-08-03"), ("Y", "2026-09-02")} <= b, (name, sorted(b))
-        assert _open_versions(con, INC, keys), (name, sorted(b))
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-03", "2026-09-01", False),
+                     ("Y", "2026-09-02", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_only_the_replay_start_date_is_pruned():
+    """The narrower case: 08-03 (where the replay starts) is pruned but 09-02
+    (inside the window) is still in raw. B's 09-02 version must still be
+    RE-DERIVED from raw as before -- an unchanged re-delivery of it must not
+    open a spurious new version -- while 08-03 is seeded."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for _, deliveries in _scenario("2026-08-03")[:2]:
+            for cob_date, version, rows, ts in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+            _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        _deliver(con, keys, attr, constants, "2026-09-03", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-04 06:00")
+        _build(con, name, INC, incremental=True)
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-03", "2026-09-01", False),
+                     ("Y", "2026-09-02", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_a_retained_redelivery_still_retracts_a_version_seeded_at_its_start():
+    """The interaction the design direction calls out explicitly: the
+    replay-start version is pruned (seeded, not re-derived), and a LATER,
+    still-retained date is then re-delivered dropping the key entirely. That
+    re-delivery must still retract the version it began (09-02, Y) and reopen
+    the one before it (08-03, X) -- even though 08-03 itself is only in the
+    replay because it was seeded, not because raw still holds it. C, whose
+    only version was 09-02, has nothing left to seed or re-derive and is
+    retracted outright."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for _, deliveries in _scenario("2026-08-03")[:2]:
+            for cob_date, version, rows, ts in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+            _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        _deliver(con, keys, attr, constants, "2026-09-02", 2,
+                 {"A": "a"}, "2026-09-03 09:00")
+        _build(con, name, INC, incremental=True)
+        # A's attribute value is case-folded by ref_rating's cleaning
+        # (`upper(clean_string('rating'))`) but not by ref_counterparty's, so
+        # only the dates and is_current -- not the value -- are compared.
+        a = [r[len(keys) + 1:] for r in _state(con, INC, keys, attr) if r[0] == "A"]
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        c = con.execute(f"select * from {INC} where {keys[0]} = 'C'").fetchall()
+        assert a == [("2026-08-03", "9999-12-31", True)], (name, a)
+        assert b == [("X", "2026-08-03", "9999-12-31", True)], (name, b)
+        assert c == [], (name, c)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_a_key_unchanged_for_weeks_survives_daily_pruning():
+    """A `full_snapshot` feed re-delivers B unchanged every day and retention
+    keeps only a short rolling window of raw -- the estate's actual shape,
+    per CLAUDE.md: `full_snapshot` touches every key every day, and reference
+    versions are mostly old. Once B's origin date (08-01) is pruned,
+    `scd2_pruned_seed` is the only thing keeping its single open version
+    alive at all; before this fix, every rebuild after that point stranded a
+    second copy beside it. The target must end with exactly the one version
+    it always had, audit columns aside."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for day in range(1, 21):
+            cob_date = f"2026-08-{day:02d}"
+            _deliver(con, keys, attr, constants, cob_date, 1,
+                     {"A": "a", "B": "X"}, f"{cob_date} 06:00")
+            _build(con, name, INC, incremental=True)
+            # nightly retention: keep only the newest 6 COB dates in raw.
+            con.execute("delete from raw_src where _cob_date < "
+                        "(select max(_cob_date) from raw_src) - interval 5 day")
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-01", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
 
 
 # ------------------------------------------- the final review's two findings
