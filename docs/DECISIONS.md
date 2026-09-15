@@ -2847,20 +2847,20 @@ conflict, and only what config can legitimately change is refreshed.
 
 `next_file_version` (`ingest_feed.py`) reads `MAX(_file_version)` for a
 (raw table, COB date) on the ingest's own branch, forked from `main`, and
-returns `MAX + 1`. Two ingests of the same COB date, cut from the same base
-and running at once, both read the same MAX and both compute the SAME
-version — a plain read-then-write with no lock. `docs/todo/15` first assumed
-that meant the two would silently tie once merged, since item 09 made
-`dedupe_rank` gate on the newest `_file_version` per date rather than ranking
-per key. **Measured live, that assumption is wrong**, because the tie never
-reaches `main`.
+returns `MAX + 1` — a plain read-then-write with no lock. Two ingests of one
+COB date, cut from the same base and running at once, both read the same MAX
+and compute the SAME version. An earlier analysis assumed the two would tie
+once merged, since item 09 made `dedupe_rank` gate on the newest
+`_file_version` per date rather than ranking per key. **Measured live, that
+assumption is wrong**, because the tie never reaches the target ref.
 
 ### What was measured
 
-Two branches were cut from one base and both ran `next_file_version` for
-`fo_trade` / `2026-08-19`, both computing `_file_version=2`. Both appended
-their row to `raw.fo_trade` on their own branch. Merging the first branch
-into `main` applied cleanly. Merging the SECOND then failed:
+Two branches were cut from one base, both ran `next_file_version` for
+`fo_trade`/`2026-08-19` and both computed `_file_version=2`. Both merges
+targeted `probe/item15/fakemain`, a throwaway stand-in for `main` (all three
+branches deleted afterwards; `main`'s own hash, `487d319…`, never moved).
+The first applied cleanly. The second failed:
 
 ```
 409 Conflict ... /history/merge:
@@ -2869,86 +2869,52 @@ into `main` applied cleanly. Merging the SECOND then failed:
  "errorCode": "REFERENCE_CONFLICT"}
 ```
 
-The first merge's own response carried
-`'details': [{'key': {'elements': ['raw', 'fo_trade']}, 'mergeBehavior': 'NORMAL'}]`
 — Nessie's v2 merge applies **NORMAL** per-content-key merge behaviour by
-default: a key changed on both sides since the branches diverged is a
-conflict, and the merge that would silently overwrite it is refused outright,
-not applied. The two files do not tie. The loser's merge fails loudly, `main`
-is untouched by it, and a re-run of that ingest cuts a fresh branch, re-reads
-`MAX(_file_version)` — now 2, since the winner is on `main` — and correctly
-computes 3.
+default (the applied merge's own response carried
+`'mergeBehavior': 'NORMAL'` for the `raw.fo_trade` key): a key changed on
+both sides since the branches diverged conflicts, refused outright rather
+than silently applied. A re-run cuts a fresh branch, re-reads
+`MAX(_file_version)` — now reflecting the winner — and gets the correct
+next value.
 
 ### What actually serialises `_file_version`, and what does not
 
-**It is this merge conflict, not the `lakehouse_write` pool.** The pool gives
-every *Cosmos-rendered Airflow task* one slot, which does serialise the DAG
-path — but `scripts/bulk_ingest.py` runs its ingests as its own subprocesses
-outside Airflow, where the pool does not apply, and so does the bare CLI
-(`python -m reporting_platform.ingest.ingest_feed`). (`bulk_ingest.py` in
-fact runs its chunks sequentially today, so nothing here is currently
-exploitable through it — but that is a property of how it happens to be
-written, not a guarantee anything enforces, and the pool covers neither path
-regardless.) Whichever path caused two branches to be open on one COB date at
-once, the SAME conflict fires: the merge, not the caller, is what refuses the
-second write. `docs/todo/15`'s own text asked to "write down which" —
-this is that answer, and neither `next_file_version`'s docstring nor
-`ingest_feed`'s module docstring may attribute this to the pool.
+**It is this merge conflict, not the `lakehouse_write` pool.** The ingest
+task itself declares `pool="lakehouse_write"` (`feed_ingest.py`), giving it
+one slot — but `scripts/bulk_ingest.py` runs ingests as its own subprocesses
+outside Airflow, and so does the bare CLI, neither subject to any pool.
+(`bulk_ingest.py` happens to run its chunks sequentially today; that is how
+it is written, not a guarantee anything enforces.) Whichever path opens two
+branches on one COB date at once, the merge — not the pool, not the caller —
+refuses the second write, and no docstring here may attribute this to it.
 
-**This depends entirely on `Nessie.merge` never overriding the per-key merge
-mode.** Nessie's v2 merge request accepts `defaultKeyMergeMode` and
-`keyMergeModes` for exactly this: passing `FORCE` (apply over the conflicting
-key anyway) or `DROP` (silently skip it) instead of the default `NORMAL`
-would turn this 409 back into a silent double-write, restoring the failure
-mode `docs/todo/15` was originally worried about. `Nessie.merge` sends
-neither field, and `tests/test_nessie_merge.py` pins the request body to
-prove it — shown failing first by adding `"defaultKeyMergeMode": "FORCE"` to
-the body and re-running it. This repo has no vendored copy of Nessie's v2
-OpenAPI spec and no other comment naming a further field that would change
-conflict behaviour, so nothing beyond these two names is asserted or claimed
-here.
+**What would break it:** `Nessie.merge` sending `defaultKeyMergeMode` /
+`keyMergeModes` (FORCE applies over a conflict, DROP silently skips it) or
+`returnConflictAsResult: true` (a conflict returns as a normal response
+instead of raising) — full field list from the live server's own schema,
+`Merge`/`Merge1` in `/nessie-openapi/openapi.yaml`. It sends none of them;
+`tests/test_nessie_merge.py` pins the body against an explicit allowlist,
+shown failing with `returnConflictAsResult: true` added. So would any write
+to a raw table outside branch+merge, which never goes through a merge to
+conflict on: `_bootstrap_main_if_empty` (`ingest_feed.py`) is exactly that,
+for the one-time case where `main` has no commits yet. From the code: it is
+guarded by `if history.get("logEntries"): return`, firing once per catalog,
+before any ingest has committed — two ingests racing THAT window is a real,
+unguarded gap, reported here and not fixed, since it can only happen once,
+against a brand new catalog.
 
-**Any write to a raw table outside branch+merge would also break it**, by
-never going through a merge to conflict on. `_bootstrap_main_if_empty`
-(`ingest_feed.py`) is exactly such a write: when `main` has no commits yet it
-runs `ensure_raw_namespace`/`ensure_raw_table` directly against `main`,
-bypassing branch+merge for that one call, because Nessie's "no ancestor"
-sentinel cannot be a merge target. Read live: it is guarded by
-`if history.get("logEntries"): return`, so it only ever fires once per
-catalog, before ANY ingest has committed — the first ingest to reach it wins
-the race to create `raw.fo_trade`, and every ingest after that takes the
-normal branch+merge path this section is about. Two ingests racing this
-bootstrap path itself (both finding `main` empty, both writing to `main`
-directly) is a real gap — `CREATE TABLE IF NOT EXISTS` makes a double
-`ensure_raw_table` harmless, but it is still two writers touching `main`
-outside the write-audit-publish path this whole section depends on — and it
-is UNGUARDED: nothing serialises entry into that `if` block. It is reported
-here, not fixed: it only matters for the very first ingest against a brand
-new catalog, a narrower window than the steady-state case this entry
-resolves.
-
-**The cost of relying on the conflict is that it is refused, not retried,**
-and by `ingest()`'s design (see `_merge_ingest_branch`) never auto-retried
-either — a re-run has to be a fresh ingest, cutting a fresh branch and
-re-reading `MAX(_file_version)`, because the version the losing attempt
-computed is stale the instant the 409 arrives. And the conflict is not
-specific to the SAME COB date: Nessie's key granularity is the TABLE, so any
-two concurrent writers to one raw table conflict on merge — a second ingest
-of a DIFFERENT COB date for the same feed, running at the same time, 409s
-here exactly the same way, for a reason that has nothing to do with
-`_file_version`.
+**The cost:** refused, not retried — the losing version is stale the instant
+the 409 arrives, and a retry or clear of the SAME Airflow task reuses the
+branch name and 409s on `create_branch` instead, so a genuinely NEW ingest
+run is required. Nor is the conflict specific to one COB date: Nessie's key
+granularity is the TABLE, so any two concurrent writers to one raw table
+conflict, whatever dates they touch.
 
 ### What proves it
 
-Live, against a real Nessie server, as measured above (two branches, one
-applied merge, one 409 with `REFERENCE_CONFLICT`). `tests/test_nessie_merge.py`
-pins that `Nessie.merge` sends no key-merge-mode override, out of a recording
-stand-in for `Nessie._req` — proven to fail by temporarily adding
-`defaultKeyMergeMode: FORCE` and re-running it. `tests/test_merge_conflict.py`
-pins `ingest_feed._merge_ingest_branch`'s reaction to the measured 409 shape,
-out of a stand-in `Nessie` whose `.merge` raises it, and separately that an
-unrelated HTTPError passes through unreinterpreted — neither talks to a real
-Nessie, which is what the live measurement above is for.
+The live measurement above, and `tests/test_nessie_merge.py` /
+`tests/test_merge_conflict.py`, pinning the request shape and
+`_merge_ingest_branch`'s reaction without talking to a real Nessie.
 
 ## quarantine-is-where-a-refused-delivery-goes
 
