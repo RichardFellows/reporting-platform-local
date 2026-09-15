@@ -165,6 +165,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | Anchor | The finding |
 |---|---|
 | [the-registry-records-observations-not-verdicts](#the-registry-records-observations-not-verdicts) | **No `ingested`, no `superseded`, no `status`** — the whole difference from the `stg` load-control tables |
+| [a-merge-conflict-not-the-pool-keeps-file-version-unique](#a-merge-conflict-not-the-pool-keeps-file-version-unique) | Two ingests can compute the same `_file_version`; Nessie's merge, not the `lakehouse_write` pool, refuses the loser |
 | [a-run-is-the-first-thing-the-registry-cannot-rebuild](#a-run-is-the-first-thing-the-registry-cannot-rebuild) | Which is why `run_input` has no foreign key and a run has a mutable status |
 | [version-is-per-report-and-as-at-date](#version-is-per-report-and-as-at-date) | Not per run, not per family |
 | [code-identity-is-a-digest-when-it-cannot-be-a-tag](#code-identity-is-a-digest-when-it-cannot-be-a-tag) | A value **and** a kind, never conflated |
@@ -2794,10 +2795,15 @@ in it?" without listing object storage by hand.
 
 **Postgres, because `sequence_no` needs a serialising authority.** The order in
 which the platform saw deliveries cannot be allocated by `MAX(...)+1` over a
-table several writers append to — that is `next_file_version`'s read-then-write,
-correct today only because the `lakehouse_write` pool has one slot, which is
-precisely what the concurrency work intends to change. A database sequence is
-serialised at any pool size. An Iceberg replica for analytical joins is the
+table several writers append to — that is `next_file_version`'s read-then-write.
+That pattern is safe on `raw` only because Nessie's merge refuses the loser of
+two concurrent writers outright rather than applying both — see
+[a-merge-conflict-not-the-pool-keeps-file-version-unique](#a-merge-conflict-not-the-pool-keeps-file-version-unique)
+— and it is NOT safe here: `sequence_no` is a plain column update, with no
+merge to reject the second writer, so two registry inserts racing on the same
+`MAX(...)+1` can both compute the same value and neither fails. A database
+sequence is serialised at any pool size, any number of writers. An Iceberg
+replica for analytical joins is the
 other half of the recommendation and is deliberately not built yet: it needs a
 namespace outside the dbt project, which `managed_tables()` derives from, so
 maintenance and retention would not cover it without explicit registration.
@@ -2836,6 +2842,113 @@ upload, verified against this stack — and only from reading the object when th
 ETag is a multipart hash of hashes. A row already registered is never
 re-hashed: `md5`, `bytes`, `received_at` and `sequence_no` are left alone on
 conflict, and only what config can legitimately change is refreshed.
+
+## a-merge-conflict-not-the-pool-keeps-file-version-unique
+
+`next_file_version` (`ingest_feed.py`) reads `MAX(_file_version)` for a
+(raw table, COB date) on the ingest's own branch, forked from `main`, and
+returns `MAX + 1`. Two ingests of the same COB date, cut from the same base
+and running at once, both read the same MAX and both compute the SAME
+version — a plain read-then-write with no lock. `docs/todo/15` first assumed
+that meant the two would silently tie once merged, since item 09 made
+`dedupe_rank` gate on the newest `_file_version` per date rather than ranking
+per key. **Measured live, that assumption is wrong**, because the tie never
+reaches `main`.
+
+### What was measured
+
+Two branches were cut from one base and both ran `next_file_version` for
+`fo_trade` / `2026-08-19`, both computing `_file_version=2`. Both appended
+their row to `raw.fo_trade` on their own branch. Merging the first branch
+into `main` applied cleanly. Merging the SECOND then failed:
+
+```
+409 Conflict ... /history/merge:
+{"status": 409, "reason": "Conflict",
+ "message": "The following keys have been changed in conflict: 'raw.fo_trade'",
+ "errorCode": "REFERENCE_CONFLICT"}
+```
+
+The first merge's own response carried
+`'details': [{'key': {'elements': ['raw', 'fo_trade']}, 'mergeBehavior': 'NORMAL'}]`
+— Nessie's v2 merge applies **NORMAL** per-content-key merge behaviour by
+default: a key changed on both sides since the branches diverged is a
+conflict, and the merge that would silently overwrite it is refused outright,
+not applied. The two files do not tie. The loser's merge fails loudly, `main`
+is untouched by it, and a re-run of that ingest cuts a fresh branch, re-reads
+`MAX(_file_version)` — now 2, since the winner is on `main` — and correctly
+computes 3.
+
+### What actually serialises `_file_version`, and what does not
+
+**It is this merge conflict, not the `lakehouse_write` pool.** The pool gives
+every *Cosmos-rendered Airflow task* one slot, which does serialise the DAG
+path — but `scripts/bulk_ingest.py` runs its ingests as its own subprocesses
+outside Airflow, where the pool does not apply, and so does the bare CLI
+(`python -m reporting_platform.ingest.ingest_feed`). (`bulk_ingest.py` in
+fact runs its chunks sequentially today, so nothing here is currently
+exploitable through it — but that is a property of how it happens to be
+written, not a guarantee anything enforces, and the pool covers neither path
+regardless.) Whichever path caused two branches to be open on one COB date at
+once, the SAME conflict fires: the merge, not the caller, is what refuses the
+second write. `docs/todo/15`'s own text asked to "write down which" —
+this is that answer, and neither `next_file_version`'s docstring nor
+`ingest_feed`'s module docstring may attribute this to the pool.
+
+**This depends entirely on `Nessie.merge` never overriding the per-key merge
+mode.** Nessie's v2 merge request accepts `defaultKeyMergeMode` and
+`keyMergeModes` for exactly this: passing `FORCE` (apply over the conflicting
+key anyway) or `DROP` (silently skip it) instead of the default `NORMAL`
+would turn this 409 back into a silent double-write, restoring the failure
+mode `docs/todo/15` was originally worried about. `Nessie.merge` sends
+neither field, and `tests/test_nessie_merge.py` pins the request body to
+prove it — shown failing first by adding `"defaultKeyMergeMode": "FORCE"` to
+the body and re-running it. This repo has no vendored copy of Nessie's v2
+OpenAPI spec and no other comment naming a further field that would change
+conflict behaviour, so nothing beyond these two names is asserted or claimed
+here.
+
+**Any write to a raw table outside branch+merge would also break it**, by
+never going through a merge to conflict on. `_bootstrap_main_if_empty`
+(`ingest_feed.py`) is exactly such a write: when `main` has no commits yet it
+runs `ensure_raw_namespace`/`ensure_raw_table` directly against `main`,
+bypassing branch+merge for that one call, because Nessie's "no ancestor"
+sentinel cannot be a merge target. Read live: it is guarded by
+`if history.get("logEntries"): return`, so it only ever fires once per
+catalog, before ANY ingest has committed — the first ingest to reach it wins
+the race to create `raw.fo_trade`, and every ingest after that takes the
+normal branch+merge path this section is about. Two ingests racing this
+bootstrap path itself (both finding `main` empty, both writing to `main`
+directly) is a real gap — `CREATE TABLE IF NOT EXISTS` makes a double
+`ensure_raw_table` harmless, but it is still two writers touching `main`
+outside the write-audit-publish path this whole section depends on — and it
+is UNGUARDED: nothing serialises entry into that `if` block. It is reported
+here, not fixed: it only matters for the very first ingest against a brand
+new catalog, a narrower window than the steady-state case this entry
+resolves.
+
+**The cost of relying on the conflict is that it is refused, not retried,**
+and by `ingest()`'s design (see `_merge_ingest_branch`) never auto-retried
+either — a re-run has to be a fresh ingest, cutting a fresh branch and
+re-reading `MAX(_file_version)`, because the version the losing attempt
+computed is stale the instant the 409 arrives. And the conflict is not
+specific to the SAME COB date: Nessie's key granularity is the TABLE, so any
+two concurrent writers to one raw table conflict on merge — a second ingest
+of a DIFFERENT COB date for the same feed, running at the same time, 409s
+here exactly the same way, for a reason that has nothing to do with
+`_file_version`.
+
+### What proves it
+
+Live, against a real Nessie server, as measured above (two branches, one
+applied merge, one 409 with `REFERENCE_CONFLICT`). `tests/test_nessie_merge.py`
+pins that `Nessie.merge` sends no key-merge-mode override, out of a recording
+stand-in for `Nessie._req` — proven to fail by temporarily adding
+`defaultKeyMergeMode: FORCE` and re-running it. `tests/test_merge_conflict.py`
+pins `ingest_feed._merge_ingest_branch`'s reaction to the measured 409 shape,
+out of a stand-in `Nessie` whose `.merge` raises it, and separately that an
+unrelated HTTPError passes through unreinterpreted — neither talks to a real
+Nessie, which is what the live measurement above is for.
 
 ## quarantine-is-where-a-refused-delivery-goes
 

@@ -371,6 +371,55 @@ def next_file_version(spark, fd, cob_date: date,
     return int(row["v"]) + 1
 
 
+def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
+                         version: int) -> dict:
+    """Merge `branch` into main; turn a per-key merge conflict into a message
+    that says what happened and what to do, instead of a bare 409.
+
+    Nessie's v2 merge applies its NORMAL per-content-key merge behaviour, and
+    `Nessie.merge` sends no override of it (no `defaultKeyMergeMode` /
+    `keyMergeModes` in the request body -- pinned by
+    tests/test_nessie_merge.py). That NORMAL behaviour, not the
+    `lakehouse_write` pool, is what actually keeps two concurrent ingests of
+    one COB date from both landing under the same `_file_version`: if another
+    commit touched `fd.raw_table` on `main` since `branch` was cut, THIS merge
+    is refused -- 409 REFERENCE_CONFLICT, one entry in `details` naming the
+    key -- rather than silently applied over it. Measured live: two branches
+    cut from one base both computed `_file_version=2` for one COB date; the
+    first merge applied, the second 409'd with exactly this shape. See
+    docs/DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique.
+
+    NOT RETRIED here. `version` was computed by reading `fd.raw_table` on
+    `branch` BEFORE this call, and a 409 means that read is now stale -- the
+    fix is a fresh ingest (fresh branch, fresh `next_file_version` read), not
+    a second attempt at merging this one. `branch` is left behind for
+    inspection, same as every other failure in `ingest()`.
+    """
+    import requests
+
+    try:
+        return nessie.merge(branch, into="main")
+    except requests.exceptions.HTTPError as e:
+        resp = getattr(e, "response", None)
+        body = {}
+        if resp is not None:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+        if (resp is not None and getattr(resp, "status_code", None) == 409
+                and body.get("errorCode") == "REFERENCE_CONFLICT"):
+            raise RuntimeError(
+                f"{fd.name} {bdate}: merge of {branch} into main refused "
+                f"(409 REFERENCE_CONFLICT) — this attempt computed "
+                f"_file_version={version} for {fd.raw_table}, but another "
+                f"write to that table merged into main since {branch} was "
+                f"cut. Not retrying: branch {branch} left for inspection; "
+                f"re-run the ingest to recompute the version."
+            ) from e
+        raise
+
+
 def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
     """Give `main` one real commit before the first branch+merge ever runs.
 
@@ -651,7 +700,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             log.info("dry run: would append %s rows to %s", row_count, raw_at_branch)
         else:
             df.writeTo(raw_at_branch).append()
-            nessie.merge(branch, into="main")
+            _merge_ingest_branch(nessie, branch, fd, bdate, version)
             nessie.delete_reference(branch)
             log.info("merged %s into main and deleted branch", branch)
 
