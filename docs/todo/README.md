@@ -6,7 +6,7 @@ it**, what done looks like, and a prompt to paste into a new session.
 Everything here was found by working on the platform rather than by reading it.
 Each item file carries the date its "What is wrong" was last verified:
 12–19 on 2026-09-14 against `main` at `fdb0784`, 20–24 against `cea4500`, and
-15, 16 and 18 — the three that describe what item 09 changed — re-checked on
+15, 16 and 18 — the three that were written conditional on 09 merging — re-checked on
 2026-09-15 against `76bec9c`, after 09 merged. 21, and 22's `--full-refresh`
 claim, are reasoned from the code and say so. If an item looks stale, run its verification command first — the
 platform moves, and an item that no longer reproduces should be deleted rather
