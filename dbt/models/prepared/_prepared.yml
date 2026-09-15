@@ -55,16 +55,36 @@ models:
       # exposure row for that counterparty. Nothing inside the model can see
       # that state. This is what sees it.
       #
-      # gaps: allowed, deliberately. effective_to is an INCLUSIVE upper bound
-      # (next effective_from minus one day), so contiguous versions look like a
-      # one-day gap to this test's arithmetic and `not_allowed` would fail on
-      # correct data. `allowed` still fails on any OVERLAP, which is the
-      # condition that actually matters.
+      # effective_to is an INCLUSIVE upper bound (next effective_from minus
+      # one day, scd2_effective_to); dbt_utils' own arithmetic assumes an
+      # EXCLUSIVE one. Bound here on `date_add(effective_to, 1)`, not
+      # `effective_to` itself, with `gaps: not_allowed`: a one-day version
+      # passes, and an overlap (same-day included), a zero/negative-length
+      # range, or a gap between two of one counterparty's versions all fail.
+      #
+      # Nothing legitimate produces a gap: `scd2_effective_to` makes a key's
+      # versions contiguous by construction, the incremental replay's
+      # retraction path REOPENS the preceding version rather than leaving it
+      # closed (docs/DECISIONS.md
+      # #a-snapshot-re-delivery-restates-the-whole-date), and
+      # `apply_scd2_retention` only ever deletes a PREFIX of a key's closed
+      # versions (whole range before the oldest retained COB date), never a
+      # middle one.
+      #
+      # The open version's effective_to is DATE '9999-12-31'; `date_add` of
+      # that stays a valid Spark DATE -- only COLLECTING such a date into a
+      # Python datetime overflows, and this expression is only ever counted.
+      #
+      # Does NOT catch a missing/duplicate open version
+      # (`scd2_exactly_one_current_version`'s job, a singular test under
+      # dbt/tests/, not wired here), or anything about the VALUES in a
+      # version, only the shape of the ranges. A NULL counterparty_id is
+      # not_null's to refuse, not this test's.
       - dbt_utils.mutually_exclusive_ranges:
           lower_bound_column: effective_from
-          upper_bound_column: effective_to
+          upper_bound_column: date_add(effective_to, 1)
           partition_by: counterparty_id
-          gaps: allowed
+          gaps: not_allowed
 
   - name: fo_trade
     description: Conformed, typed trade positions. No joins, no report opinions.
@@ -128,14 +148,23 @@ models:
       # SCD2: the grain is one row per (counterparty, agency) VERSION.
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [counterparty_id, agency, effective_from]
-      # See the counterparty block: this is the test that catches a failed
-      # close, which as_of() would otherwise turn into silently doubled rows.
-      # gaps: allowed because effective_to is an INCLUSIVE upper bound.
+      # See the ref_counterparty block for the full reasoning: bound on the
+      # EXCLUSIVE `date_add(effective_to, 1)` with `gaps: not_allowed`, so a
+      # one-day version passes and an overlap (same-day included), a
+      # zero/negative-length range, or a gap between two of one
+      # (counterparty, agency)'s versions all fail. Does not catch a
+      # missing/duplicate open version (scd2_exactly_one_current_version's
+      # job). A NULL in EITHER column collapses `partition_by`'s
+      # concatenation to the same NULL for every such row, regardless of
+      # which counterparty or agency it came from -- so unlike a NULL single
+      # key, this is not merely not_null's to refuse: were a NULL to reach
+      # here, the likely result is a spurious FAIL (unrelated entities'
+      # ranges read as one overlapping entity), not a missed defect.
       - dbt_utils.mutually_exclusive_ranges:
           lower_bound_column: effective_from
-          upper_bound_column: effective_to
+          upper_bound_column: date_add(effective_to, 1)
           partition_by: counterparty_id || '|' || agency
-          gaps: allowed
+          gaps: not_allowed
   - name: ref_collateral
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.
