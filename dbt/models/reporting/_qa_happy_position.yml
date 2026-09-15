@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: qa_happy_position_summary
+    description: Dummy reporting consumer for the pipe-delimited onboarding test.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cob_date, currency]
+    columns:
+      - name: cob_date
+        tests: [not_null]
+      - name: currency
+        tests: [not_null]
+      - name: position_count
+        tests: [not_null]
+      - name: total_amount
+        tests: [not_null]

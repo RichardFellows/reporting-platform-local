@@ -1,0 +1,24 @@
+name: qa_happy_position
+description: Dummy QA positions for pipe CSV and control-file end-to-end verification.
+source_system: QA
+filename_pattern: 'qa_happy_position_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+    row_count: 'RECORD_COUNT'
+    md5: 'CHECKSUM'
+delimiter: '|'
+business_key: [position_id]
+expected_min_rows: 1
+delivery_expected: false
+columns:
+  - position_id
+  - desk_code
+  - amount
+  - currency
+  - effective_date
+  - is_active
+  - description
