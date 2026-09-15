@@ -57,6 +57,23 @@ SERVER_SITES = {
     "Dockerfile.airflow": r"^ARG NESSIE_SERVER_VERSION=(\S+)",
 }
 
+# The executors' Python minor version, pinned beside the jar triple for the
+# same reason: it reaches four files and a bump that touches three of them is
+# the realistic mistake. `docker-compose.yml` declares the default TWICE --
+# once in the `x-versions` anchor (which flows into both Spark builds' `args:`
+# by alias) and once in `x-airflow-common`'s own `args:` (kept a plain literal
+# rather than merged from the anchor, so Dockerfile.airflow is never handed
+# ICEBERG_VERSION/NESSIE_SPARK_EXT_VERSION build args it does not consume) --
+# `_agree` treats the two matches as one site, same as it already does for
+# NESSIE_SERVER_VERSION appearing twice in this file. See
+# docs/DECISIONS.md#executor-python-matches-the-driver
+PYTHON_MINOR_SITES = {
+    ".env.example": r"^PYTHON_MINOR=(\S+)",
+    "docker-compose.yml": r"PYTHON_MINOR:\s*\$\{PYTHON_MINOR:-([^}]+)\}",
+    "Dockerfile.spark": r"^ARG PYTHON_MINOR=(\S+)",
+    "Dockerfile.airflow": r"^ARG PYTHON_MINOR=(\S+)",
+}
+
 # (ICEBERG_VERSION, NESSIE_SPARK_EXT_VERSION) combinations this stack has been
 # run against. BOTH COME FROM `.env.example`'s OWN HEADER -- the shipped pair
 # and the "known-good fully-upgraded alternative" it documents. Adding a
@@ -159,3 +176,38 @@ def test_the_quarkus_json_logging_keys_match_the_server_they_need():
             f"docker-compose.yml sets quarkus.log.console.json.* but the "
             f"server is {server}, below 0.104 where the build-time extension "
             f"first appears. Those keys change nothing and say nothing there.")
+
+
+def test_python_minor_agrees_everywhere_it_is_declared():
+    """FOUR SITES. `Dockerfile.airflow`'s `FROM` line and `Dockerfile.spark`'s
+    installed CPython both have to be the drivers' minor -- diverge them and
+    the failure is `PYTHON_VERSION_MISMATCH` inside a Spark task, naming
+    neither the image nor the compose file, exactly like the jar triple's
+    `NoSuchMethodError`. See docs/DECISIONS.md#executor-python-matches-the-driver
+    """
+    assert _agree(PYTHON_MINOR_SITES, "PYTHON_MINOR")
+
+
+def test_dockerfile_spark_installs_the_pinned_python_minor():
+    """The ARG default agreeing with everywhere else is not the same claim as
+    the image actually installing that interpreter -- parse the apt-get
+    install line itself, not just the ARG declaration next to it."""
+    text = repo_file("Dockerfile.spark").read_text(encoding="utf-8")
+    assert re.search(r"apt-get install.*?python\$\{PYTHON_MINOR\}",
+                      text, re.DOTALL), (
+        "Dockerfile.spark declares ARG PYTHON_MINOR but its apt-get install "
+        "line does not reference python${PYTHON_MINOR} -- the pin is "
+        "declared and nothing installs it, or it was left as a stale literal")
+
+
+def test_dockerfile_airflow_from_line_uses_the_pinned_python_minor():
+    """`ARG PYTHON_MINOR` before `FROM` only matters if `FROM` actually spends
+    it -- a literal `-python3.11` left in place would parse identically to
+    `test_python_minor_agrees_everywhere_it_is_declared` above, which reads
+    the ARG's default and cannot see whether FROM still uses the variable."""
+    text = repo_file("Dockerfile.airflow").read_text(encoding="utf-8")
+    assert re.search(r"^FROM apache/airflow:2\.10\.5-python\$\{PYTHON_MINOR\}",
+                      text, re.M), (
+        "Dockerfile.airflow's FROM line does not interpolate ${PYTHON_MINOR} "
+        "-- either it regressed to a literal tag or the ARG-before-FROM "
+        "pin moved")
