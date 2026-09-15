@@ -3092,6 +3092,8 @@ that already exist, filtered by `known_as_of()`, driven by a dbt var:
     dbt build --full-refresh --select path:models/prepared \
       --vars '{nessie_ref: <branch>, knowledge_time: "2026-08-10"}'
 
+This selects `ref_counterparty`/`ref_rating` too, and refuses if retention has pruned raw since -- see `#a-snapshot-re-delivery-restates-the-whole-date`.
+
 **A var rather than a per-call-site argument** because the filter has to reach
 every model and a model that quietly omits it returns everything, whatever the
 caller asked for. With no `knowledge_time` set the macro compiles to `1 = 1`,

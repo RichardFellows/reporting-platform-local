@@ -94,6 +94,22 @@ class _Column:
         self.quoted = f"`{name}`"
 
 
+class _QueryResult:
+    """A stand-in for the `agate.Table` real dbt's `run_query()` returns:
+    `.rows` iterable and indexable per row, like `agate.Row`. Plain tuples
+    from DuckDB already support positional indexing, so no row wrapper is
+    needed beyond this."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+
 class _Adapter:
     def __init__(self, con):
         self.con = con
@@ -101,6 +117,19 @@ class _Adapter:
     def get_columns_in_relation(self, relation):
         return [_Column(r[0]) for r in
                 self.con.execute(f"describe {relation}").fetchall()]
+
+    def get_relation(self, database, schema, identifier):
+        """`None` for a relation that does not exist -- the same signal real
+        dbt gives `scd2_refuse_full_refresh_over_pruned_raw` for a first
+        build. `database`/`schema` are accepted and ignored: DuckDB in this
+        harness has one schema and no database level."""
+        exists = self.con.execute(
+            "select count(*) from information_schema.tables "
+            "where table_name = ?", [identifier]).fetchone()[0]
+        return identifier if exists else None
+
+    def run_query(self, sql):
+        return _QueryResult(self.con.execute(sql).fetchall())
 
 
 class _DbtSpark:
@@ -799,3 +828,91 @@ def test_the_seed_reads_null_for_a_column_the_target_does_not_have_yet():
         w = con.execute(f"select {dropped} from {INC} where counterparty_id = 'B' "
                         f"and effective_from = date '2026-07-01'").fetchall()
         assert w == [(None,)], (name, w)
+
+
+# ------------------------------------- --full-refresh over pruned raw (REQ)
+# scd2_refuse_full_refresh_over_pruned_raw, called from scd2_replay's
+# non-incremental branch. Renders the real model file directly (not through
+# _build) so the guard's RuntimeError -- raised at RENDER time, before any
+# SQL runs -- can be asserted on without needing the rendered SQL to be
+# valid or executed.
+
+def _model_text(name):
+    return (PREPARED / f"{name}.sql").read_text(encoding="utf-8").replace(
+        f"source('raw', '{name}')", "source('raw', 'src')")
+
+
+def _target_with_history(con, name, keys, attr, constants):
+    """B is X from 08-03, Y from 09-02 -- built the ordinary incremental way,
+    into INC, which is the "target table name that exists" the guard needs
+    to have something to check."""
+    for cob_date, version, rows, ts in [
+            ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
+            ("2026-09-02", 1, {"A": "a", "B": "Y"}, "2026-09-03 06:00")]:
+        _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+        _build(con, name, INC, incremental=True)
+
+
+def test_full_refresh_refuses_when_raw_no_longer_explains_the_target():
+    """(a) An existing target plus a pruned origin date refuses, naming the
+    override var."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        try:
+            _render(_model_text(name), this=INC, adapter=_Adapter(con))
+        except RuntimeError as e:
+            assert "scd2_rebuild_from_pruned_raw" in str(e), (name, e)
+            assert "2026-08-03" in str(e), (name, e)
+        else:
+            raise AssertionError(
+                f"{name}: --full-refresh over pruned raw did not refuse")
+
+
+def test_full_refresh_proceeds_when_the_override_var_is_set():
+    """(b) The same pruned scenario, with `scd2_rebuild_from_pruned_raw: true`
+    -- must not raise."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        _render(_model_text(name), this=INC, adapter=_Adapter(con),
+                scd2_rebuild_from_pruned_raw=True)
+
+
+def test_full_refresh_proceeds_when_raw_holds_every_version_date():
+    """(c) An existing target with raw still holding every version's origin
+    date -- nothing pruned, must not raise."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        _render(_model_text(name), this=INC, adapter=_Adapter(con))
+
+
+def test_full_refresh_proceeds_with_no_target_relation():
+    """(d) No target relation at all (a first build) -- nothing to lose,
+    must not raise, however pruned raw already is."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _deliver(con, keys, attr, constants, "2026-09-02", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-03 06:00")
+        _render(_model_text(name), this="not_built_yet", adapter=_Adapter(con))
+
+
+def test_full_refresh_refuses_for_a_knowledge_time_as_of_build_too():
+    """An as-of build is always --full-refresh on a branch from main, where
+    the target exists -- and is exactly as re-dated by pruned raw as an
+    ordinary rebuild, so it gets no exemption."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        try:
+            _render(_model_text(name), this=INC, adapter=_Adapter(con),
+                    knowledge_time="2026-09-10")
+        except RuntimeError as e:
+            assert "scd2_rebuild_from_pruned_raw" in str(e), (name, e)
+        else:
+            raise AssertionError(
+                f"{name}: --full-refresh as-of build over pruned raw did not refuse")

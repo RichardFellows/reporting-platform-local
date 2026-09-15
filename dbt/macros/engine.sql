@@ -471,7 +471,81 @@
 {%- endmacro %}
 
 
-{% macro scd2_replay(stage_cte, key_columns, business_columns) %}
+{% macro scd2_refuse_full_refresh_over_pruned_raw(source_relation) %}
+  {#-
+    A FULL REFRESH of an SCD2 model reads only whatever raw currently holds,
+    so a version whose ORIGIN COB date retention has since pruned re-dates to
+    the next date raw still holds -- not a correction, a silent restatement
+    of when it began. `scd2_pruned_seed` (above) is what protects the
+    INCREMENTAL path from exactly this; nothing protected `--full-refresh`
+    until this guard. See docs/DECISIONS.md
+    #a-snapshot-re-delivery-restates-the-whole-date for the measured diff a
+    rebuild produces once retention has pruned raw.
+
+    ONLY AT EXECUTE TIME. `execute` is false while dbt is only PARSING the
+    project -- `dbt parse`/`dbt ls`, which is how the build DAGs are
+    rendered every time Cosmos parses them (#cosmos-load-bearing-settings)
+    -- and `adapter`/`run_query` reach nothing then. Guarding on `execute`
+    first means parsing the project never runs a query.
+
+    ONLY WHEN THERE IS SOMETHING TO LOSE. `adapter.get_relation` returns
+    NONE for a relation that does not exist yet: a first build, with no
+    history a rebuild could re-date. An EMPTY existing target reads as
+    nothing to lose too -- the query below simply finds no rows to check.
+
+    THE SAME DATE-LEVEL PREDICATE `scd2_pruned_seed` USES -- does raw hold
+    ANY row at all for this date -- not `min(effective_from)` against
+    `min(_cob_date)` in raw: retention keeps month-ends, so the two minimums
+    can agree while every mid-month date between them is gone. Deliberately
+    NOT filtered by `known_as_of()`: retention deletes rows outright, it does
+    not depend on when they were known, so whether a date is still in raw
+    cannot depend on a `knowledge_time` this run happens to set.
+
+    A READ THAT FAILS REFUSES. `run_query` raising propagates as an ordinary
+    Jinja error here, uncaught, because a build that could not ask the
+    question must never answer "nothing pruned" -- the same rule
+    `#an-incomplete-keep-set-refuses` states for the orphan sweep applies
+    exactly as much to a guard as to that sweep: a subject it could not READ
+    is not a subject that is EMPTY.
+
+    THE OVERRIDE IS EXPLICIT, modelled on `known_as_of()`'s own refusal
+    below: `--vars '{scd2_rebuild_from_pruned_raw: true}'`, spelled exactly
+    that way, is the only way past this. The message names the var and
+    names restoring the table from a Nessie tag or commit as the
+    alternative; it does not mention restoring from landing, because that is
+    not built.
+
+    APPLIES TO A KNOWLEDGE-TIME (AS-OF) BUILD TOO, deliberately.
+    `known_as_of()` already refuses an INCREMENTAL run with `knowledge_time`
+    set; a `--full-refresh` as-of build takes this same non-incremental
+    branch and reads the same raw, so it is exactly as re-dated by a pruned
+    origin as an ordinary rebuild and gets no exemption.
+  -#}
+  {%- if execute and not var('scd2_rebuild_from_pruned_raw', false) -%}
+    {%- set existing = adapter.get_relation(database=this.database, schema=this.schema, identifier=this.identifier) -%}
+    {%- if existing is not none -%}
+      {%- set pruned = run_query(
+            "select distinct _t.effective_from from " ~ this ~ " as _t where not exists ("
+            ~ "select 1 from " ~ source_relation ~ " as _raw where _raw._cob_date = _t.effective_from"
+            ~ ") order by _t.effective_from") -%}
+      {%- if pruned.rows | length > 0 -%}
+        {%- set examples = [] -%}
+        {%- for row in pruned.rows[:5] %}{%- do examples.append(row[0] | string) %}{%- endfor -%}
+        {{ exceptions.raise_compiler_error(
+             "--full-refresh of " ~ this ~ " would re-date " ~ (pruned.rows | length)
+             ~ " version(s) whose origin COB date raw no longer holds (e.g. "
+             ~ (examples | join(', ')) ~ ") to the next date raw still holds -- a silent "
+             ~ "restatement of when they began, not a correction. This refuses a "
+             ~ "--full-refresh knowledge_time (as-of) build for the same reason: it reads "
+             ~ "the same pruned raw. Add --vars '{scd2_rebuild_from_pruned_raw: true}' to "
+             ~ "rebuild anyway, or restore " ~ this ~ " from a Nessie tag or commit instead.") }}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{% endmacro %}
+
+
+{% macro scd2_replay(stage_cte, key_columns, business_columns, source_relation) %}
   {#
     THE ROWS AN SCD2 MODEL VERSIONS, as a CTE named `replayed`: `cob_date`
     then `scd2_output_columns(business_columns)`, one row per key per COB
@@ -550,7 +624,8 @@
   {%- endif -%}
   {%- set keys = [] -%}
   {%- for c in key_columns %}{%- do keys.append(ident(c)) %}{%- endfor -%}
-  {%- if not is_incremental() %}
+  {%- if not is_incremental() -%}
+  {%- do scd2_refuse_full_refresh_over_pruned_raw(source_relation) -%}
   replayed as (
 
       select cob_date{% for c in cols %}, {{ ident(c) }}{% endfor %}

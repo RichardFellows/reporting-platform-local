@@ -113,7 +113,7 @@ ranked_rows as (
 
 ),
 
-{{ scd2_replay('ranked_rows', ['counterparty_id', 'agency'], business_columns) }}
+{{ scd2_replay('ranked_rows', ['counterparty_id', 'agency'], business_columns, source('raw', 'ref_rating')) }}
 
 {#
   rating_rank and grade_band are DERIVED from `rating` and are deliberately

@@ -125,21 +125,55 @@ def _macro_modules(env, context):
     return macros
 
 
+class _This(str):
+    """`this` as a model sees it: a relation, not a bare name -- dbt's
+    `BaseRelation` answers `.database`/`.schema`/`.identifier` as well as
+    rendering as its qualified name in SQL. Subclassing `str` keeps every
+    existing use (`{{ this }}` in SQL text, `~` concatenation, `.replace()`)
+    working unchanged; the attributes are what
+    `scd2_refuse_full_refresh_over_pruned_raw`'s `adapter.get_relation(...)`
+    call needs. DuckDB has no `database` level here, so it reads None."""
+
+    @property
+    def database(self):
+        return None
+
+    @property
+    def schema(self):
+        return "main"
+
+    @property
+    def identifier(self):
+        return str(self)
+
+
 def _context(*, incremental=False, this="this_table", knowledge_time=None,
              config=None, adapter=None, dbt=None,
-             invocation_id="test-invocation", nessie_ref=None):
+             invocation_id="test-invocation", nessie_ref=None,
+             execute=None, scd2_rebuild_from_pruned_raw=None):
     variables = {"knowledge_time": knowledge_time, "lookback_days": 3,
-                 "nessie_ref": nessie_ref}
+                 "nessie_ref": nessie_ref,
+                 "scd2_rebuild_from_pruned_raw": scd2_rebuild_from_pruned_raw}
+    # `execute` is a real dbt global, True whenever a model actually runs
+    # (False only while parsing/compiling, when `adapter` calls would have
+    # nothing to reach). This harness has no separate parse phase, so it
+    # infers execute from whether an adapter was given -- every existing
+    # caller that renders without one exercises the same "not executing"
+    # path parsing would, and the new full-refresh guard (which needs both
+    # `execute` and `adapter`) simply does not run for them.
+    resolved_execute = execute if execute is not None else (adapter is not None)
     return dict(
         var=lambda name, default=None: (variables[name] if name in variables
                                         and variables[name] is not None
                                         else default),
         is_incremental=lambda: incremental,
-        this=this,
+        this=_This(this) if not isinstance(this, _This) else this,
         exceptions=_Exceptions(),
         modules=_Modules(),
         dbt=dbt or _Dbt(),
         invocation_id=invocation_id,
+        execute=resolved_execute,
+        run_query=(adapter.run_query if adapter is not None else None),
         **{"return": _return},
         config=config if config is not None else _Config({}),
         adapter=adapter,
@@ -158,13 +192,15 @@ def _render(template_text: str, *, incremental: bool = False,
             this: str = "this_table", knowledge_time: str | None = None,
             config: "_Config | None" = None, adapter=None,
             invocation_id: str = "test-invocation",
-            nessie_ref: str | None = None) -> str:
+            nessie_ref: str | None = None, execute: bool | None = None,
+            scd2_rebuild_from_pruned_raw: bool | None = None) -> str:
     """Render a model (or any text using the project macros) as dbt would."""
     config = config if config is not None else _Config({})
     context = _context(incremental=incremental, this=this,
                        knowledge_time=knowledge_time, config=config,
                        adapter=adapter, invocation_id=invocation_id,
-                       nessie_ref=nessie_ref)
+                       nessie_ref=nessie_ref, execute=execute,
+                       scd2_rebuild_from_pruned_raw=scd2_rebuild_from_pruned_raw)
     env = _environment()
     model_globals = dict(context, **_macro_modules(env, context))
     model_globals.update(

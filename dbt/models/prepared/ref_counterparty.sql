@@ -143,7 +143,7 @@ ranked_rows as (
 
 ),
 
-{{ scd2_replay('ranked_rows', ['counterparty_id'], business_columns) }}
+{{ scd2_replay('ranked_rows', ['counterparty_id'], business_columns, source('raw', 'ref_counterparty')) }}
 
 {#
   Business attributes only -- see the scd2_hash macro for what including an

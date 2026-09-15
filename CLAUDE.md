@@ -516,6 +516,7 @@ docker compose exec -T airflow python -m reporting_platform.monitoring.evidence
 
 # as of a knowledge time -- same models, throwaway branch, NEVER merged.
 # --full-refresh is not optional: known_as_of() refuses an incremental run.
+# also refuses ref_counterparty/ref_rating if retention has pruned raw -- add scd2_rebuild_from_pruned_raw: true to the vars, or restore the table first.
 $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).Trim()
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --full-refresh --select path:models/prepared --vars "{nessie_ref: $branch, knowledge_time: '2026-08-10'}"
 
