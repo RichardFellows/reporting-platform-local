@@ -9,8 +9,8 @@ is_last_record, false)` where `op` is `=` for `gaps: not_allowed` and `<=` for
 `gaps: allowed` -- so bound directly on `effective_to` the test either refuses
 a correct one-day version (`gaps: not_allowed`) or passes a same-day overlap
 (`gaps: allowed`, since inclusive `05 <= 05` holds for [09-01,09-05] then
-[09-05,09-10]). See docs/todo/20-mutually-exclusive-ranges-refuses-one-day-versions.md
-for the measurement this fix is built on.
+[09-05,09-10]). See the comment above the test in
+`dbt/models/prepared/_prepared.yml` for the full reasoning.
 
 The fix: `upper_bound_column: date_add(effective_to, 1)` (the EXCLUSIVE end)
 with `gaps: not_allowed`. Two things this test pins:
@@ -28,15 +28,14 @@ with `gaps: not_allowed`. Two things this test pins:
 
 NO SPARK. `date_add(effective_to, 1)` is Spark spelling (`dbt/macros/engine.sql`
 uses `date_sub`, never `- INTERVAL 1 DAY`, for the same reason: the interval
-form returns a TIMESTAMP in Spark). DuckDB 1.5.5 happens to accept
-`date_add(<date>, <int>)` directly and returns a DATE (verified below at
-import time), so no translation is needed on this DuckDB version -- but the
-translation point is kept and named in case a different DuckDB does not
-accept it, per this test's own instructions.
+form returns a TIMESTAMP in Spark). DuckDB 1.5.5 accepts `date_add(<date>,
+<int>)` directly and returns a DATE (verified by hand at the time this was
+written), so the YAML's expression is used AS-IS, with no translation layer.
+A DuckDB that ever rejected it should fail this test loudly rather than
+have the test quietly rewrite the expression: a translated spelling would be
+verifying different SQL than the one dbt actually renders.
 """
 from __future__ import annotations
-
-import re
 
 import duckdb
 import yaml
@@ -74,29 +73,6 @@ def _mutually_exclusive_ranges_configs() -> list[dict]:
 
     walk(doc)
     return found
-
-
-def _duckdb_upper_bound_expr(upper_bound_column: str) -> str:
-    """Translate the YAML's Spark-spelled upper bound for DuckDB, if needed.
-
-    Only the `date_add(<col>, <n>)` spelling is translated, and only if
-    DuckDB's own `date_add` cannot take it directly -- checked live, not
-    assumed, because a DuckDB version's `date_add` may differ or not exist.
-    """
-    probe = "select date_add(date '2026-01-01', 1)"
-    try:
-        duckdb.connect().execute(probe)
-        return upper_bound_column  # this DuckDB accepts the Spark spelling
-    except duckdb.Error:
-        m = re.fullmatch(r"date_add\(\s*(\w+)\s*,\s*(\d+)\s*\)",
-                          upper_bound_column.strip())
-        if not m:
-            raise AssertionError(
-                f"DuckDB rejects date_add() and {upper_bound_column!r} is not "
-                f"the plain date_add(<col>, <int days>) shape this test knows "
-                f"how to translate (col + int).")
-        col, n = m.groups()
-        return f"{col} + {n}"
 
 
 def _range_test_fails(con, rows: list[tuple[str, str]], gaps: str,
@@ -175,14 +151,14 @@ def test_scd2_range_test_arithmetic():
         upper = cfg.get("upper_bound_column")
         gaps = cfg.get("gaps")
         zero_ok = cfg.get("zero_length_range_allowed", False)
-        ub_expr = _duckdb_upper_bound_expr(upper)
+        ub_expr = upper  # used as-is: see the module docstring on translation
 
         def fails(rows):
             return _range_test_fails(con, rows, gaps, ub_expr, zero_ok)
 
         assert fails(one_day) == 0, (
             f"config {cfg} refuses a correct one-day SCD2 version "
-            f"([09-03, 09-03]) -- this is the defect item 20 exists to fix")
+            f"([09-03, 09-03])")
         assert fails(overlap) != 0, (
             f"config {cfg} passes a same-day overlap ([09-01,09-05] then "
             f"[09-05,09-10]) -- as_of() would match both and double every "
