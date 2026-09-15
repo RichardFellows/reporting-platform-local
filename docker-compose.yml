@@ -32,9 +32,18 @@ x-s3-env: &s3-env
   REGISTRY_DSN: postgresql://platform:platform@postgres:5432/platform
 
 # One place per jar version, from .env. See docs/DECISIONS.md#jar-versions
+#
+# PYTHON_MINOR rides along on the same anchor for the same reason -- it needs
+# to reach both spark-master's and spark-worker's `build: args:` below, and
+# an alias is what stops the three ever independently drifting. It is also
+# merged (harmlessly) into every driver's runtime `environment:` via *versions
+# below, same as the jar versions already are, so `env | grep PYTHON_MINOR`
+# in any of them reports the pin without a second lookup.
+# See docs/DECISIONS.md#executor-python-matches-the-driver
 x-versions: &versions
   ICEBERG_VERSION: ${ICEBERG_VERSION:-1.6.1}
   NESSIE_SPARK_EXT_VERSION: ${NESSIE_SPARK_EXT_VERSION:-0.99.0}
+  PYTHON_MINOR: ${PYTHON_MINOR:-3.11}
 
 x-airflow-common: &airflow-common
   build:
@@ -42,6 +51,12 @@ x-airflow-common: &airflow-common
     dockerfile: Dockerfile.airflow
     args:
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.108.1}
+      # Kept a plain literal rather than `<<: *versions`, on purpose: merging
+      # the whole anchor in would also hand Dockerfile.airflow
+      # ICEBERG_VERSION/NESSIE_SPARK_EXT_VERSION build args it declares no
+      # ARG for, which buildkit accepts but warns about on every build.
+      # See docs/DECISIONS.md#executor-python-matches-the-driver
+      PYTHON_MINOR: ${PYTHON_MINOR:-3.11}
   # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own
   # `id -u`; `.env.example` says how and why, and
   # docs/DECISIONS.md#containers-run-as-the-host-uid says what breaks otherwise.
