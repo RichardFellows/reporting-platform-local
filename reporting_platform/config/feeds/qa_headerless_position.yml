@@ -1,0 +1,25 @@
+name: qa_headerless_position
+description: Dummy QA feed with a headerless pipe-delimited control file.
+source_system: QA
+filename_pattern: 'qa_headerless_position_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+      header: false
+      columns:
+        - FILENAME
+        - RECORD_COUNT
+        - CHECKSUM
+    row_count: 'RECORD_COUNT'
+    md5: 'CHECKSUM'
+delimiter: '|'
+business_key: [position_id]
+expected_min_rows: 1
+delivery_expected: false
+columns:
+  - position_id
+  - amount
+  - currency
