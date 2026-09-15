@@ -19,7 +19,7 @@ item that no longer reproduces should be deleted rather than worked.
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
 | [18](18-adding-a-feed-sample-model-is-missing-macros.md) | The sample prepared model in `ADDING-A-FEED.md` misses `known_as_of()` and `source_provenance()` | low–medium | 30 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
-| [20](20-mutually-exclusive-ranges-refuses-one-day-versions.md) | `mutually_exclusive_ranges` refuses a legitimate one-day SCD2 version | medium | 1 hour |
+| [20](20-mutually-exclusive-ranges-refuses-one-day-versions.md) | `mutually_exclusive_ranges` refuses a correct one-day SCD2 version and passes a same-day overlap | high | 1–2 hours |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
 | [23](23-date-partitioned-models-rank-the-raw-key.md) | `fo_trade` and `ref_collateral` dedupe on the raw key, then clean it | low–medium | 1–2 hours |
@@ -28,11 +28,13 @@ item that no longer reproduces should be deleted rather than worked.
 ## Where to start
 
 **22 and 15 first**, in either order. **22** breaks both SCD2 builds on the
-first nightly housekeeping that prunes raw — nothing has pruned raw on this
-estate yet, which is the only reason it is green. **15**: under 09's decision
+first build after housekeeping first prunes raw — every key is touched every
+day, so not only keys that change — and nothing has pruned raw on this estate
+yet, which is the only reason it is green. **15**: under 09's decision
 the newest `_file_version` decides a whole COB date, and 15 is how a version
-gets mis-numbered. **20** is an hour and stops the SCD2 tests refusing correct
-one-day versions, so take it before relying on those tests.
+gets mis-numbered. **20** is short and the SCD2 range test is currently wrong both
+ways — it fails correct one-day versions and passes same-day overlaps — so
+take it before relying on that test.
 
 **07** is no longer blocked: 09 decided that `full_snapshot` selects the
 newest delivery per COB date, so 07's premise holds as written. It is
@@ -41,8 +43,10 @@ its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
 
-**12–24** were found working 08–10 and each was reproduced before it was
-written down; **20–24** came out of 09's reviews and live runs. **16** and **18** describe models 09 changed, so re-read them
+**12–24** were found working 08–10. 12–20, 23 and 24 were reproduced before
+they were written down; **21** and part of **22** (what `--full-refresh`
+does after pruning) are reasoned from the code and say so — reproduce them
+first. **20–24** came out of 09's reviews and live runs. **16** and **18** describe models 09 changed, so re-read them
 against the current models before starting. The rest are independent.
 
 ## Done

@@ -28,10 +28,17 @@ estate — but it follows from the same read.
 
 ## Why it matters
 
-Nothing has pruned raw here yet, so the stack is green. The first nightly
-housekeeping that does will break both SCD2 builds on the next change to any
-counterparty or rating whose version began before the keep-set, and the
-obvious fix a person reaches for — `--full-refresh` — rewrites history.
+Nothing has pruned raw here yet — `platform_housekeeping` is paused and has
+never run — which is the only reason the stack is green. And the failure does
+not wait for a counterparty to CHANGE: `scd2_replay` treats a key as touched
+if the stage carries it anywhere in the lookback window, and a
+`full_snapshot` feed delivers every key every day, so every key is touched on
+every build. Any key whose version began on a now-pruned date gets two open
+versions on the very next build — the pinned test re-delivers B with an
+UNCHANGED value and still gets two. Reference versions are mostly old, so the
+first build after the first housekeeping that prunes raw breaks both SCD2
+models almost wholesale, and the obvious fix a person reaches for —
+`--full-refresh` — rewrites history.
 
 ## What done looks like
 
@@ -39,6 +46,13 @@ obvious fix a person reaches for — `--full-refresh` — rewrites history.
       at `replay_from`, already seeded for the version before it by item 09),
       not from raw that may be gone, so an incremental run never depends on a
       pruned date.
+- [ ] **Without losing 09's retraction of that version.** `DECISIONS.md`'s
+      "limit that remains" paragraph says seeding the start version from the
+      target "would change which re-deliveries can retract it, and is not
+      done here". Read it first: a re-delivery of the start version's own
+      date must still be able to retract it
+      (`test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too`
+      and the C-drop tests must stay green), and the answer must say how.
 - [ ] `test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted`
       is changed to assert the build is CORRECT, not loud.
 - [ ] A decision on `--full-refresh` for SCD2 models after retention: refuse

@@ -20,7 +20,17 @@ header-only re-delivery ingests (`expected_min_rows` defaults to 0), gets
 `insert_overwrite` rewrites the date with version 1's population, and the
 SCD2 models retract nothing.
 
-`DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date` names this as a
+It is not even ingested once. `already_ingested()` (`ingest/arrival.py`)
+decides what is done by reading `_source_file` back out of raw, and a zero-row
+ingest writes no row carrying it — so `find_pending` offers the same delivery
+again on every run, and it is re-ingested (branch, empty append, merge) every
+time until retention drops its date:
+
+```bash
+grep -n 'def already_ingested' -A14 reporting_platform/ingest/arrival.py | grep -n '_source_file'
+```
+
+`DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date` names the rank half as a
 risk; nothing enforces or implements it. The four current feeds set floors
 (100 on `fo_trade`, 10 inherited from the `ref_src` convention), so they refuse an empty file at ingest; a scaffolded feed on the
 default does not.
@@ -40,7 +50,14 @@ nothing says a newer delivery was ignored.
       the reason. If an empty date, "newest delivery" has to come from
       something that records a delivery without rows — `registry.delivery`
       is an index, not a ledger, so check what it may carry before using it.
-- [ ] A test of whichever answer, in the `tests/test_dedupe_rank.py` harness.
+- [ ] Either way, `already_ingested` stops treating an empty delivery as
+      pending for ever — an "empty date" answer has to change it as well as
+      the rank.
+- [ ] A test of whichever answer, in the `tests/test_dedupe_rank.py` harness,
+      and one that an empty delivery is ingested once.
+- [ ] **Not yet reproduced by running an ingest** — the analysis above is
+      from the code. Land a header-only re-delivery on a throwaway branch
+      first and confirm both halves before designing.
 
 ## Prompt for a new session
 
