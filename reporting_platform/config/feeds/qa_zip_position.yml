@@ -1,0 +1,41 @@
+name: qa_zip_position
+description: QA ZIP archive with two pipe-delimited position feeds and headerless control files
+source_system: QA
+filename_pattern: 'qa_zip_position_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+arrival:
+  source_pattern: 'feeds\.zip'
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+      header: false
+      columns:
+        - FILENAME
+        - RECORD_COUNT
+        - CHECKSUM
+  archive:
+    member_pattern: 'feedfile_(?P<cob_date>\d{8})\.csv'
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+      header: false
+      columns:
+        - FILENAME
+        - RECORD_COUNT
+        - CHECKSUM
+    row_count: 'RECORD_COUNT'
+    md5: 'CHECKSUM'
+delimiter: '|'
+business_key: [position_id]
+expected_min_rows: 1
+delivery_expected: false
+columns:
+  - position_id
+  - amount
+  - currency
+column_types:
+  currency: string

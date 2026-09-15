@@ -67,3 +67,18 @@ sources:
         columns:
           - name: position_id
             tests: [not_null]
+      - name: qa_zip_position
+        description: QA ZIP archive with two pipe-delimited position feeds and headerless control files.
+        columns:
+          - name: position_id
+            tests: [not_null]
+      - name: qa_zip_control_dated
+        description: QA ZIP archive whose undated members get COB dates from headerless controls.
+        columns:
+          - name: position_id
+            tests: [not_null]
+      - name: qa_zip_container_dated
+        description: QA dated ZIP archive whose CSV members share the container COB date.
+        columns:
+          - name: position_id
+            tests: [not_null]

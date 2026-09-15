@@ -1,0 +1,44 @@
+name: qa_zip_control_dated
+description: QA ZIP archive whose undated members get COB dates from headerless controls
+source_system: QA
+filename_pattern: 'qa_zip_control_dated_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+arrival:
+  source_pattern: 'results\.zip'
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+      header: false
+      columns:
+        - FILENAME
+        - BUSINESS_DATE
+        - RECORD_COUNT
+        - CHECKSUM
+    cob_date: 'BUSINESS_DATE'
+  archive:
+    member_pattern: '(?:results|context)\.csv'
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+      header: false
+      columns:
+        - FILENAME
+        - BUSINESS_DATE
+        - RECORD_COUNT
+        - CHECKSUM
+    row_count: 'RECORD_COUNT'
+    md5: 'CHECKSUM'
+delimiter: '|'
+business_key: [position_id]
+expected_min_rows: 1
+delivery_expected: false
+columns:
+  - position_id
+  - amount
+  - currency
+column_types:
+  currency: string

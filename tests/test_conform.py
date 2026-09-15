@@ -98,17 +98,16 @@ def test_arrival_block_resolves():
     assert set(fd.delivery["control"]) == {"pattern", "row_count", "md5"}
 
 
-def test_the_shipped_feeds_need_no_conforming():
-    """Every feed that exists today, against the REAL feeds.yml. The gate has
-    to be opt-in, or onboarding a conformant upstream would suddenly require
-    a control file it has no reason to send."""
+def test_the_shipped_feeds_only_conform_when_they_declare_arrival():
+    """Every feed that exists today, against the REAL feeds.yml. The gate is
+    opt-in: only feeds with an arrival contract are routed through it."""
     config_dir()                      # the shipped config, not the fixture
     from reporting_platform.common.context import feeds
 
     registry = feeds()
     assert registry, "the shipped feeds.yml resolved to nothing"
     for name, feed in registry.items():
-        assert feed.needs_conforming is False, name
+        assert feed.needs_conforming is bool(feed.arrival), name
         assert feed.claims_source("anything.csv") is False, name
 
 

@@ -234,3 +234,63 @@ models:
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [cob_date, position_id]
+  - name: qa_zip_position
+    description: QA ZIP archive with two pipe-delimited position feeds and headerless control files
+    # SCAFFOLDED MINIMUM: not_null on the business key, uniqueness
+    # over [cob_date, <business key>], and relationships on any
+    # foreign key. Uniqueness proves the in-file dedupe left one row
+    # per key. It cannot see a key a re-delivery dropped surviving --
+    # uniqueness holds either way; tests/test_dedupe_rank.py pins that.
+    # None of it proves the values are right. Add accepted_values /
+    # accepted_range for this feed's domain, or it will publish
+    # whatever it is given.
+    columns:
+      - name: cob_date
+        tests: [not_null]
+      - name: delivery_id
+        tests: [not_null]
+      - name: position_id
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cob_date, position_id]
+  - name: qa_zip_control_dated
+    description: QA ZIP archive whose undated members get COB dates from headerless controls
+    # SCAFFOLDED MINIMUM: not_null on the business key, uniqueness
+    # over [cob_date, <business key>], and relationships on any
+    # foreign key. Uniqueness proves the in-file dedupe left one row
+    # per key. It cannot see a key a re-delivery dropped surviving --
+    # uniqueness holds either way; tests/test_dedupe_rank.py pins that.
+    # None of it proves the values are right. Add accepted_values /
+    # accepted_range for this feed's domain, or it will publish
+    # whatever it is given.
+    columns:
+      - name: cob_date
+        tests: [not_null]
+      - name: delivery_id
+        tests: [not_null]
+      - name: position_id
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cob_date, position_id]
+  - name: qa_zip_container_dated
+    description: QA dated ZIP archive whose CSV members share the container COB date
+    # SCAFFOLDED MINIMUM: not_null on the business key, uniqueness
+    # over [cob_date, <business key>], and relationships on any
+    # foreign key. Uniqueness proves the in-file dedupe left one row
+    # per key. It cannot see a key a re-delivery dropped surviving --
+    # uniqueness holds either way; tests/test_dedupe_rank.py pins that.
+    # None of it proves the values are right. Add accepted_values /
+    # accepted_range for this feed's domain, or it will publish
+    # whatever it is given.
+    columns:
+      - name: cob_date
+        tests: [not_null]
+      - name: delivery_id
+        tests: [not_null]
+      - name: position_id
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cob_date, position_id]

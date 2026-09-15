@@ -51,6 +51,40 @@ The feed declares the control columns in positional order as `FILENAME`,
 `RECORD_COUNT`, and `CHECKSUM`, with `header: false`. The row-count and MD5
 fields gate ingestion; the filename is retained as sender context.
 
+## ZIP archive variant
+
+`feeds.zip` models one upstream container carrying two independent deliveries:
+
+```text
+feeds.zip
+├── feedfile_20260915.csv
+├── feedfile_20260915.ctl
+├── feedfile_20260916.csv
+└── feedfile_20260916.ctl
+```
+
+Each CSV is pipe-delimited and has a header. Each sibling control file is a
+single headerless pipe-delimited record in `filename|rowcount|md5hash` order.
+The member filename supplies the COB date; the control file declares columns
+`FILENAME`, `RECORD_COUNT`, and `CHECKSUM` with `header: false`.
+
+The inbox unpacks the container and lands the members independently as
+`qa_zip_position_20260915.csv` and `qa_zip_position_20260916.csv`. Expect two
+rows for 2026-09-15 (`ZIP001`, `ZIP002`) and one for 2026-09-16 (`ZIP003`).
+
+Two date-source variants are included as well:
+
+- `results.zip` contains undated `results.csv` and `context.csv` members. Each
+  sibling control is a headerless
+  `filename|business_date|rowcount|md5hash` record. The inbox reads
+  `BUSINESS_DATE` and lands the members as independent deliveries for
+  2026-08-30 and 2026-08-31.
+- `results_20260830.zip` is one archive delivery. Its container filename
+  supplies the COB date shared by both matching CSV members. Controls packed
+  inside this shape are retained in the fixture to mirror the sender, but the
+  archive delivery reads only matching CSV members; an integrity control for
+  the whole archive would have to arrive beside the ZIP.
+
 ## SCD2 prepared version
 
 `prepared.qa_happy_position_scd2` reads the same raw deliveries and applies
