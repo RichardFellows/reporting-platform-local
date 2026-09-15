@@ -431,6 +431,75 @@ def test_the_project_default_is_insert_overwrite():
         assert models[layer]["+partition_by"] == ["cob_date"]
 
 
+# ---------------------------------------------- (e) item 23: padded raw key
+def _create_padded_raw(con, table: str, key: str) -> None:
+    """A raw table wide enough for either date-partitioned model's `cleaned`
+    CTE to select from -- unused columns just pass through as NULL."""
+    con.execute(f"""
+        create or replace table {table} (
+            _cob_date date, _file_version int, _row_number bigint,
+            {key} varchar, mtm varchar, notional varchar, mtm_value varchar,
+            market_value varchar, counterparty_id varchar, book varchar,
+            product_type varchar, currency varchar, trade_date varchar,
+            maturity_date varchar, collateral_type varchar, valuation_date varchar,
+            haircut_pct varchar, is_eligible varchar,
+            _source_file varchar, _delivery_id varchar, _schema_version varchar,
+            _source_system varchar, _batch_id varchar,
+            _received_at timestamp, _ingest_ts timestamp
+        )
+    """)
+
+
+def _raw_padded_key(con, table: str, key: str, first_key: str, second_key: str) -> None:
+    """One COB date, one delivery, two rows whose key differs only by
+    whitespace -- padded and plain spellings of 'T1', in each file order.
+    `mtm`/`notional`/`market_value` all carry the row's file position (1 or
+    2), so survivorship can be read off whichever one the caller's model
+    actually cleans."""
+    _create_padded_raw(con, table, key)
+    con.execute(f"""
+        insert into {table}
+            (_cob_date, _file_version, _row_number, {key}, mtm, notional, market_value,
+             _received_at, _ingest_ts)
+        values
+            (DATE '{D1}', 1, 1, '{first_key}',  '1', '1', '1',
+             TIMESTAMP '2026-09-02 06:00', TIMESTAMP '2026-09-02 06:05'),
+            (DATE '{D1}', 1, 2, '{second_key}', '2', '2', '2',
+             TIMESTAMP '2026-09-02 06:00', TIMESTAMP '2026-09-02 06:05')
+    """)
+
+
+def test_c_padded_key_collides_only_after_cleaning():
+    """docs/todo/23: ' T1' and 'T1' in one file are ONE cleaned key. Ranked
+    on the RAW key -- what fo_trade and ref_collateral did -- each spelling
+    is 'last in file' for itself and both survive as separate rows with the
+    same (cob_date, cleaned key), the scaffolded uniqueness test's job.
+    Ranked on the CLEANED key -- as ref_counterparty's `ranked_rows` does --
+    exactly one row remains: the one that arrived LATER in the file,
+    whichever spelling that was."""
+    for path, table, key, value_col in [
+        (PREPARED / "fo_trade.sql", "raw_fo_trade", "trade_id", "notional"),
+        (PREPARED / "ref_collateral.sql", "raw_ref_collateral", "collateral_id", "market_value"),
+    ]:
+        for first_key, second_key in ((" T1", "T1"), ("T1", " T1")):
+            con = duckdb.connect()
+            _raw_padded_key(con, table, key, first_key, second_key)
+            got = _run(con, _render(_model(path)), "deduped",
+                       f"select {key}, cast({value_col} as double) from deduped")
+            assert got == [("T1", 2.0)], (path.name, first_key, second_key, got)
+
+
+def test_c_scaffold_padded_key_collides_only_after_cleaning():
+    """The scaffold template emits the same shape a hand-written model does,
+    so a brand-new feed must not be the one model with the old rank."""
+    for first_key, second_key in ((" T1", "T1"), ("T1", " T1")):
+        con = duckdb.connect()
+        _raw_padded_key(con, "raw_t_new", "trade_id", first_key, second_key)
+        got = _run(con, _render(_scaffolded("t_new", "trade_id")), "deduped",
+                   "select trade_id, mtm from deduped")
+        assert got == [("T1", "2")], (first_key, second_key, got)
+
+
 def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():
     """The SCD2 models rank every raw row now -- the replay scope is applied
     after cleaning (`scd2_replay`) -- so a window would see whole dates too.
