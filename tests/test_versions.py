@@ -22,8 +22,12 @@ No stack, no network. See docs/DECISIONS.md#jar-versions
 """
 from __future__ import annotations
 
+import pathlib
 import re
 
+import yaml
+
+from tests import test_ci_pins as ci_pins
 from tests.support import repo_file
 
 # EVERY DECLARATION SITE, with the pattern that finds the version in it. Each
@@ -57,22 +61,26 @@ SERVER_SITES = {
     "Dockerfile.airflow": r"^ARG NESSIE_SERVER_VERSION=(\S+)",
 }
 
-# The executors' Python minor version, pinned beside the jar triple for the
-# same reason: it reaches four files and a bump that touches three of them is
-# the realistic mistake. `docker-compose.yml` declares the default TWICE --
-# once in the `x-versions` anchor (which flows into both Spark builds' `args:`
-# by alias) and once in `x-airflow-common`'s own `args:` (kept a plain literal
-# rather than merged from the anchor, so Dockerfile.airflow is never handed
-# ICEBERG_VERSION/NESSIE_SPARK_EXT_VERSION build args it does not consume) --
-# `_agree` treats the two matches as one site, same as it already does for
-# NESSIE_SERVER_VERSION appearing twice in this file. See
-# docs/DECISIONS.md#executor-python-matches-the-driver
-PYTHON_MINOR_SITES = {
-    ".env.example": r"^PYTHON_MINOR=(\S+)",
-    "docker-compose.yml": r"PYTHON_MINOR:\s*\$\{PYTHON_MINOR:-([^}]+)\}",
-    "Dockerfile.spark": r"^ARG PYTHON_MINOR=(\S+)",
-    "Dockerfile.airflow": r"^ARG PYTHON_MINOR=(\S+)",
-}
+# The executors' Python minor is NOT a `.env`/`docker-compose.yml` knob like
+# the jar triple, because nothing there could keep the promise a shared
+# variable implies: `Dockerfile.airflow`'s Airflow constraint file URL
+# (`constraints-2.10.5/constraints-3.11.txt`, in itself AND in
+# `.github/workflows/parse.yml`) and `python-version: '3.11'` in both
+# `.github/workflows/config.yml` and `parse.yml` are LITERAL strings a
+# `PYTHON_MINOR=3.12` in `.env` would never reach -- it would build a 3.12
+# driver image against 3.11 constraints, which resolves, installs and fails
+# nowhere near here. So the driver's minor stays four literal sites, checked
+# against each other and against the one place a version genuinely IS an
+# ARG: `Dockerfile.spark`'s `PYTHON_VERSION`, which installs its own copy of
+# CPython (deadsnakes does not publish 3.11 for Focal -- measured at build).
+# See docs/DECISIONS.md#executor-python-matches-the-driver
+DRIVER_MINOR_SITES = (
+    "Dockerfile.airflow's FROM tag",
+    "Dockerfile.airflow's Airflow constraint file URL",
+    "parse.yml's Airflow constraint file URL",
+    "parse.yml's actions/setup-python",
+    "config.yml's actions/setup-python",
+)
 
 # (ICEBERG_VERSION, NESSIE_SPARK_EXT_VERSION) combinations this stack has been
 # run against. BOTH COME FROM `.env.example`'s OWN HEADER -- the shipped pair
@@ -178,36 +186,100 @@ def test_the_quarkus_json_logging_keys_match_the_server_they_need():
             f"first appears. Those keys change nothing and say nothing there.")
 
 
-def test_python_minor_agrees_everywhere_it_is_declared():
-    """FOUR SITES. `Dockerfile.airflow`'s `FROM` line and `Dockerfile.spark`'s
-    installed CPython both have to be the drivers' minor -- diverge them and
-    the failure is `PYTHON_VERSION_MISMATCH` inside a Spark task, naming
-    neither the image nor the compose file, exactly like the jar triple's
+def _agree_values(values: dict[str, str], label: str) -> str:
+    """Like `_agree`, but starting from already-extracted values rather than
+    (relative path, pattern) sites -- two of the driver sites are a workflow
+    field, not a whole-file regex, so they cannot go through `_version`."""
+    unique = set(values.values())
+    assert len(unique) == 1, (
+        f"{label} disagrees across the places that declare it: "
+        + ", ".join(f"{n}={v}" for n, v in sorted(values.items())))
+    return unique.pop()
+
+
+def _workflow_python_version(relative: str, job: str) -> str:
+    """`python-version:` off the `actions/setup-python` step, read as YAML --
+    never the raw file text, which is how a stale copy sitting in a comment
+    could still match. Mirrors `test_ci_pins._steps()`, generalised to
+    whichever workflow file is asked for (that module hardcodes parse.yml)."""
+    workflow = yaml.safe_load(repo_file(relative).read_text(encoding="utf-8"))
+    steps = workflow["jobs"][job]["steps"]
+    setup = [s for s in steps if str(s.get("uses", "")).startswith("actions/setup-python")]
+    assert len(setup) == 1, f"{relative} does not set up exactly one Python"
+    return str(setup[0]["with"]["python-version"])
+
+
+def _airflow_from_tag_minor() -> str:
+    text = repo_file("Dockerfile.airflow").read_text(encoding="utf-8")
+    m = re.search(r"^FROM apache/airflow:2\.10\.5-python(\d+\.\d+)$", text, re.M)
+    assert m, "Dockerfile.airflow has no recognisable FROM apache/airflow:2.10.5-pythonX.Y line"
+    return m.group(1)
+
+
+def _spark_python_minor() -> str:
+    """`Dockerfile.spark`'s `PYTHON_VERSION` ARG, reduced to its minor --
+    `3.11.11` -> `3.11` -- for comparison against the drivers' sites, which
+    only ever name a minor."""
+    text = repo_file("Dockerfile.spark").read_text(encoding="utf-8")
+    m = re.search(r"^ARG PYTHON_VERSION=(\d+\.\d+)\.\d+$", text, re.M)
+    assert m, "Dockerfile.spark: nothing matched ARG PYTHON_VERSION=X.Y.Z -- " \
+              "the pin moved, or this site no longer declares one"
+    return m.group(1)
+
+
+def _driver_minor_values() -> dict[str, str]:
+    airflow_constraints = ci_pins.CONSTRAINTS.search(ci_pins._dockerfile())
+    assert airflow_constraints, "Dockerfile.airflow resolves no Airflow constraint file"
+    parse_constraints = ci_pins.CONSTRAINTS.search("\n".join(ci_pins._commands()))
+    assert parse_constraints, "parse.yml resolves no Airflow constraint file"
+
+    return dict(zip(DRIVER_MINOR_SITES, [
+        _airflow_from_tag_minor(),
+        airflow_constraints.group(2),
+        parse_constraints.group(2),
+        _workflow_python_version(".github/workflows/parse.yml", "parse"),
+        _workflow_python_version(".github/workflows/config.yml", "config"),
+    ]))
+
+
+def test_the_drivers_python_minor_agrees_across_every_site_that_names_it():
+    """FIVE SITES, none of them `.env`. `Dockerfile.airflow`'s own FROM tag
+    and constraint URL have to agree with each other (already asserted by
+    `test_ci_pins.test_airflow_is_the_version_the_base_image_is`, reused here
+    rather than re-implemented) and with the same two facts in
+    `.github/workflows/parse.yml`, plus `config.yml`'s own Python setup --
+    the one site nothing else in this repo checks, because `test_ci_pins.py`
+    is scoped to `parse.yml` only."""
+    assert _agree_values(_driver_minor_values(), "the drivers' Python minor")
+
+
+def test_the_executors_python_minor_matches_the_drivers():
+    """The one comparison that is actually this item: `Dockerfile.spark`'s
+    installed CPython against the drivers' agreed minor above. Diverge them
+    and the failure is `PYTHON_VERSION_MISMATCH` inside a Spark task, naming
+    neither the image nor this file -- exactly like the jar triple's
     `NoSuchMethodError`. See docs/DECISIONS.md#executor-python-matches-the-driver
     """
-    assert _agree(PYTHON_MINOR_SITES, "PYTHON_MINOR")
+    driver_minor = _agree_values(_driver_minor_values(), "the drivers' Python minor")
+    spark_minor = _spark_python_minor()
+    assert spark_minor == driver_minor, (
+        f"Dockerfile.spark installs Python {spark_minor} for the executors, "
+        f"but the drivers all run {driver_minor}.")
 
 
-def test_dockerfile_spark_installs_the_pinned_python_minor():
-    """The ARG default agreeing with everywhere else is not the same claim as
-    the image actually installing that interpreter -- parse the apt-get
-    install line itself, not just the ARG declaration next to it."""
+def test_dockerfile_spark_actually_uses_its_python_version_arg():
+    """The ARG's value agreeing with the drivers is not the same claim as the
+    build actually spending it -- parse the download URL and the symlink
+    commands, not just the ARG declaration beside them."""
     text = repo_file("Dockerfile.spark").read_text(encoding="utf-8")
-    assert re.search(r"apt-get install.*?python\$\{PYTHON_MINOR\}",
-                      text, re.DOTALL), (
-        "Dockerfile.spark declares ARG PYTHON_MINOR but its apt-get install "
-        "line does not reference python${PYTHON_MINOR} -- the pin is "
-        "declared and nothing installs it, or it was left as a stale literal")
-
-
-def test_dockerfile_airflow_from_line_uses_the_pinned_python_minor():
-    """`ARG PYTHON_MINOR` before `FROM` only matters if `FROM` actually spends
-    it -- a literal `-python3.11` left in place would parse identically to
-    `test_python_minor_agrees_everywhere_it_is_declared` above, which reads
-    the ARG's default and cannot see whether FROM still uses the variable."""
-    text = repo_file("Dockerfile.airflow").read_text(encoding="utf-8")
-    assert re.search(r"^FROM apache/airflow:2\.10\.5-python\$\{PYTHON_MINOR\}",
-                      text, re.M), (
-        "Dockerfile.airflow's FROM line does not interpolate ${PYTHON_MINOR} "
-        "-- either it regressed to a literal tag or the ARG-before-FROM "
-        "pin moved")
+    assert re.search(r"cpython-\$\{PYTHON_VERSION\}", text), (
+        "Dockerfile.spark declares ARG PYTHON_VERSION but the download URL "
+        "does not reference ${PYTHON_VERSION} -- the pin is declared and "
+        "nothing installs it")
+    assert re.search(r"PYVER_MINOR=.*PYTHON_VERSION", text), (
+        "Dockerfile.spark does not derive a minor from ${PYTHON_VERSION} -- "
+        "a hardcoded python3.11 in the symlink commands would silently stop "
+        "tracking the ARG on the next bump")
+    assert re.search(r"ln -sf .*PYVER_MINOR.* /usr/local/bin/python3\b", text), (
+        "Dockerfile.spark does not symlink /usr/local/bin/python3 to the "
+        "interpreter it just installed")

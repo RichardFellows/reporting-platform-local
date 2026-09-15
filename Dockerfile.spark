@@ -24,53 +24,7 @@ RUN set -eux; \
     curl -fsSL -o $JARS/nessie-spark-extensions.jar \
       $M2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_${SCALA_VERSION}/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_${SCALA_VERSION}-${NESSIE_SPARK_EXT_VERSION}.jar
 
-# EXECUTORS MUST RUN THE DRIVERS' PYTHON MINOR. A pip-installed pyspark
-# driver (airflow, notebook, feed-ui, inbox, watchdog -- all 3.11) ships its
-# own `sys.version_info` to every executor; the executor's worker.py checks
-# it against ITS OWN interpreter (pyspark/worker.py's `main()`) and refuses a
-# mismatch with PYTHON_VERSION_MISMATCH. This base image's own apt python3 is
-# Ubuntu Focal's system Python -- 3.8 -- so it must not be what `python3`
-# resolves to for this user.
-#
-# NOT via `update-alternatives`: focal's own apt/dpkg tooling is built
-# against /usr/bin/python3 (3.8) and repointing it system-wide breaks apt
-# itself. Instead: deadsnakes installs 3.11 separately, alongside the
-# system one, and a /usr/local/bin/python3 symlink -- which every
-# Debian-derived PATH (this image's base, eclipse-temurin:11-jre-focal, sets
-# none of its own -- confirmed against its own Dockerfile) resolves BEFORE
-# /usr/bin -- wins the `python3` lookup without touching /usr/bin/python3.
-# See docs/DECISIONS.md#executor-python-matches-the-driver
-ARG PYTHON_MINOR=3.11
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      software-properties-common gnupg dirmngr; \
-    add-apt-repository -y ppa:deadsnakes/ppa; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      python${PYTHON_MINOR} python${PYTHON_MINOR}-distutils; \
-    ln -sf /usr/bin/python${PYTHON_MINOR} /usr/local/bin/python3; \
-    ln -sf /usr/bin/python${PYTHON_MINOR} /usr/local/bin/python${PYTHON_MINOR}; \
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py; \
-    python${PYTHON_MINOR} /tmp/get-pip.py --no-cache-dir; \
-    rm -f /tmp/get-pip.py; \
-    rm -rf /var/lib/apt/lists/*
-ENV PYTHON_MINOR=${PYTHON_MINOR}
-
-# pyyaml: `common/context.py` (mounted onto this image, PYTHONPATH below)
-# imports it at module level, and that module is what a Python UDF or
-# `createDataFrame` closure referencing this platform's code would pull in.
-# boto3: several `reporting_platform` modules use it directly (ingest,
-# retention, registry). Both installed against the interpreter `python3` now
-# resolves to, not the apt one that install used to target.
-#
-# pynessie DROPPED, with evidence rather than silently carried onto the wrong
-# interpreter: `grep -rn pynessie reporting_platform/ scripts/ tests/ dbt/`
-# finds zero imports anywhere in this repo -- the only mention was this line
-# -- and its own `||` fallback already treated a failed pynessie install as
-# expected, which is what an unused, unmaintained-for-3.11 CLI client looks
-# like from here.
-RUN python3 -m pip install --no-cache-dir pyyaml boto3
+RUN pip install --no-cache-dir pyyaml boto3 pynessie==0.65.0 || pip install --no-cache-dir pyyaml boto3
 
 ENV PYTHONPATH=/opt/platform
 USER spark

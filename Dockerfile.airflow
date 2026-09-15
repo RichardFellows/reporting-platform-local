@@ -1,15 +1,5 @@
 # Airflow 2.x, deliberately, not 3.x. See docs/DECISIONS.md#airflow-2-not-3
-#
-# PYTHON_MINOR is an ARG BEFORE FROM on purpose: it is the only way a
-# Dockerfile can parameterise its own base-image tag, and this repo needs the
-# driver's Python minor to be the SAME PIN Dockerfile.spark installs for the
-# executors, from the SAME .env value, or the two drift silently and the
-# failure surfaces as PYTHON_VERSION_MISMATCH inside a Spark task. Scope
-# stops at FROM -- Docker resets ARGs after it unless redeclared -- but
-# nothing later in this file needs it. See
-# docs/DECISIONS.md#executor-python-matches-the-driver
-ARG PYTHON_MINOR=3.11
-FROM apache/airflow:2.10.5-python${PYTHON_MINOR}
+FROM apache/airflow:2.10.5-python3.11
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
