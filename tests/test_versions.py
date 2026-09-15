@@ -22,7 +22,6 @@ No stack, no network. See docs/DECISIONS.md#jar-versions
 """
 from __future__ import annotations
 
-import pathlib
 import re
 
 import yaml
@@ -69,7 +68,7 @@ SERVER_SITES = {
 # `.github/workflows/config.yml` and `parse.yml` are LITERAL strings a
 # `PYTHON_MINOR=3.12` in `.env` would never reach -- it would build a 3.12
 # driver image against 3.11 constraints, which resolves, installs and fails
-# nowhere near here. So the driver's minor stays four literal sites, checked
+# nowhere near here. So the driver's minor stays five literal sites, checked
 # against each other and against the one place a version genuinely IS an
 # ARG: `Dockerfile.spark`'s `PYTHON_VERSION`, which installs its own copy of
 # CPython (deadsnakes does not publish 3.11 for Focal -- measured at build).
