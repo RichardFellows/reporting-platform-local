@@ -3,10 +3,14 @@
 One file per item. Each states what is wrong, **with the command that shows
 it**, what done looks like, and a prompt to paste into a new session.
 
-Everything here was found by working on the platform rather than by reading it,
-and each was re-verified on 2026-09-13 against `main` at `0354304`. If an item
-looks stale, run its verification command first — the platform moves, and an
-item that no longer reproduces should be deleted rather than worked.
+Everything here was found by working on the platform rather than by reading it.
+Each item file carries the date its "What is wrong" was last verified:
+12–19 on 2026-09-14 against `main` at `fdb0784`, 20–24 against `cea4500`, and
+15, 16 and 18 — the three that were written conditional on 09 merging — re-checked on
+2026-09-15 against `76bec9c`, after 09 merged. 21, and 22's `--full-refresh`
+claim, are reasoned from the code and say so. If an item looks stale, run its verification command first — the
+platform moves, and an item that no longer reproduces should be deleted rather
+than worked.
 
 | | Item | Value | Effort |
 |---|---|---|---|
@@ -14,7 +18,7 @@ item that no longer reproduces should be deleted rather than worked.
 | [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
-| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high once 09 lands | 2–4 hours |
+| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high | 2–4 hours |
 | [16](16-exposure-change-removed-never-fires.md) | `exposure_change`'s `'REMOVED'` category can never be assigned | medium | ½ day |
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
 | [18](18-adding-a-feed-sample-model-is-missing-macros.md) | The sample prepared model in `ADDING-A-FEED.md` misses `known_as_of()` and `source_provenance()` | low–medium | 30 min |
@@ -140,7 +144,9 @@ tests in `tests/test_scd2_incremental.py` that failed on `2ae6052`:
   matches) or doubled (a revert left two back-to-back versions). Fixed in
   `scd2_replay`: the target's version before the replay start heads the
   replayed rows, so lead() reopens or extends it, and it is never read from
-  raw, whose copy of its date retention may have pruned. The tests' history
+  raw, whose copy of its date retention may have pruned. (The replay's START
+  version is still re-derived from raw, which retention prunes — item
+  [22](22-scd2-replay-reads-pruned-raw.md).) The tests' history
   carries a version before that one too, whose raw date is still there, so
   a retraction scope that reached past the seed would be caught deleting it.
 - **The replay scope compared RAW keys to the target's CLEANED keys**, in
@@ -154,7 +160,7 @@ tests in `tests/test_scd2_incremental.py` that failed on `2ae6052`:
 The probe prints EQUAL for every case, padded and control. The review's
 third, low finding is recorded as a risk in the DECISIONS entry, not fixed: a
 delivery with no rows cannot supersede anything, because "newest" is read
-off raw rows.
+off raw rows — item [21](21-an-empty-redelivery-cannot-supersede.md).
 
 *A second review of those fixes confirmed the seed and cleaned-key logic*
 through the harness against six further cases (two retractions in one run,
@@ -177,7 +183,7 @@ first:
   **Found, not fixed:** `fo_trade` and `ref_collateral` rank raw `trade_id`
   and `collateral_id` the same way, so ` T1` and `T1` in one file would both
   survive; their uniqueness tests would fail that build rather than publish
-  it. Left for a separate item — their path is live-verified as it stands.
+  it. Left for item [23](23-date-partitioned-models-rank-the-raw-key.md) — their path is live-verified as it stands.
 - **A reopened seed row kept an earlier run's audit columns** (low): it now
   takes this run's `dbt_invocation_id`, `nessie_ref` and `dbt_updated_at`
   through `audit_columns()`, and keeps the target's `source_batch_id`.
@@ -219,12 +225,14 @@ dbt_utils' test defaults to `zero_length_range_allowed: false`, which
 requires `effective_from < effective_to` strictly, and this project's
 `effective_to` is inclusive, so any value in force for exactly one COB date
 (`Q`, 09-03 → 09-03) is refused. The full refresh over the same raw is
-identical, so it fails there too. Filed as its own item.
+identical, so it fails there too. Filed as item
+[20](20-mutually-exclusive-ranges-refuses-one-day-versions.md), which also found
+the test passes a same-day overlap.
 
 One thing the run found that the host tests could not: the procedure's first
 seeding helper built rows with `createDataFrame`, which needs Python workers
 on the cluster, and those run 3.8 against the driver's 3.11
-(`PYTHON_VERSION_MISMATCH`). SQL `INSERT ... SELECT` literals, which stay in
+(`PYTHON_VERSION_MISMATCH`; item [24](24-spark-workers-run-python-3-8.md)). SQL `INSERT ... SELECT` literals, which stay in
 the JVM, worked. The platform's own ingest does not hit this; a notebook or
 script that does will.
 
@@ -315,7 +323,10 @@ The orchestrator re-verified the extensionless case end to end as well: a
 probe feed from `POSA`/`POSA.ctl` members saved, and `plan_arrival` planned
 both members dated from their indented control files.
 
-*Found, not fixed.* **`inbox --dry-run` without `--loop` prints `inbox empty`
+*Found, not fixed* — now item [12](12-inbox-one-shot-dry-run-says-empty.md);
+the same work also found items
+[13](13-undated-file-sniff-prefills-an-unsaveable-form.md) and
+[19](19-sniffer-can-propose-a-marker-file.md). **`inbox --dry-run` without `--loop` prints `inbox empty`
 with a file in the inbox.** `STABLE_POLLS = 2` needs three observations and
 once-off mode sweeps twice. To reproduce, stop the watcher, drop any file in
 `./inbox`, then run `docker compose run --rm --no-deps -T inbox python -m

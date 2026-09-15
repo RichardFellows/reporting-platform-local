@@ -2,7 +2,7 @@
 
 **Value** medium · **Effort** half a day · **Branch** `fix/exposure-change-removed`
 
-## What is wrong (verified 2026-09-14)
+## What is wrong (verified 2026-09-15, after 09 merged)
 
 ```bash
 grep -n "'REMOVED'\|from current_exposure cur\|join" dbt/models/reporting/exposure_change.sql
@@ -25,7 +25,7 @@ most interesting row in a change report — is silently omitted, while the
 presented categories imply it would be flagged. Nothing fails: the model and
 its tests are green.
 
-Item 09 makes "absent from the newest delivery" a real, deliberate outcome for
+Item 09 made "absent from the newest delivery" a real, deliberate outcome for
 the snapshot feeds, so a key vanishing between dates is now something the
 platform means rather than an artefact.
 
@@ -38,7 +38,7 @@ platform means rather than an artefact.
       (a full outer join, or a union of the missing keys), with a dbt test that
       builds a date pair where one disappears.
 - [ ] Verify on a throwaway Nessie branch; the model is `insert_overwrite`
-      per `cob_date` once 09 lands, so a `REMOVED` row must belong to the
+      per `cob_date` since 09 merged, so a `REMOVED` row must belong to the
       CURRENT date's partition.
 
 ## Prompt for a new session
