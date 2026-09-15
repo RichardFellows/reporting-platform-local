@@ -371,6 +371,14 @@ def next_file_version(spark, fd, cob_date: date,
     return int(row["v"]) + 1
 
 
+def _content_key(table: str) -> str:
+    """Nessie's content-key spelling of a fully-qualified table name:
+    `lakehouse.raw.fo_trade` -> `raw.fo_trade`. The catalog is not part of
+    the key Nessie reports a conflict on, so it has to come off before a
+    conflict message is checked for it."""
+    return table.split(".", 1)[1] if "." in table else table
+
+
 def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
                          version: int) -> dict:
     """Merge `branch` into main; turn a per-key merge conflict into a message
@@ -389,11 +397,21 @@ def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
     first merge applied, the second 409'd with exactly this shape. See
     docs/DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique.
 
-    NOT RETRIED here. `version` was computed by reading `fd.raw_table` on
-    `branch` BEFORE this call, and a 409 means that read is now stale -- the
-    fix is a fresh ingest (fresh branch, fresh `next_file_version` read), not
-    a second attempt at merging this one. `branch` is left behind for
-    inspection, same as every other failure in `ingest()`.
+    REFERENCE_CONFLICT is not exclusively "another write raced this one" --
+    Nessie also returns it for a moved/recreated reference or "No common
+    ancestor", neither of which is a version race. So the conflicting-write
+    story is told only when Nessie's OWN message names this table's content
+    key (`raw.fo_trade` for `lakehouse.raw.fo_trade`, via `_content_key`);
+    otherwise the message is quoted VERBATIM and no claim is made about the
+    cause.
+
+    NOT RETRIED here, and NOT what an Airflow retry or task clear should do
+    either: `branch` is a deterministic function of (feed, cob_date, run_id),
+    an Airflow retry/clear reuses the same run_id, so it recomputes the same
+    branch name -- and `ingest()`'s `nessie.create_branch(branch)` has no
+    `exist_ok`, so it 409s on the leftover branch instead of re-attempting
+    anything. The fix is a NEW ingest run (a new DAG run, or the CLI /
+    `scripts.bulk_ingest` again), and only after `branch` is deleted.
     """
     import requests
 
@@ -409,13 +427,24 @@ def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
                 body = {}
         if (resp is not None and getattr(resp, "status_code", None) == 409
                 and body.get("errorCode") == "REFERENCE_CONFLICT"):
+            nessie_message = body.get("message", "")
+            if _content_key(fd.raw_table) in nessie_message:
+                cause = (f" That means another write to {fd.raw_table} "
+                         f"merged into main since {branch} was cut.")
+            else:
+                cause = (" The conflict does not name this table's key, so "
+                         "no claim is made about the cause -- treat this as "
+                         "a genuine merge failure, not a version race.")
             raise RuntimeError(
                 f"{fd.name} {bdate}: merge of {branch} into main refused "
-                f"(409 REFERENCE_CONFLICT) — this attempt computed "
-                f"_file_version={version} for {fd.raw_table}, but another "
-                f"write to that table merged into main since {branch} was "
-                f"cut. Not retrying: branch {branch} left for inspection; "
-                f"re-run the ingest to recompute the version."
+                f"(409 REFERENCE_CONFLICT) while landing "
+                f"_file_version={version} into {fd.raw_table}. Nessie said: "
+                f"{nessie_message!r}.{cause} Do not retry or clear this "
+                f"task: it reuses branch {branch}, and create_branch will "
+                f"409 on the leftover branch instead of doing anything. "
+                f"Start a NEW ingest run instead (trigger a new DAG run, or "
+                f"run the CLI / scripts.bulk_ingest again) after deleting "
+                f"{branch}."
             ) from e
         raise
 
