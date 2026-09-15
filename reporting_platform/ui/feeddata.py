@@ -173,6 +173,7 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
     leaving the caller to work out which half.
     """
     import boto3
+    from reporting_platform.ingest.normalize import is_control_file
 
     checked = []
     for filename, content in payloads:
@@ -183,29 +184,34 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
             raise DataError(f"{filename} is larger than "
                             f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
         parsed = feed.parse_filename(filename)
-        if parsed is None:
+        control = parsed is None and is_control_file(feed, filename)
+        if parsed is None and not control:
             raise DataError(
                 f"{filename} does not match {feed.name}'s filename pattern "
                 f"({feed.filename_pattern}), so it would land and never be "
                 f"ingested. Rename it, or fix the pattern.")
-        checked.append((filename, content, parsed[0]))
+        checked.append((filename, content, parsed[0] if parsed else None, control))
 
     # Oldest COB date first, for the same reason land() does it: the
     # prepared layer's relationships tests compare against whatever reference
     # data has arrived.
-    checked.sort(key=lambda t: (t[2], t[0]))
+    # Land controls first, including controls uploaded separately after data.
+    # They have no independent COB date and are never parsed as data headers.
+    checked.sort(key=lambda t: (not t[3], str(t[2] or ""), t[0]))
 
     s3 = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT"))
     bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
     bucket = bucket.split("//", 1)[-1].split("/", 1)[0]
     out = []
-    for filename, content, cob_date in checked:
+    for filename, content, cob_date, control in checked:
         key = f"{feed.landing_prefix}/{feed.name}/{filename}"
         s3.put_object(Bucket=bucket, Key=key, Body=content)
         out.append({"filename": filename, "key": key,
-                    "cob_date": cob_date.isoformat(),
+                    "cob_date": cob_date.isoformat() if cob_date else None,
+                    "control_file": control,
                     "bytes": len(content),
-                    **compare_header(feed, header_of(content, feed))})
+                    **({"missing_columns": [], "extra_columns": []} if control
+                       else compare_header(feed, header_of(content, feed)))})
     return out
 
 
