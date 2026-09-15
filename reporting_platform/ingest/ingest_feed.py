@@ -405,13 +405,24 @@ def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
     otherwise the message is quoted VERBATIM and no claim is made about the
     cause.
 
-    NOT RETRIED here, and NOT what an Airflow retry or task clear should do
-    either: `branch` is a deterministic function of (feed, cob_date, run_id),
-    an Airflow retry/clear reuses the same run_id, so it recomputes the same
-    branch name -- and `ingest()`'s `nessie.create_branch(branch)` has no
-    `exist_ok`, so it 409s on the leftover branch instead of re-attempting
-    anything. The fix is a NEW ingest run (a new DAG run, or the CLI /
-    `scripts.bulk_ingest` again), and only after `branch` is deleted.
+    NOT RETRIED here -- but `_merge_ingest_branch` raising is not the end of
+    the story on the DAG path. `feed_ingest.py`'s `DEFAULT_ARGS` sets
+    `retries: 2`, so Airflow retries the SAME task AUTOMATICALLY once this
+    exception surfaces; nobody has to choose to retry it. `branch` is a
+    deterministic function of (feed, cob_date, run_id), and a same-DagRun
+    retry (or a manual task clear) reuses that run_id, so it recomputes the
+    identical branch name -- and `ingest()`'s `nessie.create_branch(branch)`
+    has no `exist_ok`, so BOTH retries 409 there instead, with a bare
+    "already exists" that names neither `_file_version` nor this conflict.
+    So the cause is visible only in the FIRST attempt's log (this one), and
+    Airflow's own retry mechanism cannot recover from it -- a known gap,
+    filed as its own follow-up rather than fixed here, because a retry after
+    a merge that SUCCEEDED but whose `delete_reference` failed must not
+    re-ingest, which needs its own design. The message says this directly:
+    recovery is a NEW ingest run (a new DAG run, or a fresh CLI /
+    `scripts.bulk_ingest` invocation -- each gets its own run id and so its
+    own branch), not a retry or a clear of this one. `branch` may be deleted
+    once inspected, but that is not required for a new run to succeed.
     """
     import requests
 
@@ -439,12 +450,15 @@ def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
                 f"{fd.name} {bdate}: merge of {branch} into main refused "
                 f"(409 REFERENCE_CONFLICT) while landing "
                 f"_file_version={version} into {fd.raw_table}. Nessie said: "
-                f"{nessie_message!r}.{cause} Do not retry or clear this "
-                f"task: it reuses branch {branch}, and create_branch will "
-                f"409 on the leftover branch instead of doing anything. "
-                f"Start a NEW ingest run instead (trigger a new DAG run, or "
-                f"run the CLI / scripts.bulk_ingest again) after deleting "
-                f"{branch}."
+                f"{nessie_message!r}.{cause} Airflow will retry this task "
+                f"automatically, and both retries will fail at "
+                f"nessie.create_branch({branch!r}) with a bare 'already "
+                f"exists' -- the cause is in THIS attempt's log, not "
+                f"theirs. Recovery is a NEW ingest run (a new DAG run, or a "
+                f"fresh CLI / scripts.bulk_ingest invocation gets a new run "
+                f"id and so a new branch), not a retry or clear of this "
+                f"task. Branch {branch} may be deleted once inspected, but "
+                f"that is not required to start a new run."
             ) from e
         raise
 
