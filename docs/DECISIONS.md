@@ -2903,10 +2903,19 @@ before any ingest has committed — two ingests racing THAT window is a real,
 unguarded gap, reported here and not fixed, since it can only happen once,
 against a brand new catalog.
 
-**The cost:** refused, not retried — the losing version is stale the instant
-the 409 arrives, and a retry or clear of the SAME Airflow task reuses the
-branch name and 409s on `create_branch` instead, so a genuinely NEW ingest
-run is required. Nor is the conflict specific to one COB date: Nessie's key
+**The cost:** not retried BY THE INGEST ITSELF — the losing version is stale
+the instant the 409 arrives — but Airflow's own automatic retries
+(`feed_ingest.py`'s `DEFAULT_ARGS` sets `retries: 2`) do not recover it
+either: both re-fail at `create_branch` on the same, now-leftover branch
+name, with a bare "already exists" that names neither `_file_version` nor
+this conflict, so the cause is visible only in the FIRST attempt's log.
+**That is a known, unfixed gap** — filed as its own follow-up rather than
+solved here, since a retry after a merge that SUCCEEDED but whose
+`delete_reference` failed must not re-ingest, which needs its own design.
+Recovery is a genuinely NEW ingest run (new DAG run, or a fresh CLI /
+`scripts.bulk_ingest` invocation, each with its own run id and branch); the
+leftover branch may be deleted once inspected but that is not required for
+the new run. Nor is the conflict specific to one COB date: Nessie's key
 granularity is the TABLE, so any two concurrent writers to one raw table
 conflict, whatever dates they touch.
 

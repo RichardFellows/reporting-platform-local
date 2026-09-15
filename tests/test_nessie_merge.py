@@ -87,3 +87,25 @@ def test_merge_body_has_no_field_outside_the_allowlist():
     body = bodies[0]
     extra = set(body) - _ALLOWED_MERGE_BODY_KEYS
     assert not extra, (extra, body)
+
+
+def test_merge_with_message_and_properties_still_only_uses_allowed_keys():
+    """The allowlist's one CONDITIONAL member -- `commitMeta` -- only appears
+    when a message or properties are given (REQ-405). The first test above
+    never exercises that path, so a caller could add a forbidden field
+    alongside `commitMeta` and this suite would not notice. Confirms both
+    that the body is still within the allowlist AND that `commitMeta` is
+    shaped the way `Nessie.merge` promises (message/properties carried, not
+    silently dropped)."""
+    n, rec = _merging_nessie()
+    n.merge("ingest/fo_trade/20260819/run2", into="main",
+           message="REQ-405 test merge", properties={"change_ref": "RPT-1"})
+
+    bodies = rec.merge_bodies()
+    assert len(bodies) == 1, bodies
+    body = bodies[0]
+    extra = set(body) - _ALLOWED_MERGE_BODY_KEYS
+    assert not extra, (extra, body)
+    assert "commitMeta" in body, body
+    assert body["commitMeta"]["message"] == "REQ-405 test merge", body
+    assert body["commitMeta"]["properties"] == {"change_ref": "RPT-1"}, body
