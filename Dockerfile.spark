@@ -24,7 +24,44 @@ RUN set -eux; \
     curl -fsSL -o $JARS/nessie-spark-extensions.jar \
       $M2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_${SCALA_VERSION}/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_${SCALA_VERSION}-${NESSIE_SPARK_EXT_VERSION}.jar
 
-RUN pip install --no-cache-dir pyyaml boto3 pynessie==0.65.0 || pip install --no-cache-dir pyyaml boto3
+# Executors must run the DRIVERS' Python minor (3.11) or Python work on an
+# executor fails with PYTHON_VERSION_MISMATCH -- see
+# docs/DECISIONS.md#executor-python-matches-the-driver for the mechanism.
+# Not update-alternatives: this base is Focal, and its own apt/dpkg needs
+# /usr/bin/python3 to stay 3.8. Not deadsnakes either -- measured at build,
+# it does not publish 3.11 for Focal ("Unable to locate package python3.11").
+# So: python-build-standalone's portable CPython, pinned by release AND
+# checksummed, extracted to /opt/python and symlinked ahead of /usr/bin on
+# PATH. tests/test_versions.py checks PYTHON_VERSION against every driver
+# site; changing it means changing the checksums below with it.
+ARG TARGETARCH
+ARG PBS_RELEASE=20250115
+ARG PYTHON_VERSION=3.11.11
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64)  PBS_ARCH=x86_64; \
+        PBS_SHA256=c8aacfa97d7524a78d81c2a5ed57b525b49e2e72fff117e0f6b00b488c1b97f5 ;; \
+      arm64)  PBS_ARCH=aarch64; \
+        PBS_SHA256=6a350d6fe284fd608f351cbf1659abad4c339720cfa3bf381b7d74b38fade7e9 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    PYVER_MINOR="${PYTHON_VERSION%.*}"; \
+    URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PYTHON_VERSION}%2B${PBS_RELEASE}-${PBS_ARCH}-unknown-linux-gnu-install_only.tar.gz"; \
+    curl -fsSL -o /tmp/cpython.tar.gz "$URL"; \
+    echo "${PBS_SHA256}  /tmp/cpython.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/python; \
+    tar -xzf /tmp/cpython.tar.gz -C /opt/python --strip-components=1; \
+    rm -f /tmp/cpython.tar.gz; \
+    ln -sf "/opt/python/bin/python${PYVER_MINOR}" /usr/local/bin/python3; \
+    ln -sf "/opt/python/bin/python${PYVER_MINOR}" "/usr/local/bin/python${PYVER_MINOR}"
+
+# pyyaml: common/context.py (mounted here, PYTHONPATH below) imports it.
+# boto3: several reporting_platform modules import it directly. Both now
+# against the interpreter python3 resolves to (3.11), via the install_only
+# build's own pip -- no get-pip needed. pynessie DROPPED: grep finds it
+# imported nowhere in this repo, and the old line's own `|| pip install
+# pyyaml boto3` already treated a failed pynessie install as accepted.
+RUN python3 -m pip install --no-cache-dir pyyaml boto3
 
 ENV PYTHONPATH=/opt/platform
 USER spark
