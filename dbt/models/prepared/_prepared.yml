@@ -55,16 +55,45 @@ models:
       # exposure row for that counterparty. Nothing inside the model can see
       # that state. This is what sees it.
       #
-      # gaps: allowed, deliberately. effective_to is an INCLUSIVE upper bound
-      # (next effective_from minus one day), so contiguous versions look like a
-      # one-day gap to this test's arithmetic and `not_allowed` would fail on
-      # correct data. `allowed` still fails on any OVERLAP, which is the
-      # condition that actually matters.
+      # effective_to is an INCLUSIVE upper bound (next effective_from minus
+      # one day, scd2_effective_to). dbt_utils' own arithmetic --
+      # `lower_bound < upper_bound` and `upper_bound {op} next_lower_bound` --
+      # is written for an EXCLUSIVE one, so it is bound here on
+      # `date_add(effective_to, 1)`, not `effective_to` itself, with
+      # `gaps: not_allowed`. That accepts a one-day version ([09-03, 09-03] ->
+      # [09-03, 09-04) doesn't overlap [09-04, ...)) and CATCHES what the
+      # previous `gaps: allowed, effective_to` config missed: a same-day
+      # overlap like [09-01,09-05] then [09-05,09-10], where inclusive `05 <=
+      # 05` passed but `date_add(09-05,1) = 09-06 > 09-05` now fails. It also
+      # catches a zero/negative-length range (effective_to < effective_from,
+      # since zero_length_range_allowed defaults to false) and a genuine GAP
+      # between versions of one key -- confirmed nothing legitimate produces
+      # one: `scd2_effective_to` makes each key's versions contiguous by
+      # construction, the incremental replay's retraction path REOPENS the
+      # preceding version rather than leaving it closed
+      # (docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date),
+      # and `apply_scd2_retention` only deletes a PREFIX of a key's closed
+      # versions (whole range before the oldest retained COB date), never a
+      # middle one, so what remains stays contiguous.
+      #
+      # The open version's effective_to is DATE '9999-12-31'; `date_add` of
+      # that stays a valid Spark DATE (verified: not NULL, not an error,
+      # compares correctly) -- it is only COLLECTING such a date into a
+      # Python datetime that overflows, and this SQL expression is never
+      # collected, only counted.
+      #
+      # What this does NOT catch: a MISSING open version, or more than one --
+      # that is `scd2_exactly_one_current_version`'s job (a singular test
+      # under dbt/tests/, not wired here); a NULL business key, which groups
+      # every NULL-key row of the partition into one entity under window
+      # semantics, so two genuinely distinct NULL-keyed entities would not be
+      # told apart; and anything about the VALUES in a version, only the
+      # shape of the ranges.
       - dbt_utils.mutually_exclusive_ranges:
           lower_bound_column: effective_from
-          upper_bound_column: effective_to
+          upper_bound_column: date_add(effective_to, 1)
           partition_by: counterparty_id
-          gaps: allowed
+          gaps: not_allowed
 
   - name: fo_trade
     description: Conformed, typed trade positions. No joins, no report opinions.
@@ -128,14 +157,19 @@ models:
       # SCD2: the grain is one row per (counterparty, agency) VERSION.
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [counterparty_id, agency, effective_from]
-      # See the counterparty block: this is the test that catches a failed
-      # close, which as_of() would otherwise turn into silently doubled rows.
-      # gaps: allowed because effective_to is an INCLUSIVE upper bound.
+      # See the ref_counterparty block for the full reasoning: bound on the
+      # EXCLUSIVE `date_add(effective_to, 1)` with `gaps: not_allowed`, so a
+      # one-day version passes and a same-day overlap, a zero/negative-length
+      # range, or a gap between two of one (counterparty, agency)'s versions
+      # all fail. Does not catch a missing/duplicate open version
+      # (scd2_exactly_one_current_version's job) or a NULL-producing
+      # partition_by (either key NULL makes the whole concatenation NULL,
+      # grouping every such row into one entity).
       - dbt_utils.mutually_exclusive_ranges:
           lower_bound_column: effective_from
-          upper_bound_column: effective_to
+          upper_bound_column: date_add(effective_to, 1)
           partition_by: counterparty_id || '|' || agency
-          gaps: allowed
+          gaps: not_allowed
   - name: ref_collateral
     description: Collateral positions held against counterparty exposure, from the collateral management
       system.
