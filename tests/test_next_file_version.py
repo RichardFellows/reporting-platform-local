@@ -2,8 +2,8 @@
 
 The one call site (`ingest`, in `ingest_feed.py`) runs this straight after
 `ensure_raw_table` and `ensure_raw_schema` have created and reconciled the
-table on THIS branch (see docs/todo/15-next-file-version-reads-unreadable-as-
-version-1.md). So by the time this runs, a failure reading it --
+table on THIS branch (see `next_file_version`'s own docstring). So by the
+time this runs, a failure reading it --
 `TABLE_OR_VIEW_NOT_FOUND` included -- means a wrong ref or a wrong name, not
 a first delivery. It used to catch every exception and return `1`, which is
 exactly CLAUDE.md's "a subject it could not READ is not a subject that is
