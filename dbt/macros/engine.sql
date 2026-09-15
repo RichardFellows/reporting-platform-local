@@ -512,11 +512,16 @@
         version's own COB date in raw, which retention may have pruned.
       * `scd2_pruned_seed` -- every version FROM the replay start onward whose
         own COB date raw no longer holds AT ALL: the same "does raw have a
-        delivery for this date" question `scd2_retractions`' guard asks
-        (`newest_file_version`), asked here at seed time instead of at
-        retraction time. Such a version is taken from the TARGET, exactly like
-        `scd2_seed_from`'s row -- never re-derived, never a retraction
-        candidate -- because raw has nothing to say about it either way. A
+        delivery for this date" question `scd2_retractions` used to guard
+        its marker with (`newest_file_version`), asked here at seed time
+        instead. Such a version is taken from the TARGET, exactly like
+        `scd2_seed_from`'s row -- never re-derived, because raw has nothing
+        to say about it -- and, ordinarily, carried forward unchanged. It CAN
+        still be marked for retraction, though not for lacking raw evidence:
+        if an adjacent, RETAINED delivery restates the identical value,
+        `scd2_changes` collapses the seeded row away as redundant, and
+        `scd2_retractions` deletes the now-superseded target row rather than
+        stranding it beside the version that subsumed it (see that macro). A
         version whose date raw DOES hold is excluded here and left to the
         ordinary raw branch above, so a re-delivery of that date can still
         retract or revert it as before; the two branches partition the scope
@@ -528,7 +533,9 @@
     window is for the `cob_date`-partitioned models, and needs a full
     refresh. A date inside the replay that retention has since pruned is not
     a re-delivery at all -- there is nothing to deliver -- so it is carried
-    forward from the target unchanged by `scd2_pruned_seed` instead.
+    forward from the target by `scd2_pruned_seed` instead, unless a later,
+    retained re-delivery has since made that carried-forward version
+    redundant (`scd2_retractions`).
 
     The mutually_exclusive_ranges and scd2_exactly_one_current_version tests
     catch a replay that gets this wrong, and are not optional on any table
@@ -700,23 +707,31 @@
     (on_schema_change adds it after the temporary view exists), so reading
     one from `this` would fail the first run after it was added.
 
-    TWO BOUNDS:
+    ONE BOUND, not two, since item 22: THE REPLAY'S SCOPE -- touched keys,
+    from `replay_from` onward, the identical join `scd2_pruned_seed` uses.
+    Both sides are cleaned keys (`scd2_replay`).
 
-      * THE REPLAY'S SCOPE: touched keys, from `replay_from` onward -- exactly
-        the versions this run re-derives from raw, so "not re-derived" means
-        something. The seed version before it is re-emitted, never marked.
-        Both sides are cleaned keys (`scd2_replay`).
-      * ONLY WHERE RAW STILL HOLDS A DELIVERY FOR THE VERSION'S COB DATE
-        (`newest_file_version`, which the model defines). A retraction means
-        "the newest delivery for that date no longer says this"; a date raw
-        no longer holds at all -- retention prunes raw to month-ends -- says
-        nothing, and is not evidence the version was wrong. Without this, a
-        pruned date would silently delete the version and re-date the key to
-        the next delivery raw still holds. With it, a version whose date raw
-        no longer holds is left alone here -- `scd2_replay`'s
-        `scd2_pruned_seed` seeds it from the target instead of re-deriving or
-        retracting it, using the identical existence check, so it is neither
-        deleted nor duplicated.
+    A version in that scope, "not re-derived" USED TO MEAN "not re-derived
+    from raw", and a version whose COB date raw no longer holds at all could
+    never be re-derived -- so this carried a second bound, only where raw
+    still held a delivery for the version's date, or every pruned version
+    would have been deleted and the key silently re-dated to the next
+    retained delivery.
+
+    THAT SECOND BOUND IS GONE, because `scd2_replay`'s `scd2_pruned_seed` now
+    means every version in scope is ALWAYS represented going into
+    `scd2_changes` -- from raw where raw still holds the date, from the
+    target where it does not. So "not re-derived" now means "not re-derived
+    AND not carried forward either", which can only happen one way: the
+    version was carried forward BY `scd2_pruned_seed`, but its row was then
+    collapsed by `scd2_changes` because an adjacent, retained delivery
+    restates the identical value -- upstream's own correction subsuming a
+    version retention had already pruned the evidence for. That must retract
+    it, or it strands as a second current row beside the version that
+    subsumed it. Absence of evidence is still not a retraction: nothing here
+    is ever deleted merely because raw does not hold its date, only when a
+    delivery raw DOES hold makes it redundant.
+    See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
   -#}
   {%- if is_incremental() %}
   union all
@@ -735,10 +750,6 @@
   from {{ this }} as _old
   join replay_from as _p on {{ scd2_key_match('_p', '_old', key_columns) }}
   where _old.effective_from >= coalesce(_p.from_date, date '1900-01-01')
-    and exists (
-        select 1 from newest_file_version as _nv
-        where _nv._newest_cob_date = _old.effective_from
-    )
     and not exists (
         select 1 from {{ final_cte }} as _new
         where {{ scd2_key_match('_new', '_old', key_columns) }}
