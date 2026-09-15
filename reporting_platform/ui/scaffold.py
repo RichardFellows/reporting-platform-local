@@ -238,6 +238,13 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
                      + [_line("_source_file", "source_file"),
                         _line("_file_version", "source_file_version")])
 
+    # The explicit final column list `deduped` projects, in the same order
+    # `body` cleans them -- so ranking on the cleaned key (below) cannot leak
+    # `_rn`, `_file_version`, `_row_number` or `_cob_date` into the output.
+    final_columns = (["cob_date"] + [col for col, _ in rendered]
+                     + ["source_file", "source_file_version"])
+    final_body = "\n".join(f"        {c}," for c in final_columns)
+
     # `insert_overwrite` and no `unique_key`: an incremental run rewrites each
     # COB date it selects, whole, so a key a snapshot re-delivery dropped is
     # gone rather than merged around. The template's select admits raw by date
@@ -266,31 +273,64 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
 
 with raw_rows as (
 
-    select
-        *,
-        {{{{ dedupe_rank([{key_list}]) }}}} as _rn
+    select *
     from {{{{ source('raw', '{spec.name}') }}}}
     where {{{{ incremental_window('_cob_date', 'cob_date') }}}}
       and {{{{ known_as_of() }}}}
 
 ),
 
-deduped as (
-    select * from raw_rows where _rn = 1
-),
-
 cleaned as (
 
+    {{#
+      Every admitted raw row, cleaned ONCE. The rank runs on this in
+      `ranked_rows` below -- see its comment, and ref_counterparty's
+      `ranked_rows` (dbt/models/prepared/ref_counterparty.sql), which this
+      mirrors.
+    #}}
     select
 {body}
         {{{{ source_provenance() }}}}
-        {{{{ audit_columns() }}}}
+        {{{{ audit_columns() }}}},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number
 
-    from deduped
+    from raw_rows
+
+),
+
+ranked_rows as (
+
+    {{#
+      THE IN-FILE DEDUPE IS ON THE CLEANED KEY -- see ref_counterparty's
+      `ranked_rows` comment: ranked on the raw key, two spellings of one
+      cleaned key would each be "last in file" for themselves and both
+      survive as two rows with the same (cob_date, cleaned key).
+    #}}
+    select
+        *,
+        {{{{ dedupe_rank([{key_list}]) }}}} as _rn
+    from cleaned
+
+),
+
+deduped as (
+
+    select
+{final_body}
+        {{{{ source_provenance_columns() }}}}
+        source_batch_id,
+        dbt_invocation_id,
+        nessie_ref,
+        dbt_updated_at
+    from ranked_rows
+    where _rn = 1
 
 )
 
-select * from cleaned
+select * from deduped
 """
 
 
