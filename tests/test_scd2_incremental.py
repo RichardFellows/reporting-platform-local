@@ -508,14 +508,24 @@ REPLAYED = "select cob_date::varchar, counterparty_id, source_file_version from 
 
 
 def test_scd2_incremental_replay_drops_a_key_the_newest_delivery_omitted():
+    """`this_table`'s two anchor dates (A's current version from 09-10, B's
+    only version from 06-01) have no matching delivery anywhere in this
+    fixture's `raw_src` -- indistinguishable, to `scd2_pruned_seed`, from a
+    date retention has since pruned. Both are therefore seeded from
+    `this_table` rather than left unrepresented: `source_file_version` reads
+    NULL because `this_table`'s minimal schema (effective_from, is_current,
+    the key) has no such column, exactly as `in_target` intends for a column
+    the seed source lacks."""
     for name, keys, attr, constants in MODELS:
         con = _connect()
         text = _replay_case(con, name, keys, attr, constants)
         sql = _duck(_render(text, incremental=True, adapter=_Adapter(con)))
         got = _run(con, sql, "replayed", REPLAYED)
         assert (D1, "B", 1) not in got, (name, got)
-        assert got == [(D2, "A", 1), (D2, "B", 1),
-                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
+        assert got == [("2026-06-01", "B", None),
+                       (D2, "A", 1), (D2, "B", 1),
+                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1),
+                       ("2026-09-10", "A", None)], (name, got)
 
 
 def test_scd2_full_refresh_replay_agrees():

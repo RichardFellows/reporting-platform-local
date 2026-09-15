@@ -510,17 +510,25 @@
         a re-delivery that REVERTS to its value extend it instead of starting
         a duplicate beside it. It also means the replay never needs that
         version's own COB date in raw, which retention may have pruned.
+      * `scd2_pruned_seed` -- every version FROM the replay start onward whose
+        own COB date raw no longer holds AT ALL: the same "does raw have a
+        delivery for this date" question `scd2_retractions`' guard asks
+        (`newest_file_version`), asked here at seed time instead of at
+        retraction time. Such a version is taken from the TARGET, exactly like
+        `scd2_seed_from`'s row -- never re-derived, never a retraction
+        candidate -- because raw has nothing to say about it either way. A
+        version whose date raw DOES hold is excluded here and left to the
+        ordinary raw branch above, so a re-delivery of that date can still
+        retract or revert it as before; the two branches partition the scope
+        by date, so a (key, cob_date) pair is never produced by both.
 
     WHAT IS HONOURED, then: re-deliveries of every COB date from each touched
-    key's replay start onward. A re-delivery of an EARLIER date is outside
-    the replay, exactly as a date outside the lookback window is for the
-    `cob_date`-partitioned models, and needs a full refresh.
-
-    ASSUMES raw still holds every COB date from each key's replay start
-    onward. Where retention has pruned one, the replay cannot re-derive the
-    version that began there; `scd2_retractions` refuses to treat that as a
-    retraction, so the result is two open versions, which the SCD2 tests
-    refuse.
+    key's replay start onward THAT RAW STILL HOLDS. A re-delivery of an
+    EARLIER date is outside the replay, exactly as a date outside the lookback
+    window is for the `cob_date`-partitioned models, and needs a full
+    refresh. A date inside the replay that retention has since pruned is not
+    a re-delivery at all -- there is nothing to deliver -- so it is carried
+    forward from the target unchanged by `scd2_pruned_seed` instead.
 
     The mutually_exclusive_ranges and scd2_exactly_one_current_version tests
     catch a replay that gets this wrong, and are not optional on any table
@@ -588,6 +596,29 @@
 
   ),
 
+  scd2_pruned_seed as (
+
+      {#- Every version FROM the replay start onward whose own COB date raw no
+          longer holds a delivery at all -- the SAME predicate
+          `scd2_retractions`' guard reads (`newest_file_version`, date-level),
+          asked here instead so the version is seeded rather than left for a
+          replay that cannot re-derive it and a retraction guard that (rightly)
+          refuses to delete it. A date raw DOES still hold is excluded by the
+          `not exists`, so it is left to the ordinary raw branch in `replayed`
+          below -- the two can never emit the same (key, cob_date), because
+          this CTE and that branch partition the scope by exactly that
+          existence check. -#}
+      select _old.*
+      from {{ this }} as _old
+      join replay_from as _p on {{ scd2_key_match('_p', '_old', key_columns) }}
+      where _old.effective_from >= coalesce(_p.from_date, date '1900-01-01')
+        and not exists (
+            select 1 from newest_file_version as _nv
+            where _nv._newest_cob_date = _old.effective_from
+        )
+
+  ),
+
   replayed as (
 
       select _s.cob_date{% for c in cols %}, _s.{{ ident(c) }}{% endfor %}
@@ -612,6 +643,19 @@
       join scd2_seed_from as _f
         on {{ scd2_key_match('_f', '_q', key_columns) }}
        and _q.effective_from = _f.seed_from
+
+      union all
+
+      {# A pruned-date version, seeded the same way as the row above it: the
+         target's own columns, this run's audit columns, source_batch_id kept
+         from the delivery that began the version. Never re-derived, never a
+         retraction candidate -- raw has nothing to say about this date. #}
+      select _u.effective_from as cob_date
+             {%- for c in cols[:-4] %},
+             {% if c | lower in in_target %}_u.{{ ident(c) }}{% else %}null{% endif %} as {{ ident(c) }}
+             {%- endfor %},
+             {{ audit_columns('_u.source_batch_id' if 'source_batch_id' in in_target else 'null') }}
+      from scd2_pruned_seed as _u
 
   ),
   {%- endif %}
@@ -668,9 +712,11 @@
         no longer holds at all -- retention prunes raw to month-ends -- says
         nothing, and is not evidence the version was wrong. Without this, a
         pruned date would silently delete the version and re-date the key to
-        the next delivery raw still holds. With it, a replay that cannot
-        re-derive from pruned raw fails the way it always did: two open
-        versions, which the SCD2 tests refuse.
+        the next delivery raw still holds. With it, a version whose date raw
+        no longer holds is left alone here -- `scd2_replay`'s
+        `scd2_pruned_seed` seeds it from the target instead of re-deriving or
+        retracting it, using the identical existence check, so it is neither
+        deleted nor duplicated.
   -#}
   {%- if is_incremental() %}
   union all
