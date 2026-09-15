@@ -1,8 +1,8 @@
 # `next_file_version` treats an unreadable raw table as version 1
 
-**Value** high once 09 lands · **Effort** 2–4 hours · **Branch** `fix/next-file-version-unreadable`
+**Value** high · **Effort** 2–4 hours · **Branch** `fix/next-file-version-unreadable`
 
-## What is wrong (verified 2026-09-14)
+## What is wrong (verified 2026-09-15, after 09 merged)
 
 ```bash
 grep -n 'def next_file_version' -A10 reporting_platform/ingest/ingest_feed.py
@@ -24,7 +24,7 @@ It is `CLAUDE.md`'s rule exactly: a subject it could not READ reported as
 EMPTY. The `COALESCE(..., 0)` already handles the genuinely empty case, so the
 `except` only ever catches the unreadable one.
 
-It becomes a correctness defect, not a cosmetic one, under item 09's decision
+It is a correctness defect, not a cosmetic one, since item 09's decision
 (`dedupe_rank` selects the newest `_file_version` per COB date, whole). A
 re-delivery mis-numbered as version 1 alongside an existing version 1 ties
 with the delivery it was meant to replace, and a version 2 that already exists

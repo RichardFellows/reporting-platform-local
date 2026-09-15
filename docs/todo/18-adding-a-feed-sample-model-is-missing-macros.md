@@ -2,7 +2,7 @@
 
 **Value** low–medium · **Effort** 30 minutes · **Branch** `docs/adding-a-feed-sample-model`
 
-## What is wrong (verified 2026-09-14)
+## What is wrong (verified 2026-09-15, after 09 merged)
 
 ```bash
 awk '/^```sql/{f=1;next} /^```/{f=0} f' docs/ADDING-A-FEED.md | grep -c 'known_as_of\|source_provenance'
@@ -28,8 +28,9 @@ models' `delivery_id` — has nothing to read for that feed. Neither fails.
 - [ ] The sample matches what `ui/scaffold.py` emits today (strategy, rank,
       `known_as_of()`, `source_provenance()`), or is replaced by a pointer to
       the scaffold plus the one thing the doc needs to show.
-- [ ] Check the doc's sample AFTER item 09 merges: 09 changes the strategy
-      and the rank, and the sample must follow.
+- [ ] 09 has already moved the sample to `insert_overwrite` with no
+      `unique_key`; what it still lacks is exactly the two macros above
+      (re-checked after 09 merged).
 - [ ] Consider a test that renders the doc's SQL block the way
       `tests/test_dedupe_rank.py` renders models, so the sample cannot drift
       again.
