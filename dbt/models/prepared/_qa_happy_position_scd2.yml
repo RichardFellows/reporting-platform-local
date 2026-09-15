@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: qa_happy_position_scd2
+    description: >
+      Happy-path positions with one version per change to conformed business
+      attributes. Validity dates are inclusive and use delivery COB dates;
+      effective_date remains a separate source business attribute.
+      Missing positions carry forward. Corrected deliveries restate history.
+    columns:
+      - name: position_id
+        tests: [not_null]
+      - name: delivery_id
+        tests: [not_null]
+      - name: effective_from
+        tests: [not_null]
+      - name: effective_to
+        tests: [not_null]
+      - name: is_current
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [position_id, effective_from]
+      - dbt_utils.mutually_exclusive_ranges:
+          lower_bound_column: effective_from
+          upper_bound_column: date_add(effective_to, 1)
+          partition_by: position_id
+          gaps: not_allowed

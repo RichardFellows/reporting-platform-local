@@ -37,3 +37,42 @@ must return GBP: 2 positions, 1500.00; USD: 1 position, -100.00.
 
 Live execution results are recorded separately; this fixture alone does not
 prove ingestion or publication succeeded.
+
+## Headerless control variant
+
+`qa_headerless_position_20260915.csv` has two pipe-delimited rows. Its control
+file contains exactly one headerless record:
+
+```text
+qa_headerless_position_20260915.csv|2|e503b1d9efa39929629b06ee8348f1c7
+```
+
+The feed declares the control columns in positional order as `FILENAME`,
+`RECORD_COUNT`, and `CHECKSUM`, with `header: false`. The row-count and MD5
+fields gate ingestion; the filename is retained as sender context.
+
+## SCD2 prepared version
+
+`prepared.qa_happy_position_scd2` reads the same raw deliveries and applies
+the same conformance as `prepared.qa_happy_position`. It tracks changes to
+desk, amount, currency, effective date, active status and description by
+`position_id`. Repeated values do not create versions. Missing positions
+carry forward; corrected deliveries can retract a superseded change.
+
+`effective_from` and `effective_to` are inclusive COB dates. The source's
+`effective_date` is a separate business attribute. Current versions have
+`is_current = true` and `effective_to = '9999-12-31'`. Delivery provenance
+identifies the delivery that began the version.
+
+With only the original fixture loaded, expect three current versions starting
+on `2026-09-14`, with the values above. Query current data with:
+
+```sql
+select * from lakehouse.prepared.qa_happy_position_scd2
+where is_current;
+```
+
+For historical data, filter a date between `effective_from` and `effective_to`.
+Build with `dbt build --select qa_happy_position_scd2 --vars
+'nessie_ref: <build-branch>'` on a build branch, following the project's
+write-audit-publish process.
