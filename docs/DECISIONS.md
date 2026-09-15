@@ -4383,16 +4383,98 @@ weighed.**
   its version was deleted and the key silently re-dated to the next retained
   delivery, every SCD2 test green (measured, by removing it).
 
-**The limit that remains, and it predates this change:** the replay reads
-raw from each key's replay start, and raw is pruned. Once retention has
-removed the date a replay starts from, the replay re-derives the key from its
-first retained delivery as a NEW version, beside the one it could not
-re-derive: two open versions, and the build refuses. The guard above keeps
-that failure loud rather than turning it into a deletion;
-`tests/test_scd2_incremental.py` pins both. The seed removes the dependency on
-raw for the version BEFORE the replay start, not for the start version
-itself; seeding that one from the target too would change which re-deliveries
-can retract it, and is not done here.
+**The limit above was real through item 09, and item 22 closed it.** Through
+item 09, the replay read raw from each key's replay start onward, and raw is
+pruned: once retention removed the date a replay starts from, the replay
+re-derived the key from its first retained delivery as a NEW version, beside
+the one it could not re-derive -- two open versions, and the build refused.
+The guard above kept that failure loud rather than turning it into a
+deletion; that was deliberate, and correct as far as it went, but it was not
+a fix. The seed removed the dependency on raw for the version BEFORE the
+replay start (`scd2_seed_from`), not for the start version itself; this
+entry used to say seeding that one from the target too "would change which
+re-deliveries can retract it", and that reasoning is why it was not done
+then.
+
+**What item 22 added: `scd2_pruned_seed`, gated on the SAME existence check
+the retraction guard already used, asked at seed time instead of at
+retraction time.** Every version in the replay's scope (touched keys, from
+`replay_from` onward -- so this includes the replay-start version itself, not
+only the ones after it) whose own COB date has no row at all in
+`newest_file_version` is seeded from the target exactly as `scd2_seed_from`'s
+row already was: never re-derived, never a retraction candidate, NULL for a
+column the target does not yet have, `source_batch_id` kept from the target,
+this run's audit columns from `audit_columns()`. A version whose date raw
+DOES still hold -- even a re-delivery of that date that drops or reverts the
+key -- is excluded from the seed and left to the ordinary raw branch, so it
+is replayed and can still be retracted exactly as before.
+
+**That is what keeps the old worry from applying.** The 2026-09-14 reasoning
+was that seeding the start version unconditionally would change which
+re-deliveries can retract it. Item 22's seed is not unconditional: it fires
+only when the date is ABSENT from raw entirely, and a re-delivery is, by
+definition, a row raw now holds for that date. So a re-delivery of the
+replay start's own date is never seeded away from the ordinary path --
+`tests/test_scd2_incremental.py`'s
+`test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too` and
+the C-drop/C-revert tests are unchanged and still green. What changes is only
+the case that date has nothing to re-deliver: no row in raw at all, because
+retention removed it. `test_only_the_replay_start_date_is_pruned` pins the
+narrow case (only the start date gone); the rewritten
+`test_a_version_whose_cob_date_raw_no_longer_holds_is_seeded_from_the_target`
+pins it together with a pruned in-window date;
+`test_a_retained_redelivery_still_retracts_a_version_seeded_at_its_start`
+pins the interaction -- the start version is pruned and seeded, and a later,
+still-retained re-delivery still retracts the version after it and reopens
+the seeded one, exactly as if raw still held the start date; and
+`test_a_key_unchanged_for_weeks_survives_daily_pruning` runs the estate's
+actual shape (`full_snapshot` touches every key every day) over twenty days
+of rolling retention.
+
+A (key, cob_date) pair can never be produced by both the raw branch and
+`scd2_pruned_seed`: the raw branch's `stage_cte` only ever carries rows for
+dates raw still holds (`raw_rows` joins raw to `newest_file_version` by
+`_cob_date`), and `scd2_pruned_seed` only ever carries dates absent from
+`newest_file_version` -- the two conditions are exact complements, over the
+same existence check, so the MERGE's cardinality guard
+(`test_the_harness_refuses_a_merge_spark_would_refuse`) has nothing to catch
+here and did not.
+
+**Two edge cases were checked and neither breaks.** The version-before-the-
+start seed (`scd2_seed_from`) and `scd2_pruned_seed` cannot coincide: the
+first is scoped to `effective_from < replay_from` and the second to
+`effective_from >= coalesce(replay_from, ...)`, strictly disjoint by
+construction. And an as-of build never reaches this code at all --
+`known_as_of()` refuses an incremental run outright when `knowledge_time` is
+set (see `#as-of-is-a-var-not-a-second-model`), and `scd2_pruned_seed` only
+exists inside `scd2_replay`'s `is_incremental()` branch.
+
+**`--full-refresh` once retention has pruned raw is still not decided here,
+and item 22 did not change it or guard it.** A full rebuild reads only
+whatever raw currently holds, so it re-dates every version whose origin was
+pruned to the next retained delivery -- measured directly (not merely
+reasoned about), by rebuilding both models with the same harness after the
+daily-pruning scenario above (twenty days of deliveries, retention keeping
+only the newest six `_cob_date`s each night):
+
+```
+oldest raw _cob_date still present: 2026-08-15
+incremental target B: [('X', '2026-08-01', '9999-12-31', True)]
+full-refresh target B: [('X', '2026-08-15', '9999-12-31', True)]
+```
+
+for both `ref_counterparty` and `ref_rating`. The incremental target's B is
+still open from its true origin, 2026-08-01, because `scd2_pruned_seed`
+carries it forward every run; a full rebuild over the same raw has no way to
+know that origin and reopens B fourteen days later than it actually began.
+A guard
+would need to compare the target's own history to what raw currently covers
+-- e.g. the oldest retained `_cob_date` in raw against the target's own
+`min(effective_from)` for a version raw no longer explains -- and
+`known_as_of()`'s `raise_compiler_error` on the incremental path is a
+directly reusable shape for it (same macro file, same mechanism, a
+compile-time refusal rather than a silent restatement). Building that guard,
+or documenting a restore path instead, is the owner's decision.
 
 ### counterparty_exposure read raw with the same mistake
 
