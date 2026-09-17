@@ -15,6 +15,8 @@ labelled with what it costs.
 """
 from __future__ import annotations
 
+from reporting_platform.common.parsing import csv_rows, feed_format, raw_values
+
 import csv
 import io
 import os
@@ -122,10 +124,9 @@ def preview(feed: Feed, filename: str, rows: int = 5) -> dict[str, Any]:
     much cheaper to see here.
     """
     path = _seed_path(feed, filename)
-    with path.open(encoding=feed.file_encoding, newline="") as fh:
-        reader = csv.reader(fh, delimiter=feed.delimiter, quotechar=feed.quote_char)
-        header = next(reader, [])
-        sample = [row for _, row in zip(range(rows), reader)]
+    reader = csv_rows(path.read_bytes(), feed_format(feed), source=filename)
+    header = next(reader, []) if feed.header else feed.file_header
+    sample = [raw_values(row) for _, row in zip(range(rows), reader)]
     return {"header": header, "rows": sample, **compare_header(feed, header)}
 
 
@@ -142,9 +143,9 @@ def compare_header(feed: Feed, header: list[str]) -> dict[str, list[str]]:
 
 
 def header_of(content: bytes, feed: Feed) -> list[str]:
-    text = content.decode(feed.file_encoding, errors="replace")
-    reader = csv.reader(io.StringIO(text), delimiter=feed.delimiter,
-                        quotechar=feed.quote_char)
+    if not feed.header:
+        return feed.file_header
+    reader = csv_rows(content, feed_format(feed))
     return [h.strip() for h in next(reader, [])]
 
 
@@ -154,8 +155,7 @@ def columns_from_csv(content: bytes, encoding: str = "utf-8",
 
     Used before the feed exists, so it cannot go through a Feed object.
     """
-    text = content.decode(encoding, errors="replace")
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    reader = csv_rows(content, {"encoding": encoding, "delimiter": delimiter})
     return [h.strip() for h in next(reader, [])]
 
 

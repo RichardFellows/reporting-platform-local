@@ -115,6 +115,8 @@ def _summary(fd) -> dict[str, Any]:
         "quote_char": fd.quote_char,
         "header": fd.header,
         "file_encoding": fd.file_encoding,
+        "control_encoding": fd.control_encoding,
+        "csv_options": dict(fd.csv_options),
         "source_columns": dict(fd.source_columns or {}),
         "expected_min_rows": fd.expected_min_rows,
         "cadence": fd.cadence,
@@ -375,22 +377,43 @@ def api_columns_from_header(payload: dict):
 # delivered file (delimiter, encoding, per-column TYPES read from real values
 # rather than guessed from names, business-key candidates, and for a zip its
 # member layout). See ingest/sniff.py and DECISIONS.md#the-sniffer.
-def _sniff_or_400(filename: str, data: bytes) -> dict:
+def _sniff_or_400(filename: str, data: bytes, encoding: str | None = None,
+                  control_encoding: str | None = None) -> dict:
     from reporting_platform.ingest import sniff
 
     try:
-        return sniff.propose_feed(filename, data)
+        return sniff.propose_feed(filename, data, encoding, control_encoding)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/sniff")
-async def api_sniff(file: UploadFile = File(...)):
+async def api_sniff(file: UploadFile = File(...), encoding: str | None = Form(None),
+                    control_encoding: str | None = Form(None)):
     """Sniff an uploaded sample -- the same upload control `/api/infer-columns`
     uses, one door down on the form, but reading real values rather than
     only the header row.
     """
-    return _sniff_or_400(file.filename or "upload.csv", await file.read())
+    return _sniff_or_400(file.filename or "upload.csv", await file.read(), encoding, control_encoding)
+
+
+@app.post("/api/samples/diagnose")
+async def api_diagnose_samples(definition: str = Form(...),
+                               data: UploadFile = File(...),
+                               control: UploadFile | None = File(None)):
+    """Read a draft and its explicitly paired samples without activating it."""
+    import json
+    from reporting_platform.ingest.sample_diagnostics import from_definition, MAX_SAMPLE_BYTES
+    try:
+        spec = json.loads(definition)
+        if not isinstance(spec, dict):
+            raise ValueError("definition must be a JSON object")
+        return from_definition(spec, await data.read(MAX_SAMPLE_BYTES + 1),
+                               await control.read(MAX_SAMPLE_BYTES + 1) if control else None,
+                               data_filename=data.filename or "sample.csv",
+                               control_filename=control.filename if control else "missing control")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/unclaimed")

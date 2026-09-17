@@ -51,6 +51,8 @@ watcher's stability check (`inbox.STABLE_POLLS`).
 """
 from __future__ import annotations
 
+from reporting_platform.common.parsing import DecodeError, csv_rows, feed_format
+
 import csv
 import hashlib
 import io
@@ -244,9 +246,7 @@ def count_rows(feed: Feed, content: bytes) -> int:
     would report a correct file as short -- rejecting a good delivery at the
     door, which is worse than the truncation the check exists to catch.
     """
-    text = content.decode(feed.file_encoding, errors="replace")
-    reader = csv.reader(io.StringIO(text), delimiter=feed.delimiter,
-                        quotechar=feed.quote_char)
+    reader = csv_rows(content, feed_format(feed))
     rows = sum(1 for row in reader if row)
     return max(rows - 1, 0) if feed.header else rows
 
@@ -267,9 +267,14 @@ def observe(feed: Feed, content: bytes) -> dict[str, Any]:
     the ingest later disputes the row count, this says whether the file
     changed after arrival or arrived wrong.
     """
-    return {"bytes": len(content),
-            "md5": hashlib.md5(content).hexdigest(),
-            "row_count": count_rows(feed, content)}
+    observed = {"bytes": len(content), "md5": hashlib.md5(content).hexdigest()}
+    try:
+        observed["row_count"] = count_rows(feed, content)
+    except ValueError as exc:
+        # Integrity errors still land as evidence; never invent a count for
+        # unreadable bytes. The production reader refuses them at ingest.
+        observed.update(row_count=None, parsing_error=str(exc))
+    return observed
 
 
 # ------------------------------------------------------------- the promotion
@@ -786,10 +791,10 @@ def _plan_file(feed: Feed, filename: str, content: bytes, siblings: Siblings,
     """A plain delivery, with its control file beside it in the inbox."""
     control_name = find_control(feed, filename, siblings.names)
     control_bytes = siblings.read(control_name) if control_name else None
-    control_text = (control_bytes.decode(feed.file_encoding, errors="replace")
-                    if control_bytes is not None else None)
     consumed = (control_name,) if control_name else ()
     try:
+        control_text = (control_mod.decode(feed, control_bytes, control_name)
+                        if control_bytes is not None else None)
         plan = conform(feed, filename, content,
                        control_filename=control_name, control_text=control_text,
                        received_at=received_at, taken=taken,
@@ -798,7 +803,7 @@ def _plan_file(feed: Feed, filename: str, content: bytes, siblings: Siblings,
         return [Waiting(filename, str(exc))]
     except DuplicateDelivery as exc:
         return [Duplicate(filename, exc.landing_filename, str(exc), consumed)]
-    except ConformanceError as exc:
+    except (ConformanceError, DecodeError) as exc:
         # The control file is refused WITH the delivery it gates: on its own it
         # is unreadable evidence, and the commonest identity failure is that
         # the two disagree.
@@ -840,10 +845,9 @@ def _plan_archive(feed: Feed, filename: str, content: bytes,
     for member_name, member_bytes in claimed:
         control_name = find_control(feed, member_name, inside.names)
         control_bytes = inside.read(control_name) if control_name else None
-        control_text = (control_bytes.decode(feed.file_encoding,
-                                             errors="replace")
-                        if control_bytes is not None else None)
         try:
+            control_text = (control_mod.decode(feed, control_bytes, control_name)
+                            if control_bytes is not None else None)
             plan = conform_member(
                 feed, filename, content, member_name, member_bytes,
                 control_filename=control_name, control_text=control_text,
@@ -852,7 +856,7 @@ def _plan_archive(feed: Feed, filename: str, content: bytes,
             out.append(Duplicate(f"{filename}!{member_name}",
                                  exc.landing_filename, str(exc)))
             continue
-        except (ConformanceError, NotReady) as exc:
+        except (ConformanceError, NotReady, DecodeError) as exc:
             # NotReady CANNOT CLEAR ON ITS OWN HERE, so it is a refusal rather
             # than a wait: a member's control file is packed in the same
             # container, and a container is complete the moment it arrives.

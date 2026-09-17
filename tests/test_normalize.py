@@ -40,7 +40,9 @@ def test_manifest_records_date_parts_and_format():
         # Format is captured from feeds.yml AT NORMALIZE TIME, so an ingest
         # can be reproduced later even if the config has moved on.
         assert m["format"] == {"delimiter": ",", "quote_char": '"',
-                               "header": True, "encoding": "utf-8"}, m["format"]
+                               "header": True, "encoding": "utf-8",
+                               "escape_char": '"', "multiline": True,
+                               "parser_contract": 2}, m["format"]
         assert m["normalizer"] == "file/v1"
     finally:
         uninstall(monkey)

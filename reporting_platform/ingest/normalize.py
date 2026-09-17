@@ -40,6 +40,8 @@ the data, and it is asserted in the tests.
 """
 from __future__ import annotations
 
+from reporting_platform.common.parsing import feed_format
+
 import json
 import logging
 import re
@@ -180,7 +182,7 @@ def _declared(feed: Feed, control_key: str) -> dict[str, Any]:
     if not any(k in control for k in ("row_count", "md5")):
         return {}
     body = _client().get_object(Bucket=_bucket(), Key=control_key)["Body"].read()
-    text = body.decode(feed.file_encoding, errors="replace")
+    text = control_mod.decode(feed, body, control_key)
 
     # HOW the file is read is `delivery.control.format`'s answer, and
     # `ingest/control.py` is the only implementation of it -- the same reader
@@ -270,12 +272,7 @@ def _normalize_file(feed: Feed, object_key: str) -> dict[str, Any]:
         # actually used for a delivery six months ago. Correcting a wrong one
         # means fixing feeds.yml and re-normalizing, which is cheap because
         # `ready/` is a cache.
-        "format": {
-            "delimiter": feed.delimiter,
-            "quote_char": feed.quote_char,
-            "header": feed.header,
-            "encoding": feed.file_encoding,
-        },
+        "format": feed_format(feed),
         # What the control file declared, an OBSERVATION recorded once rather
         # than re-read at ingest -- see the module header on why the manifest
         # never holds derived state, only what arrived. None for a feed with
@@ -404,12 +401,7 @@ def _normalize_archive(feed: Feed, object_key: str) -> dict[str, Any]:
         "received_at": head["LastModified"].astimezone(timezone.utc).isoformat(),
         "source_object": object_key,
         "parts": parts,
-        "format": {
-            "delimiter": feed.delimiter,
-            "quote_char": feed.quote_char,
-            "header": feed.header,
-            "encoding": feed.file_encoding,
-        },
+        "format": feed_format(feed),
         "control_object": control_key,
         # The total across the members: what ingest counts after unioning the
         # parts, which is the number a sender describing this delivery states.
