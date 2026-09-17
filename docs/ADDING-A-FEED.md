@@ -117,7 +117,9 @@ property of the source system far more often than of one feed.
 |---|---|---|
 | `delimiter` | `","` | The upstream sends pipes, tabs or semicolons. **Never inherited by a control file** — `control.format` needs its own, because pipes read as commas is not an error, it is one column named by the whole header line. |
 | `quote_char` | `'"'` | The upstream quotes with something else, or nothing. |
-| `file_encoding` | `utf-8` | A mainframe extract in `cp1252` or `latin-1`. Getting this wrong does not fail — it lands mojibake. |
+| `file_encoding` | `utf-8` | A data extract uses another supported encoding such as `cp1252`, `latin-1` or UTF-16. Decoding is strict and the configured codec must map to a verified Spark codec; bad bytes fail before publication. |
+| `control_encoding` | same as `file_encoding` | The control file uses a different encoding from the data file. |
+| `csv_options` | `{}` | The CSV overrides `escape_char` or explicitly disables multiline records with `multiline: false`. These options are validated and recorded in the delivery manifest. |
 | `header` | `true` | The file has no header row. `columns:` then carries the whole contract by position. |
 | `schema_drift` | `warn` | `fail` aborts the load on an extra **or** missing column, leaves the ingest branch for inspection, and never touches `main`. The default is usually right: a rejected file is a file nobody looks at. |
 | `landing_prefix` / `ready_prefix` / `raw_namespace` | `landing` / `ready` / `raw` | Effectively never. They exist so the paths have one definition, not so feeds vary. |
