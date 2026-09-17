@@ -169,6 +169,9 @@ class Feed:
     quote_char: str = '"'
     header: bool = True
     file_encoding: str = "utf-8"
+    # None preserves the historical data-encoding fallback for controls.
+    control_encoding: str | None = None
+    csv_options: dict[str, Any] = field(default_factory=dict)
     schema_drift: str = "warn"
     # Per-column prepared-layer treatment, e.g. {"haircut_pct": "decimal"}.
     # Sparse: only columns whose treatment differs from what
@@ -414,8 +417,8 @@ CONTROL_FIELD_GROUPS = {"cob_date": "cob_date", "version": "version",
 # only place a control file is parsed -- and the choice CHANGES WHAT THE
 # FIELDS ABOVE MEAN: a regex with a named group under `regex`, a column name
 # under `delimited`. That is why the format is resolved before them.
-CONTROL_FORMATS = ("regex", "delimited")
-CONTROL_FORMAT_KEYS = {"kind", "delimiter", "quote_char", "header", "columns"}
+CONTROL_FORMATS = ("regex", "delimited", "key_value")
+CONTROL_FORMAT_KEYS = {"kind", "delimiter", "quote_char", "header", "columns", "separator"}
 
 # Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
 # error can say "not built" rather than "unknown": one is a typo, the other a
@@ -547,6 +550,16 @@ def resolve_control_format(feed_name: str, block: str,
             f"{where(feed_name)}: `{block}.format.kind: {kind!r}` "
             f"is not recognised. Valid: {', '.join(CONTROL_FORMATS)}")
 
+    if kind == "key_value":
+        if set(fmt) - {"kind", "separator"}:
+            raise ValueError(f"{where(feed_name)}: key_value format accepts only separator")
+        separator = fmt.get("separator", "=")
+        if not isinstance(separator, str) or len(separator) != 1 or separator in "\r\n":
+            raise ValueError(f"{where(feed_name)}: key_value separator must be one non-newline character")
+        return {"kind": kind, "separator": separator}
+
+    if "separator" in fmt:
+        raise ValueError(f"{where(feed_name)}: separator is only valid for key_value format")
     if kind == "regex":
         extra = set(fmt) - {"kind"}
         if extra:
@@ -632,7 +645,7 @@ def _resolve_control_field(feed_name: str, block: str, key: str, value: Any,
     and it was two copies of one loop before a second format made the
     difference between them matter.
     """
-    if fmt["kind"] == "delimited":
+    if fmt["kind"] in ("delimited", "key_value"):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(
                 f"{where(feed_name)}: `{block}.{key}` is "
@@ -932,11 +945,7 @@ def check_single_char(feed_name: str, key: str, value: Any) -> str:
 
 
 def check_file_encoding(feed_name: str, value: Any) -> str:
-    """The codec the delivery is read with.
-
-    `codecs.lookup` rather than a list, because the set of valid encodings is
-    Python's and restating a subset of it would refuse something that works.
-    """
+    """The data codec must have a tested Python/Java reader mapping."""
     text = str(value).strip()
     try:
         codecs.lookup(text)
@@ -944,7 +953,29 @@ def check_file_encoding(feed_name: str, value: Any) -> str:
         raise ValueError(
             f"{where(feed_name)}: `file_encoding: {value!r}` is not an "
             f"encoding Python knows. Try utf-8, latin-1 or cp1252.") from None
+    from reporting_platform.common.parsing import spark_encoding
+    try:
+        spark_encoding(text)
+    except ValueError as exc:
+        raise ValueError(f"{where(feed_name)}: file_encoding: {exc}") from exc
     return text
+
+
+def check_control_encoding(feed_name: str, value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        codecs.lookup(text)
+        b"".decode(text)
+    except (LookupError, ValueError) as exc:
+        raise ValueError(f"{where(feed_name)}: control_encoding {value!r} is not a Python text codec") from exc
+    return text
+
+
+def check_csv_options(feed_name: str, value: Any) -> dict:
+    from reporting_platform.common.parsing import check_csv_options as check
+    return check(feed_name, value)
 
 
 # DECLARED-ONLY, and that is what keeps the defaults in one place. A key
@@ -957,6 +988,8 @@ VALUE_CHECKS = (
     ("schema_drift", check_schema_drift),
     ("expected_min_rows", check_expected_min_rows),
     ("file_encoding", check_file_encoding),
+    ("control_encoding", check_control_encoding),
+    ("csv_options", check_csv_options),
 )
 
 

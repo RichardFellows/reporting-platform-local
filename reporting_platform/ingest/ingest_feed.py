@@ -30,6 +30,7 @@ import logging
 import os
 import sys
 from datetime import date, datetime, timezone
+from reporting_platform.common.parsing import feed_format
 
 from reporting_platform.common.context import (
     CATALOG, Nessie, branch_name, feed as get_feed, new_run_id, spark_session,
@@ -275,22 +276,53 @@ def ensure_raw_schema(spark, table: str, fd) -> dict[str, list]:
 
 
 def read_landing(spark, fmt: dict, uri: str):
-    """Read the CSV with every column as string, permissively.
+    """Read strings with the recorded contract; old manifests keep their defaults.
 
     `fmt` comes from the delivery's MANIFEST, not from feeds.yml, so an ingest
     is reproducible: what delimiter a delivery was actually read with is
     recorded next to it rather than inferred from whatever the config says
     today. See ingest/normalize.py.
     """
-    return (
+    from reporting_platform.common.parsing import csv_rows, spark_encoding
+    if fmt.get("parser_contract", 1) not in (1, 2):
+        raise ValueError(f"unsupported CSV parser contract {fmt['parser_contract']!r}")
+    if fmt.get("parser_contract", 1) >= 2:
+        # Java's CSV decoder can replace bad bytes even in FAILFAST mode.
+        # Validate the original bytes before giving them to that reader.
+        from urllib.parse import urlsplit
+        from pathlib import Path
+        from reporting_platform.ingest.arrival import _client
+        location = urlsplit(uri)
+        if location.scheme in ("s3", "s3a"):
+            body = _client().get_object(Bucket=location.netloc,
+                                        Key=location.path.lstrip("/"))["Body"]
+            try:
+                data = body.read()
+            finally:
+                body.close()
+        elif location.scheme in ("", "file"):
+            data = Path(location.path if location.scheme else uri).read_bytes()
+        else:
+            raise ValueError(f"strict CSV validation does not support {location.scheme!r}")
+        for _ in csv_rows(data, fmt, source=uri):
+            pass
+    reader = (
         spark.read.option("header", str(fmt["header"]).lower())
         .option("sep", fmt["delimiter"])
         .option("quote", fmt["quote_char"])
-        .option("encoding", fmt["encoding"])
-        .option("mode", "PERMISSIVE")
+        .option("encoding", spark_encoding(fmt["encoding"]))
+        .option("escape", fmt.get("escape_char", "\\"))
+        .option("multiLine", str(fmt.get("multiline", False)).lower())
+        .option("mode", "FAILFAST" if fmt.get("parser_contract", 1) >= 2 else "PERMISSIVE")
         .option("inferSchema", "false")
-        .csv(uri)
+        .option("nullValue", "")
+        .option("emptyValue", "")
     )
+    if not fmt["header"] and fmt.get("columns"):
+        from pyspark.sql.types import StringType, StructField, StructType
+        reader = reader.schema(StructType([StructField(name, StringType(), True)
+                                          for name in fmt["columns"]]))
+    return reader.csv(uri)
 
 
 def reconcile_schema(df, fd) -> tuple:
@@ -422,8 +454,7 @@ def resolve_delivery(fd, key: str, cob_date: date | None = None) -> dict:
                 "delivery_id": key.rsplit("/", 1)[-1], "received_at": None,
                 "source_object": key,
                 "parts": [{"object_key": key, "bytes": None}],
-                "format": {"delimiter": fd.delimiter, "quote_char": fd.quote_char,
-                           "header": fd.header, "encoding": fd.file_encoding},
+                "format": feed_format(fd),
                 "control_object": None, "declared_row_count": None,
                 "normalizer": "manual/v1",
             }

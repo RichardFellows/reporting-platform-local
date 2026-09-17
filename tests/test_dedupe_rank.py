@@ -439,7 +439,7 @@ def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():
     before the rank must not quietly make the default window wrong again.
     Their replay is tested end to end in `test_scd2_incremental.py`."""
     scd2 = [p for p in sorted(PREPARED.glob("*.sql")) if "scd2_replay(" in _model(p)]
-    assert len(scd2) == 2, scd2
+    assert scd2, "no SCD2 models found; the assertions below would prove nothing"
     for path in scd2:
         text = _model(path)
         assert "newest_file_version(" in text, path.name

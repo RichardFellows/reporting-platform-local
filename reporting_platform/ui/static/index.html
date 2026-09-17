@@ -392,6 +392,8 @@ function feedForm(f, creating) {
                              value: f?.quote_char ?? '"'});
   const encoding = el("input", {class: "mono", style: "width:10em",
                                 value: f?.file_encoding ?? "utf-8"});
+  let csvOptions = {...(f?.csv_options ?? {})};
+  const controlEncoding = el("input", {class: "mono", value: f?.control_encoding ?? "", placeholder: "same as data"});
   const hasHeader = el("input", {type: "checkbox"});
   hasHeader.checked = f ? f.header : true;
 
@@ -642,10 +644,11 @@ function feedForm(f, creating) {
   const ctlFormat0 = f?.delivery?.control?.format ?? f?.arrival?.control?.format;
   const isDelimited0 = ctlFormat0?.kind === "delimited";
   const ctlFormat = el("select", {}, [
-    el("option", {value: "regex", selected: isDelimited0 ? null : "selected"},
+    el("option", {value: "regex", selected: !ctlFormat0 || ctlFormat0.kind === "regex" ? "selected" : null},
        "text \u2014 a pattern per field"),
     el("option", {value: "delimited", selected: isDelimited0 ? "selected" : null},
        "delimited \u2014 a column per field"),
+    el("option", {value: "key_value", selected: ctlFormat0?.kind === "key_value" ? "selected" : null}, "key/value — a key per field"),
   ]);
   const ctlDelimiter = el("input", {class: "mono", style: "max-width:90px",
     value: ctlFormat0?.delimiter ?? "|", placeholder: "|"});
@@ -736,14 +739,15 @@ function feedForm(f, creating) {
   // label. Retitled rather than duplicated: it is the same setting either way.
   function syncControlFormat() {
     const delimited = ctlFormat.value === "delimited";
+    const keyValue = ctlFormat.value === "key_value";
     ctlFormatFields.style.display = delimited ? "" : "none";
-    arrCtlDateLabel.textContent = delimited ? "COB date column" : "COB date pattern";
-    arrCtlDateHelp.style.display = delimited ? "none" : "";
+    arrCtlDateLabel.textContent = delimited ? "COB date column" : keyValue ? "COB date key" : "COB date pattern";
+    arrCtlDateHelp.style.display = delimited || keyValue ? "none" : "";
     arrCtlDate.placeholder = delimited
       ? "BUSINESS_DATE" : "ReportingDate\\|(?P<cob_date>\\d{8})";
     controlRowCountLabel.textContent = delimited
       ? "Declared row count column (optional)"
-      : "Declared row count pattern (optional)";
+      : keyValue ? "Declared row count key (optional)" : "Declared row count pattern (optional)";
     controlRowCount.placeholder = delimited
       ? "RECORD_COUNT  (optional)" : "ROWS=(?P<rows>\\d+)  (optional)";
     controlMd5Label.textContent = delimited
@@ -855,6 +859,8 @@ function feedForm(f, creating) {
     setDelimiterField(r.delimiter);
     quote.value = r.quote_char;
     encoding.value = r.file_encoding;
+    csvOptions = {...(r.csv_options ?? {})};
+    if (r.control_encoding) controlEncoding.value = r.control_encoding;
     hasHeader.checked = r.header;
     colsBox.textContent = "";
     for (const c of r.columns)
@@ -1079,6 +1085,7 @@ function feedForm(f, creating) {
         "Leave as \" unless the source quotes with something else."),
     ]),
     el("div", {class: "grid2"}, [
+      field("control_encoding", "Control file encoding", controlEncoding, "Leave blank to use the data file encoding. Changing it requires validating the paired samples again."),
       field("file_encoding", "File encoding", encoding,
         "utf-8 unless the source says otherwise \u2014 latin-1 and cp1252 are the usual others."),
       el("div", {class: "field"}, [
@@ -1118,6 +1125,7 @@ function feedForm(f, creating) {
   // Null when the format is the default, so an ordinary feed's block keeps
   // the shape it has always had in the diff.
   const readControlFormat = () => {
+    if (ctlFormat.value === "key_value") return {kind: "key_value", separator: ctlFormat0?.separator ?? "="};
     if (ctlFormat.value !== "delimited") return null;
     const out = {kind: "delimited", delimiter: ctlDelimiter.value};
     const cols = ctlColumns.value.split(",").map(c => c.trim()).filter(Boolean);
@@ -1195,6 +1203,8 @@ function feedForm(f, creating) {
       delimiter: readDelim(),
       quote_char: quote.value,
       file_encoding: encoding.value.trim(),
+      control_encoding: controlEncoding.value.trim() || null,
+      csv_options: csvOptions,
       header: hasHeader.checked,
       delivery: readDelivery(),
       arrival: readArrival(),

@@ -1836,8 +1836,8 @@ FEED a control file belongs to is
 `control.format` names HOW a control file is read, separately from WHAT is
 read out of it. The original reading -- a regex per field over the file's
 whole text -- stays the default and the name of a format nobody has to write
-down; the second is `kind: delimited`, for a control file that is a small
-table.
+down. `kind: delimited` reads a small table; `kind: key_value` reads one
+declared key and value per line through the same shared parser.
 
 ```yaml
 delivery:
@@ -1856,6 +1856,25 @@ against
 FEED|BUSINESS_DATE|RECORD_COUNT|CHECKSUM
 POSITIONS|20260801|2|517263d1618098b81bb21c1cb7cfed25
 ```
+
+A structured key/value control declares its separator and names keys rather
+than regexes:
+
+```yaml
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: key_value
+      separator: '='
+    row_count: ROWS
+    md5: CHECKSUM
+```
+
+against `ROWS=2` and `CHECKSUM=517263d1618098b81bb21c1cb7cfed25` on separate
+lines. Duplicate keys, missing separators and empty keys are refused. Control
+bytes are decoded strictly using `control_encoding`, which defaults to the data
+file's `file_encoding`; a matching BOM is removed before every format parser.
 
 **The field values change meaning with the format, and that is the point.**
 A regex over a delimited line has to count the fields in front of the one it

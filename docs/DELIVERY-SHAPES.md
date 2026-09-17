@@ -25,12 +25,14 @@ makes every awkward delivery shape cheap.**
 
 ## What already works, so nobody builds it twice
 
-**Pipe-delimited, tab-delimited, unusual quoting, non-UTF-8 encodings are one
-line each.** `delimiter`, `quote_char`, `header` and `file_encoding` are
-per-feed keys with global defaults in `feeds.yml`, they reach Spark's reader
-unchanged (`read_landing`, `ingest_feed.py`), and the console exposes all
-four on the form with `unescape_char` so `\t` can be typed literally
-(`ui/registry.py`). A pipe feed is `delimiter: "|"` and nothing else.
+**Pipe-delimited, tab-delimited, unusual quoting, non-UTF-8 encodings and
+multiline records share one parser contract.** `delimiter`, `quote_char`,
+`header`, `file_encoding` and validated `csv_options` are recorded in a v2
+manifest and translated to explicit Spark reader options. Python preview and
+counting use the same contract, including escape behavior and universal newline
+handling. `control_encoding` defaults to the data encoding but can be set
+independently. Decoding is strict: unsupported codecs, bad bytes and malformed
+records fail before publication. A pipe feed still needs only `delimiter: "|"`.
 
 **`.csv.gz` needs no unpacking.** Hadoop's input formats decompress gzip and
 bzip2 transparently, so a single gzipped CSV already reads through the same
@@ -144,8 +146,9 @@ Normalization writes one JSON manifest per delivery into `ready/<feed>/`:
   "source_object": "landing/treasury_margin_call/marginCalls_20260801.zip",
   "parts": [{"object_key": "ready/treasury_margin_call/.../part1.csv",
              "bytes": 41203, "member": "part1.csv"}],
-  "format": {"delimiter": "|", "quote_char": "\"", "header": true,
-             "encoding": "utf-8"},
+  "format": {"parser_contract": 2, "delimiter": "|", "quote_char": "\"",
+             "header": true, "encoding": "utf-8", "escape_char": "\"",
+             "multiline": true},
   "declared_row_count": 4211,
   "normalizer": "archive/v1" }
 ```

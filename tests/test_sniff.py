@@ -546,7 +546,7 @@ def test_no_pairs_means_no_member_control_and_the_old_proposal():
             r"custodyPositions_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.zip"), r
         assert set(r) == {
             "delimiter", "quote_char", "header", "file_encoding",
-            "encoding_confidence", "columns", "source_columns", "column_types",
+            "encoding_confidence", "columns", "source_columns", "column_types", "csv_options",
             "business_key_candidates", "archive_members", "sniffed_member",
             "member_pattern_candidate", "filename_pattern", "filename_has_date",
             "container_has_date"}, sorted(r)
