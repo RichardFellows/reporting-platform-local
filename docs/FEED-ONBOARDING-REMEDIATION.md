@@ -322,12 +322,12 @@ and comparison status. The service is read-only and bounded to 8 MiB per sample.
 Validation results:
 
 * Targeted pure suite: **248 passed, 0 failed**.
-* Full pure suite: **596 passed, 1 failed, 14 skipped** in the container. The one
-  failure predates these changes: its assertion expects two SCD2 models while
-  the checkout already contains three. Running that test from an untouched
-  archive of `HEAD` produced the same failure. The 14 repository-text checks
-  skipped because the runtime image does not contain the repository root; their
-  host run was **15 passed, 0 failed**.
+* Full pure suite: **597 passed, 0 failed, 14 skipped** in the container. The
+  initial run exposed a stale assertion that expected exactly two SCD2 models
+  although `main` already contains three. The check now discovers all SCD2
+  models and refuses an empty set, so every current and future model is checked.
+  The 14 repository-text checks skipped because the runtime image does not
+  contain the repository root; their host run was **15 passed, 0 failed**.
 * Real Spark 3.5.3 validation passed 14 isolated cases: UTF-8, UTF-8 BOM,
   UTF-16/LE/BE, Latin-1, CP1252 including punctuation, headerless input,
   backslash escaping, pipe delimiters, zero rows, null/empty fields and ASCII.
