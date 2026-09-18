@@ -3168,7 +3168,8 @@ check could see nothing about the deliveries behind older rows.
     coalesce(_delivery_id, element_at(split(_source_file, '/'), -1))
 
 **The basename, not the key, and that is the whole subtlety.**
-`_delivery_id` holds a bare filename; `_source_file` holds a full object key.
+For the legacy rows for which this decision was introduced, `_delivery_id`
+holds a bare filename; `_source_file` holds a full object key.
 Coalescing them without stripping the prefix would put two namespaces in one
 column — every join and group-by over it silently wrong for exactly the rows
 that predate provenance, and looking perfectly ordinary in both. It is exact
@@ -3181,6 +3182,13 @@ row exists, and the limit is written down rather than left to be found.
 `source_provenance()` projects it as `delivery_id`, so a rebuilt prepared table
 can name the delivery behind every row it holds — which is what makes a run's
 input set enumerable across the whole history rather than from phase 3 onwards.
+
+> **Phase 5 amendment.** Phase 4's v2 Raw path writes an opaque `dlv_...`
+> DeliveryID into `_delivery_id`. The coalesce still expresses the migration
+> rule, but the preferred value is no longer a filename: new rows preserve
+> that opaque ID unchanged into Prepared. Only a null historical
+> `_delivery_id` takes the basename fallback. `_source_file` remains physical
+> part provenance and `_file_version` remains restatement ordering.
 
 **A macro change reaches only the models rebuilt after it**, and this one is
 the prepared layer's version of the migration `migrate_raw.py` performs for
@@ -3303,6 +3311,15 @@ one dbt subprocess per model, each overwriting that file with its own
 invocation id, so there is no single manifest for a run and the field would
 record whichever task finished last. The project's source is what determines
 what was built.
+
+> **Phase 5 amendment.** The digest remains `dbt_manifest_ref`; it was not
+> replaced with whichever task happened to finish last. Actual execution
+> artifacts now have a separate `dbt_artifacts_ref`: every Cosmos task copies
+> its own `manifest.json` and `run_results.json` (and `catalog.json` when
+> generated) into an immutable run/task/attempt object prefix before the next
+> subprocess overwrites `target/`. Publication checks all successful task
+> artifacts before merge. This preserves execution evidence without inventing
+> a false single-invocation manifest or a metadata catalogue.
 
 Both follow `Feed.schema_version`: derived, not declared, because a version
 somebody has to remember to bump is wrong the first time somebody forgets.
@@ -4607,5 +4624,6 @@ same Delivery twice.
 
 `_file_version` remains the platform ordering number used by existing dbt
 restatement logic. It is not Delivery identity. Prepared/Reporting provenance
-and Airflow-native orchestration remain Phase 5 and Phase 6 respectively. The
-full contract is in `docs/RAW-INGESTION-CONTRACT.md`.
+is completed in Phase 5 without redesigning that ordering. Airflow-native
+orchestration remains Phase 6. The full contract is in
+`docs/RAW-INGESTION-CONTRACT.md`.

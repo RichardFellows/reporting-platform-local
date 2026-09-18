@@ -217,3 +217,73 @@ def test_the_diff_is_keyed_per_report_and_as_at_date_like_the_versions_are():
     sig = inspect.signature(runs.diff)
     assert sig.parameters["from_version"].default is None
     assert sig.parameters["to_version"].default is None
+
+
+def test_report_version_trace_keeps_missing_delivery_evidence_visible():
+    """The normalized chain is version -> run -> inputs -> evidence coverage."""
+    import contextlib
+    import sys
+
+    sys.path.insert(0, str(REPO))
+    from reporting_platform.registry import deliveries, runs
+
+    columns = [
+        "report", "as_at_date", "version_no", "tag", "created_at", "run_id",
+        "purpose", "status", "environment", "dag_id", "airflow_run_id",
+        "branch", "merged_hash", "cob_date", "started_at", "finished_at",
+        "code_ref", "code_ref_kind", "dbt_manifest_ref", "dbt_artifacts_ref",
+        "change_ref", "dbt_project_ref", "deployment_change_ref",
+        "deployment_pipeline_ref", "error",
+    ]
+    row = ["risk", BD, 3, "published/risk/2026-08-01/r3", "created", "run-3",
+           "reporting", "published", "prod", "reporting_build", "airflow-3",
+           "build/reporting/r3", "hash", BD, "started", "finished", "code",
+           "deployed", "digest", "s3://lakehouse/dbt-artifacts/run-3/", None,
+           "project", "change", "pipeline", None]
+
+    class Cursor:
+        description = [(name,) for name in columns]
+
+        def execute(self, sql, args):
+            assert "FROM registry.report_version" in sql
+            assert args == ("risk", BD, 3)
+
+        def fetchone(self):
+            return row
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    @contextlib.contextmanager
+    def connect():
+        yield Connection()
+
+    original = runs.db.connect, runs.inputs_for_run, deliveries.deliveries_by_id
+    runs.db.connect = connect
+    runs.inputs_for_run = lambda run_id: [
+        {"feed": "feed_a", "delivery_id": "dlv_A"},
+        {"feed": "feed_b", "delivery_id": "dlv_missing"},
+    ]
+    deliveries.deliveries_by_id = lambda pairs: [
+        {"feed": pairs[0][0], "delivery_id": pairs[0][1], "registered": True,
+         "manifest_key": "deliveries/DCM/t-a/delivery-manifest.json",
+         "source_object": "received/t-a/source.csv"},
+        {"feed": pairs[1][0], "delivery_id": pairs[1][1], "registered": False,
+         "manifest_key": None, "source_object": None},
+    ]
+    try:
+        traced = runs.trace_version("risk", BD, 3)
+    finally:
+        runs.db.connect, runs.inputs_for_run, deliveries.deliveries_by_id = original
+    assert traced["report_version"]["run_id"] == "run-3"
+    assert traced["run"]["dbt_artifacts_ref"].endswith("/run-3/")
+    assert traced["inputs"][0]["manifest_key"].endswith("delivery-manifest.json")
+    assert traced["inputs"][1]["delivery_id"] == "dlv_missing"
+    assert traced["evidence_coverage"] == {"resolved": 1, "missing": 1}

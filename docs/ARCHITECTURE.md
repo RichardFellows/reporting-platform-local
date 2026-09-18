@@ -517,8 +517,9 @@ work against it:
 
 - **The delivery half records no verdicts.** There is no `ingested`, no
   `superseded`, no `status`. Whether a delivery reached raw stays derived from
-  `_source_file` in the raw table; whether it supersedes another stays
-  `dedupe_rank`'s answer. This is the single difference from the legacy `stg`
+  `_delivery_id` in the raw table for v2 (with the explicit historical
+  `_source_file` basename fallback in `delivery_ref()`); whether it supersedes
+  another stays `dedupe_rank`'s answer. This is the single difference from the legacy `stg`
   load-control tables this platform replaces — those held a status that could
   disagree with the data, and eventually did.
 - **`run_input` carries no foreign key to `delivery`.** A run is an event and a
@@ -526,6 +527,10 @@ work against it:
   delivery row was rebuilt, renumbered, or not yet reconciled. The input set is
   *derived* — read out of the prepared models on the branch, before the merge,
   using the same `delivery_ref()` the rows themselves carry.
+- **A report version reaches evidence through its run.** `report_version.run_id`
+  leads to `run_input`; each pair may resolve through the rebuildable delivery
+  observation to its DeliveryManifest, Transport marker and original received
+  objects. A missing observation is reported as coverage debt, never dropped.
 - **A run has a mutable status. A delivery may not.** For the same reason.
 
 Postgres rather than Iceberg because `sequence_no` — the order in which the
@@ -643,6 +648,11 @@ asserts the two agree.
 and the two legitimately differ: an SCD2 dimension may contribute 10 of 40
 deliveries to a published figure while OpenLineage correctly reports all 40 as
 read. **Do not reconcile them** — they answer different questions.
+
+Cosmos also retains each rendered dbt task's `manifest.json` and
+`run_results.json` under the object-store prefix recorded on the run (and
+`catalog.json` when a task generates it). The project digest, deployed project
+identity and per-task execution artifacts remain separate evidence.
 
 Three operational facts that are easy to lose an afternoon to:
 
