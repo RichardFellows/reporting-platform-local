@@ -211,7 +211,12 @@ provenance, `delivery_ref()`, and Airflow trigger shape are unchanged.
 
 ## Deferred work
 
-Later phases own orchestration/discovery, DeliveryManifest-to-normalization,
-Raw and dbt provenance migration, registry schema/reconciliation, archive
-handling from `received/`, supersession/restatement, content-result
-persistence, historical backfill, and production object-store controls.
+Phase 3 now owns DeliveryManifest-to-normalization, archive handling from
+`received/`, and an additive registry projection. New DeliveryManifests add a
+`feed_contract.normalization` snapshot containing the resolved kind, parser
+format, columns/source mapping, and archive member pattern. Existing immutable
+manifests are not backfilled. See `NORMALIZATION-CONTRACT.md`.
+
+Later phases still own orchestration/discovery, Raw and dbt provenance
+migration, supersession/restatement, content-result persistence, historical
+backfill, and production object-store controls.

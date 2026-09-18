@@ -235,6 +235,170 @@ def register_quietly(feed: Feed, manifest: dict[str, Any],
                     f"{type(exc).__name__}: {exc}")
 
 
+# -------------------------------------------- Delivery/Normalization v2 path
+def observations_v2(feed: Feed, delivery, manifest: dict[str, Any], md5: str,
+                    bucket: str) -> dict[str, Any]:
+    """Pure projection of immutable Delivery evidence plus its v2 plan.
+
+    `normalization_parts` are kept separate from legacy `parts`: Phase 3 has
+    not made these keys Raw `_source_file` identities. The former describes a
+    rebuildable read plan; the latter remains the legacy Raw join table.
+    """
+    data_files = [item for item in delivery.source_files if item.role == "data"]
+    if len(data_files) != 1:
+        raise ValueError(
+            f"{delivery.delivery_id}: registry v2 projection requires one data object")
+    source = data_files[0]
+    assertions = delivery.producer_assertions
+    normalized_parts = []
+    for number, part in enumerate(manifest["parts"]):
+        source_meta = part.get("source") or {}
+        normalized_parts.append({
+            "part_no": number,
+            "object_key": part["object_key"],
+            "bytes": part.get("bytes"),
+            "source_member": source_meta.get("archive_member"),
+            "materialized": bool(part.get("materialized")),
+        })
+    return {
+        "feed": delivery.feed,
+        "delivery_id": delivery.delivery_id,
+        "source_system": feed.source_system,
+        "cob_date": delivery.business_date,
+        "received_at": delivery.received_at,
+        "source_object": source.object_key,
+        "normalizer": manifest["normalizer"],
+        "bytes": source.bytes,
+        "md5": md5,
+        "schema_version": delivery.schema_version,
+        "origin": f"transport:{delivery.transport_source}",
+        "origin_uri": f"s3://{bucket}/{source.object_key}",
+        "source_filename": source.original_filename,
+        "source_container": (source.original_filename
+                             if manifest["normalizer"] == "archive/v2" else None),
+        "control_object": next(
+            (item.object_key for item in delivery.source_files
+             if item.role == "control"), None),
+        "declared_row_count": assertions.get("row_count"),
+        "declared_md5": assertions.get("md5"),
+        "producer_run_id": assertions.get("producer_run_id"),
+        "parts": [],
+        "normalization_parts": normalized_parts,
+    }
+
+
+def write_v2(conn, row: dict[str, Any], delivery_manifest_key: str) -> None:
+    """Upsert a v2 observation without assigning Raw semantics to its parts."""
+    values = {**{c: row.get(c) for c in _COLUMNS},
+              "manifest_key": delivery_manifest_key}
+    sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in _UPDATABLE)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO registry.delivery ({', '.join(_COLUMNS)}) "
+            f"VALUES ({', '.join('%(' + c + ')s' for c in _COLUMNS)}) "
+            f"ON CONFLICT (feed, delivery_id) DO UPDATE SET {sets}", values)
+        cur.execute("DELETE FROM registry.normalization_part "
+                    "WHERE feed = %s AND delivery_id = %s",
+                    (row["feed"], row["delivery_id"]))
+        for part in row["normalization_parts"]:
+            cur.execute(
+                "INSERT INTO registry.normalization_part "
+                "(feed, delivery_id, part_no, object_key, bytes, "
+                " source_member, materialized) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (row["feed"], row["delivery_id"], part["part_no"],
+                 part["object_key"], part["bytes"], part["source_member"],
+                 part["materialized"]))
+
+
+def register_v2(delivery, manifest: dict[str, Any], delivery_manifest_key: str,
+                *, client, bucket: str, conn=None,
+                registry: dict[str, Feed] | None = None) -> dict[str, Any]:
+    """Index one v2 evidence chain. Object storage remains authoritative."""
+    registry = feeds() if registry is None else registry
+    expected = {
+        "delivery_id": delivery.delivery_id,
+        "feed": delivery.feed,
+        "delivery_manifest": delivery_manifest_key,
+        "business_date": delivery.business_date.isoformat(),
+        "schema_version": delivery.schema_version,
+    }
+    conflicts = [field for field, value in expected.items()
+                 if manifest.get(field) != value]
+    if conflicts:
+        raise ValueError(
+            f"{delivery.delivery_id}: NormalizationManifest conflicts in "
+            f"{', '.join(conflicts)}")
+    feed = registry.get(delivery.feed)
+    if feed is None:
+        raise ValueError(f"unknown Feed {delivery.feed!r}")
+    source = manifest["source_object"]
+    body = client.get_object(Bucket=bucket, Key=source)["Body"].read()
+    import hashlib
+    md5 = hashlib.md5(body).hexdigest()
+    row = observations_v2(feed, delivery, manifest, md5, bucket)
+    if conn is not None:
+        write_v2(conn, row, delivery_manifest_key)
+    else:
+        with db.connect() as own:
+            write_v2(own, row, delivery_manifest_key)
+    return row
+
+
+def register_v2_quietly(delivery, manifest: dict[str, Any],
+                        delivery_manifest_key: str, *, client, bucket: str,
+                        registry: dict[str, Feed] | None = None) -> None:
+    try:
+        register_v2(delivery, manifest, delivery_manifest_key, client=client,
+                    bucket=bucket, registry=registry)
+    except Exception as exc:  # noqa: BLE001 - this index is best-effort
+        log.warning("registry: could not record v2 %s/%s: %s -- reconcile-v2 "
+                    "will pick it up", delivery.feed, delivery.delivery_id,
+                    f"{type(exc).__name__}: {exc}")
+
+
+def reconcile_v2(*, client, bucket: str,
+                 registry: dict[str, Feed] | None = None) -> dict[str, Any]:
+    """Rebuild v2 observations from Delivery and Normalization manifests."""
+    from reporting_platform.ingest import delivery as delivery_contract
+    from reporting_platform.ingest import normalization
+    from reporting_platform.ingest import transport as transport_contract
+
+    registry = feeds() if registry is None else registry
+    paginator = client.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix="deliveries/"):
+        keys.extend(obj["Key"] for obj in page.get("Contents", [])
+                    if obj["Key"].endswith("/delivery-manifest.json"))
+    out: dict[str, Any] = {"registered": [], "missing_normalization": [],
+                           "failed": []}
+    for delivery_key in sorted(keys):
+        try:
+            delivery = delivery_contract.read_delivery_manifest(
+                delivery_key, client=client, bucket=bucket)
+            if delivery.feed not in registry:
+                raise ValueError(f"unknown Feed {delivery.feed!r}")
+            normalization_key = normalization.manifest_key(delivery)
+            try:
+                client.head_object(Bucket=bucket, Key=normalization_key)
+            except Exception as exc:  # missing cache is not a failed observation
+                if transport_contract._is_missing(exc):  # noqa: SLF001
+                    out["missing_normalization"].append(delivery_key)
+                    continue
+                raise
+            manifest = normalization.read_normalization_manifest(
+                normalization_key, client=client, bucket=bucket)
+            # One transaction per observation: a later malformed manifest
+            # cannot roll back rows already reconstructed successfully.
+            with db.connect() as conn:
+                register_v2(delivery, manifest, delivery_key, client=client,
+                            bucket=bucket, conn=conn, registry=registry)
+            out["registered"].append(delivery.delivery_id)
+        except Exception as exc:  # noqa: BLE001
+            out["failed"].append({"delivery_manifest": delivery_key,
+                                  "error": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
 # --------------------------------------------------------------- reconciling
 def reconcile(feed: Feed, *, normalize_first: bool = True) -> dict[str, Any]:
     """Register every delivery in object storage that has no row yet.

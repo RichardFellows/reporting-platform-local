@@ -205,6 +205,27 @@ that caused it. Both constants are in `registry/db.py`.
   nothing. An arrivals table would hold verdicts the platform derives and could
   not be rebuilt. ([`#the-arrivals-view-is-a-join-not-a-record`](DECISIONS.md#the-arrivals-view-is-a-join-not-a-record))
 
+## Phase 3 Delivery and normalization observations
+
+`registry.delivery` can now also index a Phase 2 DeliveryID. In that projection
+`manifest_key` is the immutable DeliveryManifest, `source_object` is the
+producer data object below `received/`, and `origin` names the Transport
+source. The row remains an observation: no normalized, ingested, processed, or
+generic status column was added. Existing legacy rows and `run_input` are
+unchanged.
+
+`registry.normalization_part` is additive and rebuildable. It indexes each v2
+part's deterministic key, size, optional original archive-member name, and
+whether the object was materialized. It is separate from
+`registry.delivery_part`, whose established meaning is a physical part that
+can join to the current Raw `_source_file`. Phase 3 does not claim that for v2.
+
+Inline registration is best-effort. `deliveries.reconcile_v2()` reconstructs
+the projection by walking DeliveryManifests and their NormalizationManifests;
+repetition upserts the same `(feed, delivery_id)` and replaces only that
+delivery's v2 part observations. Registry failure never removes or invalidates
+object-store evidence.
+
 ## Related
 
 - [`REQUIREMENTS.md`](REQUIREMENTS.md) — the 100 and 400/500 blocks

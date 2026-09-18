@@ -17,6 +17,7 @@ import re
 from typing import Any, Callable, Iterable
 
 from reporting_platform.common.context import Feed, feeds
+from reporting_platform.common.parsing import feed_format
 from reporting_platform.ingest import control
 from reporting_platform.ingest import transport as transport_contract
 
@@ -113,6 +114,27 @@ class ResolvedIdentity:
     file_version: int | None
     provenance: dict[str, Any]
     producer_assertions: dict[str, Any]
+
+
+def normalization_contract(feed: Feed) -> dict[str, Any]:
+    """The resolved, historical contract needed to normalize this Delivery.
+
+    Identity fields remain at ``feed_contract``'s top level for v1 readers.
+    This nested block was added additively in Phase 3; an already-created
+    DeliveryManifest is immutable and is never backfilled.
+    """
+    configured = feed.delivery or {}
+    kind = configured.get("kind", "file")
+    out: dict[str, Any] = {
+        "contract_version": 1,
+        "kind": kind,
+        "format": feed_format(feed),
+        "columns": list(feed.columns),
+        "source_columns": dict(feed.source_columns),
+    }
+    if kind == "archive":
+        out["member_pattern"] = configured["member_pattern"]
+    return out
 
 
 def delivery_id_for(transport: transport_contract.Transport) -> str:
@@ -308,6 +330,7 @@ def create_delivery(marker_key: str, *, client=None, bucket: str | None = None,
             "identity_sources": list(feed.delivery_identity),
             "filename_pattern": feed.filename_pattern,
             "control": ((feed.delivery or {}).get("control") or {}),
+            "normalization": normalization_contract(feed),
         },
     )
     body = serialize_manifest(delivery)

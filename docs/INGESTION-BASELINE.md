@@ -47,9 +47,13 @@ this Phase 0 baseline.
 Phase 1 adds the DCM boundary under the distinct `received/` prefix. Phase 2
 now interprets a validated Transport as an immutable DeliveryManifest under
 `deliveries/`, resolving Feed and business identity without renaming or
-copying source bytes. This additive boundary still does not enter Landing,
-Ready, raw, or Airflow. See `docs/TRANSPORT-CONTRACT.md` and
-`docs/DELIVERY-CONTRACT.md`.
+copying source bytes. Phase 3 adds a separate NormalizationManifest v2 under a
+DeliveryID-based Ready directory. Plain v2 normalization points back to
+`received/`; archive v2 normalization materializes only deterministic Ready
+parts. It still does not enter Landing, Raw, or Airflow. The independent legacy
+path described below remains current for Raw ingestion. See
+`docs/TRANSPORT-CONTRACT.md`, `docs/DELIVERY-CONTRACT.md`, and
+`docs/NORMALIZATION-CONTRACT.md`.
 
 ### Implementation flow
 
@@ -133,6 +137,13 @@ Rebuilding a deleted Ready entry requires:
 Those inputs regenerate the same manifest and stable member keys. The sidecar
 is not needed to construct the manifest, but it is needed to reconstruct the
 original producer-name provenance in the registry.
+
+Phase 3 adds a second, explicit namespace:
+`ready/<feed>/<dlv_...>/normalization-manifest.json`, with deterministic
+`part-0001...` objects only for materializing normalizers. This v2 cache is
+rebuilt from DeliveryManifest plus `received/` evidence and is not consumed by
+Raw yet. It does not change the legacy v1 retention or reconstruction rules
+above.
 
 ### Raw Iceberg
 
@@ -244,10 +255,11 @@ phase.
 - Landing immutability is not enforced by storage configuration. The code
   trusts approved direct writers not to replace a key; only the inbox gate's
   MD5/version logic protects its own path.
-- Ready reconstruction depends on current feed configuration. A historical
-  snapshot of the configuration is not stored independently; the manifest
-  captures parsing format after normalization but cannot rebuild itself once
-  it has been deleted.
+- Legacy Ready v1 reconstruction depends on current feed configuration. A
+  historical snapshot of the configuration is not stored independently; the
+  v1 manifest captures parsing format after normalization but cannot rebuild
+  itself once it has been deleted. Phase 3 addresses this for newly created
+  DeliveryManifests/v2 normalization only.
 - `registry.delivery` observations are rebuildable; exact `sequence_no`
   values and the run/version/submission/lifecycle tables are not.
 - Polling, waiting, retry, and sequencing are partly custom: the inbox watcher

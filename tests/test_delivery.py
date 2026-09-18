@@ -331,3 +331,19 @@ def test_received_at_is_transport_upload_time_not_interpretation_time():
     got = _create(s3, _put_transport(s3), fd)
     assert got.received_at == datetime(
         2026, 9, 17, 5, 43, 2, tzinfo=timezone.utc)
+
+
+def test_new_delivery_snapshots_the_normalization_contract():
+    s3 = FakeS3()
+    fd = replace(_feed(), delimiter="|", quote_char="'", header=False,
+                 file_encoding="cp1252", columns=["id", "value"],
+                 source_columns={"value": "Producer Value"})
+    got = _create(s3, _put_transport(s3), fd)
+    snapshot = got.feed_contract["normalization"]
+    assert snapshot["kind"] == "file"
+    assert snapshot["format"]["delimiter"] == "|"
+    assert snapshot["format"]["quote_char"] == "'"
+    assert snapshot["format"]["header"] is False
+    assert snapshot["format"]["encoding"] == "cp1252"
+    assert snapshot["columns"] == ["id", "value"]
+    assert snapshot["source_columns"] == {"value": "Producer Value"}
