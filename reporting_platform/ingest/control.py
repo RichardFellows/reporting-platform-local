@@ -1,9 +1,10 @@
 """How a control file is READ. One implementation, both gates.
 
 WHAT a control file may say is fixed and small: `cob_date` and `version`
-(IDENTITY, read at the door by `conform`), `row_count` and `md5` (INTEGRITY,
-read on the landing side by `normalize`). HOW it says it is not fixed at all,
-because every upstream writes a different file.
+(IDENTITY, read at the legacy door by `conform`, or directly from Transport
+by Phase 2 Delivery creation), `row_count` and `md5` (INTEGRITY, read on the
+landing side by `normalize`). HOW it says it is not fixed at all, because
+every upstream writes a different file.
 
 So `control.format` names a reader and this module is the only place one
 lives:
@@ -19,7 +20,7 @@ lives:
     to count the ones before it, and a column inserted upstream then reads the
     wrong value rather than failing.
 
-ONE IMPLEMENTATION, TWO CALLERS, which is the whole reason this is a module
+ONE IMPLEMENTATION, MULTIPLE CALLERS, which is the whole reason this is a module
 and not a function in each. The gate and the normalizer read THE SAME BYTES --
 the control file is promoted into `landing/`, not consumed -- for different
 fields. They had a regex loop each, identical but for the wording of the

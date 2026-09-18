@@ -1,6 +1,9 @@
 name: qa_happy_position
 description: Dummy QA positions for pipe CSV and control-file end-to-end verification.
 source_system: QA
+source_identifiers:
+  DCM: qa-happy-position
+delivery_identity: [control, filename]
 filename_pattern: 'qa_happy_position_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
 delivery:
   control:
@@ -8,6 +11,8 @@ delivery:
     format:
       kind: delimited
       delimiter: '|'
+    cob_date: 'BUSINESS_DATE'
+    version: 'FILE_VERSION'
     row_count: 'RECORD_COUNT'
     md5: 'CHECKSUM'
 delimiter: '|'

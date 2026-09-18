@@ -263,6 +263,16 @@ class Feed:
     # keep-set per feed from that feed's landing prefix.
     # See docs/DECISIONS.md#retention-classes-name-the-obligation
     retention_class: str = "standard"
+    # External identities used by acquisition/transport systems. The key is
+    # the Transport.source value (for example ``DCM``) and the value is that
+    # source's explicit feed id. This is deliberately separate from
+    # filename_pattern: routing a Transport by guessing from a producer name
+    # would make the transport metadata decorative rather than authoritative.
+    source_identifiers: dict[str, str] = field(default_factory=dict)
+    # Ordered evidence sources used to resolve business date and version for
+    # Transport -> Delivery. Both sources are still inspected so conflicting
+    # evidence is refused; ordering selects provenance when they agree.
+    delivery_identity: list[str] = field(default_factory=lambda: ["filename"])
 
     @property
     def needs_conforming(self) -> bool:
@@ -404,12 +414,14 @@ DELIVERY_KINDS = ("file", "archive")
 COB_DATE_FROM = ("container",)
 PARTS_MODES = ("concat",)
 DELIVERY_KEYS = {"kind", "member_pattern", "cob_date_from", "parts", "control"}
-CONTROL_KEYS = {"pattern", "format", "row_count", "md5"}
+CONTROL_KEYS = {"pattern", "format", "cob_date", "version", "row_count", "md5"}
 
 # WHAT a control file may declare, and the regex group each field's pattern
-# must capture under `kind: regex`. One table, because both control blocks
-# read one file: `arrival.control` takes the identity pair at the door,
-# `delivery.control` the integrity pair on the landing side.
+# must capture under `kind: regex`. One table, because both control blocks and
+# Phase 2 Delivery interpretation use the same parser: `arrival.control` takes
+# identity at the legacy inbox door; `delivery.control` keeps its legacy
+# integrity fields and may additionally expose identity directly from accepted
+# Transport evidence.
 CONTROL_FIELD_GROUPS = {"cob_date": "cob_date", "version": "version",
                         "row_count": "rows", "md5": "md5"}
 
@@ -723,17 +735,80 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, Any]:
                                  control.get("format"))
     if fmt["kind"] != "regex":
         out["format"] = fmt
-    # The INTEGRITY checks, both optional -- a control file may be a pure
-    # readiness gate. Read on the landing side and checked at ingest, so they
-    # run once for every delivery however it arrived.
+    # The complete set of assertions this control may make. COB date and
+    # version are ignored by legacy normalization (the conformant Landing name
+    # remains authoritative there) but are read directly from Transport
+    # evidence when this feed opts into control identity. Row count and MD5
+    # retain their existing legacy integrity semantics.
     # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
-    for key in ("row_count", "md5"):
+    for key in ("cob_date", "version", "row_count", "md5"):
         value = control.get(key)
         if value is None:
             continue
         out[key] = _resolve_control_field(feed_name, "delivery.control", key,
                                           value, fmt, "normalize")
     return out
+
+
+IDENTITY_SOURCES = ("control", "filename")
+
+
+def resolve_source_identifiers(feed_name: str, value: Any) -> dict[str, str]:
+    """Validate one feed's explicit acquisition-system identifiers."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{where(feed_name)}: `source_identifiers` must be a mapping of "
+            f"transport source to external feed id")
+    out: dict[str, str] = {}
+    for source, external_id in value.items():
+        if (not isinstance(source, str) or not source.strip()
+                or source != source.strip()):
+            raise ValueError(
+                f"{where(feed_name)}: source identifier key {source!r} must "
+                f"be a non-empty transport source without surrounding whitespace")
+        if (not isinstance(external_id, str) or not external_id.strip()
+                or external_id != external_id.strip()):
+            raise ValueError(
+                f"{where(feed_name)}: source identifier for {source!r} must "
+                f"be a non-empty string without surrounding whitespace")
+        out[source] = external_id
+    return out
+
+
+def resolve_delivery_identity(feed_name: str, value: Any) -> list[str]:
+    """Validate the small ordered Transport identity strategy."""
+    if value is None:
+        return ["filename"]
+    if (not isinstance(value, list) or not value
+            or not all(isinstance(v, str) for v in value)):
+        raise ValueError(
+            f"{where(feed_name)}: `delivery_identity` must be a non-empty "
+            f"ordered list containing: {', '.join(IDENTITY_SOURCES)}")
+    unknown = [v for v in value if v not in IDENTITY_SOURCES]
+    if unknown:
+        raise ValueError(
+            f"{where(feed_name)}: `delivery_identity` has unknown source(s) "
+            f"{', '.join(unknown)}. Valid: {', '.join(IDENTITY_SOURCES)}")
+    if len(set(value)) != len(value):
+        raise ValueError(
+            f"{where(feed_name)}: `delivery_identity` names a source more than once")
+    return list(value)
+
+
+def check_source_identifiers_are_unique(registry: dict[str, Feed]) -> None:
+    """Reject ambiguous external Feed ids across the resolved registry."""
+    claimed: dict[tuple[str, str], str] = {}
+    for name, fd in registry.items():
+        for source, external_id in fd.source_identifiers.items():
+            key = (source, external_id)
+            if key in claimed:
+                raise ValueError(
+                    f"feed {name!r}: source identifier {source}={external_id!r} "
+                    f"is already mapped by feed {claimed[key]!r}. An external "
+                    f"feed id must resolve exactly one Feed.")
+            claimed[key] = name
 
 
 # -------------------------------------------------------------- supersession
@@ -1523,6 +1598,10 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
             block["name"], merged.get("expected_by"))
         merged["retention_class"] = check_retention_class(
             block["name"], merged.get("retention_class"))
+        merged["source_identifiers"] = resolve_source_identifiers(
+            block["name"], merged.get("source_identifiers"))
+        merged["delivery_identity"] = resolve_delivery_identity(
+            block["name"], merged.get("delivery_identity"))
         for key, check in VALUE_CHECKS:
             if key in merged:
                 merged[key] = check(name, merged[key])
@@ -1542,6 +1621,7 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
     # registry rather than about a feed: whether two feeds can be told apart
     # is not a question either of them can answer alone.
     check_control_patterns_are_distinguishable(out)
+    check_source_identifiers_are_unique(out)
     return out
 
 

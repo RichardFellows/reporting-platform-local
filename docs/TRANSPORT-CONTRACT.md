@@ -186,11 +186,13 @@ simulator implementation is isolated in
 `reporting_platform/ingest/dcm_simulator.py`. Neither is called by an Airflow
 DAG in Phase 1.
 
+The accepted-Transport consumer is now specified in
+[`DELIVERY-CONTRACT.md`](DELIVERY-CONTRACT.md). It resolves the explicit
+external Feed id and creates a separate immutable DeliveryManifest without
+copying evidence into Landing.
+
 ## Deferred decisions
 
-Phase 2 must define how an accepted Transport maps to a platform Delivery,
-including feed mapping and the relationship between TransportID and a future
-DeliveryID. It must preserve the original evidence boundary rather than
-forcing these objects through the filename-derived current path. Later phases
-also own orchestration, manifest separation, raw-ingestion identity, registry
-relationships, and deployment-level object-store controls.
+Phase 2 defines Transport-to-Delivery in `docs/DELIVERY-CONTRACT.md`. Later
+phases still own orchestration, Delivery-aware normalization/raw provenance,
+registry reconciliation, and deployment-level object-store controls.

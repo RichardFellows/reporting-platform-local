@@ -294,7 +294,8 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
     if parts:
         out["parts"] = parts
     control = _control_from_payload(raw.get("control"),
-                                    ("pattern", "row_count", "md5"))
+                                    ("pattern", "cob_date", "version",
+                                     "row_count", "md5"))
     if control:
         out["control"] = control
     return out
@@ -720,7 +721,8 @@ def _delivery_block(value: dict[str, Any]) -> CommentedMap:
         dv["parts"] = value["parts"]
     control = value.get("control")
     if isinstance(control, dict) and control:
-        dv["control"] = _control_block(control, ("row_count", "md5"))
+        dv["control"] = _control_block(
+            control, ("cob_date", "version", "row_count", "md5"))
     return dv
 
 

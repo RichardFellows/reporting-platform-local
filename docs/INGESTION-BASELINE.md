@@ -44,10 +44,12 @@ The local inbox is the current optional conformance gate; it is not a model
 for a new DFS/SFTP poller. The future DCM follow-on upload belongs outside
 this Phase 0 baseline.
 
-Phase 1 adds that DCM boundary under the distinct `received/` prefix. It is
-additive and is not connected to this flow yet: a completed Transport is not
-currently a Delivery and does not enter Landing, Ready, raw, or Airflow. See
-`docs/TRANSPORT-CONTRACT.md`.
+Phase 1 adds the DCM boundary under the distinct `received/` prefix. Phase 2
+now interprets a validated Transport as an immutable DeliveryManifest under
+`deliveries/`, resolving Feed and business identity without renaming or
+copying source bytes. This additive boundary still does not enter Landing,
+Ready, raw, or Airflow. See `docs/TRANSPORT-CONTRACT.md` and
+`docs/DELIVERY-CONTRACT.md`.
 
 ### Implementation flow
 
