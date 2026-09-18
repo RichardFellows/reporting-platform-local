@@ -104,11 +104,11 @@ def connect(ensure: bool = True):
 SCHEMA = """
 CREATE SCHEMA IF NOT EXISTS registry;
 
--- One row per DELIVERY: a set of bytes this platform accepted into landing/
--- for one feed and one COB date. The natural key is the landing
--- filename, because that is what identity means here -- `_v2` is a different
--- delivery from the file it corrects, and that is the whole point of the
--- versioning `conform._free_name` does.
+-- One row per DELIVERY: a set of producer bytes accepted for one feed and one
+-- COB date. Legacy rows identify the conformant landing filename (`_v2` is a
+-- distinct delivery); Phase 3 rows use the transport-derived `dlv_...` ID.
+-- Both are stable within their own evidence contract, so the additive natural
+-- key remains (feed, delivery_id).
 CREATE TABLE IF NOT EXISTS registry.delivery (
     feed               TEXT        NOT NULL,
     delivery_id        TEXT        NOT NULL,
@@ -117,8 +117,8 @@ CREATE TABLE IF NOT EXISTS registry.delivery (
     sequence_no        BIGSERIAL   NOT NULL UNIQUE,
     source_system      TEXT        NOT NULL,
     cob_date      DATE        NOT NULL,
-    -- The DELIVERY's arrival time -- the landing object's LastModified, the
-    -- same value the manifest carries -- not the moment this row was written.
+    -- The DELIVERY's durable arrival time -- legacy Landing LastModified or
+    -- v2 Transport uploaded_at -- not the moment this row was written.
     received_at        TIMESTAMPTZ NOT NULL,
     -- The moment the registry first saw it. The gap between the two is how
     -- far behind the registry was running, and it is the only clock in this
@@ -170,6 +170,27 @@ CREATE TABLE IF NOT EXISTS registry.delivery_part (
 
 CREATE INDEX IF NOT EXISTS delivery_part_object
     ON registry.delivery_part (object_key);
+
+-- Phase 3 NormalizationManifest v2 parts. These are deliberately not written
+-- to delivery_part: that legacy table means "physical objects whose keys may
+-- appear in Raw _source_file". Phase 4 has not made that claim for v2 yet.
+-- `materialized=false` is the plain-file pass-through into received/;
+-- `materialized=true` is a rebuildable object extracted below ready/.
+CREATE TABLE IF NOT EXISTS registry.normalization_part (
+    feed          TEXT    NOT NULL,
+    delivery_id   TEXT    NOT NULL,
+    part_no       INT     NOT NULL,
+    object_key    TEXT    NOT NULL,
+    bytes         BIGINT,
+    source_member TEXT,
+    materialized  BOOLEAN NOT NULL,
+    PRIMARY KEY (feed, delivery_id, part_no),
+    FOREIGN KEY (feed, delivery_id)
+        REFERENCES registry.delivery (feed, delivery_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS normalization_part_object
+    ON registry.normalization_part (object_key);
 
 -- REQ-106. A delivery that arrived and could not be accepted is evidence too,
 -- and until now it was a file moved into a folder on one container's bind

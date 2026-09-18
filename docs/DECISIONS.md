@@ -4559,3 +4559,27 @@ schema and consumers understand both manifest kinds would make the index lie.
 The future projection must reconcile from DeliveryManifests first, remain
 additive to legacy rows and `run_input`, and keep registry availability out of
 manifest creation. The complete boundary is in `docs/DELIVERY-CONTRACT.md`.
+
+## delivery-normalization-is-a-separate-rebuildable-contract
+
+**Decision.** Phase 3 normalizes an immutable DeliveryManifest into a separate
+NormalizationManifest v2 at
+`ready/<feed>/<delivery-id>/normalization-manifest.json`. It does not mutate the
+DeliveryManifest and does not create a compatibility object in Landing.
+
+A plain file part points directly to `received/`. An archive stays unchanged
+there while sorted matching members become deterministic numbered Ready parts.
+Create-only, verify-identical writes make partial retry and full cache rebuild
+the same operation; producer filenames and archive member names remain
+metadata rather than storage identity.
+
+New DeliveryManifests snapshot the resolved normalization contract. Old Phase
+2 manifests use current Feed configuration only for the first normalization,
+record that compatibility source explicitly, and thereafter use the v2
+snapshot. They are never rewritten to invent missing history.
+
+The registry uses a distinct `normalization_part` table because legacy
+`delivery_part` means a key that may occur in Raw `_source_file`. Raw and dbt
+identity are Phase 4 decisions, so assigning that meaning to v2 parts now
+would silently pull the migration forward. The complete contract and boundary
+are in `docs/NORMALIZATION-CONTRACT.md`.
