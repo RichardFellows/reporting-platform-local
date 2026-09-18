@@ -98,6 +98,7 @@ def test_plain_file_passes_received_object_through_without_filename_parsing_or_c
     assert set(s3.objects) - before == {result.key}
     assert manifest["declared_row_count"] == 1
     assert manifest["declared_md5"] == "abc"
+    assert manifest["source_system"] == fd.source_system
     assert not any("unrelated-name.ctl" in call for call in s3.calls)
 
 

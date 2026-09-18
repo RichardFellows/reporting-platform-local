@@ -132,6 +132,12 @@ def normalize_delivery(delivery_manifest_key: str, *, client=None,
         "declared_md5": assertions.get("md5"),
         "source_object": source.object_key,
     }
+    # Phase 4 consumes this without having to reinterpret Transport.source
+    # (for example DCM) as the business source system.  Older immutable
+    # Phase-2 manifests do not have this additive contract field; their
+    # explicit compatibility fallback remains in the Raw adapter.
+    if contract.get("source_system"):
+        manifest["source_system"] = contract["source_system"]
     if delivery.file_version is not None:
         manifest["file_version"] = delivery.file_version
     if existing is not None and serialize_manifest(existing) != serialize_manifest(manifest):
@@ -193,6 +199,14 @@ def _validate_contract(contract: Any, source: str) -> None:
         raise NormalizationError(f"{source}: unsupported normalization kind {kind!r}")
     if not isinstance(contract.get("format"), dict):
         raise NormalizationError(f"{source}: format is missing or malformed")
+    if "source_system" in contract and not isinstance(contract["source_system"], str):
+        raise NormalizationError(f"{source}: source_system is malformed")
+    if "expected_min_rows" in contract and (
+            type(contract["expected_min_rows"]) is not int
+            or contract["expected_min_rows"] < 0):
+        raise NormalizationError(f"{source}: expected_min_rows is malformed")
+    if "schema_drift" in contract and contract["schema_drift"] not in ("warn", "fail"):
+        raise NormalizationError(f"{source}: schema_drift is malformed")
     if kind == "archive" and not isinstance(contract.get("member_pattern"), str):
         raise NormalizationError(f"{source}: archive member_pattern is missing")
 

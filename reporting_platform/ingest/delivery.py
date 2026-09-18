@@ -128,6 +128,12 @@ def normalization_contract(feed: Feed) -> dict[str, Any]:
     out: dict[str, Any] = {
         "contract_version": 1,
         "kind": kind,
+        # These are ingestion semantics, not transport metadata.  Snapshot
+        # them beside the parser contract so a delayed Delivery is not read
+        # using whichever Feed YAML happens to be current at ingest time.
+        "source_system": feed.source_system,
+        "expected_min_rows": feed.expected_min_rows,
+        "schema_drift": feed.schema_drift,
         "format": feed_format(feed),
         "columns": list(feed.columns),
         "source_columns": dict(feed.source_columns),

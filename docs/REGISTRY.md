@@ -32,7 +32,8 @@ questions it will not answer.
 | **Records verdicts?** | **never** | yes, that is what they are |
 
 The delivery half holds no `ingested`, no `superseded`, no `status`. Whether a
-delivery reached raw stays derived from `_source_file` in the raw table;
+legacy v1 delivery reached raw stays derived from `_source_file`; for a
+NormalizationManifest v2 Delivery it is derived from Raw `_delivery_id`;
 whether it supersedes another stays `dedupe_rank`'s answer. That is the single
 difference from the legacy `stg` load-control tables this platform replaces —
 those held a status that could disagree with the data, and eventually did.
@@ -218,7 +219,11 @@ unchanged.
 part's deterministic key, size, optional original archive-member name, and
 whether the object was materialized. It is separate from
 `registry.delivery_part`, whose established meaning is a physical part that
-can join to the current Raw `_source_file`. Phase 3 does not claim that for v2.
+can join to the current Raw `_source_file`. Phase 4 writes v2 physical keys to
+Raw but does not turn either registry part table into an ingestion ledger.
+
+Phase 4 leaves this projection observational. Raw `_delivery_id`, not a
+registry status column, is authoritative for whether a v2 Delivery committed.
 
 Inline registration is best-effort. `deliveries.reconcile_v2()` reconstructs
 the projection by walking DeliveryManifests and their NormalizationManifests;
