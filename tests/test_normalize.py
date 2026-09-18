@@ -143,6 +143,28 @@ def test_reconcile_is_idempotent():
         uninstall(monkey)
 
 
+def test_ready_cache_can_be_deleted_and_rebuilt_byte_identically():
+    """Landing plus feed config is sufficient to reconstruct plain ready/."""
+    s3, monkey, fd, norm = _setup()
+    try:
+        report = norm.reconcile(fd)
+        assert len(report["created"]) == 1, report
+        manifest_key = report["created"][0]
+        first = s3.objects[manifest_key][0]
+        landing_bytes = s3.objects[LANDED][0]
+
+        s3.delete_object(Bucket="lakehouse", Key=manifest_key)
+        assert manifest_key not in s3.objects
+        assert s3.objects[LANDED][0] == landing_bytes
+
+        rebuilt = norm.reconcile(fd)
+        assert rebuilt["created"] == [manifest_key], rebuilt
+        assert s3.objects[manifest_key][0] == first
+        assert s3.objects[LANDED][0] == landing_bytes
+    finally:
+        uninstall(monkey)
+
+
 def test_one_unroutable_file_does_not_block_the_others():
     """Raising here would let a single bad filename stop the night's load."""
     s3, monkey, fd, norm = _setup()

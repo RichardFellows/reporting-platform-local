@@ -211,6 +211,34 @@ def test_renormalizing_is_byte_identical():
         uninstall(monkey)
 
 
+def test_ready_cache_can_be_deleted_and_rebuilt_from_the_archive():
+    """The retained Landing container can recreate every archive artifact."""
+    s3, monkey, fd, norm = _setup(TWO_PARTS)
+    try:
+        manifest = norm.normalize(fd, ZIP_KEY)
+        ready_before = {
+            key: value[0] for key, value in s3.objects.items()
+            if key.startswith("ready/")
+        }
+        container = s3.objects[ZIP_KEY][0]
+
+        for key in list(ready_before):
+            s3.delete_object(Bucket="lakehouse", Key=key)
+        assert not any(key.startswith("ready/") for key in s3.objects)
+        assert s3.objects[ZIP_KEY][0] == container
+
+        rebuilt = norm.reconcile(fd)
+        assert rebuilt["created"] == [norm.manifest_key(fd, ZIP_KEY)], rebuilt
+        assert {
+            key: value[0] for key, value in s3.objects.items()
+            if key.startswith("ready/")
+        } == ready_before
+        assert norm.read_manifest(rebuilt["created"][0]) == manifest
+        assert s3.objects[ZIP_KEY][0] == container
+    finally:
+        uninstall(monkey)
+
+
 def test_member_keys_are_stable_so_reingest_does_not_happen():
     """`already_ingested` matches on `_source_file`, which holds a part's key.
     A timestamp or uuid in that key re-ingests every delivery forever."""
