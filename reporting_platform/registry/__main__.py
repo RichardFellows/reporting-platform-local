@@ -9,6 +9,7 @@
     python -m reporting_platform.registry runs [--purpose reporting]
     python -m reporting_platform.registry versions [--report NAME]
     python -m reporting_platform.registry inputs --run-id RUN
+    python -m reporting_platform.registry trace --report NAME --as-at DATE --version N
     python -m reporting_platform.registry submissions
     python -m reporting_platform.registry state [--report NAME] [--as-at DATE]
     python -m reporting_platform.registry lock --report NAME --as-at DATE \
@@ -87,6 +88,12 @@ def main(argv=None) -> int:
     ip = sub.add_parser("inputs", help="the deliveries one run read")
     ip.add_argument("--run-id", required=True)
 
+    tr = sub.add_parser("trace", help="trace a report version to source evidence")
+    tr.add_argument("--report", required=True)
+    tr.add_argument("--as-at", required=True, dest="as_at",
+                    type=lambda s: date.fromisoformat(s))
+    tr.add_argument("--version", required=True, type=int)
+
     sub.add_parser("submissions", help="recorded submissions")
 
     # ------------------------------------------------------ the lifecycle
@@ -151,6 +158,14 @@ def main(argv=None) -> int:
         return 0
     if a.command == "inputs":
         print(json.dumps(runs.inputs_for_run(a.run_id), indent=2, default=str))
+        return 0
+    if a.command == "trace":
+        try:
+            out = runs.trace_version(a.report, a.as_at, a.version)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(out, indent=2, default=str))
         return 0
     if a.command == "submissions":
         print(json.dumps(runs.submissions(), indent=2, default=str))

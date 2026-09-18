@@ -240,9 +240,10 @@ def observations_v2(feed: Feed, delivery, manifest: dict[str, Any], md5: str,
                     bucket: str) -> dict[str, Any]:
     """Pure projection of immutable Delivery evidence plus its v2 plan.
 
-    `normalization_parts` are kept separate from legacy `parts`: Phase 3 has
-    not made these keys Raw `_source_file` identities. The former describes a
-    rebuildable read plan; the latter remains the legacy Raw join table.
+    `normalization_parts` are kept separate from legacy `parts`: the former
+    describes a v2 rebuildable read plan; the latter remains the legacy Ready
+    v1 Raw join table. Phase 4 writes v2 part keys to `_source_file` without
+    changing either table's evidence contract.
     """
     data_files = [item for item in delivery.source_files if item.role == "data"]
     if len(data_files) != 1:
@@ -622,7 +623,8 @@ def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
         return []
     wanted = sorted(set(pairs))
     sql = ("SELECT feed, delivery_id, source_object, cob_date, "
-           "       received_at, md5, bytes "
+           "       received_at, md5, bytes, manifest_key, origin, origin_uri, "
+           "       source_filename, source_container, control_object "
            "FROM registry.delivery WHERE (feed, delivery_id) IN %s")
     with db.connect() as conn, conn.cursor() as cur:
         cur.execute(sql, (tuple(wanted),))
@@ -637,6 +639,9 @@ def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
             out.append({"feed": feed, "delivery_id": delivery_id,
                         "source_object": None, "cob_date": None,
                         "received_at": None, "md5": None, "bytes": None,
+                        "manifest_key": None, "origin": None,
+                        "origin_uri": None, "source_filename": None,
+                        "source_container": None, "control_object": None,
                         "registered": False})
     return out
 

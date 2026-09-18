@@ -89,9 +89,14 @@ manifests but is not substituted into this platform ordering field.
 Thus `_file_version` remains an ordering mechanism; it is not the identity of
 an accepted Delivery and does not compete with `_delivery_id`.
 
-## Deferred boundaries
+## Downstream boundary
 
-Prepared/Reporting provenance, `registry.run_input`, and dbt lineage migration
-remain Phase 5. Airflow-native discovery and orchestration remain Phase 6.
+Phase 5 now maps `_delivery_id` unchanged to Prepared `delivery_id` through
+`delivery_ref()`, with an explicit basename-of-`_source_file` fallback only for
+historical rows where `_delivery_id` is null. `registry.run_input` collects
+those prepared Delivery references from the build branch before merge. See
+`LINEAGE.md` for the publication-to-evidence chain.
+
+Airflow-native discovery and orchestration remain Phase 6.
 Legacy historical rows are not rewritten or backfilled, Ready v1 is not
 removed, and no supersession/SCD2 policy is redesigned here.

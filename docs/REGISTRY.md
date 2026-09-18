@@ -104,7 +104,8 @@ copy of the same thing.
 |---|---|
 | `runs [--purpose prepared\|reporting] [--limit N]` | Build runs, newest first. |
 | `versions [--report R] [--limit N]` | Published report versions and the tag pinning each. |
-| `inputs --run-id RUN` | The deliveries that run actually read. |
+| `inputs --run-id RUN` | Deliveries whose rows are present in what that run published. |
+| `trace --report R --as-at DATE --version N` | Report version → run → run inputs → Delivery evidence. |
 | `submissions` | Recorded submissions. |
 | `submit --destination D --by WHO --version R:DATE:N [--version …] [--family F] [--note …]` | Record that published versions were **sent somewhere**. |
 | `diff --report R --as-at DATE [--from N] [--to N]` | What changed between two versions — **inputs and code, not data**. |
@@ -113,7 +114,20 @@ copy of the same thing.
 **`inputs` is derived, not declared.** The publish step selects the distinct
 delivery ids out of the prepared models on the branch before the merge, using
 the same `delivery_ref()` the rows themselves carry. Nobody hands the platform
-a list.
+a list. It is deliberately **not every Delivery scanned**: an unchanged SCD2
+restatement creates no historical version, so it is absent from the published
+input set.
+
+`trace` follows the normalized `report_version.run_id` relationship rather
+than copying DeliveryIDs onto report versions. It includes DeliveryManifest
+and original-source references from `registry.delivery`. The join is tolerant:
+an unreconciled observation appears with `registered: false` and is counted as
+missing evidence coverage, while the `run_input` DeliveryID remains visible.
+
+Each run also records `dbt_artifacts_ref`, an immutable object-store prefix
+containing every Cosmos task's `manifest.json` and `run_results.json` (and
+`catalog.json` where generated). `dbt_manifest_ref` remains the dbt project
+content digest; `dbt_project_ref` remains the deployed project identity.
 
 **`diff` defaults to the last two versions**, which is the comparison anybody
 actually wants and the one that is tedious to type. It reports the set

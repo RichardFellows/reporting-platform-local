@@ -172,8 +172,9 @@ CREATE INDEX IF NOT EXISTS delivery_part_object
     ON registry.delivery_part (object_key);
 
 -- Phase 3 NormalizationManifest v2 parts. These are deliberately not written
--- to delivery_part: that legacy table means "physical objects whose keys may
--- appear in Raw _source_file". Phase 4 has not made that claim for v2 yet.
+-- to delivery_part: that legacy table is coupled to legacy Ready v1 semantics,
+-- while this table describes the v2 rebuildable normalization plan. Phase 4
+-- writes these physical keys to Raw without collapsing the two evidence kinds.
 -- `materialized=false` is the plain-file pass-through into received/;
 -- `materialized=true` is a rebuildable object extracted below ready/.
 CREATE TABLE IF NOT EXISTS registry.normalization_part (
@@ -256,6 +257,11 @@ CREATE TABLE IF NOT EXISTS registry.run (
     code_ref          TEXT        NOT NULL,
     code_ref_kind     TEXT        NOT NULL,
     dbt_manifest_ref  TEXT        NOT NULL,
+    -- Object-store prefix containing each Cosmos/dbt task's manifest.json and
+    -- run_results.json (plus catalog.json when generated).  Separate from the
+    -- project digest above: one identifies model source, the other preserves
+    -- the actual per-invocation artifacts.
+    dbt_artifacts_ref TEXT,
     -- REQ-405. The change this ONE PUBLICATION was made under, as supplied by
     -- whoever triggered it -- a restatement, a backfill, an out-of-cycle
     -- rerun. Also written onto the Nessie merge commit.
@@ -423,6 +429,7 @@ MIGRATIONS = """
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_project_ref         TEXT;
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_change_ref   TEXT;
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_pipeline_ref TEXT;
+ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_artifacts_ref       TEXT;
 """
 
 

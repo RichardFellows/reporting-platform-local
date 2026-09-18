@@ -138,6 +138,29 @@ EXECUTION_CONFIG = ExecutionConfig(
 TEST_BEHAVIOR = TestBehavior(os.environ.get("COSMOS_TEST_BEHAVIOR", "after_all"))
 
 
+def _archive_dbt_artifacts(context) -> None:
+    """Retain this Cosmos task's artifacts before the next task overwrites them."""
+    import logging
+
+    from reporting_platform.registry import artifacts
+
+    ti = context["ti"]
+    branch = ti.xcom_pull(task_ids="open_branch")
+    if not branch:
+        raise RuntimeError(
+            f"{ti.task_id}: cannot associate dbt artifacts without open_branch")
+    result = artifacts.archive(
+        _run_key(branch), ti.task_id, ti.try_number,
+        target_path=os.environ.get("DBT_TARGET_PATH"))
+    if result["missing"]:
+        raise RuntimeError(
+            f"{ti.task_id}: dbt did not produce required artifacts "
+            f"{result['missing']}")
+    logging.getLogger("airflow.task").info(
+        "retained dbt artifacts for %s at %s", ti.task_id,
+        result["reference"])
+
+
 def _render_config(select: str) -> RenderConfig:
     return RenderConfig(
         # LOAD-BEARING: Cosmos's own CUSTOM parser double-emits every test and
@@ -181,6 +204,11 @@ def _operator_args(branch_task_id: str) -> dict:
         # See docs/DECISIONS.md#cosmos-packages
         "install_deps": False,
         "copy_dbt_packages": False,
+        # Cosmos invokes dbt once per task and every invocation overwrites the
+        # shared target directory. Archive while the task still owns it; the
+        # publish task verifies all successful invocations before merging.
+        "on_success_callback": _archive_dbt_artifacts,
+        "on_failure_callback": _archive_dbt_artifacts,
     }
 
 
@@ -268,6 +296,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                 deployment_provenance,
             )
             from reporting_platform.registry import runs
+            from reporting_platform.registry import artifacts
 
             # BEFORE the run row and before any model builds. In a controlled
             # environment this RAISES, and failing here is the point: the
@@ -287,6 +316,7 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
                     run_id, purpose, branch,
                     environment=ENV, code_ref=ref, code_ref_kind=kind,
                     dbt_manifest_ref=dbt_manifest_ref(),
+                    dbt_artifacts_ref=artifacts.reference(run_id),
                     dag_id=dag_id, airflow_run_id=context["run_id"],
                     change_ref=(context["params"].get("change_ref") or None),
                     provenance=deployment_provenance())
@@ -342,6 +372,21 @@ def build_dag(dag_id: str, schedule, select: str, outlet, purpose: str):
             log = logging.getLogger("airflow.task")
             run_id = _run_key(branch)
             change_ref = (context["params"].get("change_ref") or "").strip() or None
+
+            # Every successful Cosmos task must have copied its manifest and
+            # run_results before anything is merged. A callback exception alone
+            # does not reliably change the completed task's state in every
+            # supported Airflow version, so publication verifies the evidence.
+            from reporting_platform.registry import artifacts
+
+            dbt_attempts = [
+                (ti.task_id, ti.try_number)
+                for ti in context["ti"].get_dagrun().get_task_instances()
+                if ti.task_id.startswith("dbt.") and ti.state == "success"
+            ]
+            if not dbt_attempts:
+                raise RuntimeError("no successful dbt tasks found for artifact retention")
+            artifacts.require_complete(run_id, dbt_attempts)
 
             # 1. What this build read, from the branch it built on.
             inputs, cob_date = {}, None
