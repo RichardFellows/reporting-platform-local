@@ -20,6 +20,10 @@ class NoSuchKey(Exception):
     pass
 
 
+class PreconditionFailed(Exception):
+    pass
+
+
 class FakeS3:
     def __init__(self) -> None:
         self.objects: dict[str, tuple[bytes, datetime]] = {}
@@ -42,8 +46,13 @@ class FakeS3:
         return {"ContentLength": len(body), "LastModified": when}
 
     def put_object(self, Bucket: str, Key: str, Body: bytes,     # noqa: N803
-                   ContentType: str = ""):                       # noqa: N803
+                   ContentType: str = "",                       # noqa: N803
+                   IfNoneMatch: str = ""):                      # noqa: N803
         self.calls.append(f"put:{Key}")
+        if IfNoneMatch == "*" and Key in self.objects:
+            raise PreconditionFailed(Key)
+        if hasattr(Body, "read"):
+            Body = Body.read()
         self.objects[Key] = (Body, datetime.now(timezone.utc))
         return {}
 

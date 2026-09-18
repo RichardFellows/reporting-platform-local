@@ -4497,3 +4497,25 @@ on Spark against Iceberg on a Nessie branch.
 > file gave one version and a MERGE Spark accepted, and a key that cleans to
 > NULL was versioned, matched on the next run and closed -- each state
 > identical to a full refresh over the same raw.
+
+## DCM uploads completed transport evidence
+
+**Decision.** DCM remains the owner of DFS watching and source-side
+completeness. Its follow-on action writes original source objects beneath
+`received/<transport-id>/`, verifies them, and writes `_COMPLETE.json` last.
+The reporting platform begins at that marker, validates its versioned contract
+and every declared object's size and SHA-256, and does no stability polling.
+
+`received/` is intentionally separate from the existing feed-scoped
+`landing/`. A TransportID identifies one DCM transfer execution and is opaque
+to this platform; it is neither a producer filename nor the current
+filename-derived DeliveryID. Phase 1 therefore does not rename or copy a
+Transport into Landing merely to satisfy `Feed.parse_filename`. The
+Transport-to-Delivery mapping is a later decision.
+
+At application level the evidence is append-only. The development simulator
+uses conditional create-only writes, returns the existing validated contract
+for an identical retry, and refuses conflicting reuse of a TransportID. This
+does not make the bucket WORM: production versioning, Object Lock and
+retention controls remain deployment decisions. The full producer and
+consumer contract is in `docs/TRANSPORT-CONTRACT.md`.
