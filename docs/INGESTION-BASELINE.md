@@ -50,8 +50,9 @@ now interprets a validated Transport as an immutable DeliveryManifest under
 copying source bytes. Phase 3 adds a separate NormalizationManifest v2 under a
 DeliveryID-based Ready directory. Plain v2 normalization points back to
 `received/`; archive v2 normalization materializes only deterministic Ready
-parts. It still does not enter Landing, Raw, or Airflow. The independent legacy
-path described below remains current for Raw ingestion. See
+parts. Phase 4 now reads that v2 plan directly into Raw without entering
+Landing; Airflow orchestration remains deferred. The independent legacy path
+described below remains operational for Raw ingestion. See
 `docs/TRANSPORT-CONTRACT.md`, `docs/DELIVERY-CONTRACT.md`, and
 `docs/NORMALIZATION-CONTRACT.md`.
 
@@ -66,7 +67,7 @@ path described below remains current for Raw ingestion. See
 | Arrival resolution | A DAG parameter containing a Landing or manifest key, or the next result from `arrival.find_pending` | `airflow/dags/feed_ingest.py`: `resolve_arrival`; `reporting_platform/ingest/arrival.py`: `find_pending` | Before selecting pending work, the fallback poll reconciles `ready/`. It then removes deliveries whose manifest part keys already appear as raw `_source_file`. `tests/test_find_pending.py` covers this. |
 | Normalization | A conformant Landing object; output is manifest v1 in `ready/<feed>/<delivery_id>.json` | `reporting_platform/ingest/normalize.py`: `_gate`, `_normalize_file`, `_normalize_archive`, `normalize`, `reconcile` | Plain files are not copied: their part points back to Landing. Archives stay in Landing while safe, matching members are extracted below `ready/`. The control gate runs before extraction. A repeat with unchanged Landing state and config produces identical JSON and stable part keys. `tests/test_normalize.py`, `tests/test_control*.py`, and `tests/test_archive.py` cover these properties. |
 | Delivery registry | A normalized manifest plus Landing listing/sidecar observations; output is `registry.delivery` and `registry.delivery_part` | `reporting_platform/registry/deliveries.py`: `observations`, `register`, `reconcile`, `coverage` | Inline registration is best-effort. Reconciliation is the correctness path and uses the same observation projection. `(feed, delivery_id)` is the primary key, so reconciliation does not duplicate an observation. `tests/test_registry.py` covers the boundary. |
-| Raw ingestion | Ordered manifest parts plus captured format instructions; output is an Iceberg raw table | `reporting_platform/ingest/ingest_feed.py`: `resolve_delivery`, `read_landing`, `reconcile_schema`, `ingest`; invoked by `feed_ingest.py:ingest_task` | Spark reads each physical part, adds raw provenance, writes on a Nessie branch, validates count/checksum/minimum rows, then merges. The DAG's normal pending path suppresses already-seen part keys. A direct explicit replay is not independently guarded; see Known limitations. Tests cover parsing/schema/provenance, while `scripts/verify_happy_path.py` checks the live stack. |
+| Raw ingestion | Ordered manifest parts plus captured format instructions; output is an Iceberg raw table | `reporting_platform/ingest/ingest_feed.py`: legacy `ingest` and v2 `ingest_normalized_delivery`; the generated DAG still invokes only legacy `ingest` | Spark reads each physical part, adds raw provenance, writes on a Nessie branch, validates parser/schema/count/checksum/minimum-row controls, then merges. Legacy pending suppresses seen part keys; v2 guards explicit retries by DeliveryID inside the domain operation. `scripts/verify_happy_path.py` and `scripts/verify_phase4_raw.py` exercise the two live paths. |
 | Prepared build | A raw Airflow Asset update; output is typed/conformed Iceberg prepared models | `airflow/dags/dbt_builds.py`; `dbt/models/prepared/`; macros in `dbt/macros/engine.sql` | Cosmos runs the selected dbt graph with tests after all models. Work happens on a Nessie branch and merges only after the build and tests pass. `tests/test_happy_path_scd2.py` executes representative model SQL in DuckDB. |
 | Reporting build | Prepared Asset update; output is reporting models and published registry run/version information | `airflow/dags/dbt_builds.py`; `dbt/models/reporting/`; dbt schema tests | The same branch/test/merge pattern applies. The QA smoke path ends at `reporting.qa_happy_position_summary`; `scripts/verify_happy_path.py` asserts exact live output and types. |
 
@@ -141,17 +142,18 @@ original producer-name provenance in the registry.
 Phase 3 adds a second, explicit namespace:
 `ready/<feed>/<dlv_...>/normalization-manifest.json`, with deterministic
 `part-0001...` objects only for materializing normalizers. This v2 cache is
-rebuilt from DeliveryManifest plus `received/` evidence and is not consumed by
-Raw yet. It does not change the legacy v1 retention or reconstruction rules
-above.
+rebuilt from DeliveryManifest plus `received/` evidence. Phase 4 consumes it
+through an explicit Raw entry point without changing the legacy v1 retention
+or reconstruction rules above. See `docs/RAW-INGESTION-CONTRACT.md`.
 
 ### Raw Iceberg
 
 The raw table stores source business values as strings plus `_cob_date`,
 `_source_file`, `_file_version`, `_ingest_ts`, `_row_number`, `_batch_id`,
 `_delivery_id`, `_received_at`, `_schema_version`, and `_source_system`. The physical part key
-in `_source_file` is currently both provenance and the normal-path ingestion
-ledger.
+in `_source_file` remains provenance and the legacy v1 ingestion ledger. For
+v2, `_delivery_id` is the accepted Delivery identity and Raw ingestion ledger;
+archive parts keep distinct `_source_file` values under that shared identity.
 
 ### Postgres registry
 
@@ -247,11 +249,12 @@ phase.
 - Normal pending/already-ingested detection compares every manifest part with
   raw `_source_file`, not a logical delivery identifier. A stable extracted
   member key is therefore required to avoid archive re-ingestion.
-- The ordinary reconciliation/pending path is retry-safe. Calling
-  `ingest(feed, explicit_key)` directly bypasses pending detection and has no
+- The ordinary legacy reconciliation/pending path is retry-safe. Calling
+  legacy `ingest(feed, explicit_key)` directly bypasses pending detection and has no
   same-delivery guard; it can allocate another `_file_version` and duplicate
-  raw input. Current semantics are therefore undefined for forced replay, and
-  this phase deliberately adds no test that invents a new policy.
+  raw input. Current semantics therefore remain undefined for forced v1
+  replay. Phase 4's explicit v2 entry point is independently guarded by
+  DeliveryID.
 - Landing immutability is not enforced by storage configuration. The code
   trusts approved direct writers not to replace a key; only the inbox gate's
   MD5/version logic protects its own path.

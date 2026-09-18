@@ -4583,3 +4583,29 @@ The registry uses a distinct `normalization_part` table because legacy
 identity are Phase 4 decisions, so assigning that meaning to v2 parts now
 would silently pull the migration forward. The complete contract and boundary
 are in `docs/NORMALIZATION-CONTRACT.md`.
+
+## raw-v2-is-ledgered-by-delivery-not-part
+
+**Decision (Phase 4).** `ingest_normalized_delivery()` consumes one
+NormalizationManifest v2 key without entering Landing. `_delivery_id` is the
+opaque identity of the accepted Delivery and the committed Raw table on
+`main` is the v2 ingestion ledger. `_source_file` remains the exact physical
+object Spark read, so archive members differ there while sharing one
+DeliveryID.
+
+The legacy Ready v1 path keeps its `_source_file`-based pending semantics. The
+two entry points are explicit because silently auto-detecting and blending
+their ledgers would make a part name compete with a Delivery occurrence.
+
+The write retains the existing Nessie branch/merge boundary. Validation and
+Iceberg append happen on the branch; only the merge makes a Delivery visible
+to `already_ingested_delivery()`. A failed attempt is therefore retryable
+without a mutable manifest or registry verdict. Reused Spark sessions refresh
+the Raw table before the ledger query; live verification caught that without
+the refresh an immediate retry could observe pre-merge metadata and append the
+same Delivery twice.
+
+`_file_version` remains the platform ordering number used by existing dbt
+restatement logic. It is not Delivery identity. Prepared/Reporting provenance
+and Airflow-native orchestration remain Phase 5 and Phase 6 respectively. The
+full contract is in `docs/RAW-INGESTION-CONTRACT.md`.

@@ -20,8 +20,9 @@ which `received/` objects contain the producer evidence.
 `NormalizationManifest v2` is a rebuildable consumption plan. It says how a
 later Raw reader should parse that Delivery and which ordered objects hold its
 rows. It references the DeliveryManifest rather than copying its identity
-evidence. Legacy Ready manifest v1 is unchanged and remains the only manifest
-consumed by Raw in Phase 3.
+evidence. Legacy Ready manifest v1 is unchanged. Phase 4 now consumes this v2
+manifest through the explicit `ingest_normalized_delivery()` entry point while
+the v1 Raw path remains operational; see `RAW-INGESTION-CONTRACT.md`.
 
 ## Manifest v2
 
@@ -37,6 +38,7 @@ The JSON document contains:
   "file_version": 2,
   "received_at": "2026-09-17T05:43:02Z",
   "schema_version": "abc123",
+  "source_system": "QA",
   "normalizer": "file/v2",
   "format": {"delimiter": ",", "quote_char": "\"", "header": true,
              "encoding": "utf-8"},
@@ -52,14 +54,19 @@ The JSON document contains:
 
 `normalization_contract` is the exact resolved contract used: contract
 version, delivery kind, parser format, declared platform columns, source
-column mapping, and archive member pattern where applicable. `format` is also
-top-level to preserve the field shape used by the future Raw adapter.
+column mapping, business source system, ingestion controls, and archive member
+pattern where applicable. `format` is also
+top-level as the stable field shape consumed by the Phase 4 Raw adapter.
 
 Identity is never parsed again. `business_date`, optional `file_version`,
 `received_at`, `schema_version`, producer row count and producer MD5 all come
 from the DeliveryManifest. Normalization does not list, find, or parse a
 sibling control file. `checksum_objects` names the producer data object the
 sender hashed: the plain file or the original archive, never extracted parts.
+
+For newly created Delivery evidence, `source_system`, `expected_min_rows`, and
+`schema_drift` are snapshotted as ingestion semantics. DCM remains the
+Transport source and is not silently used as the business source system.
 
 ## Plain files
 
@@ -125,8 +132,7 @@ a Phase 4 Raw-provenance claim in Phase 3.
 
 ## Phase 4 boundary
 
-Phase 3 stops at an ingestion-ready plan. It does not change
-`arrival.find_pending`, `already_ingested`, `_source_file`, `_delivery_id`,
-file-version allocation, dbt `delivery_ref()`, prepared/reporting provenance,
-or the generated Airflow ingest DAG. Phase 4 must define those migrations and
-teach Raw ingestion to consume NormalizationManifest v2.
+Phase 3 stopped at an ingestion-ready plan. Phase 4 adds explicit v2 Raw
+consumption and DeliveryID-led idempotency without changing the legacy v1
+queue, dbt `delivery_ref()`, prepared/reporting provenance, or the generated
+Airflow ingest DAG. Airflow-native discovery and orchestration remain Phase 6.
