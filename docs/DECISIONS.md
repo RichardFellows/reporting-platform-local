@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-99 entries. They are grouped here by subject; the file itself is in the order
+100 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -137,6 +137,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [ready-is-a-derived-index](#ready-is-a-derived-index) | **`ready/` is a derived index of `landing/`**, not a queue somebody fills |
 | [the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests) | 157 deleted, 157 remade, both logging success |
 | [namespace-before-branch](#namespace-before-branch) | The namespace is created against `main`, before the ingest branch exists |
+| [transport-to-delivery-is-an-immutable-interpretation](#transport-to-delivery-is-an-immutable-interpretation) | Explicit external Feed identity, occurrence-derived DeliveryID, and a create-once interpretation separate from Ready |
 
 ### Feeds, columns and the console
 
@@ -1882,8 +1883,8 @@ wants -- `^(?:[^|]*\|){3}(?P<rows>\d+)` -- so a column inserted upstream
 reads the wrong value rather than failing. Naming the column moves the
 question to the header row, where the sender answers it on every delivery.
 
-**One reader, two callers.** `arrival.control` (identity: COB date, version,
-read at the door) and `delivery.control` (integrity: row count, md5, read on
+**One reader, multiple callers.** `arrival.control` (identity: COB date, version,
+read at the legacy door) and `delivery.control` (integrity: row count, md5, read on
 the landing side) are the same file: the gate PROMOTES the control file into
 `landing/` byte for byte rather than consuming it, see
 [#the-inbox-is-the-conformance-gate](#the-inbox-is-the-conformance-gate).
@@ -1895,6 +1896,11 @@ where it was -- `conform` turns `cob_date` into a date it must name a file
 after, `ingest_feed` compares `row_count` against rows it counted -- because
 that boundary is the identity/integrity split and it does not belong inside a
 parser.
+
+> **Amended for Phase 2.** A DCM Transport does not pass through the inbox, so
+> `delivery.control` may also name COB date and version for direct
+> DeliveryManifest interpretation. Legacy normalization still reads only its
+> integrity pair; both paths reuse `ingest/control.py`.
 
 **The format is declared on each block, and `check_gates_are_coherent`
 refuses two that disagree.** The alternative was one declaration inherited by
@@ -4519,3 +4525,37 @@ for an identical retry, and refuses conflicting reuse of a TransportID. This
 does not make the bucket WORM: production versioning, Object Lock and
 retention controls remain deployment decisions. The full producer and
 consumer contract is in `docs/TRANSPORT-CONTRACT.md`.
+
+## transport-to-delivery-is-an-immutable-interpretation
+
+**Decision.** A validated Transport becomes a Delivery by explicit external
+Feed mapping and an immutable interpretation manifest, not by conforming its
+filename or copying it into Landing.
+
+`Feed.source_identifiers` maps `(Transport.source, legacy_feed_id)` to exactly
+one Feed and duplicate pairs fail registry loading. `Feed.delivery_identity`
+is deliberately only an ordered list of the two evidence forms the platform
+already understands: configured control fields and the original data
+filename. Every configured source is inspected and disagreement is an error;
+the ordering chooses provenance only when evidence agrees.
+
+The DeliveryID is a domain-separated SHA-256 digest of transport source and
+TransportID, rendered as an opaque `dlv_` value. TransportID already names the
+immutable occurrence, so this gives identical retry identity without an
+allocation database and keeps two distinct DCM executions distinct even when
+they transfer the same producer filename.
+
+The manifest lives at the deterministic
+`deliveries/<source>/<transport-id>/delivery-manifest.json` key and is written
+with a create-only precondition. A valid existing manifest is verified against
+the accepted Transport and returned; today's Feed configuration cannot
+silently regenerate historical business identity or schema interpretation.
+It references `received/` objects directly and carries no processing status.
+
+`registry.delivery` is unchanged in this phase. Its current reconstruction is
+from legacy Ready/Landing evidence and its parts imply Raw-readable objects;
+mixing new non-ingestible Deliveries into that projection before the registry
+schema and consumers understand both manifest kinds would make the index lie.
+The future projection must reconcile from DeliveryManifests first, remain
+additive to legacy rows and `run_input`, and keep registry availability out of
+manifest creation. The complete boundary is in `docs/DELIVERY-CONTRACT.md`.
