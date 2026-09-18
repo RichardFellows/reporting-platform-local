@@ -28,7 +28,9 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from reporting_platform.common.parsing import feed_format
 
@@ -37,6 +39,7 @@ from reporting_platform.common.context import (
 )
 
 log = logging.getLogger("ingest")
+_DELIVERY_ID = re.compile(r"dlv_[0-9a-f]{32}")
 
 
 def _at_branch(table: str, branch: str | None) -> str:
@@ -118,9 +121,9 @@ def ensure_raw_namespace(spark, fd) -> None:
 #
 #   _delivery_id     which delivery, joinable to `registry.delivery` on
 #                    (feed, delivery_id). Not `_source_file`, which is the
-#                    PART -- for an archive those differ, and
-#                    `already_ingested` depends on `_source_file` staying the
-#                    part, so the delivery needed a column of its own.
+#                    PART -- for an archive those differ. Legacy v1 pending
+#                    detection uses that part; v2 ingestion is ledgered by
+#                    this DeliveryID instead.
 #   _received_at     when it arrived, which is not `_ingest_ts`: a delivery
 #                    landed Friday and ingested Monday has two timestamps.
 #   _schema_version  the declared column contract it was read against.
@@ -381,6 +384,109 @@ def next_file_version(spark, fd, cob_date: date,
         return 1
 
 
+def already_ingested_delivery(spark, fd, delivery_id: str,
+                                table: str | None = None) -> bool:
+    """Whether Raw on ``main`` contains the accepted Delivery.
+
+    This is the v2 ledger.  It deliberately queries ``_delivery_id`` rather
+    than any physical part in ``_source_file``.  A failed branch write is not
+    visible on ``main`` and therefore remains eligible for retry.
+
+    Legacy Ready v1 continues to use :func:`arrival.already_ingested`, whose
+    part-key semantics are unchanged.
+    """
+    if not isinstance(delivery_id, str) or not _DELIVERY_ID.fullmatch(delivery_id):
+        raise ValueError(f"invalid opaque DeliveryID {delivery_id!r}")
+    target = table or fd.raw_table
+    if not spark.catalog.tableExists(target):
+        return False
+    # A chunked caller deliberately reuses one SparkSession across branch
+    # merges.  Spark can retain the pre-merge Iceberg metadata in that
+    # session; refresh before asking Raw to act as the ledger or an immediate
+    # retry can miss the commit it just made and append the Delivery twice.
+    spark.catalog.refreshTable(target)
+    columns = {name.lower() for name, _ in
+               spark.sql(f"SELECT * FROM {target} LIMIT 0").dtypes}
+    if "_delivery_id" not in columns:
+        return False
+    escaped = delivery_id.replace("'", "''")
+    rows = spark.sql(
+        f"SELECT 1 AS present FROM {target} "
+        f"WHERE _delivery_id = '{escaped}' LIMIT 1"
+    ).collect()
+    return bool(rows)
+
+
+def _v2_feed_contract(fd, manifest: dict):
+    """Feed-shaped historical read contract captured in Normalization v2.
+
+    Table naming still comes from the registered Feed.  Values that decide
+    how the Delivery is parsed and validated come from immutable evidence.
+    The ``get`` fallbacks are solely for Phase-2/early-Phase-3 manifests that
+    predate the additive source/control snapshot; new manifests carry them.
+    """
+    contract = manifest.get("normalization_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("NormalizationManifest v2 has no normalization_contract")
+    columns = contract.get("columns")
+    source_columns = contract.get("source_columns")
+    if not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
+        raise ValueError("NormalizationManifest v2 contract has malformed columns")
+    if not isinstance(source_columns, dict):
+        raise ValueError("NormalizationManifest v2 contract has malformed source_columns")
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in source_columns.items()):
+        raise ValueError("NormalizationManifest v2 contract has malformed source_columns")
+    source_system = manifest.get("source_system", contract.get("source_system"))
+    if source_system is None:
+        source_system = fd.source_system
+    if not isinstance(source_system, str) or not source_system:
+        raise ValueError("NormalizationManifest v2 contract has malformed source_system")
+    expected_min_rows = contract.get("expected_min_rows", fd.expected_min_rows)
+    if type(expected_min_rows) is not int or expected_min_rows < 0:
+        raise ValueError(
+            "NormalizationManifest v2 contract has malformed expected_min_rows")
+    schema_drift = contract.get("schema_drift", fd.schema_drift)
+    if schema_drift not in ("warn", "fail"):
+        raise ValueError("NormalizationManifest v2 contract has malformed schema_drift")
+    if manifest.get("format") != contract.get("format"):
+        raise ValueError(
+            "NormalizationManifest v2 format conflicts with its frozen contract")
+    return replace(
+        fd,
+        columns=list(columns),
+        source_columns=dict(source_columns),
+        source_system=str(source_system),
+        expected_min_rows=expected_min_rows,
+        schema_drift=schema_drift,
+    )
+
+
+def _canonical_v2_manifest(manifest: dict, key: str) -> dict:
+    """Validate and adapt explicit v2 names to the shared Raw machinery."""
+    if manifest.get("normalization_manifest_version") != 2:
+        raise ValueError(f"{key}: expected NormalizationManifest v2")
+    required = ("delivery_id", "feed", "business_date", "received_at",
+                "schema_version", "format", "parts", "normalization_contract")
+    missing = [name for name in required if name not in manifest]
+    if missing:
+        raise ValueError(f"{key}: missing v2 fields: {', '.join(missing)}")
+    if (not isinstance(manifest["delivery_id"], str)
+            or not _DELIVERY_ID.fullmatch(manifest["delivery_id"])):
+        raise ValueError(f"{key}: v2 delivery_id is not opaque")
+    if not isinstance(manifest["feed"], str) or not manifest["feed"]:
+        raise ValueError(f"{key}: v2 feed is malformed")
+    if not isinstance(manifest["schema_version"], str) or not manifest["schema_version"]:
+        raise ValueError(f"{key}: v2 schema_version is malformed")
+    if not isinstance(manifest["parts"], list):
+        raise ValueError(f"{key}: v2 parts are malformed")
+    if not all(isinstance(part, dict)
+               and isinstance(part.get("object_key"), str)
+               and part["object_key"] for part in manifest["parts"]):
+        raise ValueError(f"{key}: v2 part object_key is malformed")
+    return {**manifest, "cob_date": manifest["business_date"]}
+
+
 def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
     """Give `main` one real commit before the first branch+merge ever runs.
 
@@ -466,12 +572,46 @@ def resolve_delivery(fd, key: str, cob_date: date | None = None) -> dict:
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
            cob_date: date | None = None, dry_run: bool = False,
            spark=None) -> dict:
-    """Land one delivery into `raw` on its own Nessie branch, then merge.
+    """Legacy Ready v1/Landing ingestion, retained unchanged in Phase 4."""
+    fd = get_feed(feed_name)
+    manifest = resolve_delivery(fd, object_key, cob_date)
+    return _ingest_manifest(
+        fd, fd, manifest, object_key, run_id=run_id, dry_run=dry_run,
+        spark=spark, ledger="legacy_source_file")
+
+
+def ingest_normalized_delivery(normalization_manifest_key: str,
+                               run_id: str | None = None,
+                               dry_run: bool = False, spark=None) -> dict:
+    """Ingest one NormalizationManifest v2 without a Landing dependency.
+
+    The key is the complete caller contract: feed, DeliveryID, frozen business
+    identity, parser/schema contract, source system and physical parts are read
+    from the manifest.  Raw itself is the ingestion ledger, keyed by the opaque
+    DeliveryID.
+    """
+    from reporting_platform.ingest import arrival
+    from reporting_platform.ingest.normalization import read_normalization_manifest
+
+    manifest = read_normalization_manifest(
+        normalization_manifest_key, client=arrival._client(),  # noqa: SLF001
+        bucket=arrival._bucket())  # noqa: SLF001
+    manifest = _canonical_v2_manifest(manifest, normalization_manifest_key)
+    fd = get_feed(manifest["feed"])
+    contract_fd = _v2_feed_contract(fd, manifest)
+    return _ingest_manifest(
+        fd, contract_fd, manifest, normalization_manifest_key,
+        run_id=run_id, dry_run=dry_run, spark=spark, ledger="delivery_id")
+
+
+def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
+                     *, run_id: str | None, dry_run: bool, spark,
+                     ledger: str) -> dict:
+    """Shared branch/write/validate/merge implementation for explicit v1/v2.
 
     `object_key` is a MANIFEST key under `ready/`, or a landing object key --
-    see `resolve_delivery`. Everything after that point reads the manifest and
-    never the filename: the COB date, which objects hold the rows, and
-    the delimiter/quoting/encoding all come from it.
+    for v1 see `resolve_delivery`.  The v2 caller supplies an already-read
+    NormalizationManifest and never enters Landing.
 
     `spark` is an OPTIONAL session to reuse. Pass one when ingesting several
     files in a row -- `scripts/_ingest_chunk.py` does -- and the caller owns
@@ -488,10 +628,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     from pyspark.sql import functions as F
     from pyspark.sql.window import Window
 
-    fd = get_feed(feed_name)
     run_id = run_id or new_run_id()
-
-    manifest = resolve_delivery(fd, object_key, cob_date)
     bdate = date.fromisoformat(manifest["cob_date"])
     parts = manifest["parts"]
     if not parts:
@@ -521,30 +658,59 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     # it always does.
     ensure_raw_namespace(spark, fd)
 
+    # The v2 no-op guard is inside the domain operation, not merely in a
+    # discovery queue.  It runs against main before a branch is cut, so an
+    # explicit retry cannot append the same Delivery twice.  A failed branch
+    # is invisible here and remains retryable.
+    if ledger == "delivery_id" and already_ingested_delivery(
+            spark, fd, manifest["delivery_id"]):
+        result = {
+            "feed": fd.name,
+            "cob_date": bdate.isoformat(),
+            "file_version": None,
+            "rows": 0,
+            "run_id": run_id,
+            "branch": None,
+            "source_file": parts[0]["object_key"],
+            "manifest": object_key,
+            "parts": len(parts),
+            "delivery_id": manifest["delivery_id"],
+            "schema_version": manifest["schema_version"],
+            "source_system": contract_fd.source_system,
+            "already_ingested": True,
+            "columns_added": [],
+            "columns_orphaned": [],
+            "missing_columns": [],
+            "extra_columns": [],
+            "asset_uri": fd.asset_uri,
+        }
+        if owns_session:
+            spark.stop()
+        return result
+
     branch = branch_name("ingest", fd.name, bdate, run_id)
     nessie.create_branch(branch)
     log.info("created branch %s", branch)
 
     raw_at_branch = _at_branch(fd.raw_table, branch)
     try:
-        ensure_raw_table(spark, fd, raw_at_branch)
+        ensure_raw_table(spark, contract_fd, raw_at_branch)
         # ON THE BRANCH, like the CREATE above: a schema change is a commit,
         # and a commit against `main` outside the merge is what
         # write-audit-publish exists to prevent. If the ingest then fails the
         # branch is abandoned and the column was never added to main either.
-        schema = ensure_raw_schema(spark, raw_at_branch, fd)
+        schema = ensure_raw_schema(spark, raw_at_branch, contract_fd)
         version = next_file_version(spark, fd, bdate, raw_at_branch)
 
         # ONE DATAFRAME PER PART, each tagged with its OWN object key, then
-        # unioned. `_source_file` must be the object the rows actually came
-        # from -- `already_ingested` matches on it, so writing the manifest's
-        # key here would make every delivery look un-ingested forever. With
-        # `kind: file` there is exactly one part and it is the landing key.
+        # unioned. `_source_file` is physical provenance in both paths. Legacy
+        # pending detection also uses it as its ledger; v2 does not -- v2 uses
+        # the shared DeliveryID carried by every one of these part frames.
         frames, drift = [], {"missing_columns": [], "extra_columns": []}
         for part in parts:
             part_df = read_landing(spark, manifest["format"],
                                    _landing_uri(part["object_key"]))
-            part_df, part_drift = reconcile_schema(part_df, fd)
+            part_df, part_drift = reconcile_schema(part_df, contract_fd)
             frames.append(
                 part_df.withColumn("_source_file", F.lit(part["object_key"])))
             for k in drift:
@@ -564,12 +730,12 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # column reads as "no value" rather than "never arrived" from then on.
         # A typo here would silently mean "warn", which is how this setting
         # managed to do nothing for so long. Reject anything unknown.
-        if fd.schema_drift not in ("warn", "fail"):
+        if contract_fd.schema_drift not in ("warn", "fail"):
             raise ValueError(
                 f"{fd.name}: schema_drift must be 'warn' or 'fail', got "
-                f"{fd.schema_drift!r}"
+                f"{contract_fd.schema_drift!r}"
             )
-        if fd.schema_drift == "fail" and (drift["missing_columns"]
+        if contract_fd.schema_drift == "fail" and (drift["missing_columns"]
                                           or drift["extra_columns"]):
             raise ValueError(
                 f"{fd.name} {bdate}: schema drift with schema_drift=fail — "
@@ -593,8 +759,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
               .withColumn("_delivery_id", F.lit(manifest["delivery_id"]))
               .withColumn("_received_at",
                           F.lit(manifest.get("received_at")).cast("timestamp"))
-              .withColumn("_schema_version", F.lit(fd.schema_version))
-              .withColumn("_source_system", F.lit(fd.source_system))
+              .withColumn("_schema_version", F.lit(
+                  manifest.get("schema_version", contract_fd.schema_version)))
+              .withColumn("_source_system", F.lit(contract_fd.source_system))
         )
 
         # A column the table still has and `feeds.yml` no longer declares.
@@ -606,11 +773,11 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             df = df.withColumn(orphan, F.lit(None).cast(dtype))
 
         row_count = df.count()
-        if row_count < fd.expected_min_rows:
+        if row_count < contract_fd.expected_min_rows:
             # Abandon the branch: main is untouched, nothing to roll back.
             raise ValueError(
                 f"{fd.name} {bdate}: {row_count} rows, below expected minimum "
-                f"{fd.expected_min_rows}. Branch {branch} left for inspection."
+                f"{contract_fd.expected_min_rows}. Branch {branch} left for inspection."
             )
 
         # The EXACT count next to the floor above. expected_min_rows catches a
@@ -680,7 +847,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
                          else None),
             "parts": len(parts),
             "delivery_id": manifest["delivery_id"],
-            "schema_version": fd.schema_version,
+            "schema_version": manifest.get("schema_version", contract_fd.schema_version),
+            "source_system": contract_fd.source_system,
+            "already_ingested": False,
             # What this ingest did to the TABLE, a different event from what
             # it found in the FILE (`missing_columns` / `extra_columns`
             # below). A contract change shows up here on the first delivery

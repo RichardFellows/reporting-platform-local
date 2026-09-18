@@ -347,3 +347,6 @@ def test_new_delivery_snapshots_the_normalization_contract():
     assert snapshot["format"]["encoding"] == "cp1252"
     assert snapshot["columns"] == ["id", "value"]
     assert snapshot["source_columns"] == {"value": "Producer Value"}
+    assert snapshot["source_system"] == "REF"
+    assert snapshot["expected_min_rows"] == fd.expected_min_rows
+    assert snapshot["schema_drift"] == fd.schema_drift

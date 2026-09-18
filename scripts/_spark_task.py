@@ -19,6 +19,7 @@ writes to stderr stays out of the way.
 Usage:
     python -m scripts._spark_task pending <feed>
     python -m scripts._spark_task ingest <feed> <key> [run_id] [cob_date]
+    python -m scripts._spark_task ingest-v2 <normalization_manifest_key> [run_id]
     python -m scripts._spark_task maintain-metrics <fqn:layer>...
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
@@ -97,6 +98,15 @@ def main() -> int:
             run_id=run_id,
             cob_date=date.fromisoformat(bd) if bd else None,
         )
+        print(json.dumps(result, default=str))
+        return 0
+
+    if op == "ingest-v2":
+        from reporting_platform.ingest.ingest_feed import ingest_normalized_delivery
+
+        key = sys.argv[2]
+        run_id = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+        result = ingest_normalized_delivery(key, run_id=run_id)
         print(json.dumps(result, default=str))
         return 0
 
