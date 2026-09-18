@@ -14,6 +14,9 @@ x-s3-env: &s3-env
   S3_ENDPOINT: http://minio:9000
   REPORTING_WAREHOUSE: s3a://lakehouse/warehouse
   REPORTING_LANDING: s3a://lakehouse/landing
+  # DCM transport evidence. Distinct from the current feed-scoped Landing;
+  # see docs/TRANSPORT-CONTRACT.md.
+  REPORTING_RECEIVED_PREFIX: ${REPORTING_RECEIVED_PREFIX:-received}
   NESSIE_URI: http://nessie:19120/api/v2
   # The same version store over Iceberg REST instead of the Nessie API, for
   # scripts/duckdb_console.py. See docs/DECISIONS.md#nessie-iceberg-rest
