@@ -198,6 +198,11 @@ DeliveryManifest creation has no registry dependency. Phase 3 should add an
 additive evidence reconciliation projection before any inline registration,
 preserve legacy rows and `run_input`, and add no verdict/status column.
 
+Phase 3 implemented that rebuildable projection and Phase 5 now follows its
+`manifest_key` from a published run input. The historical design constraint
+above remains: `run_input` has no foreign key to the projection, so a missing
+or rebuilding observation cannot invalidate run history.
+
 ## Relationship to Ready manifest v1
 
 DeliveryManifest v1 is separate from Ready manifest v1. The former records an

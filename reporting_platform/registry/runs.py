@@ -43,6 +43,7 @@ def open_run(run_id: str, purpose: str, branch: str, *,
              dbt_manifest_ref: str, dag_id: str | None = None,
              airflow_run_id: str | None = None,
              change_ref: str | None = None,
+             dbt_artifacts_ref: str | None = None,
              provenance: dict[str, str] | None = None) -> dict[str, Any]:
     """Record that a build has started. Idempotent on `run_id`.
 
@@ -67,10 +68,11 @@ def open_run(run_id: str, purpose: str, branch: str, *,
             INSERT INTO registry.run (run_id, purpose, status, environment,
                                       dag_id, airflow_run_id, branch,
                                       code_ref, code_ref_kind,
-                                      dbt_manifest_ref, change_ref,
+                                      dbt_manifest_ref, dbt_artifacts_ref,
+                                      change_ref,
                                       dbt_project_ref, deployment_change_ref,
                                       deployment_pipeline_ref)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (run_id) DO UPDATE SET
                 -- A retry re-reads the code and the project, and they can
                 -- legitimately have changed between attempts -- that is worth
@@ -84,6 +86,7 @@ def open_run(run_id: str, purpose: str, branch: str, *,
                 code_ref = EXCLUDED.code_ref,
                 code_ref_kind = EXCLUDED.code_ref_kind,
                 dbt_manifest_ref = EXCLUDED.dbt_manifest_ref,
+                dbt_artifacts_ref = EXCLUDED.dbt_artifacts_ref,
                 change_ref = COALESCE(EXCLUDED.change_ref, registry.run.change_ref),
                 -- Overwritten, not coalesced, unlike change_ref: a retry runs
                 -- under whatever is deployed NOW, and if that changed between
@@ -96,7 +99,8 @@ def open_run(run_id: str, purpose: str, branch: str, *,
                 error = NULL
             """,
             (run_id, purpose, RUNNING, environment, dag_id, airflow_run_id,
-             branch, code_ref, code_ref_kind, dbt_manifest_ref, change_ref,
+             branch, code_ref, code_ref_kind, dbt_manifest_ref,
+             dbt_artifacts_ref, change_ref,
              prov.get("dbt_project_ref") or None,
              prov.get("deployment_change_ref") or None,
              prov.get("deployment_pipeline_ref") or None))
@@ -313,7 +317,7 @@ def diff(report: str, as_at_date: date, from_version: int | None = None,
 
         cur.execute(
             "SELECT run_id, code_ref, code_ref_kind, dbt_manifest_ref, "
-            "       change_ref, merged_hash, status, finished_at "
+            "       dbt_artifacts_ref, change_ref, merged_hash, status, finished_at "
             "FROM registry.run WHERE run_id = ANY(%s)",
             ([lo["run_id"], hi["run_id"]],))
         cols = [c[0] for c in cur.description]
@@ -348,6 +352,53 @@ def diff(report: str, as_at_date: date, from_version: int | None = None,
 
 
 # ------------------------------------------------------------------ reading
+def trace_version(report: str, as_at_date: date, version_no: int) -> dict[str, Any]:
+    """Trace one published version to its run and Delivery evidence.
+
+    Delivery observations are LEFT-joined conceptually, through
+    ``deliveries_by_id``: an absent rebuildable registry row is returned as an
+    explicit evidence-coverage gap and never makes the authoritative run input
+    disappear.
+    """
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT v.report, v.as_at_date, v.version_no, v.tag, v.created_at, "
+            "       r.run_id, r.purpose, r.status, r.environment, r.dag_id, "
+            "       r.airflow_run_id, r.branch, r.merged_hash, r.cob_date, "
+            "       r.started_at, r.finished_at, r.code_ref, r.code_ref_kind, "
+            "       r.dbt_manifest_ref, r.dbt_artifacts_ref, r.change_ref, "
+            "       r.dbt_project_ref, r.deployment_change_ref, "
+            "       r.deployment_pipeline_ref, r.error "
+            "FROM registry.report_version v "
+            "JOIN registry.run r ON r.run_id = v.run_id "
+            "WHERE v.report = %s AND v.as_at_date = %s AND v.version_no = %s",
+            (report, as_at_date, version_no))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(
+                f"no published version {report} {as_at_date} v{version_no}")
+        record = dict(zip([d[0] for d in cur.description], row))
+
+    from reporting_platform.registry import deliveries
+
+    pairs = [(item["feed"], item["delivery_id"])
+             for item in inputs_for_run(record["run_id"])]
+    evidence = deliveries.deliveries_by_id(pairs)
+    return {
+        "report_version": {k: record[k] for k in
+                           ("report", "as_at_date", "version_no", "tag",
+                            "created_at", "run_id")},
+        "run": {k: v for k, v in record.items()
+                if k not in ("report", "as_at_date", "version_no", "tag",
+                             "created_at")},
+        "inputs": evidence,
+        "evidence_coverage": {
+            "resolved": sum(bool(item["registered"]) for item in evidence),
+            "missing": sum(not item["registered"] for item in evidence),
+        },
+    }
+
+
 def run_for_tag(tag: str) -> dict[str, Any] | None:
     """The run behind a published tag, or None if nothing recorded one.
 
@@ -358,6 +409,7 @@ def run_for_tag(tag: str) -> dict[str, Any] | None:
         cur.execute(
             "SELECT r.run_id, r.purpose, r.status, r.cob_date, "
             "       r.code_ref, r.code_ref_kind, r.dbt_manifest_ref, "
+            "       r.dbt_artifacts_ref, "
             "       r.change_ref, r.merged_hash, r.finished_at, "
             "       v.report, v.as_at_date, v.version_no "
             "FROM registry.report_version v "
@@ -379,7 +431,7 @@ def inputs_for_run(run_id: str) -> list[dict[str, str]]:
 def recent(limit: int = 20, purpose: str | None = None) -> list[dict[str, Any]]:
     sql = ("SELECT run_id, purpose, status, environment, branch, cob_date, "
            "       started_at, finished_at, code_ref, code_ref_kind, "
-           "       dbt_manifest_ref, change_ref, dbt_project_ref, "
+           "       dbt_manifest_ref, dbt_artifacts_ref, change_ref, dbt_project_ref, "
            "       deployment_change_ref, deployment_pipeline_ref, "
            "       merged_hash, error "
            "FROM registry.run")

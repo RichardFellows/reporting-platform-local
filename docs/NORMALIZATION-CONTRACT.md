@@ -134,5 +134,7 @@ a Phase 4 Raw-provenance claim in Phase 3.
 
 Phase 3 stopped at an ingestion-ready plan. Phase 4 adds explicit v2 Raw
 consumption and DeliveryID-led idempotency without changing the legacy v1
-queue, dbt `delivery_ref()`, prepared/reporting provenance, or the generated
-Airflow ingest DAG. Airflow-native discovery and orchestration remain Phase 6.
+queue or the generated Airflow ingest DAG. Phase 5 maps the resulting
+`_delivery_id` unchanged into Prepared and run inputs while retaining the
+legacy `delivery_ref()` fallback. Airflow-native discovery and orchestration
+remain Phase 6.

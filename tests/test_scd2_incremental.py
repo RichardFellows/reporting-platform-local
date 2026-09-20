@@ -206,7 +206,7 @@ def _build(con, name: str, target: str, incremental: bool,
 
 # -------------------------------------------------------------------- data
 def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts,
-             second_key="AGENCY1"):
+             second_key="AGENCY1", delivery_id=None, source_file=None):
     """Append one delivery to `raw_src`. `rows` maps the first key AS RAW HAS
     IT (padding included) to the changing attribute; any second key is
     `second_key`, also as raw has it."""
@@ -215,10 +215,12 @@ def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts,
     for n, (key, value) in enumerate(rows.items(), 1):
         record = [key] + [second_key for _ in keys[1:]] + [value] + list(constants.values())
         lits = ", ".join("null" if v is None else f"'{v}'" for v in record)
+        physical = source_file or f"landing/x_{cob_date}_v{version}.csv"
+        delivery = delivery_id or f"x_{cob_date}_v{version}.csv"
         values.append(f"(date '{cob_date}', {version}, {n}, {lits}, "
-                      f"'landing/x_{cob_date}_v{version}.csv', 'b{version}', "
+                      f"'{physical}', 'b{version}', "
                       f"null::timestamp, timestamp '{ingest_ts}', "
-                      f"'x_{cob_date}_v{version}.csv', 'sv1', 'X')")
+                      f"'{delivery}', 'sv1', 'X')")
     exists = con.execute("select count(*) from information_schema.tables "
                          "where table_name = 'raw_src'").fetchone()[0]
     if not exists:
@@ -618,6 +620,36 @@ def test_a_reopened_seed_row_carries_this_runs_audit_columns():
         ).fetchall()
         assert w == [("2026-08-31", "run3", "build/run3",
                       "landing/x_2026-07-01_v1.csv")], (name, w)
+
+
+def test_changed_versions_keep_the_delivery_that_created_each_version():
+    """A replay may revisit old rows, but it must not rewrite their source."""
+    name, keys, attr, constants = MODELS[0]
+    con = _connect()
+    _deliver(con, keys, attr, constants, "2026-09-01", 1, {"B": "X"},
+             "2026-09-02 06:00", delivery_id="dlv_A")
+    _build(con, name, INC, incremental=True)
+    _deliver(con, keys, attr, constants, "2026-09-02", 1, {"B": "Y"},
+             "2026-09-03 06:00", delivery_id="dlv_B")
+    _build(con, name, INC, incremental=True)
+    assert con.execute(
+        f"select legal_name, delivery_id from {INC} "
+        "where counterparty_id = 'B' order by effective_from"
+    ).fetchall() == [("X", "dlv_A"), ("Y", "dlv_B")]
+
+
+def test_unchanged_delivery_is_not_a_published_scd2_input():
+    """Delivery B was scanned, but no version in the result came from it."""
+    name, keys, attr, constants = MODELS[0]
+    con = _connect()
+    _deliver(con, keys, attr, constants, "2026-09-01", 1, {"B": "X"},
+             "2026-09-02 06:00", delivery_id="dlv_A")
+    _deliver(con, keys, attr, constants, "2026-09-02", 1, {"B": "X"},
+             "2026-09-03 06:00", delivery_id="dlv_B")
+    _build(con, name, FULL, incremental=False)
+    assert con.execute(
+        f"select distinct delivery_id from {FULL} order by delivery_id"
+    ).fetchall() == [("dlv_A",)]
 
 
 def test_the_harness_refuses_a_merge_spark_would_refuse():
