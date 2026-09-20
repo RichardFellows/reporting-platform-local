@@ -97,6 +97,9 @@ historical rows where `_delivery_id` is null. `registry.run_input` collects
 those prepared Delivery references from the build branch before merge. See
 `LINEAGE.md` for the publication-to-evidence chain.
 
-Airflow-native discovery and orchestration remain Phase 6.
+Airflow-native discovery and orchestration are added in Phase 6: the
+`transport_ingest` DAG's `ingest_raw` task is a thin wrapper over
+`ingest_normalized_delivery()` via `scripts._spark_task ingest-v2`, unchanged
+from the description above. See `docs/AIRFLOW-ORCHESTRATION.md`.
 Legacy historical rows are not rewritten or backfilled, Ready v1 is not
 removed, and no supersession/SCD2 policy is redesigned here.

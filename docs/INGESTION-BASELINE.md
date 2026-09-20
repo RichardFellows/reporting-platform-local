@@ -51,7 +51,10 @@ copying source bytes. Phase 3 adds a separate NormalizationManifest v2 under a
 DeliveryID-based Ready directory. Plain v2 normalization points back to
 `received/`; archive v2 normalization materializes only deterministic Ready
 parts. Phase 4 now reads that v2 plan directly into Raw without entering
-Landing; Airflow orchestration remains deferred. The independent legacy path
+Landing. Phase 6 makes Airflow the orchestration owner of that whole chain --
+a generic `transport_ingest` DAG, a deferrable fast-path sensor, and an
+independent evidence-driven reconciliation DAG; see
+`docs/AIRFLOW-ORCHESTRATION.md`. The independent legacy path
 described below remains operational for Raw ingestion. See
 `docs/TRANSPORT-CONTRACT.md`, `docs/DELIVERY-CONTRACT.md`, and
 `docs/NORMALIZATION-CONTRACT.md`.

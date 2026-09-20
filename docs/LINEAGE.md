@@ -208,6 +208,17 @@ curl -s -G http://localhost:15000/api/v1/column-lineage --data-urlencode depth=2
   --data-urlencode 'nodeId=datasetField:iceberg://lakehouse:reporting.exposure_by_country:total_mtm'
 ```
 
+## Phase 6: orchestration does not change lineage
+
+`transport_ingest`'s `ingest_raw` task calls the same
+`ingest_normalized_delivery()` Phase 4 already used, so Raw rows it writes
+carry the identical `_delivery_id`/`_source_file`/`_cob_date`/etc. provenance
+columns regardless of whether a Delivery reached Raw through the legacy
+per-feed DAG or the new Transport-driven one. `delivery_ref()`, `run_input`,
+and `registry trace` all continue to work unchanged --
+`docs/AIRFLOW-ORCHESTRATION.md` is about triggering, retries, and
+concurrency, not about what gets written or how it is traced.
+
 ## Related
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md#lineage-is-an-export-not-an-authority) — where lineage sits

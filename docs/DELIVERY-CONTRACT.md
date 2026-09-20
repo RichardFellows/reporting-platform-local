@@ -222,6 +222,11 @@ Phase 3 now owns DeliveryManifest-to-normalization, archive handling from
 format, columns/source mapping, and archive member pattern. Existing immutable
 manifests are not backfilled. See `NORMALIZATION-CONTRACT.md`.
 
-Later phases still own orchestration/discovery, Raw and dbt provenance
-migration, supersession/restatement, content-result persistence, historical
-backfill, and production object-store controls.
+Phase 6 owns orchestration/discovery: `transport_ingest`'s `create_delivery`
+task calls `create_delivery()` unchanged from the description above, and
+`transport_reconcile` walks `manifest_key()` as one stage of its
+durable-evidence progress check. See `docs/AIRFLOW-ORCHESTRATION.md`.
+
+Later phases still own Raw and dbt provenance migration, supersession/
+restatement, content-result persistence, historical backfill, and production
+object-store controls.

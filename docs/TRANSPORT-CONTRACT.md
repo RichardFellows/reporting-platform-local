@@ -193,6 +193,9 @@ copying evidence into Landing.
 
 ## Deferred decisions
 
-Phase 2 defines Transport-to-Delivery in `docs/DELIVERY-CONTRACT.md`. Later
-phases still own orchestration, Delivery-aware normalization/raw provenance,
-registry reconciliation, and deployment-level object-store controls.
+Phase 2 defines Transport-to-Delivery in `docs/DELIVERY-CONTRACT.md`. Phase 6
+adds orchestration: `transport_ingest`'s `validate_transport` task calls
+`read_validated_transport()` unchanged from the description above, and both
+`transport_watch` and `transport_reconcile` call `list_completed_transports()`
+to discover work. See `docs/AIRFLOW-ORCHESTRATION.md`. Later phases still own
+deployment-level object-store controls.

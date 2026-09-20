@@ -136,5 +136,9 @@ Phase 3 stopped at an ingestion-ready plan. Phase 4 adds explicit v2 Raw
 consumption and DeliveryID-led idempotency without changing the legacy v1
 queue or the generated Airflow ingest DAG. Phase 5 maps the resulting
 `_delivery_id` unchanged into Prepared and run inputs while retaining the
-legacy `delivery_ref()` fallback. Airflow-native discovery and orchestration
-remain Phase 6.
+legacy `delivery_ref()` fallback. Phase 6 adds Airflow-native discovery and
+orchestration: `transport_ingest`'s `normalize_delivery` task calls
+`normalize_delivery()` unchanged from the description above, and
+`transport_reconcile` walks this manifest's key
+(`normalization.manifest_key()`) as one stage of its durable-evidence
+progress check. See `docs/AIRFLOW-ORCHESTRATION.md`.
