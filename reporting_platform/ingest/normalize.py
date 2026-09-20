@@ -110,7 +110,23 @@ def manifest_key(feed: Feed, object_key: str) -> str:
 
 
 def is_manifest_key(feed: Feed, key: str) -> bool:
-    return key.startswith(manifest_prefix(feed)) and key.endswith(".json")
+    """True for THIS module's own flat `ready/<feed>/<name>.json` keys only.
+
+    Phase 3's Delivery path (`ingest/normalization.py`) writes its v2 plan
+    ONE LEVEL DEEPER, at `ready/<feed>/<delivery-id>/normalization-manifest.
+    json` -- deliberately sharing this feed's `ready/` prefix ("beside, not
+    in place of the legacy path", `docs/NORMALIZATION-CONTRACT.md`). A prefix
+    check alone does not see that extra path segment, so `list_manifests`
+    picked up v2's manifest too and `read_manifest` raised on its
+    `manifest_version` -- breaking the legacy path for every feed a Transport
+    had ever touched. Requiring no further `/` after the prefix is what an
+    ordinary v1 key (this module never nests a manifest, only extracted
+    archive members, and those are never named `*.json`) always satisfies,
+    and a v2 key never does.
+    """
+    prefix = manifest_prefix(feed)
+    return (key.startswith(prefix) and key.endswith(".json")
+            and "/" not in key[len(prefix):])
 
 
 # ------------------------------------------------------------------ the file
@@ -459,7 +475,7 @@ def list_manifests(feed: Feed) -> list[str]:
     keys = []
     for page in paginator.paginate(Bucket=_bucket(), Prefix=manifest_prefix(feed)):
         keys += [o["Key"] for o in page.get("Contents", [])
-                 if o["Key"].endswith(".json")]
+                 if is_manifest_key(feed, o["Key"])]
     return sorted(keys)
 
 
