@@ -255,6 +255,15 @@ NOTHING`:
   engine that executes it; every control this document describes is code
   that already existed, in the language its layer already used.
 
+## Phase 8: migration comparisons reuse this vocabulary, not this table
+
+A dual-run comparison against the true legacy estate is, in outcome terms,
+another control: PASS/WARN/FAIL/ERROR mean exactly what they mean above.
+It is recorded in its OWN table, `registry.migration_comparison`, not in
+`validation_result` -- a legacy reference has no Delivery/Transport/dbt-node
+identity to attach to, and forcing it through those columns would make this
+table's existing rows misleading. See `docs/MIGRATION.md`.
+
 ## Retention
 
 `validation_result` rows must outlive the run/Delivery they describe, so a

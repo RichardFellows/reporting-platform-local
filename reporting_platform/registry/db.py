@@ -482,6 +482,82 @@ CREATE INDEX IF NOT EXISTS validation_result_transport
     ON registry.validation_result (transport_id);
 CREATE INDEX IF NOT EXISTS validation_result_layer_outcome
     ON registry.validation_result (layer, outcome, executed_at DESC);
+
+-- Phase 8. Durable, queryable evidence that a dual-run MIGRATION COMPARISON
+-- executed and what it found -- reusing `validation_result`'s outcome
+-- vocabulary (PASS/WARN/FAIL/ERROR) rather than inventing a second one, but
+-- kept as its OWN table rather than folded into `validation_result`: a
+-- migration comparison identifies a LEGACY reference that has no Delivery,
+-- Transport or dbt-node identity, and forcing it through those columns would
+-- make validation_result's rows misleading (see docs/MIGRATION.md).
+--
+-- NOT A WORKFLOW-STATE TABLE. There is no row for "waiting on legacy" or
+-- "waiting on new" -- absence of a comparable pair is derived at query time
+-- from `registry.delivery`/`registry.run_input` and the legacy adapter, never
+-- stored. A row here means a comparison actually EXECUTED.
+--
+-- APPEND-ONLY AND IDEMPOTENT, same shape as `validation_result`:
+-- `comparison_id` is deterministic over (feed, checkpoint, legacy_ref,
+-- new_ref, comparison_contract_hash), so a retried Airflow task or a repeated
+-- reconciliation pass writes the SAME row rather than a duplicate, while a
+-- corrected/restated Delivery -- a genuinely different new_ref -- gets its
+-- own row. History accumulates; nothing here is ever updated in place.
+--
+-- NO FOREIGN KEY to `registry.delivery`, `registry.run` or
+-- `registry.migration_comparison` itself, for the same rebuildability
+-- reasoning `run_input`/`validation_result` already carry: this table must
+-- outlive a rebuild of the tables it references, and a legacy-side reference
+-- has no row anywhere in this registry to reference at all.
+CREATE TABLE IF NOT EXISTS registry.migration_comparison (
+    comparison_id            TEXT        PRIMARY KEY,
+    feed                     TEXT        NOT NULL,
+    business_date            DATE        NOT NULL,
+    -- 'raw' | 'prepared' | 'reporting'.
+    checkpoint               TEXT        NOT NULL,
+    -- The CORRELATION key this comparison paired the two sides on -- see
+    -- `reporting_platform/migration/correlate.py`. Not a foreign key to
+    -- anything: it is evidence identity, not a relationship.
+    correlation_key          TEXT        NOT NULL,
+    -- New-platform side: the strongest reference available. `new_run_id`
+    -- links to `registry.run` for a prepared/reporting checkpoint (no FK,
+    -- same reasoning as `run_input`); Raw has no run of its own, so it stays
+    -- NULL there and `new_ref` alone (a DeliveryID) is the reference.
+    new_ref                  TEXT        NOT NULL,
+    new_run_id               TEXT,
+    -- Legacy side: the strongest reference the adapter could return. Free
+    -- text because the true legacy estate defines its own identity scheme
+    -- (a query snapshot id, a load id, a filename+hash) that this platform
+    -- does not own -- see docs/MIGRATION.md#legacy-provenance.
+    legacy_ref               TEXT        NOT NULL,
+    -- A hash of the comparison CONTRACT actually used -- checkpoint, key,
+    -- columns, aggregates, strategy versions -- snapshotted so a later
+    -- config edit can never retroactively reinterpret what a historical
+    -- PASS meant. See docs/MIGRATION.md#comparison-contract-versioning.
+    comparison_contract_hash TEXT        NOT NULL,
+    -- 'PASS' | 'WARN' | 'FAIL' | 'ERROR' -- identical vocabulary to
+    -- `validation_result.outcome`. There is no fifth "WAITING" outcome:
+    -- a row is only ever written once both sides were actually compared.
+    outcome                  TEXT        NOT NULL,
+    -- 'blocking' | 'warn' -- whether a WARN/FAIL here counts against
+    -- acceptance. Independent of `outcome`, same relationship
+    -- `validation_result.severity` has to its own `outcome`.
+    severity                 TEXT        NOT NULL,
+    -- Summary evidence only -- never the differing rows themselves. See
+    -- docs/MIGRATION.md#difference-artifacts for why detail lives in object
+    -- storage, not here.
+    summary                  JSONB       NOT NULL,
+    -- Object-store prefix holding the full difference artifact
+    -- (legacy-only/new-only/changed + summary.json), written only when there
+    -- is something to investigate. NULL for an ordinary PASS.
+    diff_ref                 TEXT,
+    executed_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    message                  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS migration_comparison_feed_date
+    ON registry.migration_comparison (feed, business_date);
+CREATE INDEX IF NOT EXISTS migration_comparison_outcome
+    ON registry.migration_comparison (feed, outcome, executed_at DESC);
 """
 
 

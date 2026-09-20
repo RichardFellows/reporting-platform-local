@@ -432,6 +432,16 @@ session's own baseline required hand-landing matching `.ctl` objects; that
 gap is left for whoever next touches the sample-data generator, not fixed
 here per this task's scope.
 
+## Dual-run migration orchestration (Phase 8)
+
+`migration_reconcile` is a second, wholly INDEPENDENT DAG -- it calls nothing
+here and nothing here calls it. It reads what `transport_ingest`/
+`dbt_builds.py` have already published (registered Deliveries, Raw/prepared/
+reporting tables) plus a legacy adapter, and writes only to
+`registry.migration_comparison`. This DAG's schedule, retries or a legacy
+outage cannot affect ingestion latency or correctness on this page's own
+task graph. See [`MIGRATION.md`](MIGRATION.md).
+
 ## What is deliberately not here
 
 Per the Phase 6 brief's explicit non-goals: OpenMetadata, DCM .NET changes,

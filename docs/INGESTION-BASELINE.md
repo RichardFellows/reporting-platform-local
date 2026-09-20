@@ -290,3 +290,11 @@ Later phases can use these seams without treating them as Phase 0 work:
 
 Any such change must keep the representative paths above green or explicitly
 replace their contracts with versioned migrations.
+
+## Phase 8 pointer
+
+Dual-run migration (comparing this baseline's output against the true
+legacy estate, feed by feed, before cutover) is a separate concern from the
+Landing/Ready/Raw contracts this document baselines -- see
+[`MIGRATION.md`](MIGRATION.md). Nothing in `reporting_platform/migration/`
+changes any contract described above.
