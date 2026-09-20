@@ -4744,3 +4744,71 @@ named `*.json`) and a v2 manifest key never has. `list_manifests` now calls
 entirely on the v1 side, which is the side that made the unqualified claim.
 `tests/test_normalize.py::test_a_v2_delivery_manifest_sharing_this_prefix_is_not_picked_up`
 reproduces the collision and pins the fix.
+
+## validation-evidence-is-append-only
+
+**Decision (Phase 7).** `registry.validation_result` (`docs/VALIDATION.md`)
+records the outcome of controls that already run in RPL, Spark and dbt --
+it is deliberately not a fourth place those controls are DEFINED, only a
+durable, queryable record of what they OBSERVED.
+
+**Why one table across three layers, not three.** Delivery/Transport
+controls, Raw ingestion controls and dbt tests already have three different
+execution mechanisms, and Phase 7's brief is explicit that they must stay
+that way -- no generic validation engine. But an investigator asking "what do
+we know about this Delivery" or "what did this run check" needs one place to
+look, not three schemas to join by hand. `layer` says which mechanism
+produced a row; the columns that do not apply to a layer stay NULL.
+
+**Why no foreign key to `registry.run` or `registry.delivery`.** Same
+reasoning `run_input` already established (`registry/db.py`'s module
+header): a foreign key would let a rebuild of either table cascade validation
+history away, and a Delivery/Transport integrity FAILURE by definition has no
+successful `registry.delivery` row to reference in the first place -- see
+`#failed-delivery-validation-has-no-fake-manifest` below. `run_id` links
+dbt-layer rows to the `registry.run` that produced them (informational, not
+enforced); `execution_ref` is a separate, free-form pointer for the
+Delivery/Raw layers, which run in an entirely different id space (an ingest
+run id or an Airflow run id, never a `registry.run.run_id`) -- conflating the
+two under one column would make it mean two different things depending on
+which row you were reading.
+
+**Why append-only with a deterministic id, not a mutable "latest status"
+row.** A mutable row answers "did this control pass" and destroys "when did
+it first fail, and did a later run genuinely fix it" on every UPDATE -- the
+same reasoning `registry.as_at_transition` already uses for the same shape of
+problem. `validation_id` is computed from `(layer, control_id, attempt_key)`,
+where the caller's `attempt_key` names ONE LOGICAL EXECUTION (an Airflow run
+id for a Delivery control, `run_id:task_id:try_number` for a dbt task).
+`INSERT ... ON CONFLICT DO NOTHING` makes retrying that same execution a
+no-op rather than a duplicate; a genuinely later execution gets a new
+`attempt_key` and therefore its own row. Verified live: retriggering
+`transport_ingest` for the same TransportID under a fresh Airflow run id
+produced a second, independent `delivery_identity` FAIL row beside the
+first, while re-running `record` with the same `attempt_key` produced none.
+
+## failed-delivery-validation-has-no-fake-manifest
+
+**Decision (Phase 7).** A Transport/Delivery control that fails --
+`TransportContractError`/`TransportEvidenceError` from `ingest/transport.py`,
+`DeliveryError` and its subclasses from `ingest/delivery.py` -- is recorded
+in `registry.validation_result` (`layer=delivery`, `outcome=FAIL`) keyed by
+`transport_id`, never by inventing a `registry.delivery` row or a
+DeliveryManifest for something that was refused. `registry.delivery` stays
+exactly what its module header already says it is: an index over accepted
+Deliveries, rebuildable from object storage. A row for something that was
+NOT accepted would make that rebuild lie.
+
+The immutable Transport evidence under `received/<transport_id>/` already
+answers "what arrived"; the validation_result row answers "what the platform
+decided about it and why", which is the fact nothing else records. FAIL
+(a known validation exception -- the control ran and found a real problem) is
+kept distinct from ERROR (anything else -- the control itself could not
+execute), by classifying the caught exception's type rather than by outcome
+alone. See `docs/VALIDATION.md#outcomes`.
+
+Live-verified: a Transport whose control filename did not match its feed's
+`delivery.control.pattern` failed `create_delivery` with
+`IdentityResolutionError`; no `registry.delivery` row was created for it, and
+`registry validation transport <id>` returned the FAIL row naming the exact
+control and reason.

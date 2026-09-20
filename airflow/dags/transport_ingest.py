@@ -57,6 +57,35 @@ DEFAULT_ARGS = {
 RAW_ASSET_ALIAS = AssetAlias("raw-table-updated")
 
 
+def _record_delivery_failure(exc: Exception, *, control_id: str,
+                             transport_id: str, execution_ref: str,
+                             feed: str | None = None,
+                             delivery_id: str | None = None) -> None:
+    """Durable evidence for a Transport/Delivery control that DID NOT pass.
+
+    Phase 7 (`docs/VALIDATION.md`). A failed Transport/Delivery validation
+    leaves no DeliveryManifest and is NEVER given a fake one -- the immutable
+    evidence under `received/<transport_id>/` is the record of what arrived,
+    and this row is the record of what the platform decided about it. FAIL is
+    a known validation exception (the control ran and found a real problem);
+    ERROR is anything else (the control itself could not execute). Best
+    effort, like every other registry write on this path -- see
+    `registry/validation.py`.
+    """
+    from reporting_platform.ingest import delivery as delivery_contract
+    from reporting_platform.ingest import transport as transport_contract
+    from reporting_platform.registry import validation
+
+    known = (transport_contract.TransportContractError, delivery_contract.DeliveryError)
+    outcome = "FAIL" if isinstance(exc, known) else "ERROR"
+    validation.record_quietly(
+        layer="delivery", control_id=control_id, control_name=control_id,
+        outcome=outcome, severity="blocking", attempt_key=execution_ref,
+        execution_ref=execution_ref, transport_id=transport_id, feed=feed,
+        delivery_id=delivery_id, evidence_ref=transport_id,
+        message=f"{type(exc).__name__}: {exc}")
+
+
 def _spark_subprocess(*args: str) -> dict:
     """Run a Spark-using operation in a child process and parse its JSON.
 
@@ -109,11 +138,17 @@ def _dag():
             raise ValueError(
                 "transport_ingest requires transport_id in dag_run.conf or params")
         marker_key = transport_contract.complete_key(transport_id)
-        transport_contract.read_validated_transport(marker_key)
+        try:
+            transport_contract.read_validated_transport(marker_key)
+        except Exception as exc:
+            _record_delivery_failure(
+                exc, control_id="transport_contract", transport_id=transport_id,
+                execution_ref=context["run_id"])
+            raise
         return marker_key
 
     @task(task_id="create_delivery")
-    def create_delivery_task(marker_key: str) -> str:
+    def create_delivery_task(marker_key: str, **context) -> str:
         """Accepted Transport -> immutable DeliveryManifest. Returns its key.
 
         `create_delivery` is create-once: the same marker_key always returns
@@ -126,16 +161,25 @@ def _dag():
         from reporting_platform.ingest import delivery as delivery_contract
         from reporting_platform.ingest import transport as transport_contract
 
-        delivery_contract.create_delivery(marker_key)
+        transport_id = None
+        try:
+            parsed = transport_contract.read_transport(marker_key)
+            transport_id = parsed.transport_id
+            delivery_contract.create_delivery(marker_key)
+        except Exception as exc:
+            _record_delivery_failure(
+                exc, control_id="delivery_identity",
+                transport_id=transport_id or marker_key,
+                execution_ref=context["run_id"])
+            raise
         # The key is a pure function of transport identity, so this is a
         # cheap re-parse of the small completion marker -- not a re-hash of
         # the source bytes create_delivery already validated. Matches the
         # idiom tests/test_delivery.py uses.
-        parsed = transport_contract.read_transport(marker_key)
         return delivery_contract.manifest_key(parsed)
 
     @task(task_id="normalize_delivery")
-    def normalize_delivery_task(delivery_manifest_key: str) -> str:
+    def normalize_delivery_task(delivery_manifest_key: str, **context) -> str:
         """DeliveryManifest -> rebuildable NormalizationManifest v2.
 
         Also create-once/idempotent (`docs/NORMALIZATION-CONTRACT.md`): a
@@ -146,7 +190,14 @@ def _dag():
         """
         from reporting_platform.ingest.normalization import normalize_delivery
 
-        result = normalize_delivery(delivery_manifest_key)
+        try:
+            result = normalize_delivery(delivery_manifest_key)
+        except Exception as exc:
+            _record_delivery_failure(
+                exc, control_id="normalization_contract",
+                transport_id=delivery_manifest_key,
+                execution_ref=context["run_id"])
+            raise
         return result.key
 
     @task(task_id="ingest_raw", pool="lakehouse_write",

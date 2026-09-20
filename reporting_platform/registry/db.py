@@ -410,6 +410,78 @@ CREATE TABLE IF NOT EXISTS registry.submission_item (
     FOREIGN KEY (report, as_at_date, version_no)
         REFERENCES registry.report_version (report, as_at_date, version_no)
 );
+
+-- Phase 7. Durable, queryable evidence that a validation CONTROL executed and
+-- what it observed -- not a second ingestion ledger and not a verdict on
+-- `registry.delivery` (see the module header: that table stays observation,
+-- no status column). One row per (logical execution of one control).
+--
+-- THREE LAYERS share this one table rather than three: `layer` says which of
+-- Delivery/Raw/dbt produced the row, and the columns that do not apply to a
+-- given layer stay NULL rather than becoming three schemas that drift.
+--
+-- NO FOREIGN KEY to `registry.run` or `registry.delivery`, deliberately, for
+-- the same reason `run_input` has none (see the module header): validation
+-- history must outlive a rebuild of either table, and a delivery/transport
+-- integrity failure by definition has no successful `registry.delivery` row
+-- to reference. `run_id` links dbt-layer rows to the build run that produced
+-- them; `execution_ref` is a free-form pointer (an ingest run id, an Airflow
+-- run id) for the Delivery/Raw layers, which do not share `registry.run`'s id
+-- space at all -- conflating the two would make one column mean two things.
+--
+-- APPEND-ONLY. `validation_id` is DETERMINISTIC for one logical execution
+-- (one attempt of one control against one subject), so a retry of that same
+-- attempt is `ON CONFLICT DO NOTHING` rather than a duplicate row, while a
+-- later, genuinely new execution gets its own id and its own row. See
+-- `registry/validation.py`.
+CREATE TABLE IF NOT EXISTS registry.validation_result (
+    validation_id  TEXT        PRIMARY KEY,
+    -- dbt layer only: the `registry.run` this test execution belongs to.
+    run_id         TEXT,
+    -- Delivery/Raw layers: whatever identifies the executing process there
+    -- (an ingest run id, an Airflow run id). Not `registry.run.run_id`.
+    execution_ref  TEXT,
+    feed           TEXT,
+    delivery_id    TEXT,
+    transport_id   TEXT,
+    -- 'delivery' | 'raw' | 'dbt'.
+    layer          TEXT        NOT NULL,
+    -- A stable identifier for the control itself: an exception class name
+    -- ('transport_evidence'), a named RPL check ('expected_min_rows'), or a
+    -- dbt node's `unique_id` (preserved verbatim so a later OpenMetadata
+    -- ingestion of the same dbt artifacts can join on it).
+    control_id     TEXT        NOT NULL,
+    control_name   TEXT,
+    model_name     TEXT,
+    column_name    TEXT,
+    -- 'blocking' | 'warn' | 'info'. What executing this control and finding a
+    -- problem is allowed to do to the pipeline -- not what happened this time
+    -- (that is `outcome`).
+    severity       TEXT        NOT NULL,
+    -- 'PASS' | 'WARN' | 'FAIL' | 'ERROR'. FAIL is the control finding a real
+    -- problem; ERROR is the control failing to execute at all. Never conflate
+    -- the two -- see docs/VALIDATION.md.
+    outcome        TEXT        NOT NULL,
+    expected_value TEXT,
+    observed_value TEXT,
+    failure_count  BIGINT,
+    executed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Where the authoritative evidence behind this row lives: a Transport
+    -- marker key, a DeliveryManifest key, or an `s3://.../dbt-artifacts/...`
+    -- prefix. This row is a queryable PROJECTION over that evidence, not a
+    -- replacement for it.
+    evidence_ref   TEXT,
+    message        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS validation_result_run
+    ON registry.validation_result (run_id);
+CREATE INDEX IF NOT EXISTS validation_result_delivery
+    ON registry.validation_result (feed, delivery_id);
+CREATE INDEX IF NOT EXISTS validation_result_transport
+    ON registry.validation_result (transport_id);
+CREATE INDEX IF NOT EXISTS validation_result_layer_outcome
+    ON registry.validation_result (layer, outcome, executed_at DESC);
 """
 
 

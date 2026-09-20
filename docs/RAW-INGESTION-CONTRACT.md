@@ -63,10 +63,21 @@ answers which Delivery has been ingested.
 ## Validation and commit boundary
 
 The shared writer retains strict parser validation, historical column mapping,
-schema-drift policy, minimum row count, producer-declared exact row count, and
-producer MD5 verification. Assertions, observations, and results remain
-separate: the manifest holds what the producer declared, Spark measures parsed
-rows/bytes, and ingestion either accepts or raises without mutating evidence.
+schema-drift policy, minimum row count, a maximum row count (Phase 7,
+`expected_max_rows` — `None` by default, snapshotted into the normalization
+contract exactly like `expected_min_rows`), producer-declared exact row
+count, and producer MD5 verification. Assertions, observations, and results
+remain separate: the manifest holds what the producer declared, Spark
+measures parsed rows/bytes, and ingestion either accepts or raises without
+mutating evidence.
+
+Phase 7 adds durable evidence next to each of these checks: every one records
+a `registry.validation_result` row — PASS as well as FAIL, before the branch
+is abandoned — tied to `delivery_id`, so "what did Raw ingestion actually
+observe for this Delivery" has a queryable answer independent of Airflow's
+own log retention. See [`VALIDATION.md`](VALIDATION.md#raw-ingestion-evidence).
+The checks themselves, their thresholds, and the branch-abandon-on-failure
+behaviour below are unchanged.
 
 Each attempt creates a Nessie branch. Schema reconciliation, reads, counts,
 checksum checks, and the Iceberg append occur there; only `Nessie.merge` makes

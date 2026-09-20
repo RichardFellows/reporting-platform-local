@@ -21,6 +21,9 @@
         [--from N] [--to N]
     python -m reporting_platform.registry submit --destination D --by WHO \
         --version report:2026-08-01:3 [--version ...] [--family NAME]
+    python -m reporting_platform.registry validation delivery DELIVERY_ID [--feed F]
+    python -m reporting_platform.registry validation transport TRANSPORT_ID
+    python -m reporting_platform.registry validation run RUN_ID
 
 No Spark in this CLI: everything it reaches is boto3, json and psycopg2, so it
 runs in the task process rather than through `scripts/_spark_task.py`. The one
@@ -40,7 +43,7 @@ from datetime import date
 from reporting_platform.common.context import feed as get_feed
 from reporting_platform.common.context import feeds
 from reporting_platform.registry import (
-    db, deliveries, lifecycle, rejections, runs,
+    db, deliveries, lifecycle, rejections, runs, validation,
 )
 
 
@@ -135,6 +138,20 @@ def main(argv=None) -> int:
     df.add_argument("--from", dest="from_version", type=int)
     df.add_argument("--to", dest="to_version", type=int)
 
+    # -------------------------------------------------- validation evidence
+    # Phase 7. `delivery`/`transport` look up by DeliveryID/TransportID,
+    # spanning all three layers a Delivery ever touches; `run` looks up
+    # dbt-layer results by `registry.run.run_id`.
+    va = sub.add_parser("validation", help="durable validation execution evidence")
+    va_sub = va.add_subparsers(dest="validation_command", required=True)
+    va_d = va_sub.add_parser("delivery", help="validation results for one Delivery")
+    va_d.add_argument("delivery_id")
+    va_d.add_argument("--feed")
+    va_t = va_sub.add_parser("transport", help="validation results for one Transport")
+    va_t.add_argument("transport_id")
+    va_r = va_sub.add_parser("run", help="dbt-layer validation results for one run")
+    va_r.add_argument("run_id")
+
     sb = sub.add_parser("submit", help="record that versions were submitted")
     sb.add_argument("--destination", required=True)
     sb.add_argument("--by", required=True, dest="submitted_by")
@@ -165,6 +182,15 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    if a.command == "validation":
+        if a.validation_command == "delivery":
+            out = validation.for_delivery(a.delivery_id, a.feed)
+        elif a.validation_command == "transport":
+            out = validation.for_transport(a.transport_id)
+        else:
+            out = validation.for_run(a.run_id)
         print(json.dumps(out, indent=2, default=str))
         return 0
     if a.command == "submissions":

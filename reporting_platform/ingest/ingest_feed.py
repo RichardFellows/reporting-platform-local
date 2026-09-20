@@ -42,6 +42,31 @@ log = logging.getLogger("ingest")
 _DELIVERY_ID = re.compile(r"dlv_[0-9a-f]{32}")
 
 
+def _record_raw_check(*, control_id: str, fd, manifest: dict, run_id: str,
+                      attempt_key: str, severity: str, outcome: str,
+                      expected_value, observed_value,
+                      message: str | None = None) -> None:
+    """Durable evidence for one Raw ingestion control (Phase 7).
+
+    Called for BOTH the passing and the failing case, right next to the check
+    itself -- so a PASS is exactly as durable as a FAIL, and the values
+    compared are the ones this delivery actually had, not today's config.
+    Best-effort: a registry outage must not turn a successful, already-decided
+    check into a failed ingest. See `registry/validation.py`.
+    """
+    from reporting_platform.registry import validation
+
+    validation.record_quietly(
+        layer="raw", control_id=control_id, control_name=control_id,
+        outcome=outcome, severity=severity, attempt_key=attempt_key,
+        run_id=None, execution_ref=run_id, feed=fd.name,
+        delivery_id=manifest.get("delivery_id"),
+        evidence_ref=manifest.get("source_object"),
+        expected_value=expected_value, observed_value=observed_value,
+        message=message,
+    )
+
+
 def _at_branch(table: str, branch: str | None) -> str:
     """Address `table` on a Nessie branch WITHOUT rebinding the session.
 
@@ -472,6 +497,11 @@ def _v2_feed_contract(fd, manifest: dict):
     if type(expected_min_rows) is not int or expected_min_rows < 0:
         raise ValueError(
             "NormalizationManifest v2 contract has malformed expected_min_rows")
+    expected_max_rows = contract.get("expected_max_rows", fd.expected_max_rows)
+    if expected_max_rows is not None and (
+            type(expected_max_rows) is not int or expected_max_rows < 0):
+        raise ValueError(
+            "NormalizationManifest v2 contract has malformed expected_max_rows")
     schema_drift = contract.get("schema_drift", fd.schema_drift)
     if schema_drift not in ("warn", "fail"):
         raise ValueError("NormalizationManifest v2 contract has malformed schema_drift")
@@ -484,6 +514,7 @@ def _v2_feed_contract(fd, manifest: dict):
         source_columns=dict(source_columns),
         source_system=str(source_system),
         expected_min_rows=expected_min_rows,
+        expected_max_rows=expected_max_rows,
         schema_drift=schema_drift,
     )
 
@@ -761,8 +792,21 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
                 f"{fd.name}: schema_drift must be 'warn' or 'fail', got "
                 f"{contract_fd.schema_drift!r}"
             )
-        if contract_fd.schema_drift == "fail" and (drift["missing_columns"]
-                                          or drift["extra_columns"]):
+        drifted = bool(drift["missing_columns"] or drift["extra_columns"])
+        attempt_key = f"{run_id}:{manifest['delivery_id']}"
+        _record_raw_check(
+            control_id="schema_drift", fd=fd, manifest=manifest,
+            run_id=run_id, attempt_key=attempt_key,
+            severity="blocking" if contract_fd.schema_drift == "fail" else "warn",
+            outcome=("FAIL" if drifted and contract_fd.schema_drift == "fail"
+                     else "WARN" if drifted else "PASS"),
+            expected_value="no drift",
+            observed_value=(f"missing={drift['missing_columns']} "
+                            f"extra={drift['extra_columns']}") if drifted else "none",
+            message=None if not drifted else
+            f"missing {drift['missing_columns']}, extra {drift['extra_columns']}",
+        )
+        if contract_fd.schema_drift == "fail" and drifted:
             raise ValueError(
                 f"{fd.name} {bdate}: schema drift with schema_drift=fail — "
                 f"missing {drift['missing_columns']}, "
@@ -799,24 +843,59 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             df = df.withColumn(orphan, F.lit(None).cast(dtype))
 
         row_count = df.count()
-        if row_count < contract_fd.expected_min_rows:
+        below_floor = row_count < contract_fd.expected_min_rows
+        _record_raw_check(
+            control_id="expected_min_rows", fd=fd, manifest=manifest,
+            run_id=run_id, attempt_key=attempt_key, severity="blocking",
+            outcome="FAIL" if below_floor else "PASS",
+            expected_value=f">= {contract_fd.expected_min_rows}",
+            observed_value=row_count,
+        )
+        if below_floor:
             # Abandon the branch: main is untouched, nothing to roll back.
             raise ValueError(
                 f"{fd.name} {bdate}: {row_count} rows, below expected minimum "
                 f"{contract_fd.expected_min_rows}. Branch {branch} left for inspection."
             )
 
+        # The CEILING next to the floor. A platform expectation about the
+        # feed as a whole -- distinct from `declared_row_count` below, which
+        # is what THIS delivery's producer asserted. See docs/VALIDATION.md.
+        if contract_fd.expected_max_rows is not None:
+            above_ceiling = row_count > contract_fd.expected_max_rows
+            _record_raw_check(
+                control_id="expected_max_rows", fd=fd, manifest=manifest,
+                run_id=run_id, attempt_key=attempt_key, severity="blocking",
+                outcome="FAIL" if above_ceiling else "PASS",
+                expected_value=f"<= {contract_fd.expected_max_rows}",
+                observed_value=row_count,
+            )
+            if above_ceiling:
+                raise ValueError(
+                    f"{fd.name} {bdate}: {row_count} rows, above expected "
+                    f"maximum {contract_fd.expected_max_rows}. Branch {branch} "
+                    f"left for inspection."
+                )
+
         # The EXACT count next to the floor above. expected_min_rows catches a
         # truncated file; a control file states what the sender counted, so
         # this is an equality check, not another floor. Only a feed with
         # `delivery.control.row_count` and a matching control file has one.
         declared = manifest.get("declared_row_count")
-        if declared is not None and row_count != declared:
-            raise ValueError(
-                f"{fd.name} {bdate}: {row_count} rows read, control file "
-                f"{manifest.get('control_object')} declared {declared}. "
-                f"Branch {branch} left for inspection; main is untouched."
+        if declared is not None:
+            mismatched = row_count != declared
+            _record_raw_check(
+                control_id="declared_row_count", fd=fd, manifest=manifest,
+                run_id=run_id, attempt_key=attempt_key, severity="blocking",
+                outcome="FAIL" if mismatched else "PASS",
+                expected_value=declared, observed_value=row_count,
             )
+            if mismatched:
+                raise ValueError(
+                    f"{fd.name} {bdate}: {row_count} rows read, control file "
+                    f"{manifest.get('control_object')} declared {declared}. "
+                    f"Branch {branch} left for inspection; main is untouched."
+                )
 
         # The checksum, next to the count. It catches what the count cannot: a
         # delivery truncated or re-encoded in transit that still holds the
@@ -838,7 +917,14 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
         if declared_md5 is not None:
             hashed = _checksum_objects(manifest)
             actual_md5 = _delivery_md5(manifest)
-            if actual_md5 != declared_md5:
+            checksum_mismatch = actual_md5 != declared_md5
+            _record_raw_check(
+                control_id="declared_md5", fd=fd, manifest=manifest,
+                run_id=run_id, attempt_key=attempt_key, severity="blocking",
+                outcome="FAIL" if checksum_mismatch else "PASS",
+                expected_value=declared_md5, observed_value=actual_md5,
+            )
+            if checksum_mismatch:
                 raise ValueError(
                     f"{fd.name} {bdate}: {', '.join(hashed)} hashes to "
                     f"{actual_md5}, control file "

@@ -67,8 +67,9 @@ def test_transport_ingest_xcom_is_references_not_manifests():
     # The returns between tasks are all `-> str` (a key) until the final
     # summary dict, which is itself small and reference-shaped.
     assert "def validate_transport(**context) -> str:" in source
-    assert "def create_delivery_task(marker_key: str) -> str:" in source
-    assert "def normalize_delivery_task(delivery_manifest_key: str) -> str:" in source
+    assert "def create_delivery_task(marker_key: str, **context) -> str:" in source
+    assert ("def normalize_delivery_task(delivery_manifest_key: str, **context) -> str:"
+           in source)
 
 
 # ----------------------------------------------------------- transport_watch

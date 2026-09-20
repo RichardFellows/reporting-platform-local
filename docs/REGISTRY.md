@@ -26,6 +26,7 @@ questions it will not answer.
 | | Observations | Events |
 |---|---|---|
 | **Tables** | `delivery`, `delivery_part`, `rejection` | `run`, `run_input`, `report_version`, `submission`, `submission_item`, `as_at_transition` |
+| **Also** | `validation_result` sits beside both — see below | |
 | **About** | bytes that still exist in object storage | things that happened once |
 | **Rebuildable?** | **yes** — `reconcile()` is the authority, not a repair tool | **no** |
 | **Mutable status?** | no | `run` has one |
@@ -245,8 +246,28 @@ repetition upserts the same `(feed, delivery_id)` and replaces only that
 delivery's v2 part observations. Registry failure never removes or invalidates
 object-store evidence.
 
+## Phase 7 validation evidence
+
+`registry.validation_result` is neither an observation nor an event in the
+sense above — it is a durable record of a DECISION already made elsewhere
+(RPL, Spark, or dbt), append-only and keyed so a retried execution cannot
+duplicate itself. It carries no foreign key to `delivery` or `run`, for the
+same rebuildability reason `run_input` carries none, and it must never be
+mistaken for a verdict column on `delivery`: no `outcome`/`status` was added
+there. Query it by Delivery, Transport or run id:
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.registry validation delivery DELIVERY_ID
+docker compose exec -T airflow python -m reporting_platform.registry validation transport TRANSPORT_ID
+docker compose exec -T airflow python -m reporting_platform.registry validation run RUN_ID
+```
+
+Full model, outcome semantics and the dbt artifact pipeline this reads from:
+[`VALIDATION.md`](VALIDATION.md).
+
 ## Related
 
+- [`VALIDATION.md`](VALIDATION.md) — validation controls and execution evidence
 - [`REQUIREMENTS.md`](REQUIREMENTS.md) — the 100 and 400/500 blocks
 - [`ARCHITECTURE.md`](ARCHITECTURE.md#the-registry-what-is-recorded-and-what-stays-derived) — where the registry sits
 - [`MONITORING.md`](MONITORING.md) — the checks that read it

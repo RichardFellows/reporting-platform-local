@@ -156,6 +156,12 @@ class Feed:
     business_key: list[str]
     columns: list[str]
     expected_min_rows: int = 0
+    # REQ-unlabelled, Phase 7. The ceiling next to `expected_min_rows`'s
+    # floor -- None (the default) declares no ceiling, same convention as
+    # `expected_by`'s absence meaning "not judged". Distinct from
+    # `declared_row_count`: this is a PLATFORM expectation about the feed,
+    # not a producer's assertion about one delivery. See docs/VALIDATION.md.
+    expected_max_rows: int | None = None
     landing_prefix: str = "landing"
     # Where normalization puts a delivery's manifest and any derived parts.
     # Separate from `landing_prefix`, and not a subfolder of it: the landing
@@ -998,6 +1004,31 @@ def check_expected_min_rows(feed_name: str, value: Any) -> int:
     return rows
 
 
+def check_expected_max_rows(feed_name: str, value: Any) -> int | None:
+    """The ceiling above which an ingest abandons its branch. None = no ceiling.
+
+    Not cross-checked against `expected_min_rows` here: VALUE_CHECKS runs each
+    key independently and neither is guaranteed to have loaded first. An
+    inverted pair (max < min) still fails, just at the first delivery rather
+    than at load -- the same place a config error in `schema.yml`'s dbt tests
+    would surface.
+    """
+    if value is None:
+        return None
+    try:
+        rows = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{where(feed_name)}: `expected_max_rows: {value!r}` is not a "
+            f"whole number.") from None
+    if rows < 0:
+        raise ValueError(
+            f"{where(feed_name)}: `expected_max_rows: {rows}` is negative, so "
+            f"the ceiling can never NOT fire. Omit the key to declare no "
+            f"ceiling.")
+    return rows
+
+
 def check_single_char(feed_name: str, key: str, value: Any) -> str:
     """`delimiter` and `quote_char` reach Spark's `sep` and `quote`.
 
@@ -1062,6 +1093,7 @@ VALUE_CHECKS = (
     ("cadence", check_cadence),
     ("schema_drift", check_schema_drift),
     ("expected_min_rows", check_expected_min_rows),
+    ("expected_max_rows", check_expected_max_rows),
     ("file_encoding", check_file_encoding),
     ("control_encoding", check_control_encoding),
     ("csv_options", check_csv_options),
