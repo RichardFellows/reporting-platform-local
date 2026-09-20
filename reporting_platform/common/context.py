@@ -52,7 +52,7 @@ _CONFIG_CACHE = 16
 @lru_cache(maxsize=_CONFIG_CACHE)
 def _load_at(name: str, mtime_ns: int) -> dict[str, Any]:
     """Parse a config file. Cached on (name, mtime) rather than name alone."""
-    with open(CONFIG_DIR / name) as fh:
+    with open(CONFIG_DIR / name, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
@@ -80,7 +80,7 @@ def _load(name: str) -> dict[str, Any]:
 
 def _read_one(path: Path) -> dict[str, Any]:
     """Parse one registry file, refusing a shape that is not a mapping."""
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         loaded = yaml.safe_load(fh)
     if loaded is None:
         return {}
