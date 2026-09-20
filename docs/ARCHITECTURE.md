@@ -560,6 +560,14 @@ is the operator's guide to it, and
 [`DECISIONS.md#the-registry-records-observations-not-verdicts`](DECISIONS.md#the-registry-records-observations-not-verdicts)
 carries the reasoning.
 
+**A third kind sits beside both halves (Phase 7).**
+`registry.validation_result` is neither a rebuildable observation nor a
+one-off event about the platform's own process — it is durable, queryable
+evidence of what a Delivery/Raw/dbt control *decided* when it ran, append-only
+and keyed so a retry cannot duplicate itself. It is not a verdict column on
+`delivery`, and it is not a second engine: every control it records evidence
+for already ran in RPL, Spark or dbt. See [`VALIDATION.md`](VALIDATION.md).
+
 ---
 
 ## The as-at date has a lifecycle

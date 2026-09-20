@@ -133,6 +133,7 @@ def normalization_contract(feed: Feed) -> dict[str, Any]:
         # using whichever Feed YAML happens to be current at ingest time.
         "source_system": feed.source_system,
         "expected_min_rows": feed.expected_min_rows,
+        "expected_max_rows": feed.expected_max_rows,
         "schema_drift": feed.schema_drift,
         "format": feed_format(feed),
         "columns": list(feed.columns),

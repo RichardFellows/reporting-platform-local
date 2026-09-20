@@ -141,6 +141,16 @@ same as the legacy path's `ingest` task does today.
 `transport_watch`, `transport_reconcile`, or a manual replay. It never
 decides for itself when a Transport is due.
 
+**Phase 7.** The first three tasks each catch their domain call's exception,
+record a `registry.validation_result` row (`layer=delivery`, keyed by
+`transport_id`), and re-raise unchanged -- the failure attribution above is
+unaffected, only now investigable after the fact by `registry validation
+transport <id>` rather than only through Airflow's own log retention. A
+success writes nothing here; the DeliveryManifest/NormalizationManifest that
+task returns is already the evidence. `ingest_raw`'s own checks record their
+own PASS/FAIL evidence one layer down, inside `ingest_feed.py` -- see
+[`VALIDATION.md`](VALIDATION.md).
+
 ## XCom: references, not evidence
 
 Every inter-task value above is a short S3 key (a few hundred bytes at most)

@@ -205,6 +205,10 @@ def _validate_contract(contract: Any, source: str) -> None:
             type(contract["expected_min_rows"]) is not int
             or contract["expected_min_rows"] < 0):
         raise NormalizationError(f"{source}: expected_min_rows is malformed")
+    if contract.get("expected_max_rows") is not None and (
+            type(contract["expected_max_rows"]) is not int
+            or contract["expected_max_rows"] < 0):
+        raise NormalizationError(f"{source}: expected_max_rows is malformed")
     if "schema_drift" in contract and contract["schema_drift"] not in ("warn", "fail"):
         raise NormalizationError(f"{source}: schema_drift is malformed")
     if kind == "archive" and not isinstance(contract.get("member_pattern"), str):

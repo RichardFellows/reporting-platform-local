@@ -139,26 +139,48 @@ TEST_BEHAVIOR = TestBehavior(os.environ.get("COSMOS_TEST_BEHAVIOR", "after_all")
 
 
 def _archive_dbt_artifacts(context) -> None:
-    """Retain this Cosmos task's artifacts before the next task overwrites them."""
+    """Retain this Cosmos task's artifacts before the next task overwrites them.
+
+    Also captures per-test validation evidence (Phase 7) from the SAME local
+    `run_results.json`/`manifest.json` this callback already has open, before
+    they are archived and the next task's invocation overwrites them. Runs on
+    BOTH `on_success_callback` and `on_failure_callback`, so a failing test
+    task's evidence is captured exactly like a passing one -- before
+    publication is even considered, and independent of whether publication
+    happens at all. See `registry/validation.py`.
+    """
     import logging
 
-    from reporting_platform.registry import artifacts
+    from reporting_platform.registry import artifacts, validation
 
     ti = context["ti"]
     branch = ti.xcom_pull(task_ids="open_branch")
     if not branch:
         raise RuntimeError(
             f"{ti.task_id}: cannot associate dbt artifacts without open_branch")
+    run_id = _run_key(branch)
+    target_path = os.environ.get("DBT_TARGET_PATH")
     result = artifacts.archive(
-        _run_key(branch), ti.task_id, ti.try_number,
-        target_path=os.environ.get("DBT_TARGET_PATH"))
+        run_id, ti.task_id, ti.try_number, target_path=target_path)
     if result["missing"]:
         raise RuntimeError(
             f"{ti.task_id}: dbt did not produce required artifacts "
             f"{result['missing']}")
-    logging.getLogger("airflow.task").info(
-        "retained dbt artifacts for %s at %s", ti.task_id,
-        result["reference"])
+    log = logging.getLogger("airflow.task")
+    log.info("retained dbt artifacts for %s at %s", ti.task_id, result["reference"])
+
+    try:
+        captured = validation.capture_dbt_task(
+            run_id, ti.task_id, ti.try_number, target_path=target_path,
+            evidence_ref=result["reference"])
+        log.info("captured %d validation result(s) for %s",
+                 len(captured), ti.task_id)
+    except Exception as exc:                                     # noqa: BLE001
+        # Best-effort, like every other registry write on this path: the
+        # artifacts themselves (just archived above) remain the authoritative
+        # evidence even if the projection into validation_result fails.
+        log.warning("could not capture validation results for %s: %s",
+                    ti.task_id, f"{type(exc).__name__}: {exc}")
 
 
 def _render_config(select: str) -> RenderConfig:
