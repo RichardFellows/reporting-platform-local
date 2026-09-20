@@ -56,7 +56,7 @@ def _mutually_exclusive_ranges_configs() -> list[dict]:
     test sits, so a block moved from `tests:` to a differently-shaped config
     (or added on a fourth SCD2 model later) is still found.
     """
-    text = repo_file(PREPARED_YML).read_text()
+    text = repo_file(PREPARED_YML).read_text(encoding="utf-8")
     doc = yaml.safe_load(text)
     found: list[dict] = []
 

@@ -35,8 +35,9 @@ def test_a_feed_file_must_declare_the_name_it_is_called():
     start a new feed and changing one of the two."""
     d = config_dir(synthetic())
     (d / "feeds" / "t_one.yml").write_text(
-        (d / "feeds" / "t_one.yml").read_text().replace("name: t_one",
-                                                        "name: t_other"))
+        (d / "feeds" / "t_one.yml").read_text(encoding="utf-8").replace("name: t_one",
+                                                        "name: t_other"),
+        encoding="utf-8")
     msg = _raises(lambda: _feeds(d))
     assert "t_one.yml" in msg and "t_other" in msg, msg
 
@@ -46,7 +47,7 @@ def test_a_feed_filename_must_be_a_legal_name():
     charset IS the identity charset -- a space or a capital is legal in a
     filename and in none of the four places the name has to work."""
     d = config_dir(synthetic())
-    (d / "feeds" / "Trade Feed.yml").write_text("name: x\n")
+    (d / "feeds" / "Trade Feed.yml").write_text("name: x\n", encoding="utf-8")
     msg = _raises(lambda: _feeds(d))
     assert "Trade Feed" in msg and "lowercase" in msg, msg
 
@@ -56,7 +57,7 @@ def test_an_underscore_prefixed_file_is_not_a_feed():
     one. Anything else `_`-prefixed is scratch, and must not become a feed
     with no columns that every sweep then reports on."""
     d = config_dir(synthetic())
-    (d / "feeds" / "_scratch.yml").write_text("name: whatever\n")
+    (d / "feeds" / "_scratch.yml").write_text("name: whatever\n", encoding="utf-8")
     assert set(_feeds(d)) == {"t_one"}
 
 
@@ -83,7 +84,7 @@ def _touch(path, content: str) -> None:
     writes landing in different filesystem ticks would fail rarely and for
     the wrong reason.
     """
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8")
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns + 10**9, stat.st_mtime_ns + 10**9))
 
@@ -92,14 +93,14 @@ def test_editing_a_feed_file_is_picked_up():
     d = config_dir(synthetic())
     assert _feeds(d)["t_one"].delimiter == ","
     path = d / "feeds" / "t_one.yml"
-    _touch(path, path.read_text() + "delimiter: '|'\n")
+    _touch(path, path.read_text(encoding="utf-8") + "delimiter: '|'\n")
     assert _feeds(d)["t_one"].delimiter == "|", "the feed file was cached"
 
 
 def test_editing_the_defaults_file_is_picked_up():
     d = config_dir(synthetic())
     path = d / "feeds" / "_defaults.yml"
-    _touch(path, path.read_text().replace('delimiter: ","', "delimiter: ';'"))
+    _touch(path, path.read_text(encoding="utf-8").replace('delimiter: ","', "delimiter: ';'"))
     assert _feeds(d)["t_one"].delimiter == ";", "_defaults.yml was cached"
 
 
@@ -143,7 +144,7 @@ def test_origins_names_the_tier_each_value_came_from():
     from reporting_platform.common.context import origins
     where = origins("t_one")
     assert where["columns"] == "feed"
-    assert where["expected_min_rows"].endswith("conventions/ref.yml"), where
+    assert where["expected_min_rows"].replace(os.sep, "/").endswith("conventions/ref.yml"), where
     assert where["delimiter"].endswith("_defaults.yml"), where
     # Nothing declared `cadence`; it is the dataclass default and says so
     # rather than being attributed to the nearest file that might have.
@@ -165,5 +166,5 @@ def test_origins_names_the_link_that_declared_it_not_the_one_named():
         "    convention: group_eu\n"))
     from reporting_platform.common.context import origins
     where = origins("t_one")
-    assert where["delimiter"].endswith("conventions/group.yml"), where
-    assert where["expected_min_rows"].endswith("conventions/group_eu.yml"), where
+    assert where["delimiter"].replace(os.sep, "/").endswith("conventions/group.yml"), where
+    assert where["expected_min_rows"].replace(os.sep, "/").endswith("conventions/group_eu.yml"), where

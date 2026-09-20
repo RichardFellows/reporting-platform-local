@@ -31,7 +31,7 @@ def test_v2_delivery_id_wins_over_same_physical_filename_and_restatement():
             _batch_id, _received_at, _ingest_ts, _delivery_id, _schema_version,
             _source_system)
     """)
-    model = (REPO / "dbt/models/prepared/qa_happy_position.sql").read_text()
+    model = (REPO / "dbt/models/prepared/qa_happy_position.sql").read_text(encoding="utf-8")
     con.execute("create table prepared_result as " + _duck(_render(model)))
     assert con.execute(
         "select position_id, amount, delivery_id, source_file, source_file_version "

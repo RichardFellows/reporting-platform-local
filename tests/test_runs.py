@@ -132,12 +132,12 @@ def test_the_digests_actually_change_when_the_code_does(tmp=None):
 
     c = _context()
     d = pathlib.Path(tempfile.mkdtemp(prefix="rp-code-"))
-    (d / "a.py").write_text("x = 1\n")
+    (d / "a.py").write_text("x = 1\n", encoding="utf-8")
     first = c._tree_digest([d], (".py",))
-    (d / "a.py").write_text("x = 2\n")
+    (d / "a.py").write_text("x = 2\n", encoding="utf-8")
     assert c._tree_digest([d], (".py",)) != first
     # And moving a file counts as a change: the path is hashed with the bytes.
-    (d / "a.py").write_text("x = 1\n")
+    (d / "a.py").write_text("x = 1\n", encoding="utf-8")
     assert c._tree_digest([d], (".py",)) == first
     (d / "a.py").rename(d / "b.py")
     assert c._tree_digest([d], (".py",)) != first
@@ -163,7 +163,7 @@ def test_the_run_key_is_derived_from_the_branch_and_carries_the_purpose():
         "_dbt_builds_probe", DAGS / "dbt_builds.py")
     # The module imports cosmos and airflow, which the test environment does
     # not have, so the helper is read out of the source rather than imported.
-    source = (DAGS / "dbt_builds.py").read_text()
+    source = (DAGS / "dbt_builds.py").read_text(encoding="utf-8")
     body = source[source.index("def _run_key("):]
     body = body[:body.index("\ndef ", 1)]
     ns: dict = {}

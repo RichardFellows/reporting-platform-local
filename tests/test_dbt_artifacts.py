@@ -12,9 +12,9 @@ def test_artifacts_are_immutable_and_associated_with_the_run():
     from reporting_platform.registry import artifacts
 
     target = pathlib.Path(tempfile.mkdtemp(prefix="rp-dbt-artifacts-"))
-    (target / "manifest.json").write_text('{"metadata":{"invocation_id":"i1"}}')
-    (target / "run_results.json").write_text('{"metadata":{"invocation_id":"i1"}}')
-    (target / "catalog.json").write_text('{"nodes":{}}')
+    (target / "manifest.json").write_text('{"metadata":{"invocation_id":"i1"}}', encoding="utf-8")
+    (target / "run_results.json").write_text('{"metadata":{"invocation_id":"i1"}}', encoding="utf-8")
+    (target / "catalog.json").write_text('{"nodes":{}}', encoding="utf-8")
     s3 = FakeS3()
     first = artifacts.archive("reporting-r1", "dbt.model", 1,
                               target_path=target, client=s3, bucket="lakehouse")
@@ -32,7 +32,7 @@ def test_publication_guard_reports_the_missing_run_results():
     from reporting_platform.registry import artifacts
 
     target = pathlib.Path(tempfile.mkdtemp(prefix="rp-dbt-artifacts-"))
-    (target / "manifest.json").write_text("{}")
+    (target / "manifest.json").write_text("{}", encoding="utf-8")
     s3 = FakeS3()
     result = artifacts.archive("prepared-r1", "dbt.model", 2,
                                target_path=target, client=s3, bucket="lakehouse")
