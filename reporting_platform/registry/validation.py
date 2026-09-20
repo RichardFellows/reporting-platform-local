@@ -197,8 +197,8 @@ def parse_run_results(target_path: str | Path) -> list[dict]:
     manifest_path, results_path = target / "manifest.json", target / "run_results.json"
     if not results_path.is_file():
         return []
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {"nodes": {}}
-    run_results = json.loads(results_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {"nodes": {}}
+    run_results = json.loads(results_path.read_text(encoding="utf-8"))
 
     out = []
     for result in run_results.get("results", []):
