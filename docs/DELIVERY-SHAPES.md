@@ -1,5 +1,18 @@
 # Delivery shapes
 
+**Scope: this document predates the Transport/Delivery split and describes
+the legacy inbox/landing conformance-gate shapes** — zips, control files,
+sibling control discovery, landing-based date parsing, and Ready v1. It is
+the legacy compatibility path, not the current Transport path's shapes. For
+the Transport path's shapes (plain data+control object sets under
+`received/<TransportID>/`, multiple source objects, business-date/version
+evidence), see [TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md),
+[DELIVERY-CONTRACT.md](DELIVERY-CONTRACT.md) and
+[NORMALIZATION-CONTRACT.md](NORMALIZATION-CONTRACT.md) — those are current
+and authoritative for the Transport path. Do not treat the legacy
+filename-conformance requirements below as mandatory for a Transport-path
+Feed.
+
 **Status: all five steps built**, including console support for creating an
 archive or control-gated feed through the form -- a gap step 5 surfaced but
 did not originally fix; it is closed now
