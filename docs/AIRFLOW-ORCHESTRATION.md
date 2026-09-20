@@ -102,9 +102,10 @@ Timing out with nothing new is the ordinary steady state, not a failure:
 `feed_ingest.py`'s `resolve_arrival` already uses for "nothing pending"
 (`AirflowSkipException`).
 
-**Unverified against a live scheduler.** No stack was running in the session
-that wrote this DAG; see "Verifying the fast path locally" below before
-relying on it in place of reconciliation alone.
+**Verified against a live scheduler.** See "Verifying the fast path locally"
+below for what was run and observed -- the sensor reaches MinIO, triggers
+`transport_ingest`, and re-triggering an already-processed TransportID dedups
+via `DagRunAlreadyExists` exactly as designed.
 
 ### `transport_reconcile` (correctness path)
 
@@ -353,30 +354,73 @@ The legacy `landing/ -> ready/ (v1) -> raw` path (`feed_ingest.py`,
 adds no code path from `received/` into `landing/`, and the legacy
 `feed_ingest.py` DAGs do not discover `received/` -- `resolve_arrival` and
 `arrival.find_pending` only ever look at `landing/`/`ready/`. The two paths
-share nothing except their final destination, Raw, and the same
-`lakehouse_write` pool that already serialises every writer.
+share the object-storage destination, Raw, the `lakehouse_write` pool that
+already serialises every writer, and one feed's `ready/<feed>/` prefix
+itself -- `normalization.py` (v2) deliberately writes its rebuildable plan
+one level deeper in that same prefix, `ready/<feed>/<delivery-id>/`
+(`docs/NORMALIZATION-CONTRACT.md`, "beside, not in place of"). Found live: a
+naive prefix-plus-`.json` match in the legacy `list_manifests` (v1) picked up
+v2's nested manifest too and `read_manifest` raised on its (different)
+`manifest_version` key, breaking `bulk_ingest`/`find_pending` for any feed a
+Transport had ever touched. Fixed in `is_manifest_key`
+(`reporting_platform/ingest/normalize.py`) to require no further `/` after
+the prefix -- the shape every v1 manifest key always has and a v2 one never
+does; `test_normalize.test_a_v2_delivery_manifest_sharing_this_prefix_is_not_picked_up`
+pins it.
 
 ## Verifying the fast path locally
 
-No live stack was available in the session that wrote `transport_watch`, so
-its `S3KeySensor`/MinIO connection is unverified. To confirm it once a stack
-is available:
+Done. `docker compose exec -T airflow airflow connections get aws_default`
+resolves `aws_default` to `http://minio:9000` with the credentials from
+`docker-compose.yml`'s `AIRFLOW_CONN_AWS_DEFAULT`. A Transport simulated with
+`scripts.simulate_dcm_transport --legacy-feed-id qa-happy-position ...` was
+picked up by `transport_watch`'s `S3KeySensor` within its next 1-minute
+cycle (`wait_for_completed_transport` succeeded, `trigger_discovered`
+triggered `transport_ingest`), which ran
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`
+to a committed Raw Delivery and a `dataset_triggered__...` `prepared_build`
+run, which on success triggered `reporting_build` the same way, ending in
+real rows in `reporting.qa_happy_position_summary`. Re-triggering the same
+TransportID (the marker persists, so `transport_watch` keeps finding it every
+cycle) deduped every time via `DagRunAlreadyExists`
+(`trigger_discovered`'s XCom: `{"triggered": [], "already_queued_or_done":
+1}`), with no failure and no duplicate Raw rows. `transport_reconcile`,
+triggered manually with `transport_watch` paused, correctly discovered a
+second simulated Transport that had never gone through the fast path and
+triggered `transport_ingest` for it, including `check_raw`'s
+`raw-delivery-ids` Spark query against real Iceberg/Nessie. `airflow dags
+list-import-errors` and `python -m scripts.check_dag_imports` are both
+clean. Reproduce with:
 
 ```bash
 docker compose up -d --force-recreate airflow airflow-webserver airflow-triggerer
 docker compose exec -T airflow airflow connections get aws_default
 docker compose exec -T feed-ui python -m scripts.simulate_dcm_transport \
-  --transport-id dcm-verify-1 --legacy-feed-id <a configured source_identifiers value> \
+  --transport-id dcm-verify-1 --legacy-feed-id qa-happy-position \
   --source-observed-at 2026-09-17T05:42:17Z \
-  --data /opt/platform/inbox/<a sample file>
+  --data /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.csv \
+  --control /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.ctl
 docker compose exec -T airflow airflow dags list-runs -d transport_watch -o plain
 docker compose exec -T airflow airflow dags list-runs -d transport_ingest -o plain
 docker compose exec -T airflow airflow dags list-runs -d prepared_build -o plain
 ```
 
-`transport_reconcile` needs no such caveat: it uses the same plain-boto3
+`transport_reconcile` needed no such caveat: it uses the same plain-boto3
 client every other module in this platform already uses successfully against
-MinIO, with no new provider or connection.
+MinIO, with no new provider or connection -- confirmed live along with
+everything else above.
+
+One unrelated, pre-existing gap surfaced while seeding a clean baseline for
+this run and is **not** a Phase 6 defect: `scripts/generate_feeds.py` /
+`reporting_platform/ui/sampledata.py` never emit `.ctl` control files for
+`qa_happy_position` or `qa_headerless_position`, and `scripts/land_feeds.py`
+only lands files matching a feed's DATA `filename_pattern`, never a control
+file. Both feeds' seeded deliveries sit permanently "awaiting control" under
+the standard QUICKSTART seed -> land -> bulk_ingest walkthrough, predating
+Phase 6 (introduced with these two feeds, commit `ca59b8d`). Verifying this
+session's own baseline required hand-landing matching `.ctl` objects; that
+gap is left for whoever next touches the sample-data generator, not fixed
+here per this task's scope.
 
 ## What is deliberately not here
 
@@ -397,9 +441,6 @@ on any manifest.
   and Airflow assets/dbt `ref()` dependencies are preferred over recreating
   them for any NEW dependency introduced in this path.
 - OpenMetadata integration (Phase 7+).
-- Confirming `transport_watch`'s S3KeySensor/MinIO connection against a live
-  stack (see above) -- until then, `transport_reconcile` alone is the
-  proven, if slower, correctness path.
 - A custom lightweight discovery `Trigger` class that would avoid
   `transport_watch` listing the prefix twice per cycle (once inside the
   sensor's own poke, once in `trigger_discovered`) -- a minor, acknowledged

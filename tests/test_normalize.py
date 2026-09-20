@@ -225,3 +225,27 @@ def test_unparsable_name_with_an_explicit_date_still_ingests():
         assert m["normalizer"] == "manual/v1"
     finally:
         uninstall(monkey)
+
+
+# ---------------------------------------------- coexistence with Ready v2
+def test_a_v2_delivery_manifest_sharing_this_prefix_is_not_picked_up():
+    """Phase 3's Delivery path writes ONE LEVEL DEEPER in this same feed's
+    `ready/` prefix -- `ready/<feed>/<delivery-id>/normalization-manifest.
+    json`, deliberately "beside, not in place of" this module
+    (`docs/NORMALIZATION-CONTRACT.md`). A v1 `list_manifests` that matched on
+    prefix + `.json` alone picked that up too and `read_manifest` raised on
+    its (different) `manifest_version` key, breaking `bulk_ingest` for any
+    feed a Transport had ever touched -- found running Phase 6 live against a
+    feed also carrying legacy deliveries.
+    """
+    s3, monkey, fd, norm = _setup()
+    try:
+        norm.normalize(fd, LANDED)
+        s3.put(f"ready/{fd.name}/dlv_deadbeef/normalization-manifest.json",
+              json.dumps({"normalization_manifest_version": 2}))
+        keys = norm.list_manifests(fd)
+        assert keys == [norm.manifest_key(fd, LANDED)], keys
+        # The real symptom: this must not raise on the v2 manifest's shape.
+        assert len(norm.manifests_for(fd)) == 1
+    finally:
+        uninstall(monkey)

@@ -4670,11 +4670,11 @@ matches Datasets by URI rather than by which DAG/task emitted the event,
 `dbt_builds.py` needed no change to receive these events alongside the
 legacy per-feed DAGs' own.
 
-This was written and reviewed without a live Airflow 2.10.5 scheduler
-available in the session; see
-`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally` for how to
-confirm `prepared_build` actually fires from a `transport_ingest` run before
-relying on this in production.
+**Live verification.** Confirmed against a real Airflow 2.10.5 scheduler: an
+`ingest_raw` run's outlet event produced a `dataset_triggered__...`
+`prepared_build` run, which on success triggered `reporting_build` the same
+way, ending in real rows in `reporting.qa_happy_position_summary`. See
+`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally`.
 
 ## a-deferrable-sensor-plus-reconciliation-not-bespoke-polling
 
@@ -4705,3 +4705,42 @@ that correctness must not depend on events alone. See
 `docs/AIRFLOW-ORCHESTRATION.md#reconciliation` for the staged evidence walk
 and `#reconciliation-scale` for why it bounds Raw's Spark cost to one query
 per Feed with a candidate rather than one per Delivery.
+
+**Live verification.** Confirmed against a real stack: `airflow connections
+get aws_default` resolves the MinIO endpoint from
+`docker-compose.yml`'s `AIRFLOW_CONN_AWS_DEFAULT`; a simulated Transport was
+picked up by the sensor within its next cycle and triggered
+`transport_ingest`; re-triggering the same TransportID repeatedly (the
+marker persists, so `transport_watch` keeps finding it every minute) deduped
+every time via `DagRunAlreadyExists`, never a failure or a duplicate Raw
+row; and `transport_reconcile`, run with `transport_watch` paused, correctly
+discovered and triggered a Transport the fast path had never seen. See
+`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally`.
+
+## ready-v1-manifest-listing-must-not-match-ready-v2-manifests
+
+**Decision (Phase 6, found in live verification).** `normalize.py`'s (v1)
+`is_manifest_key`/`list_manifests` matched any key under a feed's
+`ready/<feed>/` prefix ending in `.json`. `normalization.py`'s (v2) Delivery
+path deliberately shares that same prefix, one level deeper --
+`ready/<feed>/<delivery-id>/normalization-manifest.json`
+(`docs/NORMALIZATION-CONTRACT.md`, "beside, not in place of the legacy
+path"). A prefix-plus-suffix match cannot see the extra path segment, so v1's
+listing picked up v2's manifest too, and `read_manifest`'s version check
+raised on the mismatch (`manifest_version` vs. v2's
+`normalization_manifest_version`) -- discovered running `bulk_ingest` against
+a feed (`qa_happy_position`) that had received one Transport-based Delivery:
+`find_pending` raised and the legacy path was permanently broken for that
+feed from then on, contradicting `docs/AIRFLOW-ORCHESTRATION.md`'s claim that
+the two paths "share nothing except their final destination, Raw."
+
+Fixed by tightening `is_manifest_key` to require no further `/` after the
+prefix -- the shape every v1 manifest key has by construction (v1 manifests
+are never nested; only extracted archive members are, and those are never
+named `*.json`) and a v2 manifest key never has. `list_manifests` now calls
+`is_manifest_key` instead of duplicating a looser check inline, so
+`retention/ready.py`'s sweep (which calls `manifests_for`, built on
+`list_manifests`) is covered by the same fix. No v2 code changed; the fix is
+entirely on the v1 side, which is the side that made the unqualified claim.
+`tests/test_normalize.py::test_a_v2_delivery_manifest_sharing_this_prefix_is_not_picked_up`
+reproduces the collision and pins the fix.

@@ -19,11 +19,10 @@ brief (an approved object-store event integration is not available locally;
 Airflow's own asset/dataset mechanism does not reach an external object-store
 arrival Airflow itself never wrote), one rung above bare periodic discovery.
 
-UNVERIFIED AGAINST A LIVE SCHEDULER in the session that wrote this: there is
-no running stack available to confirm the sensor actually reaches MinIO.
-`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally` gives the
-exact steps to prove it; do that before relying on this DAG in place of
-`transport_reconcile` alone.
+VERIFIED AGAINST A LIVE SCHEDULER: the sensor reaches MinIO via `aws_default`
+(`docker-compose.yml`'s hand-built connection JSON) and triggers
+`transport_ingest`. See
+`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally`.
 """
 from __future__ import annotations
 
