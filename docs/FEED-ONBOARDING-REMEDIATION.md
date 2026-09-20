@@ -1,5 +1,10 @@
 # Sample-driven feed onboarding: review and implementation handoff
 
+**This is a point-in-time review/remediation-plan document, not living
+architecture documentation.** It scopes the legacy Feeds UI's onboarding flow
+specifically. For current architecture, read
+[ARCHITECTURE.md](ARCHITECTURE.md) and [ADDING-A-FEED.md](ADDING-A-FEED.md).
+
 Reviewed 2026-09-17 at commit `b191feaae68e909d5324708c1a537cfc7a671e24`.
 Scope: unclaimed deliveries, sample inspection, feed configuration, inbox,
 control checks, normalization, ingest, and generated dbt datasets.

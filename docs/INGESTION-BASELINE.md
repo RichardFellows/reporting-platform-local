@@ -1,11 +1,22 @@
 # Ingestion baseline (Phase 0)
 
-This document records the current, working ingestion path that a future
-redesign must preserve or deliberately replace. It describes the repository
-implementation and tests, not the intended future architecture. In
-particular, this phase does not add DCM integration, a new acquisition
-service, a transport contract, a new delivery identifier, or new manifest
-types.
+**Scope note (added Phase 7.5): this baseline was captured before the
+Transport/Delivery migration path existed.** Phases 1-8 have since introduced
+the Transport contract, DeliveryManifest, NormalizationManifest v2, Raw
+`_delivery_id` provenance, generic Airflow orchestration, Phase 7 validation
+evidence and Phase 8 dual-run migration — none of which this document
+describes. It is retained as migration/compatibility evidence — what the
+legacy path looked like before those phases — not as current architecture.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) and the domain-contract docs
+(TRANSPORT-CONTRACT.md, DELIVERY-CONTRACT.md, NORMALIZATION-CONTRACT.md,
+RAW-INGESTION-CONTRACT.md) for the current architecture first.
+
+This document records the ingestion path that existed at Phase 0, which a
+future redesign was to preserve or deliberately replace. It describes the
+repository implementation and tests as they stood then, not the intended
+future architecture. In particular, this phase did not add DCM integration, a
+new acquisition service, a transport contract, a new delivery identifier, or
+new manifest types.
 
 Code and tests are the primary evidence. `docs/ADDING-A-FEED.md`,
 `docs/DECISIONS.md`, and `docs/DELIVERY-SHAPES.md` remain useful explanations,
