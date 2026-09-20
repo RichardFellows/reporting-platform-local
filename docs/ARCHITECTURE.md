@@ -177,6 +177,22 @@ feed missed; that is the orchestrator's and the watchdog's territory.
 
 ---
 
+## The Transport-driven path (Phase 6)
+
+Alongside the per-feed `landing/` path above, a second entry point exists for
+DCM's new S3 handoff: `received/<transport-id>/_COMPLETE.json` ->
+`transport_ingest` (one generic Airflow DAG, not one per Feed) ->
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`.
+It shares the SAME Raw layer, the SAME `lakehouse_write` pool, and the SAME
+asset-triggered `prepared_build`/`reporting_build` chain as the diagram
+above -- only how a Delivery reaches Raw differs. A single deferrable sensor
+(`transport_watch`) and an independent evidence-driven reconciliation DAG
+(`transport_reconcile`) trigger it; see `docs/AIRFLOW-ORCHESTRATION.md` for
+the full design and `docs/TRANSPORT-CONTRACT.md`/`docs/DELIVERY-CONTRACT.md`/
+`docs/NORMALIZATION-CONTRACT.md`/`docs/RAW-INGESTION-CONTRACT.md` for the
+domain contracts it orchestrates. The legacy `landing/` path is unchanged and
+remains fully operational during migration.
+
 ## Nessie: write-audit-publish
 
 Every ingest and every dbt build runs on a **branch**, not on `main`.

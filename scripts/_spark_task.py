@@ -20,6 +20,7 @@ Usage:
     python -m scripts._spark_task pending <feed>
     python -m scripts._spark_task ingest <feed> <key> [run_id] [cob_date]
     python -m scripts._spark_task ingest-v2 <normalization_manifest_key> [run_id]
+    python -m scripts._spark_task raw-delivery-ids <feed>
     python -m scripts._spark_task maintain-metrics <fqn:layer>...
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
@@ -108,6 +109,22 @@ def main() -> int:
         run_id = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
         result = ingest_normalized_delivery(key, run_id=run_id)
         print(json.dumps(result, default=str))
+        return 0
+
+    if op == "raw-delivery-ids":
+        # Read-only: deliberately outside the lakehouse_write pool, like
+        # completeness/reproducibility below. See
+        # docs/AIRFLOW-ORCHESTRATION.md#reconciliation-scale.
+        from reporting_platform.common.context import feed as get_feed, spark_session
+        from reporting_platform.ingest.ingest_feed import raw_delivered_ids
+
+        fd = get_feed(sys.argv[2])
+        spark = spark_session(f"raw-delivery-ids-{fd.name}", ref="main")
+        try:
+            ids = raw_delivered_ids(spark, fd)
+        finally:
+            spark.stop()
+        print(json.dumps({"feed": fd.name, "delivery_ids": sorted(ids)}))
         return 0
 
     if op == "migrate-raw":

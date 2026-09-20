@@ -172,3 +172,69 @@ def test_missing_raw_table_means_retryable_not_ingested():
         spark, feeds()["qa_happy_position"],
         "dlv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     assert spark.queries == []
+
+
+class _DistinctRows(_Rows):
+    """SELECT DISTINCT _delivery_id, for Phase 6 reconciliation's bulk check."""
+
+    def __init__(self, delivery_ids: set[str], dtypes=()):
+        super().__init__(
+            [{"_delivery_id": d} for d in sorted(delivery_ids)], dtypes)
+
+
+class _BulkSpark(_Spark):
+    def sql(self, query):
+        self.queries.append(query)
+        if "LIMIT 0" in query:
+            return _Rows(dtypes=[("_delivery_id", "string"),
+                                 ("_source_file", "string")])
+        if "DISTINCT _delivery_id" in query:
+            return _DistinctRows(self.present)
+        return _Rows([{"present": 1}] if any(x in query for x in self.present) else [])
+
+
+def test_raw_delivered_ids_is_the_bulk_sibling_of_the_single_check():
+    """One query per Feed, never one per Delivery -- see
+    docs/AIRFLOW-ORCHESTRATION.md#reconciliation-scale for why: Raw is the
+    only v2 ingestion ledger, so a caller checking many candidate Deliveries
+    at once must not spin up a Spark application per candidate.
+    """
+    config_dir()
+    from reporting_platform.common.context import feeds
+    from reporting_platform.ingest.ingest_feed import raw_delivered_ids
+
+    first = "dlv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    second = "dlv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    spark = _BulkSpark({first, second})
+    ids = raw_delivered_ids(spark, feeds()["qa_happy_position"])
+    assert ids == {first, second}
+    # Exactly one distinct-ids query, not one per delivery_id.
+    assert sum("DISTINCT _delivery_id" in q for q in spark.queries) == 1
+    assert spark.catalog.refreshed == [feeds()["qa_happy_position"].raw_table]
+
+
+def test_raw_delivered_ids_on_a_table_with_no_v2_provenance_is_empty():
+    config_dir()
+    from reporting_platform.common.context import feeds
+    from reporting_platform.ingest.ingest_feed import raw_delivered_ids
+
+    # LIMIT 0 dtypes deliberately omit _delivery_id -- a legacy-only table.
+    class _LegacyOnlySpark(_Spark):
+        def sql(self, query):
+            self.queries.append(query)
+            if "LIMIT 0" in query:
+                return _Rows(dtypes=[("_source_file", "string")])
+            raise AssertionError("should never query a table with no _delivery_id")
+
+    spark = _LegacyOnlySpark()
+    assert raw_delivered_ids(spark, feeds()["qa_happy_position"]) == set()
+
+
+def test_raw_delivered_ids_on_a_missing_table_is_empty_and_retryable():
+    config_dir()
+    from reporting_platform.common.context import feeds
+    from reporting_platform.ingest.ingest_feed import raw_delivered_ids
+
+    spark = _Spark(exists=False)
+    assert raw_delivered_ids(spark, feeds()["qa_happy_position"]) == set()
+    assert spark.queries == []

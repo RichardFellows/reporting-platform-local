@@ -4625,5 +4625,83 @@ same Delivery twice.
 `_file_version` remains the platform ordering number used by existing dbt
 restatement logic. It is not Delivery identity. Prepared/Reporting provenance
 is completed in Phase 5 without redesigning that ordering. Airflow-native
-orchestration remains Phase 6. The full contract is in
+orchestration is added in Phase 6, below. The full contract is in
 `docs/RAW-INGESTION-CONTRACT.md`.
+
+## one-generic-transport-dag-not-one-per-feed
+
+**Decision (Phase 6).** `transport_ingest` is one DAG
+(`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`)
+serving every Feed, rather than a bespoke DAG per Feed the way the legacy
+`feed_ingest.py` generates one `ingest_<feed>` per entry in `feeds.yml`. The
+legacy shape is per-Feed because Landing/Ready v1 identity is per-Feed by
+construction; the new path's unit of acquisition is Transport, and which Feed
+a Transport belongs to is resolved data (`resolve_transport_feed`), not DAG
+topology. A bespoke-per-Feed shape here would mean hundreds of near-identical
+DAG definitions once DCM's Feed count grows, which is the anti-pattern the
+Phase 6 brief names directly.
+
+Feed-specific behaviour -- filename pattern, control format, archive member
+pattern, schema contract -- still comes entirely from Feed configuration and
+the Delivery/Normalization manifests it produces, unchanged from Phases 2-4.
+Nothing about a Feed's parsing or validation moved into `transport_ingest.py`.
+See `docs/AIRFLOW-ORCHESTRATION.md`.
+
+## the-raw-asset-is-emitted-through-an-alias-not-a-static-list
+
+**Decision (Phase 6).** `ingest_raw` declares
+`outlets=[AssetAlias("raw-table-updated")]` and resolves the concrete asset at
+run time (`context["outlet_events"][alias].add(Asset(feed.asset_uri))`)
+rather than a static `outlets=[Asset(f.asset_uri) for f in feeds().values()]`
+the way `dbt_builds.py`'s `RAW_ASSETS` is built.
+
+A static list was considered and rejected: Airflow marks every Dataset in a
+task's `outlets=` updated on success, unconditionally, regardless of which
+one the task's logic actually touched. A single generic DAG processing one
+Feed per run cannot know which concrete asset to declare at PARSE time
+(`transport_ingest.py` is parsed once, before any Transport exists), and a
+static full-feed-list outlet would mark every OTHER Feed's raw asset updated
+on every single Transport this DAG processes -- wrong, and indistinguishable
+from a real update to a consumer watching that asset. `AssetAlias`
+(`DatasetAlias` pre-Airflow-3, added in Airflow 2.10 under AIP-59) exists
+for exactly this: outlets declared at parse time, the concrete Dataset
+resolved and emitted at run time. Because `prepared_build`'s schedule
+matches Datasets by URI rather than by which DAG/task emitted the event,
+`dbt_builds.py` needed no change to receive these events alongside the
+legacy per-feed DAGs' own.
+
+This was written and reviewed without a live Airflow 2.10.5 scheduler
+available in the session; see
+`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally` for how to
+confirm `prepared_build` actually fires from a `transport_ingest` run before
+relying on this in production.
+
+## a-deferrable-sensor-plus-reconciliation-not-bespoke-polling
+
+**Decision (Phase 6).** The fast path (`transport_watch`) is one deferrable
+`S3KeySensor` over the whole `received/` prefix; the correctness path
+(`transport_reconcile`) derives progress from object-storage evidence on a
+coarser schedule and never relies on the fast path having run at all.
+
+Rejected: a real object-store event integration (no MinIO
+webhook/notification exists in this repository, and building one would be
+infrastructure neither this repo nor its documented OpenShift target
+currently support -- see `docs/OPENSHIFT-MAPPING.md`'s still-open "Feed
+arrival" row); a Dataset/Asset-based external trigger (Airflow's asset
+mechanism models events Airflow itself emits, not an external upload it never
+wrote); and one polling sensor per Feed (explicitly the anti-pattern the
+Phase 6 brief rules out -- the unit of acquisition is now Transport).
+
+`apache-airflow-providers-amazon` was already an image dependency
+(`Dockerfile.airflow`) with nothing using it, which is a strong signal this
+was staged for exactly this purpose. Its `S3KeySensor(deferrable=True)`
+costs no new infrastructure and holds no worker slot while waiting -- the
+triggerer polls, not a task process.
+
+Reconciliation still exists and is still scheduled independently, because a
+deferrable sensor is an optimisation on Airflow's OWN availability: if the
+triggerer is down, the sensor never fires, and the Phase 6 brief is explicit
+that correctness must not depend on events alone. See
+`docs/AIRFLOW-ORCHESTRATION.md#reconciliation` for the staged evidence walk
+and `#reconciliation-scale` for why it bounds Raw's Spark cost to one query
+per Feed with a candidate rather than one per Delivery.

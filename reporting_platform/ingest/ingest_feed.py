@@ -417,6 +417,32 @@ def already_ingested_delivery(spark, fd, delivery_id: str,
     return bool(rows)
 
 
+def raw_delivered_ids(spark, fd, table: str | None = None) -> set[str]:
+    """Every ``_delivery_id`` Raw ``main`` already holds for this Feed.
+
+    A bulk sibling of :func:`already_ingested_delivery`, for a caller that
+    needs to know the state of MANY Deliveries -- Phase 6 reconciliation,
+    scanning candidates found by walking ``deliveries/`` in object storage.
+    One query per Feed rather than one per Delivery is what keeps that walk
+    from costing a Spark application per candidate: Raw is the only ledger
+    for v2 ingestion state (`docs/RAW-INGESTION-CONTRACT.md`), so there is no
+    cheaper index to ask instead.
+    """
+    target = table or fd.raw_table
+    if not spark.catalog.tableExists(target):
+        return set()
+    spark.catalog.refreshTable(target)
+    columns = {name.lower() for name, _ in
+               spark.sql(f"SELECT * FROM {target} LIMIT 0").dtypes}
+    if "_delivery_id" not in columns:
+        return set()
+    rows = spark.sql(
+        f"SELECT DISTINCT _delivery_id FROM {target} "
+        f"WHERE _delivery_id IS NOT NULL"
+    ).collect()
+    return {row["_delivery_id"] for row in rows}
+
+
 def _v2_feed_contract(fd, manifest: dict):
     """Feed-shaped historical read contract captured in Normalization v2.
 
