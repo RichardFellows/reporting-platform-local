@@ -309,6 +309,7 @@ something surprises you, not front to back.
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
 | [docs/LINEAGE.md](docs/LINEAGE.md) | OpenLineage export and Marquez — opt-in, and why it is not an authority on what a run published |
 | [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | what changes on promotion, and the three things that genuinely differ |
+| [docs/OPENSHIFT-HELM-PLAN.md](docs/OPENSHIFT-HELM-PLAN.md) | the Helm deployment plan for that target — chart shape, managed S3, Vault-injected credentials, and the code changes it needs |
 
 **Also**
 

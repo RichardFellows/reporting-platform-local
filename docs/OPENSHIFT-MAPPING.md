@@ -3,6 +3,11 @@
 The point of the local stack is that promotion changes configuration, not code.
 This table is the contract that keeps that true.
 
+**The deployment plan built on this mapping is
+[OPENSHIFT-HELM-PLAN.md](OPENSHIFT-HELM-PLAN.md)** — chart shape, a managed S3
+service in place of MinIO, Vault-injected credentials, and the handful of
+places where "configuration, not code" turns out not to hold yet.
+
 | Concern | Local | OpenShift target | What changes |
 |---|---|---|---|
 | Object storage | MinIO container | on-prem S3-compatible store | endpoint URL, credentials |
