@@ -27,6 +27,7 @@ Usage:
     python -m scripts._spark_task completeness [lookback_business_days]
     python -m scripts._spark_task reproducibility [published_tag]
     python -m scripts._spark_task run-inputs <branch>
+    python -m scripts._spark_task migration-compare <feed> <business_date>
 
 `pending` returns MANIFEST keys under ready/; `ingest` takes one of those or a
 landing object key. See reporting_platform/ingest/normalize.py.
@@ -161,6 +162,31 @@ def main() -> int:
 
         tag = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
         print(json.dumps(run(tag), default=str))
+        return 0
+
+    if op == "migration-compare":
+        # Phase 8. `feed_name` and `business_date` only -- the legacy adapter
+        # is resolved from MIGRATION_LEGACY_FIXTURES_DIR, matching every
+        # other Spark-subprocess op's "no state but what's on argv/env".
+        import os as _os
+
+        from reporting_platform.common.context import feed as get_feed, spark_session
+        from reporting_platform.migration.legacy import LocalFixtureLegacySource
+        from reporting_platform.migration.run import compare_business_date
+
+        feed_name, bd = sys.argv[2], sys.argv[3]
+        fd = get_feed(feed_name)
+        fixtures_dir = _os.environ.get(
+            "MIGRATION_LEGACY_FIXTURES_DIR", "/opt/platform/migration-fixtures")
+        legacy_source = LocalFixtureLegacySource(fixtures_dir)
+        spark = spark_session(f"migration-compare-{feed_name}", ref="main")
+        try:
+            result = compare_business_date(
+                fd, date.fromisoformat(bd), legacy_source=legacy_source,
+                spark=spark)
+        finally:
+            spark.stop()
+        print(json.dumps(result, default=str))
         return 0
 
     if op == "run-inputs":

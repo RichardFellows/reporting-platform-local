@@ -4812,3 +4812,42 @@ Live-verified: a Transport whose control filename did not match its feed's
 `IdentityResolutionError`; no `registry.delivery` row was created for it, and
 `registry validation transport <id>` returned the FAIL row naming the exact
 control and reason.
+
+## migration-comparison-is-not-validation-result
+
+**Decision (Phase 8).** Dual-run comparison evidence lives in its own table,
+`registry.migration_comparison`, rather than as a fourth `layer` value on
+`registry.validation_result`. Every existing `validation_result` row is
+identified by a Delivery, a Transport, or a dbt node -- three identity
+schemes this platform owns. A migration comparison's OTHER side is a
+reference into a legacy estate this platform does not own and cannot assign
+identity to (a legacy load id, a query snapshot id, whatever that adapter
+returns), and forcing it through `delivery_id`/`transport_id` columns would
+either be wrong (those columns mean specifically THIS platform's identity)
+or would require inventing a synthetic Delivery for something that was never
+ingested here at all -- the exact trap
+`#failed-delivery-validation-has-no-fake-manifest` above already refuses for
+a different reason.
+
+The outcome vocabulary (PASS/WARN/FAIL/ERROR) and the append-only,
+deterministic-id idempotency shape ARE reused verbatim, because those are
+genuinely the same concept. Only the identity columns differ. See
+`docs/MIGRATION.md`.
+
+## a-migration-comparison-row-is-only-written-when-both-sides-exist
+
+**Decision (Phase 8).** `registry.migration_comparison` has no
+`WAITING_FOR_LEGACY`/`WAITING_FOR_NEW` outcome and no row is ever written for
+one. `run.compare_business_date` returns a Python-level `NOT_COMPARABLE`
+value that nothing persists when either side has nothing yet for a
+business date. The alternative -- a mutable "current stage" row per
+(feed, business_date) -- is the same workflow-state trap the delivery
+registry already refuses (`#the-registry-records-observations-not-verdicts`):
+it would need updating out from under itself as sides arrive, could disagree
+with what object storage / the legacy adapter actually shows, and would give
+`migration_comparison` a second kind of row (workflow state) beside its one
+kind (an executed comparison's result). "Not yet comparable" is instead
+always a live derivation from whether the new side has a registered Delivery
+and the legacy adapter returns non-`None`, computed fresh on every
+`migration_reconcile` pass -- the same "derive, never store the absence of
+evidence" principle `deliveries.reconcile()` already applies to Landing/Raw.

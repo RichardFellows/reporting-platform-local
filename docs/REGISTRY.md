@@ -265,6 +265,21 @@ docker compose exec -T airflow python -m reporting_platform.registry validation 
 Full model, outcome semantics and the dbt artifact pipeline this reads from:
 [`VALIDATION.md`](VALIDATION.md).
 
+## Phase 8 migration comparison evidence
+
+`registry.migration_comparison` sits beside `validation_result`, same
+append-only/idempotent-by-deterministic-id shape, reusing its PASS/WARN/
+FAIL/ERROR vocabulary. It is NOT `validation_result` extended: a migration
+comparison names a legacy reference that has no Delivery/Transport/dbt-node
+identity, and there is no `WAITING` row -- absence of a comparable pair is
+never persisted, only an executed comparison is. See
+[`MIGRATION.md`](MIGRATION.md) for the full model.
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.migration overview
+docker compose exec -T airflow python -m reporting_platform.migration status <feed>
+```
+
 ## Related
 
 - [`VALIDATION.md`](VALIDATION.md) — validation controls and execution evidence

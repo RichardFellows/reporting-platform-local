@@ -183,3 +183,14 @@ Iceberg — so it cannot bite as things stand. It would the moment anyone used
 Detail, including the exact errors at each step and the ATTACH option list
 checked against the current DuckDB documentation, is in the module docstring of
 `scripts/duckdb_console.py`.
+
+## Phase 8: migration_reconcile
+
+`migration_reconcile` is one more Airflow DAG and needs no new component in
+this mapping: it runs in the same Airflow deployment, reads the same
+Postgres `platform` database (one new table, `registry.migration_comparison`)
+and the same object store (`migration-diffs/` alongside `dbt-artifacts/`).
+A production legacy adapter (`docs/MIGRATION.md#legacy-adapter`) would be the
+one new network dependency this phase's design anticipates -- read-only
+credentials to the legacy estate, configured the same way every other
+connection in this mapping is, never hard-coded.

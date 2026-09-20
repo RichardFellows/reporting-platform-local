@@ -193,6 +193,17 @@ the full design and `docs/TRANSPORT-CONTRACT.md`/`docs/DELIVERY-CONTRACT.md`/
 domain contracts it orchestrates. The legacy `landing/` path is unchanged and
 remains fully operational during migration.
 
+## Dual-run migration (Phase 8)
+
+A Feed does not cut over to this platform by decree: `migration:` config on
+the Feed (`common/context.py`) puts it in `dual_run`, an independent
+`migration_reconcile` DAG compares its new-platform output against the true
+legacy estate (SQL Server/the legacy ETL tool -- **not** the Landing/Ready-v1
+path above, which stays "new"), and `registry.migration_comparison` records
+what it found. Readiness is derived from that evidence, never declared, and
+crossing into `new_primary` is a human config edit, never automatic. See
+[`MIGRATION.md`](MIGRATION.md).
+
 ## Nessie: write-audit-publish
 
 Every ingest and every dbt build runs on a **branch**, not on `main`.

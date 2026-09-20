@@ -279,6 +279,19 @@ class Feed:
     # Transport -> Delivery. Both sources are still inspected so conflicting
     # evidence is refused; ordering selects provenance when they agree.
     delivery_identity: list[str] = field(default_factory=lambda: ["filename"])
+    # Phase 8. Dual-run migration state -- what mode this feed is being
+    # strangled in, and how its new-platform output is compared against the
+    # true external legacy system (the enterprise SQL/ETL estate this whole
+    # platform replaces -- NOT the legacy Landing/Ready-v1 ingestion path
+    # inside this repo, which stays part of "new"). Absent means
+    # `mode: legacy` -- this feed has not entered migration at all. Validated
+    # at load by `resolve_migration_config`. See docs/MIGRATION.md.
+    migration: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def migration_mode(self) -> str:
+        """`legacy` | `dual_run` | `new_primary`. See `resolve_migration_config`."""
+        return (self.migration or {}).get("mode", "legacy")
 
     @property
     def needs_conforming(self) -> bool:
@@ -887,6 +900,166 @@ def resolve_supersession_config(feed_name: str, supersession: Any) -> dict[str, 
             f"not recognised. Valid: {', '.join(SUPERSESSION_MODES)} "
             f"(not built: {', '.join(sorted(SUPERSESSION_NOT_BUILT))})")
     return {"mode": mode}
+
+
+# -------------------------------------------------------------- migration
+# Phase 8. Migration is FEED CONFIGURATION, not DAG topology: one generic
+# comparison/orchestration machinery reads this block, so onboarding a feed
+# into dual-run never means writing a per-feed DAG, sensor or workflow.
+#
+# `mode` is the only thing that changes PRODUCTION OWNERSHIP, and it is a
+# document a human edits, never a value comparison evidence flips by itself --
+# see docs/MIGRATION.md#cutover. Comparison behaviour (`compare`) and the
+# readiness bar (`acceptance`) are independent of mode so they can be tuned
+# without touching ownership, and so historical comparison results stay
+# meaningful even after `mode` changes.
+MIGRATION_MODES = ("legacy", "dual_run", "new_primary")
+MIGRATION_CHECKPOINTS = ("raw", "prepared", "reporting")
+MIGRATION_KEYS = {"mode", "compare", "acceptance"}
+MIGRATION_COMPARE_KEYS = {"checkpoint", "table", "key", "columns", "aggregates"}
+MIGRATION_AGGREGATE_KEYS = {"column", "function", "tolerance"}
+MIGRATION_AGGREGATE_FUNCTIONS = ("sum", "count", "count_distinct", "min", "max")
+MIGRATION_ACCEPTANCE_KEYS = {"consecutive_successes", "allow_warnings"}
+
+
+def _migration_error(feed_name: str, msg: str) -> ValueError:
+    return ValueError(f"{where(feed_name)}: `migration:` {msg}")
+
+
+def resolve_migration_config(feed_name: str, migration: Any) -> dict[str, Any]:
+    """Validate a `migration:` block and fill its defaults.
+
+    Absent means `{"mode": "legacy"}` -- this feed has not entered the
+    strangler pattern at all, which is the behaviour every feed already has
+    and costs no config to declare.
+
+    Checked at LOAD, same reasoning as `supersession:` and `delivery:`: an
+    unrecognised mode or an aggregate naming a tolerance nobody can parse
+    should fail before a comparison run ever tries to use it, not silently
+    compare nothing and report green.
+    """
+    if not migration:
+        return {"mode": "legacy"}
+    if not isinstance(migration, dict):
+        raise _migration_error(
+            feed_name, f"must be a mapping, got {type(migration).__name__}")
+    unknown = set(migration) - MIGRATION_KEYS
+    if unknown:
+        raise _migration_error(
+            feed_name, f"has unknown key(s) {', '.join(sorted(unknown))}. "
+            f"Valid: {', '.join(sorted(MIGRATION_KEYS))}")
+
+    mode = migration.get("mode", "legacy")
+    if mode not in MIGRATION_MODES:
+        raise _migration_error(
+            feed_name, f"mode: {mode!r} is not recognised. "
+            f"Valid: {', '.join(MIGRATION_MODES)}")
+
+    out: dict[str, Any] = {"mode": mode}
+
+    compare = migration.get("compare")
+    if compare is not None:
+        if not isinstance(compare, dict):
+            raise _migration_error(
+                feed_name, f"compare: must be a mapping, got "
+                f"{type(compare).__name__}")
+        unknown = set(compare) - MIGRATION_COMPARE_KEYS
+        if unknown:
+            raise _migration_error(
+                feed_name, f"compare: has unknown key(s) "
+                f"{', '.join(sorted(unknown))}. Valid: "
+                f"{', '.join(sorted(MIGRATION_COMPARE_KEYS))}")
+        checkpoint = compare.get("checkpoint", "raw")
+        table = compare.get("table")
+        if table is not None and not isinstance(table, str):
+            raise _migration_error(feed_name, "compare.table: must be a string")
+        if checkpoint not in MIGRATION_CHECKPOINTS:
+            raise _migration_error(
+                feed_name, f"compare.checkpoint: {checkpoint!r} is not "
+                f"recognised. Valid: {', '.join(MIGRATION_CHECKPOINTS)}")
+        key = compare.get("key") or []
+        if not isinstance(key, list) or not all(isinstance(k, str) for k in key):
+            raise _migration_error(
+                feed_name, "compare.key: must be a list of column names")
+        columns = compare.get("columns") or []
+        if not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
+            raise _migration_error(
+                feed_name, "compare.columns: must be a list of column names")
+        aggregates_in = compare.get("aggregates") or []
+        if not isinstance(aggregates_in, list):
+            raise _migration_error(feed_name, "compare.aggregates: must be a list")
+        aggregates: list[dict[str, Any]] = []
+        for agg in aggregates_in:
+            if not isinstance(agg, dict):
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: each entry must be a "
+                    f"mapping, got {type(agg).__name__}")
+            unknown = set(agg) - MIGRATION_AGGREGATE_KEYS
+            if unknown:
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}. Valid: "
+                    f"{', '.join(sorted(MIGRATION_AGGREGATE_KEYS))}")
+            column = agg.get("column")
+            if not column or not isinstance(column, str):
+                raise _migration_error(
+                    feed_name, "compare.aggregates: each entry needs a "
+                    "`column`")
+            function = agg.get("function", "sum")
+            if function not in MIGRATION_AGGREGATE_FUNCTIONS:
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: function {function!r} "
+                    f"is not recognised. Valid: "
+                    f"{', '.join(MIGRATION_AGGREGATE_FUNCTIONS)}")
+            tolerance = agg.get("tolerance") or {}
+            if not isinstance(tolerance, dict):
+                raise _migration_error(
+                    feed_name, "compare.aggregates: tolerance must be a mapping "
+                    "of 'absolute' and/or 'relative'")
+            unknown = set(tolerance) - {"absolute", "relative"}
+            if unknown:
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: tolerance has unknown "
+                    f"key(s) {', '.join(sorted(unknown))}. Valid: absolute, "
+                    f"relative")
+            for tkey, tval in tolerance.items():
+                if not isinstance(tval, (int, float)) or tval < 0:
+                    raise _migration_error(
+                        feed_name, f"compare.aggregates: tolerance.{tkey} "
+                        f"must be a non-negative number")
+            aggregates.append({"column": column, "function": function,
+                              "tolerance": {k: float(v) for k, v in tolerance.items()}})
+        out["compare"] = {"checkpoint": checkpoint, "table": table,
+                          "key": list(key), "columns": list(columns),
+                          "aggregates": aggregates}
+    else:
+        out["compare"] = {"checkpoint": "raw", "table": None, "key": [],
+                          "columns": [], "aggregates": []}
+
+    acceptance = migration.get("acceptance")
+    if acceptance is not None:
+        if not isinstance(acceptance, dict):
+            raise _migration_error(
+                feed_name, f"acceptance: must be a mapping, got "
+                f"{type(acceptance).__name__}")
+        unknown = set(acceptance) - MIGRATION_ACCEPTANCE_KEYS
+        if unknown:
+            raise _migration_error(
+                feed_name, f"acceptance: has unknown key(s) "
+                f"{', '.join(sorted(unknown))}. Valid: "
+                f"{', '.join(sorted(MIGRATION_ACCEPTANCE_KEYS))}")
+        consecutive = acceptance.get("consecutive_successes", 10)
+        if not isinstance(consecutive, int) or isinstance(consecutive, bool) or consecutive < 1:
+            raise _migration_error(
+                feed_name, "acceptance.consecutive_successes: must be a "
+                "positive integer")
+        allow_warnings = bool(acceptance.get("allow_warnings", False))
+        out["acceptance"] = {"consecutive_successes": consecutive,
+                             "allow_warnings": allow_warnings}
+    else:
+        out["acceptance"] = {"consecutive_successes": 10, "allow_warnings": False}
+
+    return out
 
 
 # ------------------------------------------------------------- expected_by
@@ -1634,6 +1807,8 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
             block["name"], merged.get("source_identifiers"))
         merged["delivery_identity"] = resolve_delivery_identity(
             block["name"], merged.get("delivery_identity"))
+        merged["migration"] = resolve_migration_config(
+            block["name"], merged.get("migration"))
         for key, check in VALUE_CHECKS:
             if key in merged:
                 merged[key] = check(name, merged[key])
