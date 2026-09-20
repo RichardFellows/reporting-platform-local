@@ -4,11 +4,16 @@ A laptop-runnable approximation of the target lakehouse: on-prem S3-compatible
 object storage, OpenShift compute, Airflow, Iceberg, Nessie, dbt and Spark —
 replacing the legacy ETL / RDBMS / scheduler ingest-and-report chain.
 
-**What it does:** consumes daily upstream CSVs → lands them immutably in object
-storage → loads to Iceberg `raw` → builds a conformed `prepared` layer → builds
-several reports from `reporting`, all sharing one lineage graph → maintains the
-Iceberg tables → enforces retention equivalent to the legacy "10 working days
-plus 80 month-ends" partition-switch job.
+**What it does:** DCM (or another approved producer) hands off a **Transport**
+into `received/` → the platform turns it into an immutable **Delivery** →
+**normalizes** it into a Spark-readable form → ingests it into Iceberg `raw` →
+builds a conformed `prepared` layer → builds several reports from `reporting`,
+all sharing one lineage graph → maintains the Iceberg tables → enforces
+retention equivalent to the legacy "10 working days plus 80 month-ends"
+partition-switch job. A **legacy compatibility path** (`inbox` → `landing` →
+`raw`) is retained alongside it — see [Legacy compatibility path](#legacy-compatibility-path)
+below — and a Phase 8 **dual-run migration** capability can compare the two
+for a feed that is cutting over; see [docs/MIGRATION.md](docs/MIGRATION.md).
 
 ## Architecture
 
@@ -16,14 +21,22 @@ Every component here has a 1:1 counterpart in the OpenShift target, so the code
 that runs locally is the code that runs in the cluster — only configuration
 changes. See [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md).
 
+This is the **current, primary path** — how a Delivery reaches a published
+report. The identity model (TransportID → DeliveryID → RunID → ReportVersion)
+and the object-store namespaces are defined precisely in
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#identity-model) and
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#object-store-namespaces).
+
 ```mermaid
 flowchart TB
-    subgraph src["Upstream"]
-        CSV["Daily CSV deliveries<br/>trade · counterparty · rating"]
+    subgraph src["Producer"]
+        DCM["DCM / approved producer"]
     end
 
     subgraph storage["Object storage — MinIO"]
-        LAND["landing/<br/><i>immutable evidence copy</i>"]
+        RECV["received/&lt;TransportID&gt;/<br/><i>source objects + _COMPLETE.json</i>"]
+        DEL["deliveries/<br/><i>immutable DeliveryManifest</i>"]
+        READY["ready/<br/><i>NormalizationManifest — rebuildable</i>"]
         WH["warehouse/<br/><i>Iceberg data + metadata</i>"]
     end
 
@@ -36,33 +49,72 @@ flowchart TB
         NESSIE["Iceberg catalog<br/><i>git-like branches, tags, commits</i>"]
     end
 
-    AF["Airflow 2.10.5<br/><i>one DAG per feed, asset-triggered builds</i>"]
+    AF["Airflow 2.10.5<br/><i>generic Transport orchestration,<br/>asset-triggered builds</i>"]
+    REG["Postgres `platform`<br/><i>delivery/run registry</i>"]
 
-    CSV -->|PutObject| LAND
-    LAND -->|"read CSV, all columns STRING"| SPARK
-    SPARK -->|"write Iceberg"| WH
+    DCM -->|"PutObject"| RECV
+    RECV -->|"validate_transport"| DEL
+    DEL -->|"normalize_delivery"| READY
+    READY -->|"ingest_raw"| SPARK
+    SPARK -->|"write Iceberg<br/>_delivery_id provenance"| WH
     DBT -->|"write Iceberg"| WH
     SPARK <-->|"branch / commit / merge"| NESSIE
     DBT <-->|"build on branch"| NESSIE
     AF -.->|orchestrates| SPARK
     AF -.->|orchestrates| DBT
+    DEL -.->|records| REG
+    SPARK -.->|records| REG
 
     classDef store fill:#e8f0fe,stroke:#4a6fa5,color:#1a1a1a
     classDef proc fill:#e8f5e9,stroke:#4a7c59,color:#1a1a1a
     classDef catalog fill:#fff4e5,stroke:#b8860b,color:#1a1a1a
-    class LAND,WH store
+    class RECV,DEL,READY,WH store
     class SPARK,DBT,AF proc
     class NESSIE catalog
+    class REG store
+```
+
+### Legacy compatibility path
+
+The platform also still runs an older path — `inbox` (legacy sender
+conformance) → `landing/` (evidence copy) → `ready/` v1 (normalization
+manifest) → `raw`, orchestrated by **one Airflow DAG per feed**
+(`airflow/dags/feed_ingest.py`, generated from `feeds.yml`) instead of the
+generic Transport DAGs above. It is retained because:
+
+- it is how every feed onboarded before Phase 6 still runs, and existing
+  local workflows/tests exercise it;
+- Phase 8's dual-run migration compares the Transport path's output against
+  it for a feed that is cutting over (`migration.mode: dual_run` on the
+  feed — see [docs/MIGRATION.md](docs/MIGRATION.md));
+- it is a staged strangler migration, not a permanent second architecture —
+  new feeds should be onboarded onto the Transport path
+  (see [docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md)), not this one.
+
+```mermaid
+flowchart TB
+    CSV["Daily CSV deliveries<br/>trade · counterparty · rating"]
+    LAND["landing/<br/><i>immutable evidence copy</i>"]
+    READY1["ready/ v1<br/><i>normalization manifest</i>"]
+    WH["warehouse/raw"]
+    AF2["feed_ingest.py<br/><i>one Airflow DAG per feed</i>"]
+
+    CSV -->|"PutObject, or via the inbox<br/>conformance gate"| LAND
+    LAND --> READY1
+    READY1 -->|"Spark, all columns STRING"| WH
+    AF2 -.->|orchestrates| READY1
 ```
 
 ### Layer model
 
-Each layer has one job. The rule that shapes everything: **a load must never
-fail because a value was unparseable** — it must land, and then fail a *test*.
+Each layer has one job, and this part is identical whichever path fed `raw` —
+Transport or the legacy `landing` path. The rule that shapes everything: **a
+load must never fail because a value was unparseable** — it must land, and
+then fail a *test*.
 
 ```mermaid
 flowchart LR
-    A["<b>landing</b><br/>CSV as received<br/><i>never rewritten</i>"]
+    A["<b>received / landing</b><br/>source objects as sent<br/><i>never rewritten</i>"]
     B["<b>raw</b><br/>Iceberg, 1:1<br/><i>every column STRING</i>"]
     C["<b>prepared</b><br/>typed, conformed<br/>deduplicated"]
     D["<b>reporting</b><br/>marts sharing<br/>one lineage graph"]
@@ -80,9 +132,14 @@ flowchart LR
 ```
 
 Casting happens in `prepared`, not at load, so a bad value fails a test instead
-of aborting a 3am load. Every `raw` row carries `_cob_date`,
-`_ingest_ts`, `_source_file`, `_file_version`, `_row_number` and `_batch_id` —
-the lineage back to the exact delivery.
+of aborting a 3am load. Every `raw` row carries `_cob_date`, `_ingest_ts`,
+`_source_file`, `_file_version`, `_row_number` and `_batch_id` — added by both
+paths — **plus `_delivery_id`, `_received_at` and `_schema_version` for a
+Transport-path row**, joinable to `registry.delivery`.  `_delivery_id` is the
+Delivery's identity; `_source_file` is only the physical object Spark read,
+and a historical row that predates the Transport path falls back to it. See
+[ARCHITECTURE.md#raw-provenance](docs/ARCHITECTURE.md#identity-model) for the
+full distinction.
 
 ### Write-audit-publish
 
@@ -121,24 +178,20 @@ hash, so "what did we publish on the 5th?" is answerable).
 
 ### Orchestration
 
-Requirement: *each feed must be processed as soon as it is received.* So there
-is no nightly batch — one DAG per feed, generated from `feeds.yml`, and builds
-triggered by Airflow **assets** rather than by schedule.
+Requirement: *each Delivery must be processed as soon as it is received.* So
+there is no nightly batch, and — for the Transport path — **no per-feed DAG
+either**: one generic Airflow DAG serves hundreds of Feed definitions, and a
+Feed's specific behaviour is configuration/domain logic (`feeds.yml`), not a
+bespoke DAG. Events optimise latency; reconciliation preserves correctness.
 
 ```mermaid
 flowchart TB
-    T(["trade arrives"]) --> IT["ingest_fo_trade"]
-    C(["counterparty arrives"]) --> IC["ingest_ref_counterparty"]
-    R(["rating arrives"]) --> IR["ingest_ref_rating"]
+    T(["Transport completes<br/>in received/"]) --> W["transport_watch<br/><i>1 fast deferrable sensor,<br/>not one per feed</i>"]
+    W --> TI["transport_ingest<br/><i>ONE generic DAG:<br/>validate → create Delivery →<br/>normalize → ingest_raw</i>"]
+    REC["transport_reconcile<br/><i>every 20 min, evidence-driven</i>"] -.->|"catches anything<br/>transport_watch missed"| TI
 
-    IT --> AT{{"Asset<br/>raw.fo_trade"}}
-    IC --> AC{{"Asset<br/>raw.ref_counterparty"}}
-    IR --> AR{{"Asset<br/>raw.ref_rating"}}
-
+    TI --> AT{{"Asset<br/>raw.&lt;feed&gt;"}}
     AT --> PB["prepared_build<br/><i>triggered by ANY<br/>upstream asset</i>"]
-    AC --> PB
-    AR --> PB
-
     PB --> AP{{"Asset<br/>prepared.*"}}
     AP --> RB["reporting_build"]
     RB --> ARP{{"Asset<br/>reporting.*"}}
@@ -148,10 +201,21 @@ flowchart TB
     classDef feed fill:#fff4e5,stroke:#b8860b,color:#1a1a1a
     classDef task fill:#e8f5e9,stroke:#4a7c59,color:#1a1a1a
     classDef asset fill:#e8f0fe,stroke:#4a6fa5,color:#1a1a1a
-    class T,C,R feed
-    class IT,IC,IR,PB,RB,HK,MNT task
-    class AT,AC,AR,AP,ARP asset
+    class T feed
+    class W,TI,REC,PB,RB,HK,MNT task
+    class AT,AP,ARP asset
 ```
+
+The scaling model is deliberately **hundreds of Feed definitions → generic
+Transport orchestration → one DAG run per Transport/Delivery**, not hundreds
+of Feed definitions → hundreds of ingestion DAG definitions. Full design in
+[docs/AIRFLOW-ORCHESTRATION.md](docs/AIRFLOW-ORCHESTRATION.md).
+
+**Legacy compatibility path:** `feed_ingest.py` still generates one
+`ingest_<feed>` DAG per entry in `feeds.yml`, feeding the same asset-triggered
+`prepared_build`/`reporting_build` chain. This is the orchestration model for
+the legacy `landing/` path only — see
+[Legacy compatibility path](#legacy-compatibility-path) above.
 
 #### Inside a build: one task per dbt model
 
@@ -269,46 +333,72 @@ submitting process runs a pip `pyspark` with no jars of its own.
 ## Documentation
 
 Read in this order: **QUICKSTART** to get it running, **ARCHITECTURE** for why
-it is shaped this way, then whichever procedure you need. `DECISIONS.md` is the
-reference the other documents and the code both point into — you go to it when
-something surprises you, not front to back.
+it is shaped this way, then **PIPELINE** for one Delivery end to end, then
+whichever procedure you need. `DECISIONS.md` is the reference the other
+documents and the code both point into — you go to it when something
+surprises you, not front to back.
 
 **Start here**
 
 | Document | Read it for |
 |---|---|
-| **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`, in nine commands.** |
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | layer model, Nessie write-audit-publish, the registry, the as-at lifecycle, per-feed DAG topology, why Spark is the only build engine |
-| **[docs/PIPELINE.md](docs/PIPELINE.md)** | one delivered file end to end — inbox → landing → ready → raw → prepared → reporting, with the failure mode at every stage |
+| **[docs/QUICKSTART.md](docs/QUICKSTART.md)** | **clone → running stack → data published to `reporting`**, Transport path first, legacy path as an alternative |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | the canonical architecture doc — layer model, Transport/Delivery/Normalization lifecycle, identity model, object-store namespaces, orchestration, write-audit-publish, the registry, validation, legacy compatibility path |
+| **[docs/PIPELINE.md](docs/PIPELINE.md)** | one Delivery end to end — Transport → Delivery → Normalization → raw → prepared → reporting, with the failure mode at every stage, plus the legacy pipeline |
 
-**Reference — the two documents everything else points into**
+**Domain contracts — authoritative for their own detail; README/ARCHITECTURE only summarise**
 
 | Document | Read it for |
 |---|---|
-| **[docs/DECISIONS.md](docs/DECISIONS.md)** | **why the code is shaped the way it is — 98 anchored entries, almost all of them learned by running the stack and reading what it actually said.** The code links here by anchor rather than repeating the reasoning; it has its own contents page at the top. |
-| [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | what every `REQ-nnn` cited in the code and tests actually requires, where it is implemented and what proves it |
+| [docs/TRANSPORT-CONTRACT.md](docs/TRANSPORT-CONTRACT.md) | what a producer must hand off in `received/<TransportID>/`, and the local DCM simulator |
+| [docs/DELIVERY-CONTRACT.md](docs/DELIVERY-CONTRACT.md) | how a Transport becomes an immutable DeliveryManifest |
+| [docs/NORMALIZATION-CONTRACT.md](docs/NORMALIZATION-CONTRACT.md) | how a Delivery becomes a rebuildable NormalizationManifest v2 |
+| [docs/RAW-INGESTION-CONTRACT.md](docs/RAW-INGESTION-CONTRACT.md) | Spark ingestion into Iceberg `raw`, and the exact provenance columns |
+
+**Platform behaviour**
+
+| Document | Read it for |
+|---|---|
+| [docs/AIRFLOW-ORCHESTRATION.md](docs/AIRFLOW-ORCHESTRATION.md) | `transport_watch` / `transport_ingest` / `transport_reconcile`, asset-triggered builds, and the legacy `feed_ingest.py` path |
+| [docs/VALIDATION.md](docs/VALIDATION.md) | the three validation layers (delivery/raw controls, Spark ingestion, dbt tests) and `validation_result` evidence |
+| [docs/REGISTRY.md](docs/REGISTRY.md) | what was delivered, what was published, out of which inputs, under which code — and the as-at lifecycle that gates publication |
+| [docs/LINEAGE.md](docs/LINEAGE.md) | OpenLineage export and Marquez — opt-in, and why it is not an authority on what a run published |
 
 **Making a change**
 
 | Document | Read it for |
 |---|---|
-| [docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md) | the five files a new feed touches, in order, with a worked example |
+| [docs/ADDING-A-FEED.md](docs/ADDING-A-FEED.md) | onboarding a Feed — the shared config/dbt files, and why the Transport path needs no per-Feed ingestion DAG |
 | [docs/ADDING-A-COLUMN.md](docs/ADDING-A-COLUMN.md) | adding a column to an existing feed — the commonest change of all, and the raw table is the part not in the git diff |
 | [docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md) | the two files a new dbt model touches, and why Cosmos means there is no DAG to edit |
-| [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 — the same five files through a form, plus land/ingest/build buttons |
-| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | zips, control files and legacy filenames — the conformance gate, and how a feed that is not a plain daily CSV is declared |
+| [docs/FEED-UI.md](docs/FEED-UI.md) | the feed console on :8082 — legacy/`landing`-path onboarding only |
 | [docs/DEV-PROCESS.md](docs/DEV-PROCESS.md) | ticket-to-prod path, why dbt and DAG changes carry different risk, the CAB digest gate |
 
-**Running it**
+**Operations**
 
 | Document | Read it for |
 |---|---|
-| [docs/REGISTRY.md](docs/REGISTRY.md) | what was delivered, what was published, out of which inputs, under which code — and the as-at lifecycle that gates publication |
 | [docs/MONITORING.md](docs/MONITORING.md) | the six checks, what each one can and cannot see, and what a red one means |
-| [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config |
+| [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config, and which namespaces have no policy yet |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
-| [docs/LINEAGE.md](docs/LINEAGE.md) | OpenLineage export and Marquez — opt-in, and why it is not an authority on what a run published |
 | [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | what changes on promotion, and the three things that genuinely differ |
+
+**Migration / compatibility**
+
+| Document | Read it for |
+|---|---|
+| [docs/MIGRATION.md](docs/MIGRATION.md) | Phase 8 dual-run migration — correlation, comparison strategies, evidence, acceptance, cutover |
+| [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | zips, control files and legacy filenames — the current Transport shapes and the legacy inbox conformance gate |
+| [docs/DELIVERY-WALKTHROUGHS.md](docs/DELIVERY-WALKTHROUGHS.md) | four worked examples of the legacy inbox/landing conformance path |
+| [docs/INGESTION-BASELINE.md](docs/INGESTION-BASELINE.md) | Phase 0 baseline captured before the Transport path existed — migration/compatibility evidence, not current architecture |
+
+**Reference**
+
+| Document | Read it for |
+|---|---|
+| **[docs/DECISIONS.md](docs/DECISIONS.md)** | **why the code is shaped the way it is — an anchored decision log, almost all of it learned by running the stack and reading what it actually said**, with superseded entries marked as such rather than deleted |
+| [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | what every `REQ-nnn` cited in the code and tests actually requires, where it is implemented and what proves it |
+| [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | (also listed under Operations) |
 
 **Also**
 
@@ -332,11 +422,17 @@ reporting_platform/       the platform library (NOT named `platform` -- that
     maintenance.yml       maintenance thresholds
   common/                 config loading and resolution, Spark session, Nessie
                           REST client, COB-date keep-set calculation
-  ingest/                 the inbox conformance gate, normalize, CSV -> raw
-                          Iceberg, raw schema migration
+  ingest/                 transport.py/delivery.py/normalization.py (current
+                          Transport/Delivery/Normalization v2 path),
+                          conform.py/inbox.py/normalize.py (legacy inbox
+                          conformance gate, Ready v1), ingest_feed.py (Spark
+                          raw write, shared by both), migrate_raw.py
   registry/               Postgres `platform`: what was delivered, what was
                           published, out of which inputs, and the as-at
-                          lifecycle. 16-subcommand CLI -- docs/REGISTRY.md
+                          lifecycle -- docs/REGISTRY.md. validation.py records
+                          Phase 7 validation_result evidence.
+  migration/              Phase 8 dual-run migration: correlation, comparison
+                          strategies, evidence, acceptance -- docs/MIGRATION.md
   monitoring/             the six checks that run outside what they watch --
                           gaps, lateness, evidence, reproducibility, watchdog
   lineage/                OpenLineage export + column classification. Off by
@@ -344,10 +440,18 @@ reporting_platform/       the platform library (NOT named `platform` -- that
   retention/              branch/tag/row/snapshot/orphan expiry, in order,
                           plus the landing, ready and quarantine sweeps
   maintenance/            metric-driven compaction, manifests, deletes
-  ui/                     the feed console on :8082 -- form, scaffold, sample
-                          data, job runner, the Arrivals join
+  ui/                     the feed console on :8082 -- legacy-path onboarding
+                          form, scaffold, sample data, job runner, Arrivals
 airflow/dags/
-  feed_ingest.py          one DAG per feed, generated from feeds.yml
+  transport_watch.py      fast path -- one deferrable sensor on received/,
+                          not one per feed
+  transport_ingest.py     ONE generic DAG: validate_transport ->
+                          create_delivery -> normalize_delivery -> ingest_raw
+  transport_reconcile.py  evidence-driven recovery for anything transport_watch
+                          missed, every 20 minutes
+  migration_reconcile.py  Phase 8: compares new-path output against the legacy
+                          estate for feeds in migration.mode: dual_run
+  feed_ingest.py          LEGACY: one DAG per feed, generated from feeds.yml
   dbt_builds.py           asset-triggered prepared and reporting builds;
                           the dbt tasks inside them are rendered by Cosmos
   platform_housekeeping.py  nightly maintenance, then retention, then the
@@ -374,7 +478,19 @@ spike/                    closed spikes, kept for their findings
 
 ---
 
-# Manual walkthrough
+# Legacy compatibility walkthrough
+
+**This walkthrough exercises the legacy `landing` → `ready` v1 → `raw` path**
+(`land_feeds`, `bulk_ingest`, `ingest_<feed>` DAGs), not the Transport path
+described above. It is kept because it is still the most detailed, step-by-step
+explanation of write-audit-publish, the registry, retention and maintenance —
+all of which are identical regardless of which path fed `raw` — and because the
+legacy path is still how most feeds in this local stack run today.
+
+For the current Transport path's equivalent walkthrough, see
+[docs/QUICKSTART.md](docs/QUICKSTART.md#transport-path-the-current-primary-path)
+and the live-verified command sequence in
+[docs/AIRFLOW-ORCHESTRATION.md](docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally).
 
 *In a hurry? [docs/QUICKSTART.md](docs/QUICKSTART.md) is the same journey in
 nine commands, with the URLs and credentials collected in one table. This
@@ -954,8 +1070,11 @@ what it does and does not prove:
 - **Not performance-representative.** One Spark worker on a laptop against
   MinIO tells you nothing about cluster throughput. Sizing figures in
   `OPENSHIFT-MAPPING.md` are starting points, not measurements.
-- **Not the real arrival mechanism.** Polling a landing prefix stands in for
-  the DFS/SFTP problem, which is discussed but not solved here.
+- **The Transport path's `received/` boundary is S3-only, by design** — see
+  [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) for the DCM/S3
+  boundary this replaces DFS/SFTP delivery with. **The legacy path's `landing`
+  arrival is still a prefix poll / inbox conformance gate**, which stands in
+  for the DFS/SFTP problem that path never solved.
 - **Was not tested end-to-end by the original author, and wasn't working when
   first run for real.** It has since been brought up against a live stack and
   eleven genuine defects found and fixed — wrong Nessie API request shapes, a

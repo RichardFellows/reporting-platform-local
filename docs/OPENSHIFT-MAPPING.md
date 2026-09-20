@@ -16,7 +16,8 @@ This table is the contract that keeps that true.
 | Secrets | `.env` | OpenShift Secrets / Vault | injection mechanism |
 | DAG deployment | bind mount | Forge CI → image → Helm | packaging only |
 | Change provenance | nothing declared; content digests | `DBT_PROJECT_REF`, `DBT_PROJECT_DIGEST`, `DEPLOYMENT_CHANGE_REF`, `DEPLOYMENT_PIPELINE_REF` from the chart | env vars only |
-| Feed arrival | poll of the MinIO landing prefix | S3 event / SFTP landing prefix poll | sensor implementation |
+| Feed arrival (current, Transport path) | DCM/producer `PutObject` into `received/<TransportID>/`, picked up by `transport_watch`'s S3 sensor | S3-compatible store, same `PutObject` boundary — DCM (or its S3-writing bridge) writes directly | none — this boundary is S3-native in both places |
+| Feed arrival (legacy compatibility path) | poll of the MinIO landing prefix | S3 event / SFTP landing prefix poll, or a DFS-to-S3 push agent (see below) | sensor implementation |
 
 ## What the chart must supply
 
@@ -53,27 +54,42 @@ local stack can only approximate:
 
 ### 1. Feed arrival
 
-Locally we poll a directory. In the cluster, files arrive from SFTP or — the
-current sticking point — a Windows DFS share reached with Windows auth via a
-privileged system AD account.
+**The Transport path's boundary is already S3-native and needs no DFS/SMB/
+Kerberos design — Phase 1-6 deliberately removed that requirement from the
+future-state boundary.** DCM (or another approved producer) writes source
+objects and `_COMPLETE.json` directly into `received/<TransportID>/` via
+`PutObject`; `transport_watch`'s deferrable `S3KeySensor` (and
+`transport_reconcile`'s recovery sweep) trigger off that arrival, in the
+cluster exactly as locally — only the endpoint and credentials change, per
+the table above. No Airflow pod needs Windows-share access on this path. See
+[TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md) for what a producer must hand
+off.
 
-The recommendation is to **stop trying to make the pod reach DFS**. Cross-domain
-Kerberos from an OpenShift container to a Windows DFS namespace is a poor
-dependency to build a strategic platform on: it needs a keytab in the cluster, a
-working `krb5.conf` for the trust path, DFS referral handling in the client, and
-it ties the new stack to exactly the licensed Windows infrastructure the
-programme is trying to decouple from.
+**The legacy compatibility path is where the Windows/DFS design question
+below still applies**, for any Feed still onboarded onto `landing/` rather
+than Transport. Locally we poll a directory. In the cluster, files would
+arrive from SFTP or — the sticking point this design work was for — a
+Windows DFS share reached with Windows auth via a privileged system AD
+account.
+
+The recommendation for that legacy path is to **stop trying to make the pod
+reach DFS**. Cross-domain Kerberos from an OpenShift container to a Windows
+DFS namespace is a poor dependency to build a strategic platform on: it needs
+a keytab in the cluster, a working `krb5.conf` for the trust path, DFS
+referral handling in the client, and it ties the new stack to exactly the
+licensed Windows infrastructure the programme is trying to decouple from.
 
 The lower-risk shape is a **push, not a pull**: a small agent on the existing
 Windows host (which already has the share mounted and the AD context) does an
-S3 `PutObject` into the landing prefix, and the pipeline triggers off the object
-arriving. That inverts the trust direction, removes Kerberos from the cluster
-entirely, and is a component that can be retired the day upstream can write to
-S3 directly.
+S3 `PutObject` into the landing prefix, and the pipeline triggers off the
+object arriving. That inverts the trust direction, removes Kerberos from the
+cluster entirely, and is a component that can be retired the day the Feed
+onboards onto the Transport path above instead.
 
 It is not free — it keeps a Windows footprint alive for longer and needs its own
 monitoring — so it is a trade, not an obvious win. But it is a smaller and more
-contained trade than in-cluster cross-domain Kerberos.
+contained trade than in-cluster cross-domain Kerberos, and it only applies to
+Feeds still on the legacy path.
 
 ### 1b. dbt execution mode
 

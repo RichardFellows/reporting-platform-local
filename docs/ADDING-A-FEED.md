@@ -1,6 +1,25 @@
 # Adding a feed
 
-Worked example: a `treasury_margin_call` feed from the `treasury` source system,
+**New Transport-path Feeds are handled by the generic ingestion
+orchestration. There is no Feed-specific ingestion DAG to add.** The Feed
+config file, dbt model and tests below (steps 1-4) are still what you write —
+the same `Feed` schema, `source_identifiers`, `filename_pattern` and
+`delivery.control` fields serve both the Transport path and the legacy
+`landing` path — but a Transport-path Feed needs no per-Feed Airflow DAG and
+therefore skips step 5 below. `transport_watch`/`transport_ingest` already run
+generically for every Feed; the Feed becomes live the moment a Delivery for it
+starts arriving under `received/`. See
+`reporting_platform/config/feeds/qa_happy_position.yml` for a worked
+Transport-path Feed, and [DELIVERY-CONTRACT.md](DELIVERY-CONTRACT.md) /
+[TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md) for identity resolution and the
+producer side.
+
+**This walkthrough below still runs the worked example through the legacy
+`landing`/`feed_ingest.py` path**, including step 5 ("unpause the generated
+DAG"), because that is what the local sample-data and CLI tooling exercises
+today. It remains accurate for a legacy/compatibility Feed, and steps 1-4 are
+shared with a Transport-path Feed. Worked example: a `treasury_margin_call`
+feed from the `treasury` source system,
 delivering `marginCalls_20260801.csv`. The lowerCamelCase filename is
 deliberate — it is what makes the per-feed `filename_pattern` earn its keep.
 
@@ -364,8 +383,10 @@ identically to a running one except for a single boolean column.
 
 Worth knowing, because it is where the effort would otherwise go:
 
-- **No DAG file.** `feed_ingest.py` generates one DAG per entry in
-  `feeds.yml`.
+- **No DAG file, on either path.** On the Transport path, `transport_ingest`
+  is one generic DAG serving every Feed. On the legacy path, `feed_ingest.py`
+  generates one DAG per entry in `feeds.yml` — still no DAG file to write by
+  hand, but still one DAG per Feed under the hood, unlike the Transport path.
 - **No maintenance registration.** `managed_tables()` derives the prepared and
   reporting sets from the dbt project directory, so writing step 3 registers
   the table. This used to be a sixth file, and was the one step with no error

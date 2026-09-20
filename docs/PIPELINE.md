@@ -1,15 +1,68 @@
 # The feed pipeline, end to end
 
-One delivered file, from the moment it appears to the moment a reporting table
-can be queried. Every stage names the code that does it, so this document can
-be checked rather than believed.
+One Delivery, from the moment it arrives to the moment a reporting table can
+be queried. Every stage names the code that does it, so this document can be
+checked rather than believed.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) first for *why* the platform is shaped
 this way; this is *what happens*, in order.
 
+This page has two walkthroughs. **The Transport path is the current, primary
+architecture** — read that one first. **The legacy pipeline is a compatibility
+path**, retained for feeds that have not yet onboarded onto Transport and for
+Phase 8 dual-run migration comparisons; see
+[Legacy compatibility pipeline](#legacy-compatibility-pipeline) below.
+
 ---
 
-## The whole path
+## Transport path (current, primary)
+
+```mermaid
+flowchart TB
+    DCM["DCM / source"] -->|"PutObject"| RECV["received/&lt;TransportID&gt;/<br/><i>source objects</i>"]
+    RECV --> COMPLETE["_COMPLETE.json<br/><i>marks the Transport whole</i>"]
+    COMPLETE -->|"transport_watch or<br/>transport_reconcile"| VALIDATE["Transport validation<br/>validate_transport"]
+    VALIDATE --> DELIVERY["Delivery creation<br/>create_delivery"]
+    DELIVERY --> DM["DeliveryManifest<br/><i>immutable, deliveries/</i>"]
+    DM --> NORM["Normalization<br/>normalize_delivery"]
+    NORM --> NM["NormalizationManifest v2<br/><i>rebuildable, ready/</i>"]
+    NM --> SPARK["Spark Raw ingestion<br/>ingest_raw"]
+    SPARK --> RAW["Raw Iceberg<br/><i>+ _delivery_id provenance</i>"]
+    RAW --> ASSET["Raw Asset"]
+    ASSET --> PREP["Prepared dbt build/test"]
+    PREP --> REP["Reporting dbt build/test"]
+    REP --> RUN["registry.run / run_input /<br/>report_version"]
+```
+
+Everything from Raw onwards happens **on a Nessie branch and merges to
+`main` only if its tests pass** — write-audit-publish, identical to the
+legacy path below.
+
+| Stage | Code / DAG | What it does | Failure boundary |
+|---|---|---|---|
+| Transport | `reporting_platform/ingest/transport.py`, `transport_watch`/`transport_reconcile` DAGs | Producer hands off source objects + `_COMPLETE.json` into `received/<TransportID>/` | An incomplete or malformed Transport is never picked up — see [TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md) |
+| Delivery | `reporting_platform/ingest/delivery.py`, `transport_ingest`'s `create_delivery` task | Resolves the Feed, business date and version; writes the immutable DeliveryManifest to `deliveries/` | A Transport that cannot be resolved to a Feed/Delivery is refused, not guessed — see [DELIVERY-CONTRACT.md](DELIVERY-CONTRACT.md) |
+| Normalization | `reporting_platform/ingest/normalization.py`, `normalize_delivery` task | Turns a Delivery into a Spark-readable NormalizationManifest v2 under `ready/` | Rebuildable from the Delivery on demand — see [NORMALIZATION-CONTRACT.md](NORMALIZATION-CONTRACT.md) |
+| Raw ingestion | `reporting_platform/ingest/ingest_feed.py` via `scripts/_spark_task.py`, `ingest_raw` task | Spark reads the manifest's parts, writes Iceberg `raw` with `_delivery_id` provenance, on a Nessie branch | `expected_min_rows`/checksum failures leave the branch for inspection, `main` untouched — see [RAW-INGESTION-CONTRACT.md](RAW-INGESTION-CONTRACT.md) |
+| Prepared / Reporting build | `airflow/dags/dbt_builds.py` (`prepared_build`, `reporting_build`), asset-triggered | Same dbt models and tests as the legacy path; a raw Asset update from *either* path triggers `prepared_build` | Any dbt test failure keeps the branch, `main` untouched |
+| Publication | `reporting_platform/registry/` | `run`, `run_input` (Deliveries that contributed to what published) and `report_version` record what was published from what | See [REGISTRY.md](REGISTRY.md) and the traceability example in [ARCHITECTURE.md](ARCHITECTURE.md#end-to-end-traceability-example) |
+
+Full operational detail — orchestration topology, idempotency, the live
+verification run — is in [AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md).
+This section intentionally does not duplicate it.
+
+---
+
+## Legacy compatibility pipeline
+
+**Everything below this point describes the legacy `inbox` → `landing` →
+`ready` v1 → `raw` path.** It is retained for feeds that have not yet
+onboarded onto Transport, for existing local workflows/tests, and as the
+comparison side of Phase 8's dual-run migration
+([MIGRATION.md](MIGRATION.md)). New Feeds should onboard onto the Transport
+path above — see [ADDING-A-FEED.md](ADDING-A-FEED.md).
+
+### The whole legacy path
 
 ```mermaid
 flowchart TB

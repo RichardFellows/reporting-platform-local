@@ -1,10 +1,86 @@
 # Quick start
 
-Clone to a published `reporting` layer, in nine commands.
+Clone to a published `reporting` layer.
 
-This is the short path. [`README.md`](../README.md)'s numbered walkthrough is
-the long one and explains *why* at each step — read that when you want to
-understand the platform rather than start it.
+This page has two paths. **[Transport path](#transport-path-the-current-primary-path)**
+is the current, primary architecture — a producer hands off a Transport,
+generic Airflow orchestration takes it the rest of the way. **[Legacy
+path](#legacy-path-nine-commands)** exercises the older `landing` →
+`ready` v1 → `raw` compatibility path (still how most feeds in this local
+stack run today) and is the longer-established, more thoroughly exercised
+route through this stack.
+
+[`README.md`](../README.md)'s numbered walkthrough is the long form of the
+legacy path and explains *why* at each step — read that when you want to
+understand the platform rather than start it. [`AIRFLOW-ORCHESTRATION.md`](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
+has the equivalent depth for the Transport path.
+
+---
+
+## Transport path (the current, primary path)
+
+Same prerequisites and stack start as [step 0](#0-prerequisites) and
+[step 1](#1-start-the-stack) below. Once the stack is up and DAGs are
+unpaused (step 5's unpause loop applies here too — Transport DAGs are paused
+at creation like every other DAG), simulate a DCM handoff and watch the
+generic orchestration take it to `reporting`:
+
+```bash
+docker compose exec -T airflow airflow connections get aws_default
+docker compose exec -T feed-ui python -m scripts.simulate_dcm_transport \
+  --transport-id dcm-quickstart-1 --legacy-feed-id qa-happy-position \
+  --source-observed-at 2026-09-17T05:42:17Z \
+  --data /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.csv \
+  --control /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.ctl
+```
+
+That is the whole trigger — no DAG to unpause per feed, no `land`/`bulk_ingest`
+step. `transport_watch`'s deferrable sensor picks the completed Transport up
+within its next 1-minute cycle and runs
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`,
+which emits the Raw Asset that fires `prepared_build`, which on success fires
+`reporting_build`. Watch it happen:
+
+```bash
+docker compose exec -T airflow airflow dags list-runs -d transport_watch -o plain
+docker compose exec -T airflow airflow dags list-runs -d transport_ingest -o plain
+docker compose exec -T airflow airflow dags list-runs -d prepared_build -o plain
+docker compose exec -T airflow airflow dags list-runs -d reporting_build -o plain
+```
+
+Then query what published, the same way as the legacy path:
+
+```bash
+docker compose exec -T airflow python -m scripts.duckdb_console \
+  "select * from lakehouse.reporting.qa_happy_position_summary"
+```
+
+**This exact sequence is the one live-verified end to end** against a real
+Transport → Raw → `prepared_build` → `reporting_build` chain, including
+`transport_reconcile` recovering a Transport that never went through the fast
+path — see [AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
+for the full reproduction and what each step proved.
+
+Repeating the same `--transport-id` is an idempotent retry: `transport_watch`
+finds the same TransportID again every cycle, but `trigger_discovered` dedupes
+it via `DagRunAlreadyExists` — no duplicate Raw rows.
+
+Retry a Transport that `transport_watch` missed without waiting: trigger
+`transport_reconcile` by hand.
+
+```bash
+docker compose exec -T airflow airflow dags trigger transport_reconcile -r qs_reconcile
+```
+
+For a Feed configured with `migration.mode: dual_run` (like
+`qa_happy_position` above), `migration_reconcile` also compares this output
+against a legacy adapter and records evidence in
+`registry.migration_comparison` — see [MIGRATION.md](MIGRATION.md). That
+comparison is diagnostic; it does not gate publication.
+
+---
+
+## Legacy path (nine commands)
 
 **Budget about 40 minutes for a cold start**, almost all of it the ingest.
 Measured end to end from `docker compose down -v` with every gitignored

@@ -1,7 +1,17 @@
 # The feed console
 
+**Scope: this UI covers the legacy `landing`-path Feed onboarding only.**
+It writes the same `feeds.yml`/dbt config files a Transport-path Feed also
+needs (see [ADDING-A-FEED.md](ADDING-A-FEED.md)), but its land/ingest/build
+buttons drive the legacy `land_feeds`/`bulk_ingest`/`feed_ingest.py` path —
+it does not onboard, simulate, or watch a Transport. There is no current UI
+for the Transport path; the config is manual YAML plus
+`scripts/simulate_dcm_transport.py` for local testing (see
+[TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md)). That gap is a known
+limitation of the current UI, not a design decision made here.
+
 <http://localhost:8082> — a small web UI for onboarding a feed and running it
-through the platform: `seed/` → landing → `raw` → `prepared` → `reporting`.
+through the legacy path: `seed/` → landing → `raw` → `prepared` → `reporting`.
 
 It is a front end for `docs/ADDING-A-FEED.md` and the run sequence at the end
 of it, plus one view that is neither: **Arrivals**, which is what became of
