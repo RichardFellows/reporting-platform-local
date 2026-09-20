@@ -13,7 +13,7 @@ def _fixtures_dir(fixture: dict) -> pathlib.Path:
     d = pathlib.Path(tempfile.mkdtemp(prefix="rp-migration-fixtures-"))
     target = d / "fo_trade" / "2026-09-17"
     target.mkdir(parents=True)
-    (target / "raw.json").write_text(json.dumps(fixture))
+    (target / "raw.json").write_text(json.dumps(fixture), encoding="utf-8")
     return d
 
 

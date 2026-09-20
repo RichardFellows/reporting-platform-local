@@ -145,7 +145,7 @@ def test_every_migrated_column_is_also_in_the_schema():
 
         from tests.support import REPO
 
-        source = (REPO / "reporting_platform" / "registry" / "db.py").read_text()
+        source = (REPO / "reporting_platform" / "registry" / "db.py").read_text(encoding="utf-8")
         migrated = set(re.findall(
             r"ALTER TABLE registry\.run ADD COLUMN IF NOT EXISTS\s+(\w+)", source))
         assert migrated, "no migrations found -- has the pattern changed?"

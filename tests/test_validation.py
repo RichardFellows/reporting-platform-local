@@ -21,8 +21,8 @@ from reporting_platform.registry import validation
 
 def _target(manifest: dict, run_results: dict) -> pathlib.Path:
     d = pathlib.Path(tempfile.mkdtemp(prefix="rp-validation-"))
-    (d / "manifest.json").write_text(json.dumps(manifest))
-    (d / "run_results.json").write_text(json.dumps(run_results))
+    (d / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (d / "run_results.json").write_text(json.dumps(run_results), encoding="utf-8")
     return d
 
 

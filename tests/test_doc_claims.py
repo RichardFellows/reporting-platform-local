@@ -63,7 +63,7 @@ CONFIG_TOKEN = re.compile(r"[\w.]+: ?[\w.]+")
 def _paragraphs(path: pathlib.Path):
     """(line number, one-line text) for every paragraph of a markdown file."""
     line = 1
-    for chunk in re.split(r"(\n\s*\n)", path.read_text()):
+    for chunk in re.split(r"(\n\s*\n)", path.read_text(encoding="utf-8")):
         if chunk.strip():
             yield line, " ".join(chunk.split())
         line += chunk.count("\n")
@@ -147,12 +147,12 @@ def test_every_quoted_error_message_is_one_the_code_can_emit():
     files = subprocess.run(["git", "ls-files"], cwd=REPO,
                            capture_output=True, text=True).stdout.split()
     source = " ".join(
-        " ".join((REPO / f).read_text(errors="ignore").split())
+        " ".join((REPO / f).read_text(encoding="utf-8", errors="ignore").split())
         for f in files if f.endswith(".py"))
 
     missing = []
     for path in docs:
-        for i, text in enumerate(path.read_text().split("\n"), 1):
+        for i, text in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
             for m in re.finditer(r'`"([^"`]{20,240})"`', text):
                 quoted = re.sub(r"^\.\.\.|\.\.\.$|[`*]", "", m.group(1))
                 quoted = " ".join(quoted.split()).strip(" .")
