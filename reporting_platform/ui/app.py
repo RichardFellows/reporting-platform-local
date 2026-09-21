@@ -793,6 +793,39 @@ def api_pipeline():
     }
 
 
+# ---------------------------------------------------------------- cob status
+# The reporting-platform's own operational view: for one COB date, which
+# feeds were expected, and where are they now. NOT the Airflow DAG list --
+# the platform is moving to generic ingestion DAGs, so a per-DAG-run view
+# stops being a feed-monitoring surface. Everything here is a read of
+# durable facts (registry.transport_receipt, registry.delivery,
+# registry.delivery_committed) already written by the ingest pipeline
+# itself; this endpoint writes nothing, same as `arrivals` above.
+@app.get("/api/cob-status")
+def api_cob_status(cob_date: str):
+    from datetime import date as _date
+
+    from reporting_platform.monitoring import feed_status
+    try:
+        parsed = _date.fromisoformat(cob_date)
+    except ValueError:
+        raise HTTPException(400, f"cob_date must be YYYY-MM-DD, got {cob_date!r}")
+    return feed_status.build_report(parsed)
+
+
+@app.get("/api/cob-status/dates")
+def api_cob_status_dates():
+    """Recent COB dates with a registered delivery, for the date picker."""
+    from datetime import datetime, timezone
+
+    from reporting_platform.registry.deliveries import recent_cob_dates
+    today = datetime.now(timezone.utc).date()
+    dates = recent_cob_dates(30)
+    if today not in dates:
+        dates = [today] + dates
+    return {"dates": [d.isoformat() for d in dates]}
+
+
 # --------------------------------------------------------------------- pages
 @app.get("/")
 def index():

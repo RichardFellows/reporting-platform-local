@@ -607,6 +607,21 @@ def deliveries_on(cob_date: date, feed: str | None = None
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def delivered_dates(feed: str, start: date, end: date) -> set[date]:
+    """COB dates `feed` has a registered delivery for, within [start, end].
+
+    The `weekly` cadence's only use of this table: "has this ISO week already
+    seen a delivery" (monitoring/feed_status.py), the same corroboration
+    `completeness.find_gaps` already applies at Raw scale, done here at
+    registry scale so a status page needs no Spark.
+    """
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT cob_date FROM registry.delivery "
+            "WHERE feed = %s AND cob_date BETWEEN %s AND %s", (feed, start, end))
+        return {r[0] for r in cur.fetchall()}
+
+
 def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
     """The registered deliveries named by (feed, delivery_id). REQ-602/REQ-400.
 
@@ -644,6 +659,93 @@ def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
                         "source_container": None, "control_object": None,
                         "registered": False})
     return out
+
+
+# -------------------------------------------------------- delivery_committed
+# THE ONE FACT `registry.delivery` CANNOT ANSWER: whether a Delivery reached
+# Raw. `register`/`register_v2` write a row at NORMALIZE time, before Raw is
+# ever touched (see this module's own header), so a row existing is not
+# evidence of a commit. This is recorded once, by `ingest_feed._ingest_manifest`
+# -- the one function both the legacy and the Transport path funnel through --
+# right where it already knows it has either appended and merged, or found the
+# Delivery already there. See registry/db.py's header on this table for why it
+# is a dedicated append-only fact rather than a column on `delivery`.
+_COMMITTED_COLUMNS = ("feed", "delivery_id", "cob_date", "source_system",
+                      "file_version", "rows", "run_id")
+
+
+def record_committed(feed: str, delivery_id: str, cob_date: date,
+                     source_system: str, rows: int | None, run_id: str,
+                     file_version: int | None = None, *, conn=None) -> dict:
+    """Record that `delivery_id` is committed to Raw on `main`. Idempotent:
+    a re-ingest of an already-committed Delivery (the `already_ingested`
+    short-circuit) writes the SAME row, never a second one and never a
+    different `committed_at` -- ON CONFLICT DO NOTHING, exactly like a
+    Transport's own `uploaded_at`.
+    """
+    values = {"feed": feed, "delivery_id": delivery_id, "cob_date": cob_date,
+             "source_system": source_system, "file_version": file_version,
+             "rows": rows, "run_id": run_id}
+    sql = (f"INSERT INTO registry.delivery_committed ({', '.join(_COMMITTED_COLUMNS)}) "
+          f"VALUES ({', '.join('%(' + c + ')s' for c in _COMMITTED_COLUMNS)}) "
+          f"ON CONFLICT (feed, delivery_id) DO NOTHING")
+    if conn is not None:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
+    else:
+        with db.connect() as own, own.cursor() as cur:
+            cur.execute(sql, values)
+    return values
+
+
+def record_committed_quietly(feed: str, delivery_id: str, cob_date: date,
+                             source_system: str, rows: int | None, run_id: str,
+                             file_version: int | None = None) -> None:
+    """`record_committed`, best-effort -- a registry outage must not turn an
+    already-successful Raw commit into a failed ingest. Same convention as
+    `register_quietly`: `delivery_committed_for` (via reconciliation-style
+    reads against Raw, see monitoring/feed_status.py) is the fallback truth."""
+    try:
+        record_committed(feed, delivery_id, cob_date, source_system, rows,
+                         run_id, file_version)
+    except Exception as exc:                                     # noqa: BLE001
+        log.warning("registry: could not record commit of %s/%s: %s",
+                    feed, delivery_id, f"{type(exc).__name__}: {exc}")
+
+
+def recent_cob_dates(limit: int = 30) -> list[date]:
+    """The most recent distinct COB dates with a registered delivery.
+
+    For the COB Status date picker (`ui/app.py`) -- an operator's most
+    useful starting list, not an exhaustive one. Deliberately reads
+    `registry.delivery` alone rather than unioning in `transport_receipt`:
+    a date with a receipt but no Delivery yet (still WAITING/RECEIVED) is
+    exactly as pickable by typing the date directly, and today's still-empty
+    COB date is the one the operator opens this page FOR -- it belongs in
+    the picker as much as any settled one, so the caller always prepends
+    today rather than relying on this list containing it.
+    """
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT cob_date FROM registry.delivery "
+            "ORDER BY cob_date DESC LIMIT %s", (limit,))
+        return [r[0] for r in cur.fetchall()]
+
+
+def committed_for_cob_date(cob_date: date, feed: str | None = None
+                           ) -> list[dict[str, Any]]:
+    """Every Delivery known to have committed to Raw for one COB date."""
+    sql = ("SELECT feed, delivery_id, cob_date, source_system, file_version, "
+          "       rows, run_id, committed_at "
+          "FROM registry.delivery_committed WHERE cob_date = %s")
+    args: list[Any] = [cob_date]
+    if feed:
+        sql += " AND feed = %s"
+        args.append(feed)
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(sql + " ORDER BY feed, committed_at", args)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def reconcile_all(*, normalize_first: bool = True) -> dict[str, Any]:

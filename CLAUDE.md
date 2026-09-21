@@ -392,6 +392,23 @@ them.
   state, so `RUNNING` there means "started, did not succeed or fail". Airflow
   is the authority on what is running.
   (`#openlineage-is-an-export-not-a-record`)
+- **The operational control plane answers "where is this feed right now" —
+  Airflow's DAG list does not**, deliberately, under generic ingestion.
+  `registry.transport_receipt` is an EVENT record like `run` (a mutable
+  status tracking one Transport occurrence through `transport_ingest`);
+  `registry.delivery_committed` is an OBSERVATION like `delivery_part` (one
+  fact, recorded once, that a Delivery reached Raw — universal across the
+  legacy and Transport paths, because `registry.delivery` itself gets a row
+  at NORMALIZE time and says nothing about a commit). Neither is a status
+  column on `delivery`. `monitoring/feed_status.py` derives COB Feed Status
+  from these plus `Feed.expected_by`/`cadence`, fresh on every request — see
+  `docs/OPERATIONAL-CONTROL-PLANE.md`.
+- **A Delivery ingested before `_delivery_id` existed on its raw table can
+  never get a `delivery_committed` row from the backfill** —
+  `scripts._spark_task reconcile-committed <feed>` reads that column, and
+  raw provenance is added, never backfilled
+  (`#a-declared-column-migrates-itself`). Such a Delivery reads PROCESSING
+  on the COB Status page until that table is rebuilt or the date ages out.
 
 ## Quick reference
 
@@ -513,6 +530,14 @@ docker compose exec -T airflow python -m reporting_platform.registry reopen --re
 docker compose exec -T airflow python -m reporting_platform.monitoring.lateness
 # is every published pin's landing evidence still there? (REQ-602, per delivery)
 docker compose exec -T airflow python -m reporting_platform.monitoring.evidence
+
+# COB Feed Status: every feed, grouped by source system, derived status for
+# one COB date. No Spark, no Airflow calls. Same report the feed console's
+# COB Status page renders.
+docker compose exec -T airflow python -m reporting_platform.monitoring.feed_status --cob-date 2026-09-21
+# one-time per feed after deploying it: recover delivery_committed facts for
+# Deliveries ingested before that table existed, from Raw itself.
+docker compose exec -T airflow python -m scripts._spark_task reconcile-committed <feed>
 
 # as of a knowledge time -- same models, throwaway branch, NEVER merged.
 # --full-refresh is not optional: known_as_of() refuses an incremental run.

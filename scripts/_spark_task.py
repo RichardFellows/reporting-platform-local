@@ -21,6 +21,7 @@ Usage:
     python -m scripts._spark_task ingest <feed> <key> [run_id] [cob_date]
     python -m scripts._spark_task ingest-v2 <normalization_manifest_key> [run_id]
     python -m scripts._spark_task raw-delivery-ids <feed>
+    python -m scripts._spark_task reconcile-committed <feed>
     python -m scripts._spark_task maintain-metrics <fqn:layer>...
     python -m scripts._spark_task maintain <force|noforce> <fqn:layer>...
     python -m scripts._spark_task retention <dry|real> <fqn:layer>...
@@ -126,6 +127,30 @@ def main() -> int:
         finally:
             spark.stop()
         print(json.dumps({"feed": fd.name, "delivery_ids": sorted(ids)}))
+        return 0
+
+    if op == "reconcile-committed":
+        # BACKFILL, not a build. A Delivery Raw already holds committed just
+        # as durably before `registry.delivery_committed` existed; this
+        # recovers that fact from Raw itself rather than re-ingesting.
+        # Idempotent (`record_committed` is ON CONFLICT DO NOTHING), so
+        # re-running it costs a no-op per already-known Delivery.
+        from reporting_platform.common.context import feed as get_feed, spark_session
+        from reporting_platform.ingest.ingest_feed import committed_rows_from_raw
+        from reporting_platform.registry import deliveries as registry_deliveries
+
+        fd = get_feed(sys.argv[2])
+        spark = spark_session(f"reconcile-committed-{fd.name}", ref="main")
+        try:
+            rows = committed_rows_from_raw(spark, fd)
+        finally:
+            spark.stop()
+        for row in rows:
+            registry_deliveries.record_committed(
+                fd.name, row["delivery_id"], row["cob_date"],
+                row["source_system"], row["rows"],
+                "backfill:reconcile-committed", file_version=row["file_version"])
+        print(json.dumps({"feed": fd.name, "rows_seen": len(rows)}, default=str))
         return 0
 
     if op == "migrate-raw":

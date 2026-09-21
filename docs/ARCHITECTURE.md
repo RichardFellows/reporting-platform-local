@@ -689,6 +689,19 @@ and keyed so a retry cannot duplicate itself. It is not a verdict column on
 `delivery`, and it is not a second engine: every control it records evidence
 for already ran in RPL, Spark or dbt. See [`VALIDATION.md`](VALIDATION.md).
 
+**A fourth pair answers "where is this feed right now" (the operational
+control plane).** `registry.transport_receipt` is an EVENT record like `run`
+— a mutable `status` tracking how far one Transport occurrence has been
+carried through `transport_ingest`, because nothing else durably records an
+attempt in flight. `registry.delivery_committed` is an OBSERVATION like
+`delivery_part` — one fact, "this Delivery reached Raw", recorded once by the
+function that performs the commit, identically for the legacy and Transport
+paths. Together with `Feed.delivery_expected`/`cadence`/`expected_by` they are
+what `monitoring/feed_status.py` derives COB Feed Status from — see
+[`OPERATIONAL-CONTROL-PLANE.md`](OPERATIONAL-CONTROL-PLANE.md) for the full
+design and why the Airflow DAG list is no longer the feed-monitoring surface
+under generic ingestion.
+
 ---
 
 ## Validation architecture
