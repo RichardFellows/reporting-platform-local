@@ -32,8 +32,16 @@ def run_id_for(transport_id: str) -> str:
     return f"transport__{transport_id}"
 
 
-def trigger_transport(transport_id: str) -> bool:
+def trigger_transport(transport_id: str, marker_key: str) -> bool:
     """Start `transport_ingest` for one TransportID. True if a NEW run started.
+
+    ``marker_key`` is the full completion-marker S3 key, carried through in
+    `conf` so `transport_ingest.validate_transport` never has to reconstruct
+    it: since Contract v2 (`docs/TRANSPORT-CONTRACT.md`) a marker's key also
+    encodes `cob_date`/`source_system`, which `transport_id` alone no longer
+    determines. `run_id_for` still keys off `transport_id` alone -- it stays
+    one opaque path-safe token, where a marker key contains `/` and `=`,
+    which Airflow run ids do not accept.
 
     False means a DagRun with this id already exists: triggered already by
     this call site or another, queued, running, or finished either way. That
@@ -50,7 +58,7 @@ def trigger_transport(transport_id: str) -> bool:
         trigger_dag(
             dag_id=TRIGGER_DAG_ID,
             run_id=run_id_for(transport_id),
-            conf={"transport_id": transport_id},
+            conf={"transport_id": transport_id, "marker_key": marker_key},
         )
         return True
     except DagRunAlreadyExists:

@@ -43,10 +43,18 @@ DEFAULT_ARGS = {"owner": "data-platform", "retries": 1, "retry_delay": RETRY_DEL
 
 
 def _bucket_and_pattern() -> tuple[str, str]:
+    """One fnmatch pattern that finds a marker at ANY depth under received/.
+
+    fnmatch's ``*`` matches ``/`` too (S3 keys are flat strings, not real
+    paths), so ``received/*_COMPLETE.json`` matches both v1's flat
+    ``received/<transport-id>/_COMPLETE.json`` and v2's partitioned
+    ``received/cob_date=.../source_system=.../<transport-id>/_COMPLETE.json``
+    with the same sensor -- no version-specific wiring here.
+    """
     from reporting_platform.ingest import transport as transport_contract
 
     return (transport_contract._bucket(),  # noqa: SLF001
-           f"{transport_contract.received_prefix()}/*/"
+           f"{transport_contract.received_prefix()}/*"
            f"{transport_contract.COMPLETE_FILENAME}")
 
 
@@ -103,8 +111,11 @@ def _dag():
         triggered: list[str] = []
         already: list[str] = []
         for marker_key in transport_contract.list_completed_transports():
+            # transport_id is always the marker's immediate parent directory,
+            # regardless of how many cob_date=/source_system= segments (v2)
+            # or none at all (v1) precede it.
             transport_id = marker_key.rsplit("/", 2)[-2]
-            if trigger_transport(transport_id):
+            if trigger_transport(transport_id, marker_key):
                 triggered.append(transport_id)
             else:
                 already.append(transport_id)

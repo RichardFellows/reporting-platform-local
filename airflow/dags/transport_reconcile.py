@@ -14,11 +14,24 @@ No mutable "current stage" is stored anywhere for this. See
 and why Raw ingestion state needs one bulk query per Feed rather than a
 cheaper index -- there isn't one; Raw is the only v2 ingestion ledger by
 design (`docs/RAW-INGESTION-CONTRACT.md`).
+
+Contract v2 (`docs/TRANSPORT-CONTRACT.md`) partitions `received/` by COB date,
+so the DEFAULT scheduled run now bounds its scan to the last
+`TRANSPORT_RECONCILE_WINDOW_DAYS` calendar days (default 7) instead of
+re-listing every Transport ever published -- see
+`docs/AIRFLOW-ORCHESTRATION.md#reconciliation-scale`. This is a genuine
+narrowing of the earlier "always list everything" design, not an addition to
+it: a Transport whose COB date is older than the window, or a v1 marker
+(which has no `cob_date=` partition to be found by), is no longer discovered
+by the scheduled run. Trigger with `-c '{"full_sweep": true}'` for the
+unbounded catch-all -- an occasional/manual operation, not the periodic
+default; see that same doc section for why this is a deliberate scope
+narrowing rather than a new durable-state subsystem.
 """
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pendulum
 
@@ -34,6 +47,15 @@ RETRY_DELAY = timedelta(
     seconds=3 * int(os.environ.get("AIRFLOW_RETRY_DELAY_SECONDS", "10")))
 DEFAULT_ARGS = {"owner": "data-platform", "retries": 1, "retry_delay": RETRY_DELAY}
 
+WINDOW_DAYS = int(os.environ.get("TRANSPORT_RECONCILE_WINDOW_DAYS", "7"))
+
+
+def _window_cob_dates(days: int, *, today: date | None = None) -> list[str]:
+    """The last ``days`` calendar dates, inclusive of today, ISO-formatted."""
+    anchor = today or date.today()
+    return [(anchor - timedelta(days=offset)).isoformat()
+           for offset in range(days)]
+
 
 @dag(
     dag_id="transport_reconcile",
@@ -48,19 +70,32 @@ DEFAULT_ARGS = {"owner": "data-platform", "retries": 1, "retry_delay": RETRY_DEL
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
     tags=["reporting-platform", "ingest", "transport"],
+    params={"full_sweep": False},
 )
 def _dag():
 
     @task(task_id="discover_progress")
-    def discover_progress() -> dict:
-        """Classify every completed Transport by durable evidence alone."""
+    def discover_progress(**context) -> dict:
+        """Classify every completed Transport by durable evidence alone.
+
+        Bounded to the last `WINDOW_DAYS` COB partitions by default -- see
+        this file's module docstring. `-c '{"full_sweep": true}'` (or
+        `params.full_sweep` on a manual trigger) instead scans the whole
+        `received/` prefix, unbounded, the same as every scheduled run did
+        before Contract v2: use it to catch a v1 marker or one whose COB date
+        fell outside the window, occasionally, not on the default schedule.
+        """
         import logging
 
         from reporting_platform.ingest.transport_reconcile import (
             discover_transport_progress,
         )
 
-        report = discover_transport_progress()
+        conf = (context["dag_run"].conf or {}) if context.get("dag_run") else {}
+        full_sweep = bool(conf.get("full_sweep",
+                                   context["params"].get("full_sweep", False)))
+        cob_dates = None if full_sweep else _window_cob_dates(WINDOW_DAYS)
+        report = discover_transport_progress(cob_dates=cob_dates)
         if report["failed"]:
             logging.getLogger("airflow.task").warning(
                 "transport_reconcile: %d transport(s) could not be read: %s",
@@ -99,7 +134,9 @@ def _dag():
         from _transport_trigger import trigger_transport
 
         pending = sorted(set(report["needs_full_chain"]) | set(raw_gap))
-        triggered = [t for t in pending if trigger_transport(t)]
+        marker_keys = report["marker_keys"]
+        triggered = [t for t in pending
+                    if t in marker_keys and trigger_transport(t, marker_keys[t])]
         return {"pending": pending, "newly_triggered": triggered,
                 "unread_transports": len(report["failed"])}
 

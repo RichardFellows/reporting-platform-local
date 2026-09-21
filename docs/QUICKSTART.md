@@ -28,11 +28,16 @@ generic orchestration take it to `reporting`:
 ```bash
 docker compose exec -T airflow airflow connections get aws_default
 docker compose exec -T feed-ui python -m scripts.simulate_dcm_transport \
-  --transport-id dcm-quickstart-1 --legacy-feed-id qa-happy-position \
+  --legacy-feed-id qa-happy-position --producer-run-id quickstart-1 \
+  --cob-date 2026-09-14 --source-system QA \
   --source-observed-at 2026-09-17T05:42:17Z \
   --data /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.csv \
   --control /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.ctl
 ```
+
+`--producer-run-id` is DCM's own execution identity: the TransportID
+(`dcm-qa-happy-position-quickstart-1`) is derived from it, not supplied
+directly -- see [docs/TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md).
 
 That is the whole trigger — no DAG to unpause per feed, no `land`/`bulk_ingest`
 step. `transport_watch`'s deferrable sensor picks the completed Transport up
@@ -61,7 +66,8 @@ Transport → Raw → `prepared_build` → `reporting_build` chain, including
 path — see [AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
 for the full reproduction and what each step proved.
 
-Repeating the same `--transport-id` is an idempotent retry: `transport_watch`
+Repeating the same command (same `--producer-run-id`, hence the same derived
+TransportID) is an idempotent retry: `transport_watch`
 finds the same TransportID again every cycle, but `trigger_discovered` dedupes
 it via `DagRunAlreadyExists` — no duplicate Raw rows.
 

@@ -17,6 +17,11 @@ x-s3-env: &s3-env
   # DCM transport evidence. Distinct from the current feed-scoped Landing;
   # see docs/TRANSPORT-CONTRACT.md.
   REPORTING_RECEIVED_PREFIX: ${REPORTING_RECEIVED_PREFIX:-received}
+  # transport_reconcile's default bounded scan window, in days -- only read
+  # by that DAG, but set alongside the other transport S3 config for one
+  # place to look. See docs/AIRFLOW-ORCHESTRATION.md, "Reconciliation scale
+  # (v2)".
+  TRANSPORT_RECONCILE_WINDOW_DAYS: ${TRANSPORT_RECONCILE_WINDOW_DAYS:-7}
   # Phase 6's transport_watch DAG (docs/AIRFLOW-ORCHESTRATION.md) is the one
   # thing on this platform that reaches S3 through an Airflow provider hook
   # (S3KeySensor) rather than a plain boto3 client, so it is the one thing

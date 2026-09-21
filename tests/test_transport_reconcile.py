@@ -62,9 +62,38 @@ def _normalize(s3, delivery_manifest_key, fd):
         registry={fd.name: fd})
 
 
-def _discover(s3, fd):
+def _put_transport_v2(s3, transport_id, *, external_id="1234",
+                      cob_date="2026-09-17", source_system="QA",
+                      filename="positions_20260917.csv",
+                      body=b"id,value\n1,x\n"):
+    prefix = (f"received/cob_date={cob_date}/source_system={source_system}/"
+             f"{transport_id}/")
+    object_key = f"{prefix}{filename}"
+    s3.put(object_key, body)
+    raw = {
+        "transport_contract_version": 2,
+        "transport_id": transport_id,
+        "source": "DCM",
+        "legacy_feed_id": external_id,
+        "producer_run_id": "1",
+        "cob_date": cob_date,
+        "source_system": source_system,
+        "source_observed_at": "2026-09-17T05:42:17Z",
+        "uploaded_at": "2026-09-17T05:43:02Z",
+        "files": [{
+            "role": "data", "original_filename": filename,
+            "object_key": object_key, "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }],
+    }
+    marker = f"{prefix}_COMPLETE.json"
+    s3.put(marker, json.dumps(raw, sort_keys=True))
+    return marker
+
+
+def _discover(s3, fd, **kwargs):
     return discover_transport_progress(
-        client=s3, bucket="lakehouse", registry={fd.name: fd})
+        client=s3, bucket="lakehouse", registry={fd.name: fd}, **kwargs)
 
 
 # --------------------------------------------------------------- staged progress
@@ -192,3 +221,31 @@ def test_unreadable_transport_is_collected_not_raised():
     assert len(report["failed"]) == 1
     assert report["failed"][0]["marker"] == "received/bad-1/_COMPLETE.json"
     assert "malformed" in report["failed"][0]["error"].lower()
+
+
+# ------------------------------------------------------- bounded (v2) reconcile
+def test_report_carries_marker_keys_so_a_caller_can_trigger_by_key():
+    """`transport_reconcile` (the Airflow DAG) needs the full marker key, not
+    just the transport_id, to trigger `transport_ingest` -- since Contract
+    v2 a marker key also encodes cob_date/source_system, which transport_id
+    alone no longer determines."""
+    s3, fd = FakeS3(), _feed()
+    marker = _put_transport_v2(s3, "t-v2-1")
+    report = _discover(s3, fd)
+    assert report["needs_full_chain"] == ["t-v2-1"]
+    assert report["marker_keys"] == {"t-v2-1": marker}
+
+
+def test_cob_dates_bounds_discovery_to_those_partitions_only():
+    """Normal reconciliation should be capable of targeting recent/relevant
+    COB partitions rather than re-listing every Transport ever published --
+    docs/AIRFLOW-ORCHESTRATION.md, 'Reconciliation scale (v2)'."""
+    s3, fd = FakeS3(), _feed()
+    _put_transport_v2(s3, "t-in-window", cob_date="2026-09-20")
+    _put_transport_v2(s3, "t-out-of-window", cob_date="2026-08-01")
+
+    bounded = _discover(s3, fd, cob_dates=["2026-09-19", "2026-09-20"])
+    assert bounded["needs_full_chain"] == ["t-in-window"]
+
+    unbounded = _discover(s3, fd)
+    assert unbounded["needs_full_chain"] == ["t-in-window", "t-out-of-window"]
