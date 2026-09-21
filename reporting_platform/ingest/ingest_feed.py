@@ -468,6 +468,36 @@ def raw_delivered_ids(spark, fd, table: str | None = None) -> set[str]:
     return {row["_delivery_id"] for row in rows}
 
 
+def committed_rows_from_raw(spark, fd, table: str | None = None) -> list[dict]:
+    """Every (delivery_id, cob_date, source_system, file_version, rows) Raw
+    `main` already holds for this Feed -- the BACKFILL source for
+    `registry.delivery_committed` (registry/db.py's header). A Delivery
+    ingested before that table existed committed just as durably; this is
+    how `python -m scripts._spark_task reconcile-committed <feed>` recovers
+    that fact without re-ingesting anything. One bulk query, the same shape
+    as `raw_delivered_ids`.
+    """
+    target = table or fd.raw_table
+    if not spark.catalog.tableExists(target):
+        return []
+    spark.catalog.refreshTable(target)
+    columns = {name.lower() for name, _ in
+              spark.sql(f"SELECT * FROM {target} LIMIT 0").dtypes}
+    if "_delivery_id" not in columns:
+        return []
+    rows = spark.sql(
+        f"SELECT _delivery_id AS delivery_id, _cob_date AS cob_date, "
+        f"       _source_system AS source_system, "
+        f"       MAX(_file_version) AS file_version, COUNT(*) AS rows "
+        f"FROM {target} WHERE _delivery_id IS NOT NULL "
+        f"GROUP BY _delivery_id, _cob_date, _source_system"
+    ).collect()
+    return [{"delivery_id": r["delivery_id"], "cob_date": r["cob_date"],
+             "source_system": r["source_system"],
+             "file_version": r["file_version"], "rows": r["rows"]}
+            for r in rows]
+
+
 def _v2_feed_contract(fd, manifest: dict):
     """Feed-shaped historical read contract captured in Normalization v2.
 
@@ -741,6 +771,15 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             "extra_columns": [],
             "asset_uri": fd.asset_uri,
         }
+        # This IS a commit -- `already_ingested_delivery` only returns True
+        # for a Delivery Raw already holds -- so the fact belongs here too,
+        # not only on the fresh-write path below. `rows` is left unknown
+        # rather than re-counted: nothing downstream needs it enough to
+        # justify a Spark action on an idempotent no-op.
+        from reporting_platform.registry import deliveries as registry_deliveries
+        registry_deliveries.record_committed_quietly(
+            fd.name, manifest["delivery_id"], bdate, contract_fd.source_system,
+            None, run_id)
         if owns_session:
             spark.stop()
         return result
@@ -974,6 +1013,13 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
         }
         if drift["missing_columns"] or drift["extra_columns"]:
             log.warning("schema drift on %s: %s", fd.name, json.dumps(drift))
+        # NOT under `dry_run`: a dry run never merged, so there is nothing to
+        # record as committed -- see registry/db.py's header on this table.
+        if not dry_run:
+            from reporting_platform.registry import deliveries as registry_deliveries
+            registry_deliveries.record_committed_quietly(
+                fd.name, manifest["delivery_id"], bdate, contract_fd.source_system,
+                row_count, run_id, file_version=version)
         return result
     finally:
         # Only if we made it. A caller that passed one in owns its lifetime.

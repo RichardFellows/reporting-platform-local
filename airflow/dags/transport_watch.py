@@ -107,6 +107,7 @@ def _dag():
         """
         from _transport_trigger import trigger_transport
         from reporting_platform.ingest import transport as transport_contract
+        from reporting_platform.registry import transports as receipts
 
         triggered: list[str] = []
         already: list[str] = []
@@ -115,6 +116,19 @@ def _dag():
             # regardless of how many cob_date=/source_system= segments (v2)
             # or none at all (v1) precede it.
             transport_id = marker_key.rsplit("/", 2)[-2]
+            # THE S3-EVENT DISCOVERY HALF of "converge on the same idempotent
+            # TransportReceipt logic" -- `transport_reconcile` is the other.
+            # Insert-once (registry/transports.py), so re-listing the whole
+            # prefix every cycle costs one no-op upsert per already-known
+            # Transport, not a growing table.
+            try:
+                parsed = transport_contract.read_transport(marker_key)
+                receipts.record_discovered_quietly(parsed, marker_key)
+            except Exception:                                       # noqa: BLE001
+                # A marker that cannot be read/parsed is trigger_transport's
+                # problem, not this observability sync's -- it still attempts
+                # the trigger below, which is what actually matters.
+                pass
             if trigger_transport(transport_id, marker_key):
                 triggered.append(transport_id)
             else:

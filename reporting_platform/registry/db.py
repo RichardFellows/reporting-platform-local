@@ -558,6 +558,102 @@ CREATE INDEX IF NOT EXISTS migration_comparison_feed_date
     ON registry.migration_comparison (feed, business_date);
 CREATE INDEX IF NOT EXISTS migration_comparison_outcome
     ON registry.migration_comparison (feed, outcome, executed_at DESC);
+
+-- Operational control plane (COB Feed Status). Two tables, deliberately not
+-- one, because they answer different questions and neither is `delivery`
+-- with a status column bolted on:
+--
+--   * `transport_receipt` is an EXECUTION record, like `run` above -- how far
+--     THIS occurrence of a Transport has been carried through
+--     transport_ingest, discovered by the fast path (`transport_watch`) or
+--     the correctness path (`transport_reconcile`) and advanced by the DAG's
+--     own tasks. It legitimately has a mutable `status`, for the same reason
+--     `run` does: nothing else durably records "how far did this attempt
+--     get" -- object storage records what each stage PRODUCED, not that a
+--     particular attempt is in flight. It exists only for Transport-origin
+--     (v2) deliveries; a legacy `landing/`-direct feed has no Transport and
+--     therefore no row here.
+--   * `delivery_committed` is an OBSERVATION, like `delivery_part` above --
+--     one immutable fact ("this Delivery reached Raw and is on `main`")
+--     recorded once, by the one function that actually performs that commit
+--     (`ingest_feed._ingest_manifest`), so it is written identically for the
+--     legacy and the Transport path. `registry.delivery` itself gets a row
+--     at NORMALIZE time, before Raw is ever touched -- see its own header --
+--     so delivery existing is evidence of neither commit nor failure, and a
+--     dedicated append-only fact is what answers COMPLETE without a Spark
+--     query on every status page render.
+--
+-- Neither table replaces Raw as the ledger: `_delivery_id` in Raw remains
+-- authoritative for whether a Delivery committed, exactly as
+-- `registry/deliveries.py`'s header says. `delivery_committed` is a cache of
+-- that fact for cheap operational queries, and unreadable/absent rows here
+-- are a reason to reconcile, never a reason to trust Raw less.
+CREATE TABLE IF NOT EXISTS registry.transport_receipt (
+    transport_id       TEXT        PRIMARY KEY,
+    source             TEXT        NOT NULL,
+    legacy_feed_id     TEXT        NOT NULL,
+    producer_run_id    TEXT,
+    -- NULL for a v1 marker, which carries neither field (see
+    -- docs/TRANSPORT-CONTRACT.md, "v1 compatibility").
+    cob_date           DATE,
+    source_system      TEXT,
+    marker_key         TEXT        NOT NULL,
+    source_observed_at TIMESTAMPTZ,
+    -- Fixed at the Transport's first publication and never rewritten by a
+    -- retry (see TRANSPORT-CONTRACT.md) -- so neither is this column, once set.
+    uploaded_at        TIMESTAMPTZ NOT NULL,
+    -- When THIS PLATFORM first saw the marker, which is a fact about the
+    -- registry's own clock, not the Transport's -- see the `first_seen_at`
+    -- reasoning on `delivery` above.
+    discovered_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Filled in once create_delivery resolves a Feed; NULL until then, and
+    -- forever NULL for a Transport that failed before that point.
+    feed               TEXT,
+    delivery_id        TEXT,
+    -- 'discovered' | 'validated' | 'delivered' | 'normalized' | 'failed'.
+    -- No 'ingested': whether Raw committed is `delivery_committed`'s
+    -- question, answered universally for both paths, not duplicated here.
+    status             TEXT        NOT NULL,
+    -- Denormalized rank of `status` in the pipeline's forward order, so an
+    -- UPDATE can refuse to move status BACKWARDS on a racing/stale task
+    -- retry without a read-then-write. Not part of this table's public
+    -- meaning -- callers read `status`, not this.
+    stage_rank         INT         NOT NULL DEFAULT 0,
+    failure_reason     TEXT,
+    airflow_dag_id     TEXT,
+    airflow_run_id     TEXT,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS transport_receipt_cob_source
+    ON registry.transport_receipt (cob_date, source_system);
+CREATE INDEX IF NOT EXISTS transport_receipt_feed_cob
+    ON registry.transport_receipt (feed, cob_date);
+CREATE INDEX IF NOT EXISTS transport_receipt_status
+    ON registry.transport_receipt (status);
+CREATE INDEX IF NOT EXISTS transport_receipt_delivery
+    ON registry.transport_receipt (feed, delivery_id);
+
+CREATE TABLE IF NOT EXISTS registry.delivery_committed (
+    feed          TEXT        NOT NULL,
+    delivery_id   TEXT        NOT NULL,
+    cob_date      DATE        NOT NULL,
+    source_system TEXT        NOT NULL,
+    file_version  INT,
+    -- NULL when the commit was discovered via the idempotent
+    -- already-committed short-circuit rather than counted fresh: re-counting
+    -- Raw only to fill in a number nothing here needs would cost a Spark
+    -- action for no operational benefit.
+    rows          BIGINT,
+    run_id        TEXT        NOT NULL,
+    committed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed, delivery_id)
+);
+
+CREATE INDEX IF NOT EXISTS delivery_committed_feed_cob
+    ON registry.delivery_committed (feed, cob_date);
+CREATE INDEX IF NOT EXISTS delivery_committed_cob
+    ON registry.delivery_committed (cob_date);
 """
 
 

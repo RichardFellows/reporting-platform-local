@@ -102,6 +102,19 @@ def _dag():
                 len(report["failed"]), report["failed"][:5])
         return report
 
+    @task(task_id="sync_receipts")
+    def sync_receipts(report: dict) -> dict:
+        """Converge `registry.transport_receipt` onto this evidence walk.
+
+        The correctness-path half of idempotent TransportReceipt discovery --
+        `transport_watch`'s `trigger_discovered` is the fast-path half. Runs
+        independently of `check_raw`/`trigger_pending`: it observes what this
+        walk already found, it does not decide what to trigger.
+        """
+        from reporting_platform.registry.transports import sync_from_progress
+
+        return sync_from_progress(report)
+
     @task(task_id="check_raw")
     def check_raw(report: dict) -> list[str]:
         """Normalized Deliveries this cannot yet prove are committed to Raw.
@@ -141,6 +154,7 @@ def _dag():
                 "unread_transports": len(report["failed"])}
 
     progress = discover_progress()
+    sync_receipts(progress)
     trigger_pending(progress, check_raw(progress))
 
 

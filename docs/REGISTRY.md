@@ -280,6 +280,38 @@ docker compose exec -T airflow python -m reporting_platform.migration overview
 docker compose exec -T airflow python -m reporting_platform.migration status <feed>
 ```
 
+## The operational control plane (COB Feed Status)
+
+Two tables answer "where is this feed right now", for an operator, without
+reading Airflow's DAG list or walking S3 on every page render:
+
+- `registry.transport_receipt` — an EVENT record, like `run`: how far one
+  Transport occurrence has been carried through `transport_ingest`
+  (`discovered` → `validated` → `delivered` → `normalized`, or `failed`).
+  Only exists for Transport-origin (v2) deliveries.
+- `registry.delivery_committed` — an OBSERVATION, like `delivery_part`: one
+  fact, "this Delivery reached Raw on `main`", recorded once by
+  `ingest_feed._ingest_manifest` for BOTH the legacy and the Transport path.
+
+Neither is a status column on `delivery`, and neither replaces Raw's own
+`_delivery_id` as the ledger — see
+[`OPERATIONAL-CONTROL-PLANE.md`](OPERATIONAL-CONTROL-PLANE.md) for the full
+design, including why this needed a durable addition when the rest of the
+registry does not, and the failure/recovery semantics.
+
+```bash
+# for one COB date: every feed, grouped by source system, with its derived
+# status. No Spark, no Airflow calls -- pure Postgres reads.
+docker compose exec -T airflow python -m reporting_platform.monitoring.feed_status --cob-date 2026-09-21
+
+# one-time per feed, after deploying this feature: recover delivery_committed
+# facts for Deliveries ingested before that table existed, from Raw itself.
+docker compose exec -T airflow python -m scripts._spark_task reconcile-committed <feed>
+```
+
+The feed console's **COB Status** page (`http://localhost:8082`) renders the
+same report.
+
 ## Related
 
 - [`VALIDATION.md`](VALIDATION.md) — validation controls and execution evidence

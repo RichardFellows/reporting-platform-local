@@ -158,14 +158,30 @@ def _dag():
                     cob_date, source_system, transport_id)
             else:
                 marker_key = transport_contract.complete_key_v1(transport_id)
+        from reporting_platform.registry import transports as receipts
+
         try:
-            transport_contract.read_validated_transport(marker_key)
+            validated = transport_contract.read_validated_transport(marker_key)
         except Exception as exc:
+            if transport_id:
+                receipts.record_stage_quietly(
+                    transport_id, "failed",
+                    failure_reason=f"{type(exc).__name__}: {exc}"[:2000],
+                    airflow_dag_id="transport_ingest",
+                    airflow_run_id=context["run_id"])
             _record_delivery_failure(
                 exc, control_id="transport_contract",
                 transport_id=transport_id or marker_key,
                 execution_ref=context["run_id"])
             raise
+        # SELF-HEALING: `record_discovered` is insert-once, so this is a no-op
+        # when transport_watch/transport_reconcile already wrote the row, and
+        # a full recovery of it when this DAG was triggered by a manual
+        # replay that neither of them saw. See registry/transports.py.
+        receipts.record_discovered_quietly(validated, marker_key)
+        receipts.record_stage_quietly(
+            validated.transport_id, "validated",
+            airflow_dag_id="transport_ingest", airflow_run_id=context["run_id"])
         return marker_key
 
     @task(task_id="create_delivery")
@@ -181,18 +197,40 @@ def _dag():
         """
         from reporting_platform.ingest import delivery as delivery_contract
         from reporting_platform.ingest import transport as transport_contract
+        from reporting_platform.registry import transports as receipts
 
         transport_id = None
         try:
             parsed = transport_contract.read_transport(marker_key)
             transport_id = parsed.transport_id
-            delivery_contract.create_delivery(marker_key)
+            created = delivery_contract.create_delivery(marker_key)
         except Exception as exc:
+            if transport_id:
+                # Best-effort: the FEED may be perfectly resolvable even
+                # though identity (date/version) resolution is what failed --
+                # and a FAILED row with no feed never surfaces on that feed's
+                # COB Status row, which is exactly the case an operator most
+                # wants to see. Never let this secondary lookup mask the real
+                # exception below.
+                failed_feed = None
+                try:
+                    failed_feed = delivery_contract.resolve_transport_feed(parsed).name
+                except Exception:                                    # noqa: BLE001
+                    pass
+                receipts.record_stage_quietly(
+                    transport_id, "failed", feed=failed_feed,
+                    failure_reason=f"{type(exc).__name__}: {exc}"[:2000],
+                    airflow_dag_id="transport_ingest",
+                    airflow_run_id=context["run_id"])
             _record_delivery_failure(
                 exc, control_id="delivery_identity",
                 transport_id=transport_id or marker_key,
                 execution_ref=context["run_id"])
             raise
+        receipts.record_stage_quietly(
+            transport_id, "delivered", feed=created.feed,
+            delivery_id=created.delivery_id, airflow_dag_id="transport_ingest",
+            airflow_run_id=context["run_id"])
         # The key is a pure function of transport identity, so this is a
         # cheap re-parse of the small completion marker -- not a re-hash of
         # the source bytes create_delivery already validated. Matches the
@@ -209,16 +247,39 @@ def _dag():
         here for an unsafe archive member, an invalid zip, or a normalization
         contract conflict -- never for anything about raw ingestion.
         """
+        from reporting_platform.ingest import delivery as delivery_contract
         from reporting_platform.ingest.normalization import normalize_delivery
+        from reporting_platform.registry import transports as receipts
+
+        # A cheap re-read of the immutable manifest this task was HANDED --
+        # not a re-derivation of anything -- purely to recover the Transport
+        # identity for the receipt row, which normalize_delivery itself has
+        # no reason to return.
+        transport_id = None
+        try:
+            transport_id = delivery_contract.read_delivery_manifest(
+                delivery_manifest_key).transport_id
+        except Exception:                                          # noqa: BLE001
+            pass
 
         try:
             result = normalize_delivery(delivery_manifest_key)
         except Exception as exc:
+            if transport_id:
+                receipts.record_stage_quietly(
+                    transport_id, "failed",
+                    failure_reason=f"{type(exc).__name__}: {exc}"[:2000],
+                    airflow_dag_id="transport_ingest",
+                    airflow_run_id=context["run_id"])
             _record_delivery_failure(
                 exc, control_id="normalization_contract",
                 transport_id=delivery_manifest_key,
                 execution_ref=context["run_id"])
             raise
+        if transport_id:
+            receipts.record_stage_quietly(
+                transport_id, "normalized", airflow_dag_id="transport_ingest",
+                airflow_run_id=context["run_id"])
         return result.key
 
     @task(task_id="ingest_raw", pool="lakehouse_write",
@@ -237,8 +298,30 @@ def _dag():
         Fails here for schema/row-count/checksum validation, never for
         anything Delivery- or Normalization-shaped.
         """
+        from reporting_platform.registry import transports as receipts
+
         run_id = context["run_id"].replace(":", "").replace("+", "")[-24:]
-        result = _spark_subprocess("ingest-v2", normalization_manifest_key, run_id)
+        try:
+            result = _spark_subprocess("ingest-v2", normalization_manifest_key, run_id)
+        except Exception as exc:
+            # (feed, delivery_id) FROM THE PATH, not a re-read of any
+            # manifest: `ready/<feed>/<delivery_id>/...` is the same stable
+            # convention `normalization.manifest_key` builds
+            # (docs/NORMALIZATION-CONTRACT.md), and parsing it here avoids
+            # this failure path needing its own Delivery/Transport lookup
+            # just to address one receipt row.
+            segments = normalization_manifest_key.split("/")
+            if len(segments) >= 3:
+                receipts.record_stage_by_delivery_id_quietly(
+                    segments[1], segments[2], "failed",
+                    failure_reason=f"{type(exc).__name__}: {exc}"[:2000],
+                    airflow_dag_id="transport_ingest",
+                    airflow_run_id=context["run_id"])
+            _record_delivery_failure(
+                exc, control_id="raw_ingestion",
+                transport_id=normalization_manifest_key,
+                execution_ref=context["run_id"])
+            raise
 
         # THE COMMIT ALREADY HAPPENED, above -- this only tells prepared_build
         # about it. Emitting on the "already_ingested" no-op path is correct,
