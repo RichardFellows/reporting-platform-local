@@ -33,7 +33,8 @@ def _exists(client, bucket: str, key: str) -> bool:
 
 
 def discover_transport_progress(*, client=None, bucket: str | None = None,
-                                registry: dict[str, Feed] | None = None
+                                registry: dict[str, Feed] | None = None,
+                                cob_dates: list[str] | None = None
                                 ) -> dict[str, Any]:
     """Classify every completed Transport by how far it has reached.
 
@@ -60,6 +61,16 @@ def discover_transport_progress(*, client=None, bucket: str | None = None,
         ``failed``: ``{"marker": ..., "error": ...}`` for evidence this could
             not read or parse. Never raised: one bad Transport must not stop
             reconciliation from making progress on the rest.
+        ``marker_keys``: ``{transport_id: marker_key}`` for every Transport
+            named anywhere else in this report -- callers that need to
+            trigger/replay a specific Transport (`transport_ingest`) address
+            it by marker key, not by re-deriving one from a bare id.
+
+    ``cob_dates``, when given, bounds the underlying
+    ``list_completed_transports`` scan to those COB partitions only -- see
+    that function's docstring for why this is the shape a periodic
+    reconciliation DAG should use, and why ``None`` (the default) still means
+    "the whole received/ prefix, v1 markers included."
     """
     client = client or transport_contract._client()  # noqa: SLF001
     bucket = bucket or transport_contract._bucket()  # noqa: SLF001
@@ -68,12 +79,14 @@ def discover_transport_progress(*, client=None, bucket: str | None = None,
     needs_full_chain: list[str] = []
     candidates_by_feed: dict[str, list[tuple[str, str]]] = {}
     failed: list[dict[str, str]] = []
+    marker_keys: dict[str, str] = {}
 
     for marker_key in transport_contract.list_completed_transports(
-            client=client, bucket=bucket):
+            client=client, bucket=bucket, cob_dates=cob_dates):
         try:
             parsed = transport_contract.read_transport(
                 marker_key, client=client, bucket=bucket)
+            marker_keys[parsed.transport_id] = marker_key
             delivery_key = delivery_contract.manifest_key(parsed)
             if not _exists(client, bucket, delivery_key):
                 needs_full_chain.append(parsed.transport_id)
@@ -98,6 +111,7 @@ def discover_transport_progress(*, client=None, bucket: str | None = None,
             feed: sorted(set(pairs))
             for feed, pairs in candidates_by_feed.items()},
         "failed": failed,
+        "marker_keys": marker_keys,
     }
 
 

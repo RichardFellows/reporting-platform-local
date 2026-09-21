@@ -34,7 +34,7 @@ flowchart TB
     end
 
     subgraph storage["Object storage — MinIO"]
-        RECV["received/&lt;TransportID&gt;/<br/><i>source objects + _COMPLETE.json</i>"]
+        RECV["received/cob_date=…/source_system=…/&lt;TransportID&gt;/<br/><i>source objects + _COMPLETE.json</i>"]
         DEL["deliveries/<br/><i>immutable DeliveryManifest</i>"]
         READY["ready/<br/><i>NormalizationManifest — rebuildable</i>"]
         WH["warehouse/<br/><i>Iceberg data + metadata</i>"]
@@ -350,7 +350,7 @@ surprises you, not front to back.
 
 | Document | Read it for |
 |---|---|
-| [docs/TRANSPORT-CONTRACT.md](docs/TRANSPORT-CONTRACT.md) | what a producer must hand off in `received/<TransportID>/`, and the local DCM simulator |
+| [docs/TRANSPORT-CONTRACT.md](docs/TRANSPORT-CONTRACT.md) | Contract v2: what a producer hands off under `received/cob_date=…/source_system=…/<TransportID>/`, the `reporting_transport` reference publisher/CLI, and the local wrapper that calls it |
 | [docs/DELIVERY-CONTRACT.md](docs/DELIVERY-CONTRACT.md) | how a Transport becomes an immutable DeliveryManifest |
 | [docs/NORMALIZATION-CONTRACT.md](docs/NORMALIZATION-CONTRACT.md) | how a Delivery becomes a rebuildable NormalizationManifest v2 |
 | [docs/RAW-INGESTION-CONTRACT.md](docs/RAW-INGESTION-CONTRACT.md) | Spark ingestion into Iceberg `raw`, and the exact provenance columns |
@@ -462,6 +462,15 @@ dbt/
                           dedupe_rank, provenance), naming.sql (schema
                           routing -- removing it moves every table reference)
 docs/                     see Documentation, above
+reporting_transport/      the reference S3 Transport producer -- contract.py
+                          (versioned wire contract, pure Python, no boto3),
+                          storage.py (StorageConfig, standard boto3 credential
+                          chain), publisher.py (publish_transport(), the one
+                          publication algorithm), cli.py/__main__.py
+                          (`python -m reporting_transport publish`). No
+                          dependency on `reporting_platform` -- a real DCM
+                          environment installs and invokes just this package.
+                          docs/TRANSPORT-CONTRACT.md
 scripts/
   generate_feeds.py       sample feed generator
   land_feeds.py           landing helper
@@ -472,6 +481,8 @@ scripts/
   _open_build_branch.py   open a throwaway Nessie build branch for a manual
                           write-audit-publish test
   duckdb_console.py       read-only query tool against published `main`
+  simulate_dcm_transport.py  thin local wrapper over
+                          reporting_transport.publisher, for MinIO
 tests/                    config-level tests; no stack, no pytest
 spike/                    closed spikes, kept for their findings
 ```

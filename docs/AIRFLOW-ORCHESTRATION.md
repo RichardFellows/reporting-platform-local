@@ -244,23 +244,16 @@ would silently skip anything.
 
 ### Reconciliation scale
 
-`transport_watch` and `transport_reconcile` both list the whole `received/`
-prefix on every run rather than tracking a cursor. That is a deliberate
-choice, not an oversight:
+`transport_watch` lists the whole `received/` prefix on every run rather than
+tracking a cursor. That is a deliberate choice, not an oversight:
 
 - The prefix listing itself (`list_objects_v2`) is the same cost class this
   platform already accepts for `registry.deliveries.reconcile()` and
   `reconcile_v2()` -- a bounded, paginated S3 LIST, not a bucket-wide scan of
   data files.
-- For `transport_watch`, re-listing history is cheap because most of it is
-  filtered for free by Airflow's own DagRun-id uniqueness before any object
-  storage evidence needs reading again.
-- For `transport_reconcile`, a completed-but-processed Transport still costs
-  one marker GET and up to two HEADs -- small, fixed, and independent of
-  source file size. What it deliberately does NOT do is re-hash the original
-  source bytes or spin up a Spark application per already-ingested Delivery:
-  the staged walk above exists specifically to bound that cost to
-  **O(feeds with an open candidate)**, not O(transports) or O(bucket size).
+- Re-listing history is cheap because most of it is filtered for free by
+  Airflow's own DagRun-id uniqueness before any object storage evidence needs
+  reading again.
 
 If a smarter cursor were wanted later (for example, an S3 inventory report,
 or a real event-driven discovery feed), it would only ever be an
@@ -268,6 +261,52 @@ optimisation on top of this walk -- per the Phase 6 brief's own words,
 "optimisation must not become the sole correctness state." A lost or absent
 cursor must still be recoverable by the broader evidence walk above, and it
 is: there is no cursor to lose.
+
+### Reconciliation scale (v2)
+
+`transport_reconcile` **no longer** lists the whole `received/` prefix by
+default. This is a genuine narrowing of the paragraph above, made possible by
+Contract v2's `received/cob_date=<date>/source_system=<system>/<transport-id>/`
+partitioning (`docs/TRANSPORT-CONTRACT.md`) -- not an addition on top of the
+old behaviour, and worth being explicit that it changes an earlier documented
+decision rather than merely extending it.
+
+The scheduled run bounds `discover_transport_progress` to the last
+`TRANSPORT_RECONCILE_WINDOW_DAYS` calendar days (default 7, `os.environ`-
+configurable) via `list_completed_transports(cob_dates=[...])`, which lists
+only those COB partitions. Cost is now **O(transports within the window)**,
+not O(all transports ever published) -- the missing piece the staged walk
+above (still unchanged) could not itself bound, because it only controls cost
+*per discovered Transport*, not how many Transports are discovered in the
+first place.
+
+The unbounded walk is still available -- `discover_transport_progress(
+cob_dates=None)`, `list_completed_transports(cob_dates=None)` -- but is no
+longer what the periodic schedule calls. Trigger it explicitly for an
+occasional full catch-all:
+
+```bash
+docker compose exec -T airflow airflow dags trigger transport_reconcile \
+  -r full_sweep_1 -c '{"full_sweep": true}'
+```
+
+Two things are **only** found by the unbounded form, never the bounded one:
+a Transport whose `cob_date` falls outside the window, and any v1 marker (no
+`cob_date=` partition exists for it to be found by at all -- see
+`docs/TRANSPORT-CONTRACT.md`, "v1 compatibility"). This is the direct,
+accepted cost of bounding the scan: a stuck Transport older than the window
+is not self-healing on the default schedule and needs an operator (or a
+longer window, or a periodic full-sweep run on a much coarser cadence) to
+surface it. Nothing here implements that coarser periodic full sweep --
+deferred, not built, because the brief for this change was "make the default
+path bounded," not "also design its own safety net's safety net."
+
+`transport_watch` is intentionally NOT bounded the same way: its job is
+noticing a Transport newly completing, which could be for any COB date
+(today's, ordinarily, but nothing prevents a backdated correction), so
+narrowing its scan by COB date would risk silently ignoring exactly the
+change that matters. Its cost argument above (cheap re-listing via DagRun
+dedup) already holds regardless.
 
 ## Raw asset emission
 
@@ -335,11 +374,28 @@ retried or duplicate-triggered run as on the run that did the write.
 
 ## Replaying a Transport
 
-An operator who knows a Transport's TransportID (its source is recorded in
-the Transport but not needed to locate the marker: `received/<transport-id>/`
-does not vary by source) can safely resume or replay it:
+An operator who knows a Transport's marker key can safely resume or replay
+it directly:
 
 ```bash
+docker compose exec -T airflow airflow dags trigger transport_ingest \
+  -r replay-<distinct-id> -c '{"marker_key": "received/cob_date=2026-09-21/source_system=RISK_ENGINE_X/dcm-1234-849217/_COMPLETE.json"}'
+```
+
+Since Contract v2 (`docs/TRANSPORT-CONTRACT.md`) a marker key also encodes
+`cob_date`/`source_system`, which `transport_id` alone no longer determines
+-- `marker_key` is therefore what `transport_watch`/`transport_reconcile`
+actually pass through `_transport_trigger.py`, and is the most direct way to
+replay one by hand too. Two other forms remain accepted by `validate_transport`
+for convenience:
+
+```bash
+# v2, from its parts
+docker compose exec -T airflow airflow dags trigger transport_ingest \
+  -r replay-<distinct-id> -c \
+  '{"transport_id": "dcm-1234-849217", "cob_date": "2026-09-21", "source_system": "RISK_ENGINE_X"}'
+
+# v1 (legacy), transport_id alone is still enough -- there is no partitioning to supply
 docker compose exec -T airflow airflow dags trigger transport_ingest \
   -r replay-<distinct-id> -c '{"transport_id": "dcm-1234-98765"}'
 ```
@@ -380,7 +436,19 @@ pins it.
 
 ## Verifying the fast path locally
 
-Done. `docker compose exec -T airflow airflow connections get aws_default`
+**This narrative describes the original Contract v1 verification run.** It
+has not been re-run live against Contract v2 in this session -- the
+reproduction command below is updated to the current CLI shape (no more
+`--transport-id`; `--cob-date`/`--source-system`/`--producer-run-id` are now
+required) so it is at least *runnable*, but "runnable" is not the same claim
+as "verified," per this file's own habit (`CLAUDE.md`, "the one habit that
+matters"). Re-run it against a live stack before trusting this section as
+current evidence for v2 specifically; the sensor pattern change
+(`docs/TRANSPORT-CONTRACT.md`) is a small, mechanical one (`received/*_COMPLETE.json`
+still matches the deeper v2 path via `fnmatch`), but that is an argument for
+why it is *likely* to still hold, not a substitute for running it.
+
+`docker compose exec -T airflow airflow connections get aws_default`
 resolves `aws_default` to `http://minio:9000` with the credentials from
 `docker-compose.yml`'s `AIRFLOW_CONN_AWS_DEFAULT`. A Transport simulated with
 `scripts.simulate_dcm_transport --legacy-feed-id qa-happy-position ...` was
@@ -406,7 +474,8 @@ clean. Reproduce with:
 docker compose up -d --force-recreate airflow airflow-webserver airflow-triggerer
 docker compose exec -T airflow airflow connections get aws_default
 docker compose exec -T feed-ui python -m scripts.simulate_dcm_transport \
-  --transport-id dcm-verify-1 --legacy-feed-id qa-happy-position \
+  --legacy-feed-id qa-happy-position --producer-run-id verify-1 \
+  --cob-date 2026-09-14 --source-system QA \
   --source-observed-at 2026-09-17T05:42:17Z \
   --data /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.csv \
   --control /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.ctl

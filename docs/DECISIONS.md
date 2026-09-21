@@ -4543,6 +4543,24 @@ does not make the bucket WORM: production versioning, Object Lock and
 retention controls remain deployment decisions. The full producer and
 consumer contract is in `docs/TRANSPORT-CONTRACT.md`.
 
+**Amendment (Contract v2).** The publication algorithm above was promoted out
+of `reporting_platform/ingest/dcm_simulator.py` (deleted) into a standalone
+`reporting_transport/` package with no dependency on the rest of this
+repository, so it is the reference producer a real DCM Python subprocess can
+invoke directly (`python -m reporting_transport publish`), not merely a local
+simulation of one. The local `scripts/simulate_dcm_transport.py` is now a
+thin wrapper calling the identical `publish_transport()` function -- there is
+one implementation of publication semantics, not two. TransportID is no
+longer caller-supplied: it is derived deterministically as
+`{source}-{legacy_feed_id}-{producer_run_id}`, which is why `producer_run_id`
+became required. `received/` gained a `cob_date=<date>/source_system=<system>/`
+partitioning ahead of `<transport-id>/`, both producer-supplied. v1 markers
+(no partitioning) remain permanently readable; nothing rewrites them. See
+`docs/TRANSPORT-CONTRACT.md` for the full v2 contract, including a known,
+accepted limitation this change introduces: TransportID does not include
+`cob_date`/`source_system`, so a caller reusing `producer_run_id` under a
+different `cob_date` is not detected as a conflicting retry.
+
 ## transport-to-delivery-is-an-immutable-interpretation
 
 **Decision.** A validated Transport becomes a Delivery by explicit external

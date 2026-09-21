@@ -214,6 +214,29 @@ No compatibility copy bridges them. The existing filename-derived legacy
 DeliveryID, `arrival.find_pending`, normalization, archive extraction, Raw
 provenance, `delivery_ref()`, and Airflow trigger shape are unchanged.
 
+## Transport Contract v2 (cob_date/source_system) is not cross-checked here
+
+`docs/TRANSPORT-CONTRACT.md` v2 adds producer-supplied `cob_date` and
+`source_system` fields to Transport itself. `resolve_business_identity`
+above is unchanged and still resolves `business_date` purely from declared
+control/filename evidence -- Transport's `cob_date` is not read, cross-checked
+against the resolved `business_date`, or otherwise consulted here, and
+`DeliveryManifest`'s `transport: {...}` block does not carry `cob_date`/
+`source_system` through for reference. This is deliberate, not an oversight:
+Transport describes what DCM delivered, Delivery describes what the
+reporting platform understood/accepted it to be, and collapsing the two
+(trusting Transport's own business-date assertion instead of resolving one
+independently) is exactly the distinction this contract exists to preserve.
+Both a cross-check and a pass-through snapshot would be small, additive
+follow-ups; see `docs/TRANSPORT-CONTRACT.md`, "Deferred: DeliveryManifest
+does not yet snapshot Transport's cob_date/source_system".
+
+Also note the naming collision, deliberately not resolved: `Feed.
+source_system` (in `feed_contract.normalization`, e.g. `QA`) and Transport's
+`source_system` (e.g. `RISK_ENGINE_X`) are unrelated concepts that happen to
+share a name at different layers -- the former is the feed's own domain
+classification, the latter is DCM's classification of the producing system.
+
 ## Deferred work
 
 Phase 3 now owns DeliveryManifest-to-normalization, archive handling from

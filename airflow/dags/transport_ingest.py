@@ -116,7 +116,8 @@ def _spark_subprocess(*args: str) -> dict:
     max_active_runs=10,
     default_args=DEFAULT_ARGS,
     tags=["reporting-platform", "ingest", "transport"],
-    params={"transport_id": ""},
+    params={"transport_id": "", "marker_key": "", "cob_date": "",
+           "source_system": ""},
 )
 def _dag():
 
@@ -127,22 +128,42 @@ def _dag():
         Read-only and side-effect free, so a retry after a transient object
         store hiccup is exactly the ordinary case, not a special one. Fails
         here, and only here, for a Transport that is not what it claims: a
-        missing/mismatched object, a bad hash, or a marker the version-1
+        missing/mismatched object, a bad hash, or a marker version the
         contract does not accept.
+
+        `conf.marker_key` (set by `transport_watch`/`transport_reconcile` via
+        `_transport_trigger.py`) is used directly when present -- since
+        Contract v2 a marker key also encodes `cob_date`/`source_system`,
+        which `transport_id` alone no longer determines. A manual replay
+        (`docs/AIRFLOW-ORCHESTRATION.md#replaying-a-transport`) may instead
+        supply `marker_key` directly, or `cob_date`+`source_system` alongside
+        `transport_id` for a v2 Transport, or bare `transport_id` for a
+        legacy v1 one.
         """
         from reporting_platform.ingest import transport as transport_contract
 
         conf = (context["dag_run"].conf or {}) if context.get("dag_run") else {}
-        transport_id = conf.get("transport_id") or context["params"].get("transport_id")
-        if not transport_id:
-            raise ValueError(
-                "transport_ingest requires transport_id in dag_run.conf or params")
-        marker_key = transport_contract.complete_key(transport_id)
+        params = context["params"]
+        transport_id = conf.get("transport_id") or params.get("transport_id")
+        marker_key = conf.get("marker_key") or params.get("marker_key")
+        if not marker_key:
+            cob_date = conf.get("cob_date") or params.get("cob_date")
+            source_system = conf.get("source_system") or params.get("source_system")
+            if not transport_id:
+                raise ValueError(
+                    "transport_ingest requires marker_key, or transport_id, "
+                    "in dag_run.conf or params")
+            if cob_date and source_system:
+                marker_key = transport_contract.complete_key(
+                    cob_date, source_system, transport_id)
+            else:
+                marker_key = transport_contract.complete_key_v1(transport_id)
         try:
             transport_contract.read_validated_transport(marker_key)
         except Exception as exc:
             _record_delivery_failure(
-                exc, control_id="transport_contract", transport_id=transport_id,
+                exc, control_id="transport_contract",
+                transport_id=transport_id or marker_key,
                 execution_ref=context["run_id"])
             raise
         return marker_key

@@ -92,6 +92,20 @@ def test_transport_watch_sensor_is_deferrable_and_does_not_fail_on_nothing_new()
     assert "wildcard_match=True" in sensor
 
 
+def test_transport_watch_pattern_matches_v1_and_v2_marker_depths():
+    """fnmatch's '*' matches '/' too, so one pattern finds a marker at any
+    depth under received/ -- v1's flat layout and v2's cob_date=/
+    source_system= partitioning both, with no version-specific wiring."""
+    source = _source("transport_watch.py")
+    assert 'f"{transport_contract.received_prefix()}/*"' in source
+
+
+def test_transport_watch_triggers_by_marker_key():
+    source = _source("transport_watch.py")
+    body = source[source.index("def trigger_discovered("):]
+    assert "trigger_transport(transport_id, marker_key)" in body
+
+
 # ------------------------------------------------------- transport_reconcile
 def test_reconciliation_raw_check_is_outside_the_write_pool():
     """check_raw only READS Raw -- see docs/ARCHITECTURE.md, "Where Spark
@@ -120,6 +134,34 @@ def test_reconciliation_has_no_mutable_stage_status():
         assert forbidden not in source
 
 
+def test_reconciliation_defaults_to_a_bounded_cob_window_not_a_full_scan():
+    """Contract v2 partitions received/ by cob_date, so the scheduled run
+    should no longer re-list every Transport ever published -- see
+    docs/AIRFLOW-ORCHESTRATION.md, 'Reconciliation scale (v2)'. The unbounded
+    walk remains available, but only opt-in via full_sweep."""
+    source = _source("transport_reconcile.py")
+    assert "cob_dates=cob_dates" in source
+    assert "full_sweep" in source
+    assert "_window_cob_dates" in source
+
+
+def test_full_sweep_conf_param_selects_the_unbounded_scan():
+    source = _source("transport_reconcile.py")
+    body = source[source.index("def discover_progress("):
+                 source.index("@task(task_id=\"check_raw\")")]
+    assert 'conf.get("full_sweep"' in body
+    assert "cob_dates = None if full_sweep else" in body
+
+
+def test_trigger_pending_addresses_transport_ingest_by_marker_key():
+    """`trigger_transport` needs the full marker key since Contract v2 --
+    transport_id alone no longer determines cob_date/source_system."""
+    source = _source("transport_reconcile.py")
+    body = source[source.index('def trigger_pending('):]
+    assert "marker_keys[t]" in body
+    assert "trigger_transport(t, marker_keys[t])" in body
+
+
 # --------------------------------------------------------- shared dedup path
 def test_both_trigger_dags_share_one_dedup_implementation():
     """A single idempotent-trigger mechanism, not two that could drift."""
@@ -133,3 +175,12 @@ def test_trigger_dedup_relies_on_airflow_run_identity_not_a_new_table():
     source = _source("_transport_trigger.py")
     assert "DagRunAlreadyExists" in source
     assert "run_id=run_id_for(transport_id)" in source
+
+
+def test_trigger_transport_carries_the_marker_key_in_conf():
+    """Since Contract v2 a marker key also encodes cob_date/source_system,
+    which transport_id alone no longer determines -- validate_transport must
+    receive it directly rather than reconstructing it."""
+    source = _source("_transport_trigger.py")
+    assert "def trigger_transport(transport_id: str, marker_key: str)" in source
+    assert '"marker_key": marker_key' in source

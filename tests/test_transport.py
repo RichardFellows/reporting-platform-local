@@ -1,16 +1,22 @@
-"""The additive DCM -> S3 transport evidence boundary."""
+"""The DCM -> S3 transport evidence boundary: contract v1 (legacy-read) and
+v2 (current) parsing, path rules, and evidence validation.
+
+Publisher-side behaviour (idempotent upload, conflict detection, deterministic
+TransportID derivation, the CLI) lives in ``reporting_transport`` and is
+tested in ``tests/test_reporting_transport.py`` -- this file is the RPL
+consumer side only.
+"""
 from __future__ import annotations
 
 from datetime import timezone
 import hashlib
 import json
-from pathlib import Path
-import tempfile
 
 from tests.fakes3 import FakeS3
 
 
 def _contract(transport_id="dcm-1234-98765", files=None):
+    """A v1 (legacy) marker document, still the platform's read-compat shape."""
     from reporting_platform.ingest import transport
 
     bodies = files or [("data", "positions_final_FINAL2.zip", b"zip bytes")]
@@ -31,7 +37,36 @@ def _contract(transport_id="dcm-1234-98765", files=None):
         "producer_run_id": "DCM-849217",
         "files": declarations,
     }
-    key = transport.complete_key(transport_id)
+    key = transport.complete_key_v1(transport_id)
+    return document, key, bodies
+
+
+def _contract_v2(transport_id="dcm-1234-849217", files=None,
+                 cob_date="2026-09-21", source_system="RISK_ENGINE_X"):
+    from reporting_platform.ingest import transport
+
+    bodies = files or [("data", "positions_20260921.csv", b"id,value\n1,x\n")]
+    declarations = [{
+        "role": role,
+        "original_filename": name,
+        "object_key": (f"received/cob_date={cob_date}/"
+                       f"source_system={source_system}/{transport_id}/{name}"),
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+    } for role, name, body in bodies]
+    document = {
+        "transport_contract_version": 2,
+        "transport_id": transport_id,
+        "source": "DCM",
+        "legacy_feed_id": "1234",
+        "producer_run_id": "849217",
+        "cob_date": cob_date,
+        "source_system": source_system,
+        "source_observed_at": "2026-09-17T05:42:17Z",
+        "uploaded_at": "2026-09-17T05:43:02Z",
+        "files": declarations,
+    }
+    key = transport.complete_key(cob_date, source_system, transport_id)
     return document, key, bodies
 
 
@@ -93,8 +128,8 @@ def test_valid_multiple_data_objects():
 
 def test_unsupported_contract_version_is_cleanly_rejected():
     document, key, _ = _contract()
-    document["transport_contract_version"] = 2
-    _fails(document, key, "unsupported transport contract version 2")
+    document["transport_contract_version"] = 3
+    _fails(document, key, "unsupported transport contract version 3")
 
 
 def test_malformed_json_and_missing_required_fields_are_rejected():
@@ -198,6 +233,70 @@ def test_received_prefix_is_configurable_without_becoming_landing():
     assert not parsed.files[0].object_key.startswith("landing/")
 
 
+# --------------------------------------------------------- contract v2
+def test_valid_v2_marker_is_typed_with_cob_date_and_source_system():
+    document, key, _ = _contract_v2()
+    parsed = _parse(document, key)
+    assert parsed.transport_contract_version == 2
+    assert parsed.cob_date == "2026-09-21"
+    assert parsed.source_system == "RISK_ENGINE_X"
+    assert parsed.producer_run_id == "849217"
+    assert parsed.files[0].object_key == (
+        "received/cob_date=2026-09-21/source_system=RISK_ENGINE_X/"
+        "dcm-1234-849217/positions_20260921.csv")
+
+
+def test_v2_producer_run_id_is_required():
+    document, key, _ = _contract_v2()
+    document.pop("producer_run_id")
+    _fails(document, key, "producer_run_id")
+
+
+def test_v2_rejects_an_invalid_cob_date():
+    for bad in ("2026-9-21", "not-a-date", "20260921", ""):
+        document, key, _ = _contract_v2()
+        document["cob_date"] = bad
+        _fails(document, key, "cob_date")
+
+
+def test_v2_rejects_an_unsafe_source_system_segment():
+    for bad in ("..", ".", "risk/engine", "risk engine", ""):
+        document, key, _ = _contract_v2()
+        document["source_system"] = bad
+        _fails(document, key, "source_system")
+
+
+def test_v2_marker_key_must_agree_with_cob_date_and_source_system():
+    document, key, _ = _contract_v2()
+    _fails(document, "received/cob_date=2026-09-21/source_system=OTHER/"
+           "dcm-1234-849217/_COMPLETE.json", "marker key must be")
+    _fails(document, "received/cob_date=2026-09-22/"
+           "source_system=RISK_ENGINE_X/dcm-1234-849217/_COMPLETE.json",
+           "marker key must be")
+
+
+def test_v2_object_key_must_include_the_full_partition_path():
+    document, key, _ = _contract_v2()
+    document["files"][0]["object_key"] = (
+        "received/dcm-1234-849217/positions_20260921.csv")
+    _fails(document, key, "must be stored unchanged")
+
+
+def test_v1_and_v2_markers_both_parse_and_stay_distinguishable():
+    """Migration policy: v1 markers remain permanently readable, never
+    rewritten. There is no tool in this platform that migrates historical
+    ``received/`` evidence -- see docs/TRANSPORT-CONTRACT.md, "v1
+    compatibility"."""
+    v1_document, v1_key, _ = _contract()
+    v2_document, v2_key, _ = _contract_v2()
+    v1 = _parse(v1_document, v1_key)
+    v2 = _parse(v2_document, v2_key)
+    assert v1.transport_contract_version == 1
+    assert v1.cob_date is None and v1.source_system is None
+    assert v2.transport_contract_version == 2
+    assert v2.cob_date is not None and v2.source_system is not None
+
+
 # ------------------------------------------------------- stored evidence
 def test_referenced_evidence_is_checked_by_size_and_sha256():
     from reporting_platform.ingest import transport
@@ -291,140 +390,58 @@ def test_discoverable_marker_with_missing_object_fails_validation():
         raise AssertionError("expected invalid visible transport to fail")
 
 
-# --------------------------------------------------------------- simulator
-def _simulate(s3, transport_id, path, *,
-              uploaded_at="2026-09-17T05:43:02Z"):
-    from reporting_platform.ingest.dcm_simulator import simulate_transport
-    return simulate_transport(
-        transport_id=transport_id,
-        legacy_feed_id="1234",
-        source_observed_at="2026-09-17T05:42:17Z",
-        uploaded_at=uploaded_at,
-        producer_run_id="DCM-849217",
-        files=[("data", path)],
-        client=s3,
-        bucket="lakehouse",
-    )
-
-
-def test_simulator_uploads_marker_after_all_source_objects():
-    with tempfile.TemporaryDirectory() as folder:
-        data = Path(folder) / "positions_final_FINAL2.zip"
-        control = Path(folder) / "positions_final_FINAL2.ctl"
-        data.write_bytes(b"zip bytes")
-        control.write_bytes(b"ROWS=1")
-        s3 = FakeS3()
-        from reporting_platform.ingest.dcm_simulator import simulate_transport
-        result = simulate_transport(
-            transport_id="dcm-order-1", legacy_feed_id="1234",
-            source_observed_at="2026-09-17T05:42:17Z",
-            files=[("data", data), ("control", control)],
-            client=s3, bucket="lakehouse")
-        puts = [call.removeprefix("put:") for call in s3.calls
-                if call.startswith("put:")]
-        assert puts == [f.object_key for f in result.files] + [
-            "received/dcm-order-1/_COMPLETE.json"], puts
-        assert s3.objects[result.files[0].object_key][0] == data.read_bytes()
-        assert s3.objects[result.files[1].object_key][0] == control.read_bytes()
-
-
-def test_same_transport_and_bytes_is_an_idempotent_retry():
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "positions.csv"
-        path.write_bytes(b"id,value\n1,x\n")
-        s3 = FakeS3()
-        first = _simulate(s3, "dcm-retry-1", path)
-        before = dict(s3.objects)
-        call_at = len(s3.calls)
-        second = _simulate(
-            s3, "dcm-retry-1", path,
-            uploaded_at="2026-09-18T12:00:00Z")
-        assert second == first
-        assert second.uploaded_at == first.uploaded_at
-        assert s3.objects == before
-        assert not any(call.startswith("put:")
-                       for call in s3.calls[call_at:]), s3.calls[call_at:]
-
-
-def test_retry_is_independent_of_caller_file_order():
-    from reporting_platform.ingest.dcm_simulator import simulate_transport
-
-    with tempfile.TemporaryDirectory() as folder:
-        data = Path(folder) / "positions.csv"
-        control = Path(folder) / "positions.ctl"
-        data.write_bytes(b"id,value\n1,x\n")
-        control.write_bytes(b"ROWS=1")
-        s3 = FakeS3()
-        common = {
-            "transport_id": "dcm-reordered-retry-1",
-            "legacy_feed_id": "1234",
-            "source_observed_at": "2026-09-17T05:42:17Z",
-            "client": s3,
-            "bucket": "lakehouse",
-        }
-        first = simulate_transport(
-            files=[("control", control), ("data", data)], **common)
-        second = simulate_transport(
-            files=[("data", data), ("control", control)], **common)
-        assert second == first
-        assert [f.role for f in first.files] == ["data", "control"]
-
-
-def test_same_transport_with_changed_bytes_fails_without_overwrite():
-    from reporting_platform.ingest.dcm_simulator import TransportConflictError
-
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "positions.csv"
-        path.write_bytes(b"first")
-        s3 = FakeS3()
-        _simulate(s3, "dcm-conflict-1", path)
-        before = dict(s3.objects)
-        path.write_bytes(b"changed")
-        try:
-            _simulate(s3, "dcm-conflict-1", path)
-        except TransportConflictError as exc:
-            assert "different evidence" in str(exc), exc
-        else:
-            raise AssertionError("expected conflicting retry to fail")
-        assert s3.objects == before
-
-
-def test_same_transport_with_changed_metadata_fails_without_overwrite():
-    from reporting_platform.ingest.dcm_simulator import (
-        TransportConflictError, simulate_transport)
-
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "positions.csv"
-        path.write_bytes(b"same bytes")
-        s3 = FakeS3()
-        _simulate(s3, "dcm-metadata-conflict-1", path)
-        before = dict(s3.objects)
-        try:
-            simulate_transport(
-                transport_id="dcm-metadata-conflict-1",
-                legacy_feed_id="different-feed",
-                source_observed_at="2026-09-17T05:42:17Z",
-                files=[("data", path)], client=s3, bucket="lakehouse")
-        except TransportConflictError as exc:
-            assert "different evidence" in str(exc), exc
-        else:
-            raise AssertionError("expected conflicting metadata to fail")
-        assert s3.objects == before
-
-
-def test_two_transports_can_preserve_the_same_original_filename():
+# ------------------------------------------------- discovery (v1+v2, bounded)
+# Publisher-side behaviour (idempotent upload, conflict detection,
+# deterministic TransportID derivation, the CLI) is exercised against
+# reporting_transport.publisher directly in test_reporting_transport.py.
+def test_v2_marker_is_discoverable_at_any_depth_and_readable():
     from reporting_platform.ingest import transport
 
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "positions.csv"
-        path.write_bytes(b"same bytes")
-        s3 = FakeS3()
-        first = _simulate(s3, "dcm-execution-1", path)
-        second = _simulate(s3, "dcm-execution-2", path)
-        assert first.files[0].original_filename == second.files[0].original_filename
-        assert first.files[0].object_key != second.files[0].object_key
-        assert transport.list_completed_transports(
-            client=s3, bucket="lakehouse") == [
-                "received/dcm-execution-1/_COMPLETE.json",
-                "received/dcm-execution-2/_COMPLETE.json",
-            ]
+    document, key, bodies = _contract_v2()
+    s3 = FakeS3()
+    _put_evidence(s3, document, key, bodies)
+    assert transport.list_completed_transports(
+        client=s3, bucket="lakehouse") == [key]
+    result = transport.read_validated_transport(
+        key, client=s3, bucket="lakehouse")
+    assert result.transport_id == document["transport_id"]
+    assert result.cob_date == "2026-09-21"
+
+
+def test_unbounded_listing_finds_both_v1_and_v2_markers():
+    from reporting_platform.ingest import transport
+
+    v1_document, v1_key, v1_bodies = _contract(transport_id="dcm-legacy-1")
+    v2_document, v2_key, v2_bodies = _contract_v2(transport_id="dcm-1234-1")
+    s3 = FakeS3()
+    _put_evidence(s3, v1_document, v1_key, v1_bodies)
+    _put_evidence(s3, v2_document, v2_key, v2_bodies)
+    assert transport.list_completed_transports(
+        client=s3, bucket="lakehouse") == sorted([v1_key, v2_key])
+
+
+def test_bounded_listing_targets_only_the_given_cob_partitions():
+    """Normal reconciliation should not have to re-list every Transport ever
+    published -- docs/AIRFLOW-ORCHESTRATION.md, "Reconciliation scale (v2)".
+    A v1 marker has no cob_date= partition and is therefore never found this
+    way; only the unbounded (cob_dates=None) listing finds it."""
+    from reporting_platform.ingest import transport
+
+    v1_document, v1_key, v1_bodies = _contract(transport_id="dcm-legacy-1")
+    in_window, in_key, in_bodies = _contract_v2(
+        transport_id="dcm-1234-in-window", cob_date="2026-09-20")
+    out_window, out_key, out_bodies = _contract_v2(
+        transport_id="dcm-1234-out-of-window", cob_date="2026-08-01")
+    s3 = FakeS3()
+    _put_evidence(s3, v1_document, v1_key, v1_bodies)
+    _put_evidence(s3, in_window, in_key, in_bodies)
+    _put_evidence(s3, out_window, out_key, out_bodies)
+
+    bounded = transport.list_completed_transports(
+        client=s3, bucket="lakehouse",
+        cob_dates=["2026-09-19", "2026-09-20", "2026-09-21"])
+    assert bounded == [in_key]
+
+    unbounded = transport.list_completed_transports(
+        client=s3, bucket="lakehouse")
+    assert unbounded == sorted([v1_key, in_key, out_key])
