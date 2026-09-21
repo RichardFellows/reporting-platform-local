@@ -60,11 +60,20 @@ docker compose exec -T airflow python -m scripts.duckdb_console \
   "select * from lakehouse.reporting.qa_happy_position_summary"
 ```
 
-**This exact sequence is the one live-verified end to end** against a real
-Transport → Raw → `prepared_build` → `reporting_build` chain, including
-`transport_reconcile` recovering a Transport that never went through the fast
-path — see [AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
-for the full reproduction and what each step proved.
+**The command above (Contract v2's CLI shape) is live-verified** through a
+committed Raw row: `transport_watch` found the published marker and
+`transport_ingest`'s `validate_transport -> create_delivery ->
+normalize_delivery -> ingest_raw` all succeeded, landing real rows in
+`raw.qa_happy_position` with `_source_file` pointing at the v2
+`cob_date=.../source_system=.../` path. **The `prepared_build ->
+reporting_build` hop was not re-confirmed in that same run** — it failed on
+OTHER feeds this particular dev stack had never ingested (unrelated to
+Transport Contract v2), which blocked the whole shared write-audit-publish
+merge, including the otherwise-successful `qa_happy_position` branch. See
+[AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
+for the full detail, including the actual bug this run caught (a missing
+`docker-compose.yml` volume mount for the new `reporting_transport/`
+package, now fixed) and what to check on a freshly seeded stack.
 
 Repeating the same command (same `--producer-run-id`, hence the same derived
 TransportID) is an idempotent retry: `transport_watch`

@@ -436,17 +436,49 @@ pins it.
 
 ## Verifying the fast path locally
 
-**This narrative describes the original Contract v1 verification run.** It
-has not been re-run live against Contract v2 in this session -- the
-reproduction command below is updated to the current CLI shape (no more
-`--transport-id`; `--cob-date`/`--source-system`/`--producer-run-id` are now
-required) so it is at least *runnable*, but "runnable" is not the same claim
-as "verified," per this file's own habit (`CLAUDE.md`, "the one habit that
-matters"). Re-run it against a live stack before trusting this section as
-current evidence for v2 specifically; the sensor pattern change
-(`docs/TRANSPORT-CONTRACT.md`) is a small, mechanical one (`received/*_COMPLETE.json`
-still matches the deeper v2 path via `fnmatch`), but that is an argument for
-why it is *likely* to still hold, not a substitute for running it.
+**Re-verified live against Contract v2**, against a long-running dev stack
+(not a fresh seed). Confirmed working end to end through a committed Raw row:
+`scripts.simulate_dcm_transport` (v2 CLI: `--legacy-feed-id qa-happy-position
+--producer-run-id quickstart-1 --cob-date 2026-09-14 --source-system QA ...`)
+published a Contract v2 marker at
+`received/cob_date=2026-09-14/source_system=QA/dcm-qa-happy-position-quickstart-1/`;
+`transport_watch`'s sensor found it within its next cycle and triggered
+`transport_ingest`, whose four tasks (`validate_transport`, `create_delivery`,
+`normalize_delivery`, `ingest_raw`) all succeeded; the row landed in
+`raw.qa_happy_position` with `_source_file` pointing at the v2 key and
+`_cob_date = 2026-09-14`, confirmed by `duckdb_console`.
+
+**One real bug this run caught and fixed**: `docker-compose.yml` never
+mounted the new `reporting_transport/` package into any container --
+`scripts/simulate_dcm_transport.py` (`feed-ui`) and
+`reporting_platform/ingest/transport.py` (every Airflow service, which now
+imports `reporting_transport.contract`/`.storage`) both raised
+`ModuleNotFoundError` before the mount was added to `x-airflow-common` and to
+`feed-ui`'s own restated `volumes:` list. Neither the pure-Python test tier
+nor CI's `parse` tier catches this class of bug -- both run against a plain
+checkout, never through the compose bind-mount topology -- which is exactly
+why this needed a live container, not just `python -m tests.run`.
+
+**Not re-verified this run**: the `prepared_build` → `reporting_build` →
+`reporting.qa_happy_position_summary` hop. This particular long-running dev
+stack has raw tables only for `fo_trade` and `qa_happy_position` --
+`qa_headerless_position`, `ref_counterparty`, `ref_collateral` and
+`ref_rating` were never ingested here, so `prepared_build`'s shared
+write-audit-publish run (one Nessie branch for every feed, one merge
+decision) failed on those unrelated models'
+`[TABLE_OR_VIEW_NOT_FOUND] raw.qa_headerless_position` before it ever reached
+the publish gate -- blocking `qa_happy_position`'s otherwise-successful branch
+build from merging too, alongside everyone else's. This is a pre-existing gap
+in this one stack's seed state (not a fresh `generate_feeds.py --clean`, and
+not something Contract v2 touched), not a defect in the Transport path
+itself; the original v1 run below was against a stack that did not have this
+problem, which is why it could observe the merge and the final `reporting`
+row. Re-run on a freshly seeded stack (or after landing/bulk-ingesting the
+other feeds) to re-confirm that last hop for v2.
+
+**Original Contract v1 run, for reference** (superseded above for the
+Transport→Raw portion, not repeated for prepared/reporting since a fresh
+stack was not available this session):
 
 `docker compose exec -T airflow airflow connections get aws_default`
 resolves `aws_default` to `http://minio:9000` with the credentials from

@@ -152,6 +152,16 @@ x-airflow-common: &airflow-common
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./reporting_platform:/opt/platform/reporting_platform
+    # The standalone reference Transport producer (docs/TRANSPORT-CONTRACT.md)
+    # -- deliberately its own top-level package, not under reporting_platform/,
+    # since it has no dependency on the rest of this repo. Read-only: nothing
+    # in this container writes to it, and PYTHONPATH is /opt/platform, so
+    # without this mount `scripts/simulate_dcm_transport.py`'s `from
+    # reporting_transport.publisher import ...` raises ModuleNotFoundError --
+    # caught only by actually running the QUICKSTART.md Transport-path command
+    # in a container, not by the pure-Python test tier, which never imports
+    # through this mount.
+    - ./reporting_transport:/opt/platform/reporting_transport:ro
     - ./scripts:/opt/platform/scripts
     # The config-level tests, so `python -m tests.run` works in the container
     # as tests/README.md says. Read-only: they must never be able to edit the
@@ -423,6 +433,10 @@ services:
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./reporting_platform:/opt/platform/reporting_platform
+      # scripts/simulate_dcm_transport.py imports this directly -- without it
+      # the QUICKSTART.md Transport-path command fails here with
+      # ModuleNotFoundError. See x-airflow-common's copy of this mount above.
+      - ./reporting_transport:/opt/platform/reporting_transport:ro
       - ./scripts:/opt/platform/scripts
       - ./tests:/opt/platform/tests:ro
       - ./dbt:/opt/platform/dbt
