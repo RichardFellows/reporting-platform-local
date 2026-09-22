@@ -76,6 +76,19 @@ class TransportConflictError(TransportContractError):
     """A TransportID or object key already holds different evidence."""
 
 
+class TransportSourceMutatedError(TransportContractError):
+    """A local source file changed while it was being published.
+
+    Raised when the bytes actually streamed disagree with a stat() taken
+    before the read, or the file's size/mtime differ from that stat()
+    afterwards -- DCM asserts a source is complete before invoking the
+    publisher, so either signal means that assertion did not hold. Never the
+    sole integrity mechanism (the declared SHA-256 always describes exactly
+    what was streamed regardless), only a fail-safe: no upload observed this
+    way is allowed to reach ``_COMPLETE.json``.
+    """
+
+
 class TransportStorageError(TransportError):
     """The object store could not be reached, or denied access.
 

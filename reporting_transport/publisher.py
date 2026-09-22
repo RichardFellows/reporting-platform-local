@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -25,7 +24,7 @@ from reporting_transport.contract import (
     Transport, TransportConflictError, TransportContractError,
     TransportEvidenceError,
 )
-from reporting_transport.storage import StorageConfig
+from reporting_transport.storage import StorageConfig, UploadTuning, _HashingReader  # noqa: F401 - re-exported for tests
 
 # Matches contract._SEGMENT: legacy_feed_id/producer_run_id/source become part
 # of the derived TransportID, so they must already be safe path-segment text.
@@ -60,7 +59,8 @@ def publish_transport(*, legacy_feed_id: str, producer_run_id: str,
                       uploaded_at: str | datetime | None = None,
                       config: StorageConfig | None = None,
                       client=None, bucket: str | None = None,
-                      prefix: str | None = None) -> Transport:
+                      prefix: str | None = None,
+                      upload: UploadTuning | None = None) -> Transport:
     """Publish one DCM transfer's evidence, then ``_COMPLETE.json``, last.
 
     Idempotent and safely retryable: the same ``(source, legacy_feed_id,
@@ -79,7 +79,7 @@ def publish_transport(*, legacy_feed_id: str, producer_run_id: str,
         cob_date=cob_date, source_system=source_system,
         source_observed_at=source_observed_at, files=files, source=source,
         uploaded_at=uploaded_at, config=config, client=client,
-        bucket=bucket, prefix=prefix).transport
+        bucket=bucket, prefix=prefix, upload=upload).transport
 
 
 def publish_transport_result(*, legacy_feed_id: str, producer_run_id: str,
@@ -91,7 +91,8 @@ def publish_transport_result(*, legacy_feed_id: str, producer_run_id: str,
                              config: StorageConfig | None = None,
                              client=None,
                              bucket: str | None = None,
-                             prefix: str | None = None) -> PublishResult:
+                             prefix: str | None = None,
+                             upload: UploadTuning | None = None) -> PublishResult:
     """Same as :func:`publish_transport`, also reporting new-vs-retry.
 
     ``config`` is only resolved from the environment (``StorageConfig.
@@ -99,6 +100,14 @@ def publish_transport_result(*, legacy_feed_id: str, producer_run_id: str,
     ``bucket`` or ``prefix`` -- a caller supplying all three directly (every
     test in this repo; a caller with its own client construction) never
     touches the environment at all.
+
+    ``upload`` tunes multipart thresholds/concurrency and checksum
+    verification strategy (``UploadTuning``); it is resolved from the
+    environment the same way when not supplied directly, independently of
+    ``config`` -- a caller that passes its own ``client``/``bucket`` and
+    never builds a ``StorageConfig`` still gets multipart/checksum
+    configuration from the environment rather than silently always using
+    hard-coded defaults.
     """
     if config is None and (client is None or bucket is None):
         config = StorageConfig.from_env()
@@ -107,6 +116,8 @@ def publish_transport_result(*, legacy_feed_id: str, producer_run_id: str,
     if prefix is None:
         prefix = (config.received_prefix if config is not None
                  else contract.DEFAULT_RECEIVED_PREFIX)
+    if upload is None:
+        upload = config.upload if config is not None else UploadTuning.from_env()
 
     source = _require_token(source, "source")
     legacy_feed_id = _require_token(legacy_feed_id, "legacy_feed_id")
@@ -125,30 +136,32 @@ def publish_transport_result(*, legacy_feed_id: str, producer_run_id: str,
     observed = _as_timestamp(source_observed_at)
     uploaded = _as_timestamp(uploaded_at or datetime.now(timezone.utc))
 
-    # calculate/reuse source evidence -- one local read per file: an upload
-    # for a missing object hashes what it actually streams (no separate
-    # stat()+hash pass beforehand, so nothing can describe bytes the upload
-    # never sent); an object already present is hashed locally once and
-    # compared to what is actually stored, which is the only way to detect a
-    # conflicting retry without trusting size/mtime.
+    # Publish (or reuse) every declared object. storage.publish_object()
+    # hashes exactly what it streams -- one local read for a fresh upload,
+    # one for a pre-existing object being compared against a retry -- and
+    # confirms durable storage matches that hash BEFORE returning: cheaply,
+    # via a server-computed SHA-256 checksum, when the backend supports one
+    # usable for this object; via the original full GET + rehash otherwise.
+    # This single per-file confirmation is what the old code's separate,
+    # unconditional second verification pass over every file used to do --
+    # removed here because it is now redundant, not because the guarantee it
+    # provided (the marker can never describe different bytes than what is
+    # durably stored, however the source file behaved after being read) is
+    # weakened: publish_object() provides exactly that guarantee itself, per
+    # file, every time. See "Large-file upload and verification strategy" in
+    # docs/TRANSPORT-CONTRACT.md.
     declared: list[contract.TransportFile] = []
     for role, path, name in local:
         object_key = f"{prefix_str}{name}"
-        if storage.object_exists(client, bucket, object_key):
-            file_bytes, digest = _hash_path(path)
-            try:
-                storage.verify_object_evidence(
-                    client, bucket, object_key, expected_bytes=file_bytes,
-                    expected_sha256=digest,
-                    label=f"transport {transport_id}")
-            except TransportEvidenceError as exc:
-                raise TransportConflictError(str(exc)) from exc
-        else:
-            file_bytes, digest = _upload_with_hash(client, bucket,
-                                                    object_key, path)
+        try:
+            published = storage.publish_object(
+                client, bucket, object_key, path, upload=upload,
+                label=f"transport {transport_id}")
+        except TransportEvidenceError as exc:
+            raise TransportConflictError(str(exc)) from exc
         declared.append(contract.TransportFile(
             role=role, original_filename=name, object_key=object_key,
-            bytes=file_bytes, sha256=digest))
+            bytes=published.bytes, sha256=published.sha256))
 
     raw = {
         "transport_contract_version": contract.CONTRACT_VERSION,
@@ -163,17 +176,6 @@ def publish_transport_result(*, legacy_feed_id: str, producer_run_id: str,
         "files": [f.as_dict() for f in declared],
     }
     candidate = contract.parse_transport(json.dumps(raw), marker_key, prefix)
-
-    # Verify complete evidence: re-derive every declared object's actual size
-    # and SHA-256 from what object storage durably holds right now, never
-    # from the upload response or an ETag. This is what guarantees the
-    # marker's SHA-256 can never describe different bytes than what is
-    # actually stored, even if a freshly-uploaded local file was rewritten
-    # moments after this process read it.
-    for file in candidate.files:
-        storage.verify_object_evidence(
-            client, bucket, file.object_key, expected_bytes=file.bytes,
-            expected_sha256=file.sha256, label=f"transport {transport_id}")
 
     if storage.object_exists(client, bucket, marker_key):
         existing = _read_marker(client, bucket, marker_key, prefix)
@@ -244,76 +246,6 @@ def _ordered_local_files(
     # data-then-control ordering also models DCM's required upload sequence.
     local.sort(key=lambda item: (0 if item[0] == "data" else 1, item[2]))
     return local
-
-
-def _upload_with_hash(client, bucket: str, key: str,
-                      path: Path) -> tuple[int, str]:
-    """Upload ``path`` and hash it in the same read pass, then return both.
-
-    Deriving bytes/SHA-256 from what is actually streamed to object storage
-    -- rather than from a separate stat()/read() beforehand -- means the
-    declared evidence can never describe bytes the upload didn't send, and
-    halves the local disk reads for the common case (first publish of a large
-    file) compared to hashing then re-opening for the upload body.
-    """
-    with path.open("rb") as raw:
-        body = _HashingReader(raw)
-        try:
-            client.put_object(Bucket=bucket, Key=key, Body=body,
-                              IfNoneMatch="*")
-        except Exception as exc:  # noqa: BLE001
-            if not storage.is_precondition_failed(exc):
-                raise
-            # Lost a create-only race: someone else published this object
-            # first. Verify it is byte-identical to what THIS process just
-            # read, without re-reading the local file a second time.
-            storage.verify_object_evidence(
-                client, bucket, key, expected_bytes=body.bytes_read,
-                expected_sha256=body.hexdigest(), label=f"object {key}")
-            return body.bytes_read, body.hexdigest()
-    return body.bytes_read, body.hexdigest()
-
-
-def _hash_path(path: Path) -> tuple[int, str]:
-    with path.open("rb") as stream:
-        return storage.sha256_stream(stream)
-
-
-class _HashingReader:
-    """A read-only file wrapper that hashes exactly what it streams out.
-
-    boto3 reads a file-like ``Body`` in chunks via ``.read(size)`` and may
-    ``seek(0)`` to resend it on a transient retry; both are supported so this
-    can be handed straight to ``put_object`` in place of a plain file object.
-    """
-
-    def __init__(self, fileobj) -> None:
-        self._file = fileobj
-        self._hasher = hashlib.sha256()
-        self.bytes_read = 0
-
-    def read(self, size: int = -1) -> bytes:
-        chunk = self._file.read(size)
-        self._hasher.update(chunk)
-        self.bytes_read += len(chunk)
-        return chunk
-
-    def hexdigest(self) -> str:
-        return self._hasher.hexdigest()
-
-    def seekable(self) -> bool:
-        return self._file.seekable()
-
-    def seek(self, offset: int, whence: int = 0) -> int:
-        result = self._file.seek(offset, whence)
-        if offset == 0 and whence == 0:
-            # A resend from the start must hash exactly what is resent.
-            self._hasher = hashlib.sha256()
-            self.bytes_read = 0
-        return result
-
-    def tell(self) -> int:
-        return self._file.tell()
 
 
 def _require_token(value: str, label: str) -> str:

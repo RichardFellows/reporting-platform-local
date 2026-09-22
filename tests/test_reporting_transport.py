@@ -11,6 +11,7 @@ install a test framework.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import datetime
 import hashlib
@@ -19,24 +20,28 @@ import json
 from pathlib import Path
 import tempfile
 
+from reporting_transport import storage as _storage
 from reporting_transport.contract import (
     Transport, TransportConflictError, TransportContractError,
-    TransportEvidenceError, TransportFile, TransportStorageError,
+    TransportEvidenceError, TransportFile, TransportSourceMutatedError,
+    TransportStorageError,
 )
 from reporting_transport.publisher import (
-    _HashingReader, publish_transport,
+    _HashingReader, publish_transport, publish_transport_result,
 )
-from tests.fakes3 import FakeS3, PreconditionFailed
+from reporting_transport.storage import UploadTuning
+from tests.fakes3 import FakeS3, NoSuchUpload, PreconditionFailed
 
 
 def _publish(s3, *, transport_id_files, legacy_feed_id="1234",
             producer_run_id="849217", cob_date="2026-09-21",
-            source_system="RISK_ENGINE_X", uploaded_at="2026-09-22T01:14:22Z"):
+            source_system="RISK_ENGINE_X", uploaded_at="2026-09-22T01:14:22Z",
+            upload=None):
     return publish_transport(
         legacy_feed_id=legacy_feed_id, producer_run_id=producer_run_id,
         cob_date=cob_date, source_system=source_system,
         source_observed_at="2026-09-22T01:13:00Z", uploaded_at=uploaded_at,
-        files=transport_id_files, client=s3, bucket="lakehouse")
+        files=transport_id_files, client=s3, bucket="lakehouse", upload=upload)
 
 
 def _write(folder: str, name: str, body: bytes) -> Path:
@@ -315,6 +320,247 @@ def test_hashing_reader_reset_on_seek_to_start_matches_a_resend():
     assert reader.bytes_read == len(body)
 
 
+# ------------------------------------------------- large files / multipart
+_TINY_MPU = UploadTuning(multipart_threshold=100, multipart_part_size=64,
+                         multipart_max_concurrency=2)
+
+
+def _get_calls(s3) -> list[str]:
+    return [c for c in s3.calls if c.startswith("get:")]
+
+
+def test_small_file_uses_a_single_put_not_multipart():
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "small.csv", b"id,value\n1,x\n")
+        s3 = FakeS3(checksum_capable=True)
+        _publish(s3, transport_id_files=[("data", data)])
+        assert not any(c.startswith("create_mpu:") for c in s3.calls)
+        assert any(c.startswith("put:") for c in s3.calls)
+
+
+def test_large_file_at_or_above_the_threshold_uses_multipart():
+    with tempfile.TemporaryDirectory() as folder:
+        body = bytes(range(256)) * 2  # 512 bytes, well above the 100-byte
+                                       # threshold and > 4 parts at 64 bytes
+        data = _write(folder, "big.csv", body)
+        s3 = FakeS3(checksum_capable=True)
+        result = _publish(s3, transport_id_files=[("data", data)], upload=_TINY_MPU)
+        assert any(c.startswith("create_mpu:") for c in s3.calls)
+        assert any(c.startswith("complete_mpu:") for c in s3.calls)
+        assert sum(1 for c in s3.calls if "upload_part:" in c) == 8  # 512/64
+        assert result.files[0].bytes == len(body)
+        assert result.files[0].sha256 == hashlib.sha256(body).hexdigest()
+        # never loads the whole file at once: parts are read/uploaded in
+        # 64-byte pieces, not one 512-byte read -- the multipart path was
+        # actually exercised, not silently a single PUT in disguise.
+        assert not any(c.startswith("put:") and c.endswith("big.csv")
+                      for c in s3.calls)
+
+
+def test_multipart_data_matches_a_single_put_of_the_same_bytes():
+    body = bytes((i * 7) % 256 for i in range(500))
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "positions.csv", body)
+        s3 = FakeS3(checksum_capable=True)
+        result = _publish(s3, transport_id_files=[("data", data)], upload=_TINY_MPU)
+        stored_body, _ = s3.objects[result.files[0].object_key]
+        assert stored_body == body
+
+
+def test_checksum_capable_backend_skips_the_post_upload_get_for_a_small_file():
+    """The headline fix: a freshly-uploaded object is never downloaded again
+    when the backend can prove its content with a checksum instead."""
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "positions.csv", b"id,value\n1,x\n" * 100)
+        s3 = FakeS3(checksum_capable=True)
+        _publish(s3, transport_id_files=[("data", data)])
+        assert _get_calls(s3) == []
+
+
+def test_checksum_capable_backend_skips_the_post_upload_get_for_a_large_file():
+    with tempfile.TemporaryDirectory() as folder:
+        body = bytes((i * 3) % 256 for i in range(500))
+        data = _write(folder, "big.csv", body)
+        s3 = FakeS3(checksum_capable=True)
+        _publish(s3, transport_id_files=[("data", data)], upload=_TINY_MPU)
+        assert _get_calls(s3) == []
+
+
+def test_checksum_incapable_backend_falls_back_to_a_full_download():
+    """The original, always-correct guarantee for any backend that does not
+    support checksums -- FakeS3()'s default."""
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "positions.csv", b"id,value\n1,x\n")
+        s3 = FakeS3()  # checksum_capable=False
+        _publish(s3, transport_id_files=[("data", data)])
+        assert len(_get_calls(s3)) == 1
+
+
+def test_full_download_mode_always_downloads_even_when_checksums_are_available():
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "positions.csv", b"id,value\n1,x\n")
+        s3 = FakeS3(checksum_capable=True)
+        _publish(s3, transport_id_files=[("data", data)],
+                upload=UploadTuning(checksum_mode="full_download"))
+        assert len(_get_calls(s3)) == 1
+
+
+def test_reusing_an_already_published_checksum_capable_object_avoids_a_get():
+    """A retry still reads the (tiny) marker JSON to compare against -- that
+    GET is unrelated to this fix. What must not happen is a GET of the
+    (potentially multi-GB) DATA object itself, which is what the old code
+    did unconditionally on every retry."""
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "positions.csv", b"id,value\n1,x\n" * 50)
+        s3 = FakeS3(checksum_capable=True)
+        _publish(s3, transport_id_files=[("data", data)],
+                uploaded_at="2026-09-22T01:14:22Z")
+        call_count_before = len(s3.calls)
+        _publish(s3, transport_id_files=[("data", data)],
+                uploaded_at="2026-09-23T00:00:00Z")
+        assert not any(c.startswith("get:") and c.endswith("positions.csv")
+                      for c in s3.calls[call_count_before:])
+
+
+def test_zero_byte_control_file_uses_single_put():
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "positions.csv", b"id,value\n1,x\n")
+        control = _write(folder, "positions.ctl", b"")
+        s3 = FakeS3(checksum_capable=True)
+        result = _publish(s3, transport_id_files=[("data", data), ("control", control)])
+        control_file = result.control_files[0]
+        assert control_file.bytes == 0
+        assert control_file.sha256 == hashlib.sha256(b"").hexdigest()
+        assert not any(c.startswith("create_mpu:") for c in s3.calls)
+
+
+# ---------------------------------------------- multipart failure/recovery
+class _FailingPartS3(FakeS3):
+    """Fails one specific part upload, to exercise abort-on-failure."""
+
+    def __init__(self, fail_on_part: int) -> None:
+        super().__init__(checksum_capable=True)
+        self._fail_on_part = fail_on_part
+
+    def upload_part(self, Bucket, Key, PartNumber, UploadId, Body,  # noqa: N803
+                    ChecksumAlgorithm=""):                           # noqa: N803
+        if PartNumber == self._fail_on_part:
+            raise RuntimeError("simulated network failure")
+        return super().upload_part(Bucket=Bucket, Key=Key, PartNumber=PartNumber,
+                                   UploadId=UploadId, Body=Body,
+                                   ChecksumAlgorithm=ChecksumAlgorithm)
+
+
+def test_multipart_failure_aborts_the_upload_and_leaves_no_object():
+    with tempfile.TemporaryDirectory() as folder:
+        body = bytes((i * 5) % 256 for i in range(500))
+        data = _write(folder, "big.csv", body)
+        s3 = _FailingPartS3(fail_on_part=3)
+        try:
+            _publish(s3, transport_id_files=[("data", data)], upload=_TINY_MPU)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected the simulated failure to propagate")
+        assert any(c.startswith("abort_mpu:") for c in s3.calls)
+        assert s3.objects == {}
+        assert s3._uploads == {}
+
+
+def test_a_retry_after_a_failed_multipart_upload_starts_a_fresh_one():
+    """An aborted multipart upload leaves no object; a retry is a normal
+    fresh publish, not confused with a completed one."""
+    with tempfile.TemporaryDirectory() as folder:
+        body = bytes((i * 5) % 256 for i in range(500))
+        data = _write(folder, "big.csv", body)
+        s3 = _FailingPartS3(fail_on_part=999)  # never actually fails
+        result = _publish(s3, transport_id_files=[("data", data)], upload=_TINY_MPU)
+        assert result.files[0].bytes == len(body)
+
+
+def test_multipart_create_only_race_loser_verifies_and_reuses_identical_evidence():
+    """Mirrors the single-PUT create-only race, but for the multipart
+    CompleteMultipartUpload call -- confirmed against real MinIO to honour
+    IfNoneMatch there exactly the same way. See docs/TRANSPORT-CONTRACT.md,
+    'Multipart create-only race semantics'."""
+    body = bytes((i * 11) % 256 for i in range(500))
+
+    class _RacingMpuS3(FakeS3):
+        def __init__(self) -> None:
+            super().__init__(checksum_capable=True)
+            self._raced = False
+
+        def complete_multipart_upload(self, Bucket, Key, UploadId,   # noqa: N803
+                                      MultipartUpload, IfNoneMatch=""):  # noqa: N803
+            if not self._raced and IfNoneMatch == "*":
+                self._raced = True
+                # another publisher wins the race with the SAME bytes
+                self.objects[Key] = (body, datetime.datetime.now(datetime.timezone.utc))
+                if self.checksum_capable:
+                    self.checksums[Key] = _b64(body)
+                del self._uploads[UploadId]
+                raise PreconditionFailed(Key)
+            return super().complete_multipart_upload(
+                Bucket=Bucket, Key=Key, UploadId=UploadId,
+                MultipartUpload=MultipartUpload, IfNoneMatch=IfNoneMatch)
+
+    with tempfile.TemporaryDirectory() as folder:
+        data = _write(folder, "big.csv", body)
+        s3 = _RacingMpuS3()
+        result = _publish(s3, transport_id_files=[("data", data)], upload=_TINY_MPU)
+        assert result.files[0].bytes == len(body)
+        assert result.files[0].sha256 == hashlib.sha256(body).hexdigest()
+
+
+def _b64(body: bytes) -> str:
+    return base64.b64encode(hashlib.sha256(body).digest()).decode()
+
+
+# ------------------------------------------------------- source mutation
+def test_source_file_modified_after_being_read_fails_safe():
+    """publish_object()'s mutation guard: a source rewritten between the
+    stat() taken before publication and the one taken after it must not
+    reach _COMPLETE.json. Exercised directly against storage._guard_mutation
+    with a real file and a real stat() -- the alternative, racing a second
+    thread against the exact read window of a real upload, would make this
+    test's timing rather than the guard's logic the thing under test."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = _write(folder, "positions.csv", b"original content")
+        initial_stat = path.stat()
+        path.write_bytes(b"rewritten content, different size")
+        _fails(lambda: _storage._guard_mutation(
+                  path, initial_stat, len(b"original content"),
+                  "transport dcm-1234-849217"),
+              TransportSourceMutatedError, "modified during publication")
+
+
+def test_source_file_truncated_mid_read_fails_safe():
+    """bytes actually streamed disagreeing with the pre-read stat is
+    detected even before the post-read stat comparison."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = _write(folder, "positions.csv", b"twenty bytes long!!!")
+        initial_stat = path.stat()
+        _fails(lambda: _storage._guard_mutation(
+                  path, initial_stat, len(b"twenty bytes long!!!") - 5,
+                  "transport dcm-1234-849217"),
+              TransportSourceMutatedError, "changed during publication")
+
+
+def test_publish_transport_result_reports_multipart_publish_from_scratch():
+    with tempfile.TemporaryDirectory() as folder:
+        body = bytes((i * 13) % 256 for i in range(500))
+        data = _write(folder, "big.csv", body)
+        s3 = FakeS3(checksum_capable=True)
+        result = publish_transport_result(
+            legacy_feed_id="1234", producer_run_id="849217",
+            cob_date="2026-09-21", source_system="RISK_ENGINE_X",
+            source_observed_at="2026-09-22T01:13:00Z",
+            files=[("data", data)], client=s3, bucket="lakehouse",
+            upload=_TINY_MPU)
+        assert result.newly_published is True
+        assert result.transport.files[0].bytes == len(body)
+
+
 # --------------------------------------------------------------------- CLI
 def _sample_transport() -> Transport:
     return Transport(
@@ -396,6 +642,7 @@ def test_cli_maps_error_types_to_distinct_documented_exit_codes():
         (TransportConflictError("conflict"), cli.EXIT_CONFLICT),
         (TransportEvidenceError("missing object"), cli.EXIT_EVIDENCE),
         (TransportStorageError("no route to host"), cli.EXIT_STORAGE),
+        (TransportSourceMutatedError("source changed"), cli.EXIT_SOURCE_MUTATED),
     ]
     with tempfile.TemporaryDirectory() as folder:
         data = _write(folder, "p.csv", b"1,2\n")
