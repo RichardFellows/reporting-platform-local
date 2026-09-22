@@ -597,6 +597,15 @@ def nessie_gc(dry_run: bool = False) -> dict:
     # `--uri` is a mark-live option ONLY. `sweep` does not accept it and exits
     # 2 if given it -- it works from the stored live-set, not from Nessie.
     nessie_uri = ["--uri", settings.nessie_uri()]
+    # nessie-gc takes its own client options, and passing a bearer token to
+    # it has never been run. It deletes data, so under BEARER it REFUSES
+    # rather than trying flags nobody has seen work.
+    # See docs/DECISIONS.md#nessie-auth-is-a-setting
+    if settings.nessie_auth_type() != "NONE":
+        raise RuntimeError(
+            f"NESSIE_AUTH_TYPE is {settings.nessie_auth_type()}, and nessie-gc "
+            f"has not been wired for Nessie auth. Refusing to run GC rather "
+            f"than run it unauthenticated or with untried options.")
     fileio = _gc_fileio()
 
     result: dict = {"cutoff": cutoff, "dry_run": dry_run}

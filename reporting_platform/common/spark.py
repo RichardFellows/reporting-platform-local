@@ -20,19 +20,11 @@ from urllib.parse import urlparse
 from reporting_platform.common import settings
 from reporting_platform.common.settings import CATALOG
 
-def spark_session(app_name: str, ref: str = "main"):
-    """Build a Spark session bound to the Nessie catalog at a given ref.
-
-    `ref` is the Nessie branch. Ingest and dbt builds run on a working branch;
-    maintenance and snapshot expiry run on main.
-
-    THE SESSION IS A CLIENT OF THE STANDALONE CLUSTER, never local[*]. The
-    caller's process is the driver; every task runs in an executor on
-    `spark-worker`. See the `master` handling below for why there is no
-    local fallback.
+def session_conf(app_name: str, ref: str = "main") -> tuple[str, dict[str, str]]:
+    """(master, every .config pair) for a session bound to the Nessie catalog
+    at `ref`. Pure -- no JVM -- so what a session WOULD be is testable, in
+    both execution modes, without starting one.
     """
-    from pyspark.sql import SparkSession
-
     endpoint = settings.s3_endpoint()
     warehouse = settings.warehouse()
     nessie_uri = settings.nessie_uri()
@@ -56,6 +48,15 @@ def spark_session(app_name: str, ref: str = "main"):
             f"silently bypasses it. Point SPARK_MASTER at the cluster "
             f"(spark://spark-master:7077)."
         )
+    kubernetes = settings.execution() == "kubernetes"
+    if kubernetes != master.startswith("k8s://"):
+        # The two must agree, or a cluster runs its executors somewhere its
+        # execution mode does not describe -- or a laptop tries to reach an
+        # API server. See docs/DECISIONS.md#execution-mode-is-configuration
+        raise RuntimeError(
+            f"PLATFORM_EXECUTION is {settings.execution()!r} but SPARK_MASTER "
+            f"is {master!r}. `kubernetes` needs a k8s:// master and `local` "
+            f"must not have one.")
 
     # `pyspark` here is the pip-installed runtime baked into
     # Dockerfile.airflow, and it is the DRIVER. It has NONE of the
@@ -85,19 +86,15 @@ def spark_session(app_name: str, ref: str = "main"):
             f"pointing this at another copy -- their versions must equal "
             f"Dockerfile.spark's.")
 
-    builder = (
-        SparkSession.builder.appName(app_name)
-        .master(master)
-        .config("spark.jars", jars)
+    cores = os.environ.get("SPARK_APP_CORES", "2")
+    conf = {
+        "spark.app.name": app_name,
+        "spark.jars": jars,
         # The driver does no task work, so it needs far less heap than a
         # local[*] session would -- but not the 1g default, which is tight once
         # Iceberg/Nessie/aws-sdk-bundle classes are loaded and exercised.
-        .config("spark.driver.memory", "2g")
-        .config("spark.driver.maxResultSize", "1g")
-        # spark.driver.host is left at its default: Spark advertises this
-        # container's hostname and Docker's embedded DNS resolves it from
-        # spark-worker, so executors can call back. Verified live.
-        #
+        "spark.driver.memory": "2g",
+        "spark.driver.maxResultSize": "1g",
         # CAP THE APP so one job cannot take the whole cluster. Standalone mode
         # grants an application every free core by default and holds them until
         # it stops; two overlapping jobs would leave the second waiting forever
@@ -105,35 +102,84 @@ def spark_session(app_name: str, ref: str = "main"):
         # WRITERS -- this is what keeps read-only jobs outside that pool from
         # colliding. Sized against SPARK_WORKER_CORES/SPARK_WORKER_MEMORY:
         # three concurrent applications fit.
-        .config("spark.cores.max", os.environ.get("SPARK_APP_CORES", "2"))
-        .config("spark.executor.cores", os.environ.get("SPARK_APP_CORES", "2"))
-        .config("spark.executor.memory", os.environ.get("SPARK_APP_MEMORY", "2g"))
-        .config(
-            # ORDER MATTERS. Each extension injects a parser wrapping the
-            # previous one, so the LAST listed ends up outermost. Iceberg's
-            # `rewrite_data_files(strategy => 'sort', sort_order => ...)`
-            # checks `parser instanceof ExtendedParser`; with Nessie last it
-            # fails with "Cannot parse order: parser is not an Iceberg
-            # ExtendedParser", which broke maintenance on every
-            # prepared/reporting table. Nessie first, Iceberg last.
-            "spark.sql.extensions",
+        "spark.cores.max": cores,
+        "spark.executor.cores": cores,
+        "spark.executor.memory": os.environ.get("SPARK_APP_MEMORY", "2g"),
+        # ORDER MATTERS. Each extension injects a parser wrapping the
+        # previous one, so the LAST listed ends up outermost. Iceberg's
+        # `rewrite_data_files(strategy => 'sort', sort_order => ...)`
+        # checks `parser instanceof ExtendedParser`; with Nessie last it
+        # fails with "Cannot parse order: parser is not an Iceberg
+        # ExtendedParser", which broke maintenance on every
+        # prepared/reporting table. Nessie first, Iceberg last.
+        "spark.sql.extensions":
             "org.projectnessie.spark.extensions.NessieSparkSessionExtensions,"
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-        )
-        .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
-        .config(f"spark.sql.catalog.{CATALOG}.catalog-impl",
-                "org.apache.iceberg.nessie.NessieCatalog")
-        .config(f"spark.sql.catalog.{CATALOG}.uri", nessie_uri)
-        .config(f"spark.sql.catalog.{CATALOG}.ref", ref)
-        .config(f"spark.sql.catalog.{CATALOG}.authentication.type", "NONE")
-        .config(f"spark.sql.catalog.{CATALOG}.warehouse", warehouse)
-        .config(f"spark.sql.catalog.{CATALOG}.io-impl",
-                "org.apache.iceberg.aws.s3.S3FileIO")
-        .config(f"spark.sql.catalog.{CATALOG}.s3.endpoint", endpoint)
-        .config(f"spark.sql.catalog.{CATALOG}.s3.path-style-access", "true")
-        .config("spark.hadoop.fs.s3a.endpoint", endpoint)
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", s3_ssl_enabled)
-        .config("spark.sql.session.timeZone", "UTC")
-    )
+        f"spark.sql.catalog.{CATALOG}": "org.apache.iceberg.spark.SparkCatalog",
+        f"spark.sql.catalog.{CATALOG}.catalog-impl":
+            "org.apache.iceberg.nessie.NessieCatalog",
+        f"spark.sql.catalog.{CATALOG}.uri": nessie_uri,
+        f"spark.sql.catalog.{CATALOG}.ref": ref,
+        # See docs/DECISIONS.md#nessie-auth-is-a-setting
+        f"spark.sql.catalog.{CATALOG}.authentication.type":
+            settings.nessie_auth_type(),
+        f"spark.sql.catalog.{CATALOG}.warehouse": warehouse,
+        f"spark.sql.catalog.{CATALOG}.io-impl":
+            "org.apache.iceberg.aws.s3.S3FileIO",
+        f"spark.sql.catalog.{CATALOG}.s3.endpoint": endpoint,
+        f"spark.sql.catalog.{CATALOG}.s3.path-style-access": "true",
+        "spark.hadoop.fs.s3a.endpoint": endpoint,
+        "spark.hadoop.fs.s3a.path.style.access": "true",
+        "spark.hadoop.fs.s3a.connection.ssl.enabled": s3_ssl_enabled,
+        "spark.sql.session.timeZone": "UTC",
+    }
+    token = settings.nessie_auth_token()
+    if token:
+        conf[f"spark.sql.catalog.{CATALOG}.authentication.token"] = token
+
+    if kubernetes:
+        # EXECUTORS AS PODS, the driver where this process is: in its own pod
+        # when `_spark_task.run` launched it, in the Airflow task's pod for a
+        # dbt build. Client mode, so the executors call back to THIS pod,
+        # which is why its IP -- from the downward API, set by the pod spec
+        # `_spark_task` builds and by the chart -- is required rather than
+        # guessed. spark.cores.max means nothing here; instances x cores is
+        # the same 2-core cap. See docs/DECISIONS.md#execution-mode-is-configuration
+        pod_ip = os.environ.get("POD_IP", "").strip()
+        if not pod_ip:
+            raise RuntimeError(
+                "PLATFORM_EXECUTION is 'kubernetes' and POD_IP is not set, so "
+                "executors cannot call this driver back. The pod spec sets it "
+                "from the downward API (status.podIP).")
+        conf.pop("spark.cores.max")
+        conf.update({
+            "spark.kubernetes.namespace": settings.kubernetes("SPARK_K8S_NAMESPACE"),
+            "spark.kubernetes.container.image":
+                settings.kubernetes("SPARK_EXECUTOR_IMAGE"),
+            "spark.kubernetes.authenticate.driver.serviceAccountName":
+                settings.kubernetes("SPARK_SERVICE_ACCOUNT"),
+            "spark.executor.instances": os.environ.get("SPARK_APP_EXECUTORS", "1"),
+            "spark.driver.host": pod_ip,
+            "spark.driver.bindAddress": "0.0.0.0",
+        })
+    return master, conf
+
+
+def spark_session(app_name: str, ref: str = "main"):
+    """Build a Spark session bound to the Nessie catalog at a given ref.
+
+    `ref` is the Nessie branch. Ingest and dbt builds run on a working branch;
+    maintenance and snapshot expiry run on main.
+
+    THE SESSION IS A CLIENT OF A CLUSTER, never local[*]. The caller's
+    process is the driver; every task runs in an executor -- on
+    `spark-worker` locally, in executor pods on Kubernetes. What it is
+    configured with is `session_conf()`.
+    """
+    from pyspark.sql import SparkSession
+
+    master, conf = session_conf(app_name, ref)
+    builder = SparkSession.builder.master(master)
+    for key, value in conf.items():
+        builder = builder.config(key, value)
     return builder.getOrCreate()

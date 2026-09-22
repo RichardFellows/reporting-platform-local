@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import sys
 
 
@@ -77,9 +78,11 @@ def _check() -> int:
     from reporting_platform.common.context import conventions, feeds
     unset = settings.missing()
     if unset:
-        print(f"REPORTING_ENV is {settings.env()!r} and these required "
-              f"settings are unset: {', '.join(unset)}. Only `local` has "
-              f"defaults.", file=sys.stderr)
+        print(f"REPORTING_ENV is {settings.env()!r}, PLATFORM_EXECUTION is "
+              f"{os.environ.get('PLATFORM_EXECUTION', 'local')!r}, and these "
+              f"required settings are unset or invalid: {', '.join(unset)}. "
+              f"Only the endpoints have defaults, and only in `local`.",
+              file=sys.stderr)
         return 1
     try:
         registry, known = feeds(), conventions()

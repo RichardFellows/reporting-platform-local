@@ -97,10 +97,19 @@ to run something for the first time, expect it to fail and read what it says.
   never a code change. (`#s3-ssl-follows-the-endpoint-scheme`)
 - **`conf/spark-defaults.conf` holds only what is the same everywhere** — the
   cluster image ships it, so a host, TLS switch or credential source there is
-  one the cluster inherits. `spark_ocp` reads every per-environment key via
-  `env_var()`, like `spark_local`; `tests/test_spark_config.py` enforces
-  both. A bare `spark-sql` in spark-master no longer knows the catalog: use
+  one the cluster inherits. `spark_ocp` merges every `spark_local` key (a
+  YAML anchor) and reads each per-environment one via `env_var()`;
+  `tests/test_spark_config.py` enforces both. A bare `spark-sql` in spark-master no longer knows the catalog: use
   `scripts/spark-sql`. (`#spark-defaults-hold-only-invariants`)
+- **`PLATFORM_EXECUTION=local|kubernetes` decides where a Spark driver
+  runs**, and `_spark_task.run` is the only launcher. In `kubernetes` it
+  starts the driver as a POD (same module, same args, same JSON) with
+  executors as pods. **dbt keeps its driver in the task (Cosmos LOCAL) in both
+  modes**, because the artifact archive and the publish gate read its
+  `target/` locally; `spark_ocp` only moves its executors. A new function in
+  `common/` needs the SCHEDULER restarted too: LocalExecutor forks tasks from
+  it, and a stale module fails with `has no attribute`.
+  (`#execution-mode-is-configuration`)
 - **Spark inside an Airflow task must go through `scripts/_spark_task.py`** (a
   subprocess), or the JVM keeps the task process alive, heartbeats stop and the
   scheduler zombie-reaps it. The *driver* lives in that process, so this holds
@@ -140,7 +149,8 @@ to run something for the first time, expect it to fail and read what it says.
   release-image` prints `PLATFORM_CODE_REF` (the image digest) and
   `DBT_PROJECT_DIGEST`. (`#the-release-image-carries-the-code`)
 - **`airflow-init` does five things**: db migrate, admin user, `pools set
-  lakehouse_write 1`, the registry schema, `dbt deps`. Without packages,
+  lakehouse_write ${LAKEHOUSE_WRITE_SLOTS:-1}` (above 1 it EXCLUDES NOTHING,
+  `#one-shared-write-pool`), the registry schema, `dbt deps`. Without packages,
   `dbt ls` cannot compile a `dbt_utils` test and the two build DAGs do not
   *import*. (`#airflow-init-load-bearing-steps`)
 - **dbt's three working directories live under `/opt/platform/run`, not the

@@ -121,6 +121,13 @@ PROJECT_CONFIG = ProjectConfig(
 )
 
 EXECUTION_CONFIG = ExecutionConfig(
+    # LOCAL IN BOTH EXECUTION MODES, deliberately. With PLATFORM_EXECUTION=
+    # kubernetes the dbt child process is still the driver, here in the task's
+    # pod; spark_ocp gives it a k8s:// master, so only the EXECUTORS move to
+    # pods. Cosmos's KUBERNETES mode would run dbt in another pod, where
+    # `_archive_dbt_artifacts` below cannot read its target/ -- and `publish`
+    # refuses to merge a build whose artifacts it cannot verify.
+    # See docs/DECISIONS.md#execution-mode-is-configuration
     execution_mode=ExecutionMode.LOCAL,
     # LOAD-BEARING: DBT_RUNNER would leave a JVM inside the task process and the
     # scheduler would zombie-reap it.

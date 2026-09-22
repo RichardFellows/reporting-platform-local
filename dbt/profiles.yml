@@ -21,7 +21,9 @@ reporting_platform:
       # addressed by spark.master below.
       host: spark-master
       threads: 4
-      server_side_parameters:
+      # ANCHORED: spark_ocp merges every one of these and overrides only what
+      # differs on Kubernetes, so the two targets cannot drift apart.
+      server_side_parameters: &spark_params
         # What puts the build on the cluster. Must not diverge from SPARK_MASTER
         # in docker-compose.yml. See docs/DECISIONS.md#spark-master-single-source
         spark.master: "{{ env_var('SPARK_MASTER', 'spark://spark-master:7077') }}"
@@ -38,7 +40,12 @@ reporting_platform:
         # THE THREAD THAT MAKES THIS A BRANCH BUILD -- the Airflow task injects
         # nessie_ref, and without it dbt writes to main.
         spark.sql.catalog.lakehouse.ref: "{{ var('nessie_ref', 'main') }}"
-        spark.sql.catalog.lakehouse.authentication.type: NONE
+        # NONE by default in every environment -- the shared Nessie has no auth
+        # today. The token's DBT_ENV_SECRET_ prefix keeps it out of dbt's logs;
+        # an empty token is ignored under NONE. Same settings spark_session()
+        # reads. See docs/DECISIONS.md#nessie-auth-is-a-setting
+        spark.sql.catalog.lakehouse.authentication.type: "{{ env_var('NESSIE_AUTH_TYPE', 'NONE') | upper }}"
+        spark.sql.catalog.lakehouse.authentication.token: "{{ env_var('DBT_ENV_SECRET_NESSIE_AUTH_TOKEN', '') }}"
         spark.sql.catalog.lakehouse.warehouse: "{{ env_var('REPORTING_WAREHOUSE') }}"
         spark.sql.catalog.lakehouse.io-impl: org.apache.iceberg.aws.s3.S3FileIO
         spark.sql.catalog.lakehouse.s3.endpoint: "{{ env_var('S3_ENDPOINT') }}"
@@ -59,15 +66,16 @@ reporting_platform:
         spark.executor.cores: "2"
         spark.executor.memory: 2g
 
-    # The cluster target: the same in-process SparkSession, in a driver pod that
-    # spark-submit created for this build. The pod's image ships
-    # conf/spark-defaults.conf, which holds ONLY the keys that are the same
-    # everywhere (extensions, catalog and io impls, timezone, AQE, Kryo); every
-    # value that differs per environment is here, from env_var(), exactly as
-    # spark_local reads it. No jars (the image bakes them) and no master
-    # (spark-submit set it). STILL UNPROVEN -- no cluster has ever run it.
-    # See docs/DECISIONS.md#dbt-spark-session-mode,
-    # docs/DECISIONS.md#spark-defaults-hold-only-invariants
+    # The cluster target: the same in-process SparkSession, as the child
+    # process of a Cosmos task in the Airflow task's own pod -- Cosmos stays
+    # LOCAL + SUBPROCESS on Kubernetes too, because its artifact archive and
+    # the publish gate read dbt's target/ from that pod's filesystem. So this
+    # is spark_local exactly, merged below, with a k8s:// master and the keys
+    # that put the EXECUTORS in pods. Nothing here comes from
+    # conf/spark-defaults.conf: this driver runs in the platform image, which
+    # does not have it. STILL UNPROVEN -- no cluster has ever run it.
+    # See docs/DECISIONS.md#execution-mode-is-configuration,
+    # docs/DECISIONS.md#dbt-spark-session-mode
     spark_ocp:
       type: spark
       method: session
@@ -76,14 +84,17 @@ reporting_platform:
       schema: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
       threads: 8
       server_side_parameters:
-        spark.sql.catalog.lakehouse.uri: "{{ env_var('NESSIE_URI') }}"
-        spark.sql.catalog.lakehouse.ref: "{{ var('nessie_ref', 'main') }}"
-        spark.sql.catalog.lakehouse.authentication.type: NONE
-        spark.sql.catalog.lakehouse.warehouse: "{{ env_var('REPORTING_WAREHOUSE') }}"
-        spark.sql.catalog.lakehouse.s3.endpoint: "{{ env_var('S3_ENDPOINT') }}"
-        spark.sql.catalog.lakehouse.s3.path-style-access: "true"
-        spark.hadoop.fs.s3a.endpoint: "{{ env_var('S3_ENDPOINT') }}"
-        spark.hadoop.fs.s3a.path.style.access: "true"
-        # Same derivation as spark_local and spark_session(). See
-        # docs/DECISIONS.md#s3-ssl-follows-the-endpoint-scheme
-        spark.hadoop.fs.s3a.connection.ssl.enabled: "{{ 'true' if env_var('S3_ENDPOINT').startswith('https://') else 'false' }}"
+        <<: *spark_params
+        # NO DEFAULT: the k8s:// API server, e.g.
+        # k8s://https://kubernetes.default.svc:443. spark_session() refuses a
+        # k8s master whose PLATFORM_EXECUTION is not `kubernetes`, and the
+        # reverse.
+        spark.master: "{{ env_var('SPARK_MASTER') }}"
+        spark.kubernetes.namespace: "{{ env_var('SPARK_K8S_NAMESPACE') }}"
+        spark.kubernetes.container.image: "{{ env_var('SPARK_EXECUTOR_IMAGE') }}"
+        spark.kubernetes.authenticate.driver.serviceAccountName: "{{ env_var('SPARK_SERVICE_ACCOUNT') }}"
+        spark.executor.instances: "{{ env_var('SPARK_APP_EXECUTORS', '1') }}"
+        # Client mode: executors call back to THIS pod, by the IP the chart
+        # sets from the downward API.
+        spark.driver.host: "{{ env_var('POD_IP') }}"
+        spark.driver.bindAddress: 0.0.0.0

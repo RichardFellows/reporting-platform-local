@@ -369,7 +369,7 @@ services:
       bash -euc "
       airflow db migrate &&
       { airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true; } &&
-      { airflow pools set lakehouse_write 1 'serialise all Iceberg writers, incl. maintenance' || true; } &&
+      { airflow pools set lakehouse_write ${LAKEHOUSE_WRITE_SLOTS:-1} 'serialise all Iceberg writers, incl. maintenance' || true; } &&
       python -m reporting_platform.registry schema &&
       dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
       "
