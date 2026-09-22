@@ -24,6 +24,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from reporting_platform.common import settings
 from reporting_platform.common.context import Feed
 from reporting_platform.ingest.arrival import find_pending, list_landing, put_landing
 
@@ -199,9 +200,11 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
     # They have no independent COB date and are never parsed as data headers.
     checked.sort(key=lambda t: (not t[3], str(t[2] or ""), t[0]))
 
-    s3 = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT"))
-    bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
-    bucket = bucket.split("//", 1)[-1].split("/", 1)[0]
+    # Was os.environ.get("S3_ENDPOINT") with NO default -- None quietly sent
+    # boto3 at real AWS instead of MinIO. settings.s3_endpoint() fixes that: it
+    # falls back to the compose default in `local` and refuses elsewhere.
+    s3 = boto3.client("s3", endpoint_url=settings.s3_endpoint())
+    bucket = settings.bucket_of(settings.landing())
     out = []
     for filename, content, cob_date, control in checked:
         key = f"{feed.landing_prefix}/{feed.name}/{filename}"

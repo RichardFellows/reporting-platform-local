@@ -89,6 +89,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
 | [spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants) | `spark-defaults.conf` ships in the cluster image, so it may hold no host, TLS switch or credential source |
 | [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
+| [settings-refuse-outside-local](#settings-refuse-outside-local) | Endpoint settings fall back to compose's hosts only when `REPORTING_ENV` is `local`; anywhere else an unset one is refused by name |
 | [spark-worker-sizing](#spark-worker-sizing) | Cap each application, or standalone mode holds every free core until the session stops |
 | [spark-in-a-subprocess](#spark-in-a-subprocess) | The JVM keeps the task process alive; heartbeats stop; the scheduler zombie-reaps it |
 | [one-session-per-chunk](#one-session-per-chunk) | `ingest()` opens and stops its own session, in a `finally` |
@@ -579,6 +580,35 @@ Locally, compose bind-mounts the file onto spark-master and spark-worker, so
 a bare `spark-sql` there no longer knows where the catalog is.
 `scripts/spark-sql` passes the per-environment values from the container's
 environment, and the README's ad hoc queries use it.
+
+## settings-refuse-outside-local
+
+About a dozen modules read `S3_ENDPOINT`, `NESSIE_URI`, `REPORTING_WAREHOUSE`
+or `REPORTING_LANDING` straight from the environment, each with the compose
+host as its default (`http://minio:9000`, `http://nessie:19120/api/v2`). On a
+cluster where one of those was left unset, the process did not fail at
+startup. It connected to a host that does not exist there, and the error
+was about a connection, not about configuration. One site
+(`ui/feeddata.py`) had no default at all: with the variable unset, boto3
+1.36 resolves `endpoint_url=None` to `https://s3.amazonaws.com` (checked in
+the feed-ui container).
+
+The reads now go through accessors in `common/settings.py`: `s3_endpoint()`,
+`nessie_uri()`, `warehouse()`, `landing()`, `registry_dsn()`. Each returns
+the compose default only when `REPORTING_ENV` is `local`; anywhere else an
+unset or empty variable raises `MissingSetting` naming it. This is the rule
+[spark-master-no-local-fallback](#spark-master-no-local-fallback) already
+applies to the master: a fallback that looks like success is worse than a
+refusal. `REGISTRY_DSN` keeps its stricter rule and has no default even
+locally.
+
+`python -m reporting_platform.config check` calls `settings.missing()`, so a
+deployment missing a setting fails at the cheapest seam there is, before any
+task runs. It reports nothing in `local`, because the cheap CI tier runs
+there with no registry. `tests/test_settings.py` fails if a direct
+`os.environ` read of one of these names appears outside `settings.py`.
+`reporting_transport/` is exempt: it imports nothing from the platform on
+purpose, and it already has no defaults.
 
 ## spark-worker-sizing
 

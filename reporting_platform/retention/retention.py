@@ -33,6 +33,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
+from reporting_platform.common import settings
 from reporting_platform.common.calendar_rules import expire_set
 from reporting_platform.common.context import (
     CATALOG, ENV, Nessie, all_snapshot_retention_days, class_keep_years,
@@ -529,7 +530,7 @@ def _gc_fileio() -> list[str]:
     `sweep` and `deferred-deletes` delete files and need this; `mark-live`
     only walks the commit graph and does not.
     """
-    endpoint = os.environ.get("S3_ENDPOINT", "http://minio:9000")
+    endpoint = settings.s3_endpoint()
     return [
         "-I", "io-impl=org.apache.iceberg.aws.s3.S3FileIO",
         "-I", f"s3.endpoint={endpoint}",
@@ -595,8 +596,7 @@ def nessie_gc(dry_run: bool = False) -> dict:
     jdbc = _gc_jdbc(cfg)
     # `--uri` is a mark-live option ONLY. `sweep` does not accept it and exits
     # 2 if given it -- it works from the stored live-set, not from Nessie.
-    nessie_uri = ["--uri", os.environ.get("NESSIE_URI",
-                                          "http://nessie:19120/api/v2")]
+    nessie_uri = ["--uri", settings.nessie_uri()]
     fileio = _gc_fileio()
 
     result: dict = {"cutoff": cutoff, "dry_run": dry_run}

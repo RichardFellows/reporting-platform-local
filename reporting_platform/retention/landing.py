@@ -35,6 +35,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
+from reporting_platform.common import settings
 from reporting_platform.common.context import (
     Feed, class_keep_years, feeds, retention_policy,
 )
@@ -54,7 +55,7 @@ def _client():
 
     return boto3.client(
         "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT", "http://minio:9000"),
+        endpoint_url=settings.s3_endpoint(),
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
@@ -62,8 +63,7 @@ def _client():
 
 
 def _bucket() -> str:
-    warehouse = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
-    return warehouse.replace("s3a://", "").replace("s3://", "").split("/")[0]
+    return settings.bucket_of(settings.warehouse())
 
 
 def keep_years(feed: Feed | None = None) -> int:

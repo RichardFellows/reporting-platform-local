@@ -71,6 +71,12 @@ to run something for the first time, expect it to fail and read what it says.
   `DBT_TARGET`): only the Spark path can address a Nessie branch. DuckDB is a
   read-only query tool (`scripts/duckdb_console.py`).
   (`#duckdb-is-not-an-engine`)
+- **Endpoints come from `common/settings.py` accessors, and fall back to the
+  compose hosts ONLY when `REPORTING_ENV=local`** — `s3_endpoint()`,
+  `nessie_uri()`, `warehouse()`, `landing()`, `registry_dsn()`. Anywhere else an
+  unset one raises naming the variable, and `config check` exits 1. A direct
+  `os.environ` read of one fails `tests/test_settings.py`.
+  (`#settings-refuse-outside-local`)
 - **`spark_session()` is in `common/spark.py` and `Nessie` in
   `common/nessie.py`**, both RE-EXPORTED from `common/context.py` — every
   existing import still works, and reading `feeds.yml` no longer drags an
