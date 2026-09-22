@@ -84,6 +84,11 @@ to run something for the first time, expect it to fail and read what it says.
   free core and the next job waits forever instead of failing.
   <http://localhost:8080>. (`#spark-master-single-source`,
   `#spark-worker-sizing`)
+- **S3 TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env
+  var** — `https://` turns on `fs.s3a.connection.ssl.enabled`, in both
+  `spark_session()` and `dbt/profiles.yml`'s `spark_local` target. Pointing
+  at a real TLS-terminated S3-compatible store needs only the URL changed,
+  never a code change. (`#s3-ssl-follows-the-endpoint-scheme`)
 - **Spark inside an Airflow task must go through `scripts/_spark_task.py`** (a
   subprocess), or the JVM keeps the task process alive, heartbeats stop and the
   scheduler zombie-reaps it. The *driver* lives in that process, so this holds

@@ -15,6 +15,7 @@ that; see docs/DECISIONS.md#spark-master-single-source.
 from __future__ import annotations
 
 import os
+from urllib.parse import urlparse
 
 from reporting_platform.common.settings import CATALOG
 
@@ -34,6 +35,13 @@ def spark_session(app_name: str, ref: str = "main"):
     endpoint = os.environ.get("S3_ENDPOINT", "http://minio:9000")
     warehouse = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
     nessie_uri = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")
+    # Hadoop's S3A connector does not infer TLS from the endpoint URL's own
+    # scheme -- it has a separate switch, and it used to be hardcoded off
+    # (fine for MinIO in http-only compose). A second env var for this would
+    # just be one more thing to keep in sync with S3_ENDPOINT, so it derives
+    # from the same URL instead: https:// turns it on. See
+    # docs/DECISIONS.md#s3-ssl-follows-the-endpoint-scheme.
+    s3_ssl_enabled = "true" if urlparse(endpoint).scheme == "https" else "false"
 
     # No local[*] fallback, deliberately: running in-container is a config
     # error that LOOKS like success. The default below matches
@@ -124,7 +132,7 @@ def spark_session(app_name: str, ref: str = "main"):
         .config(f"spark.sql.catalog.{CATALOG}.s3.path-style-access", "true")
         .config("spark.hadoop.fs.s3a.endpoint", endpoint)
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", s3_ssl_enabled)
         .config("spark.sql.session.timeZone", "UTC")
     )
     return builder.getOrCreate()
