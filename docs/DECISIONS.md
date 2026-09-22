@@ -497,23 +497,36 @@ after the one that changed — put it higher and editing a directory list costs 
 full reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
 whatever registry mirror is in front of pip. Nothing below it depends on it.
 
+`Dockerfile.spark` has the same layer, last for the same reason, and it
+learned the other half of the rule the hard way. **Own the directories as the
+image's user, in group 0 (`spark:0`, like `airflow:0`), not as root.** Group 0
+with `g+rwX` serves an arbitrary OpenShift UID, but compose runs the image's
+own `spark` user (uid 185), which is not in group 0. With root-owned
+directories every executor launch failed with `java.io.IOException: Failed to
+create directory /opt/spark/work/app-...`, and the driver reported
+`Master removed our application: FAILED`, and then the misleading
+`spark.sql.catalog.lakehouse is not defined`, because the session was
+half-dead. The layer passed a random-UID check and failed the default user,
+so check both.
+
 ## images-build-from-a-mirror
 
 The corporate build has egress only to an internal mirror, so every external
 URL a Dockerfile fetches must be a build ARG whose DEFAULT is today's public
 value — the mirror then only sets build args, never edits a Dockerfile. Five:
-`MAVEN_REPO` (`Dockerfile.spark`'s jars), `NESSIE_GC_URL` and
+`MAVEN_REPO` (the executor jars in `Dockerfile.spark` and the driver jars in
+`Dockerfile.airflow`, [driver-jars-are-baked](#driver-jars-are-baked)), `NESSIE_GC_URL` and
 `AIRFLOW_CONSTRAINTS_URL` (`Dockerfile.airflow`), `MARQUEZ_SOURCE_URL`
 (both Marquez images), `NPM_REGISTRY` (`Dockerfile.marquez-web`, told to
 every npm invocation, since an ARG is not itself an npm setting).
 `tests/test_offline_build.py` is the gate: a URL literal inside a
 RUN/COPY/ADD, including a continuation line, fails naming file:line.
 
-Two things this does NOT cover. `pip install` resolves through `pip.conf` /
-SSL cert config injected at build time in the corporate environment (see
-`Dockerfile.airflow`'s comment above the provider install) — no ARG needed,
-because pip's own resolution already goes through whatever index that config
-points at. And `FROM` base images are the deploying fork's concern, not this
+Two things this does NOT cover. `pip install` and `apt-get` resolve through
+`pip.conf`, apt sources and SSL cert config injected at build time in the
+corporate environment (see `Dockerfile.airflow`'s comment above the provider
+install) — no ARG needed, because their own resolution already goes through
+whatever index that config points at. And `FROM` base images are the deploying fork's concern, not this
 repo's: swapping `apache/airflow`, `apache/spark` or the UBI bases for
 mirrored copies is a registry/pull-through-cache setting, not a Dockerfile
 edit. Still NOT redirectable by anything here: `api`'s gradle build

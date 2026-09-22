@@ -17,7 +17,7 @@ ENV SCALA_VERSION=2.12
 #
 # MAVEN_REPO IS A BUILD ARG, NOT AN INLINE CONSTANT, because the corporate
 # build has egress only to an internal mirror: the mirror sets this one arg
-# and every URL below follows. Same arg name as the nessie-gc download in
+# and every URL below follows. Same arg name as the driver-jar layer in
 # Dockerfile.airflow, so a build only ever sets one Maven base for the whole
 # estate. See docs/DECISIONS.md#images-build-from-a-mirror
 ARG MAVEN_REPO=https://repo1.maven.org/maven2
@@ -45,8 +45,14 @@ ENV PYTHONPATH=/opt/platform
 # (OpenShift's restricted SCC, which picks a uid this compose file never
 # uses) can still write Spark's own work/log/ivy directories.
 # See docs/DECISIONS.md#image-permissions-layer
+#
+# OWNED BY `spark`, NOT root: the image's own user (uid 185, not in group 0)
+# is what compose runs, and a root-owned /opt/spark/work made every executor
+# launch fail with "Failed to create directory /opt/spark/work/app-..." --
+# the worker used to create these itself. `spark:0` serves both users, the
+# same arrangement as Dockerfile.airflow's `airflow:0`.
 RUN mkdir -p /opt/spark/work /opt/spark/logs /opt/spark/.ivy2 \
-    && chgrp -R 0 /opt/spark/work /opt/spark/logs /opt/spark/.ivy2 \
+    && chown -R spark:0 /opt/spark/work /opt/spark/logs /opt/spark/.ivy2 \
     && chmod -R g+rwX /opt/spark/work /opt/spark/logs /opt/spark/.ivy2
 
 USER spark
