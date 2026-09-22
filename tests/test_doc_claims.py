@@ -14,13 +14,24 @@ it:
     the code says". A message the code can no longer emit is a doc describing
     behaviour that does not exist, and it reads exactly like one that does.
 
+Two more go false the same silent way and are gated below as well:
+
+  * **the sample prepared model in `ADDING-A-FEED.md`.** It claims to be what
+    the console's scaffold emits for the `treasury_margin_call` worked
+    example. If `render_model()` changes and the doc is not regenerated, the
+    claim is false and the model builds green anyway.
+  * **an `ingest_<x>` or `lakehouse.raw.<x>` naming a feed.** Both are a DAG
+    id and a raw table name, so `<x>` must be a feed the registry has, or one
+    a worked example declares in its own `name:` -- not a stale or
+    never-existed feed left behind by a rename.
+
 WHAT IS DELIBERATELY NOT CHECKED HERE. Every backticked identifier in the docs
 was tried as a third check and abandoned: 31 candidates, of which one
 (`_promote_archive`) was genuinely stale and the rest were example feed names,
 external packages, Airflow's own API and history written as history. A gate at
 that signal-to-noise needs an allowlist longer than the check, and an allowlist
-rots the same way the docs do. The two checks below fire only on statements
-whose subject the code can be asked about by name.
+rots the same way the docs do. The checks below fire only on statements whose
+subject the code can be asked about by name.
 
 No stack: the docs are files and `context.NOT_BUILT` is a dict.
 """
@@ -30,6 +41,7 @@ import pathlib
 import re
 import subprocess
 
+from reporting_platform.ui.registry import FeedSpec
 from tests.support import repo_file
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -161,3 +173,153 @@ def test_every_quoted_error_message_is_one_the_code_can_emit():
                         f"{path.relative_to(REPO)}:{i} quotes a message no "
                         f"module raises: {quoted!r}")
     assert not missing, "\n".join(missing)
+
+
+# ---------------------------------------------------- the sample prepared model
+# The spec is READ from section 1 of docs/ADDING-A-FEED.md -- the
+# treasury_margin_call feed's own YAML block -- not copied here, so editing
+# that YAML without regenerating the sample fails too. The YAML declares no
+# types (the console infers them from a sample file), so the one thing kept
+# here is the type per column the sample implies.
+_SAMPLE_FEED_TYPES = {
+    "margin_call_id": "string",
+    "counterparty_id": "string",
+    "call_type": "upper",
+    "call_amount": "decimal",
+    "currency": "upper",
+    "effective_date": "date",
+    "due_date": "date",
+    "status": "upper",
+}
+
+
+def _sample_feed_spec(text: str) -> FeedSpec:
+    import yaml
+
+    block = next(b for b in re.findall(r"```yaml\n(.*?)\n```", text, re.S)
+                 if re.search(r"^name:\s*treasury_margin_call\s*$", b, re.M))
+    entry = yaml.safe_load(block)
+    return FeedSpec(**{k: entry[k] for k in (
+        "name", "description", "source_system", "filename_pattern",
+        "business_key", "columns")})
+
+
+def test_the_sample_prepared_model_is_the_scaffolds_output():
+    """ADDING-A-FEED.md's ```sql block must equal `render_model()`'s output.
+
+    Hand-editing the sample is how it drifted before: the doc kept ranking
+    the raw key and never called `known_as_of()`/`source_provenance()` while
+    the scaffold moved on. Rendering the real template with the doc's own
+    spec, rather than copying its output in by hand, is what makes this
+    catch the NEXT drift too.
+    """
+    from reporting_platform.ui.scaffold import render_model
+
+    path = repo_file("docs/ADDING-A-FEED.md")
+    text = path.read_text(encoding="utf-8")
+    blocks = re.findall(r"```sql\n(.*?)\n```", text, re.S)
+    assert blocks, f"no ```sql block in {path}"
+    doc_sql = blocks[0]
+
+    spec = _sample_feed_spec(text)
+    assert set(_SAMPLE_FEED_TYPES) == set(spec.columns), (
+        "the doc's YAML columns changed; update _SAMPLE_FEED_TYPES and "
+        "regenerate the sample")
+    rendered = render_model(spec, _SAMPLE_FEED_TYPES).strip("\n")
+
+    doc_lines = [line.rstrip() for line in doc_sql.split("\n")]
+    rendered_lines = [line.rstrip() for line in rendered.split("\n")]
+    assert doc_lines == rendered_lines, (
+        f"{path.relative_to(REPO)}'s sample prepared model has drifted from "
+        f"reporting_platform.ui.scaffold.render_model(). Regenerate it -- "
+        f"see tests/test_dedupe_rank.py::_scaffolded for how.")
+
+
+# --------------------------------------------- feed names in ingest_<x> / lakehouse.raw.<x>
+# `ingest_<x>` is a Feed's DAG id (`airflow/dags/feed_ingest.py`) and
+# `lakehouse.raw.<x>` is its raw table -- both name a REAL feed, or a stale
+# rename leaves a doc pointing at a DAG that does not exist. A generic
+# placeholder such as `ingest_<feed>` or `ingest_*` has nothing matching
+# `[a-z0-9_]+` right after the underscore, so it is never a candidate here --
+# and `transport_ingest` and friends do not start with `ingest_` at all.
+FEED_NAME_TOKEN = re.compile(r"\b(ingest_[a-z0-9_]+|lakehouse\.raw\.[a-z0-9_]+)\b")
+
+# Each of these is a real identifier this pattern also matches that is NOT a
+# feed's DAG id or raw table -- named once here rather than guessed at from a
+# suffix rule.
+NOT_A_FEED_NAME = {
+    "ingest_feed",                 # the module reporting_platform.ingest.ingest_feed (ingest_feed.py)
+    "ingest_raw",                  # a task/phase name in the ingest pipeline diagrams, not a DAG id
+    "ingest_normalized_delivery",  # ingest_feed.py's entry point function, not a DAG
+    "ingest_added",                # a column-provenance classification value, not a DAG
+    "ingest_columns",              # the function lineage/columns.py:ingest_columns, not a DAG
+}
+
+LOCAL_FEED_NAME = re.compile(r"^\s*name:\s*([a-z][a-z0-9_]*)\s*$", re.M)
+
+
+def _local_feed_names(text: str) -> set[str]:
+    """`name:` declared in a fenced ```yaml block -- a worked example's own feed."""
+    names: set[str] = set()
+    for block in re.findall(r"```yaml\n(.*?)```", text, re.S):
+        names |= set(LOCAL_FEED_NAME.findall(block))
+    return names
+
+
+def _feed_name_misses(text: str, local_names: set[str],
+                       registry_names: set[str]) -> list[tuple[int, str]]:
+    """(1-based line, token) for every `ingest_<x>`/`lakehouse.raw.<x>` in
+    `text` whose `<x>` is neither a registered feed nor one `local_names`
+    (a worked example's own `name:`) declares.
+
+    Factored out of the test so a probe can run it over a string with no
+    file behind it -- see `test_the_feed_name_scanner_catches_a_bad_reference`.
+    """
+    known = local_names | registry_names
+    misses: list[tuple[int, str]] = []
+    for m in FEED_NAME_TOKEN.finditer(text):
+        token = m.group(1)
+        if token in NOT_A_FEED_NAME:
+            continue
+        start, end = m.span(1)
+        before = text[start - 1:start]
+        after_py = text[end:end + 3] == ".py"
+        if before in (".", "/") or after_py:
+            continue                       # a module path, e.g. scripts.ingest_feed / ingest_feed.py
+        name = (token[len("lakehouse.raw."):] if token.startswith("lakehouse.raw.")
+                else token[len("ingest_"):])
+        if name in known:
+            continue
+        line = text.count("\n", 0, start) + 1
+        misses.append((line, token))
+    return misses
+
+
+def test_every_ingest_dag_and_raw_table_named_in_the_docs_is_a_feed():
+    """An `ingest_<x>` DAG id or `lakehouse.raw.<x>` table naming a feed that
+    does not exist is a stale reference -- a rename that missed a doc, or a
+    worked example copied from one feed and half-renamed to another."""
+    from reporting_platform.common.context import feeds
+
+    registry_names = set(feeds().keys())
+    docs = _docs() + [repo_file("README.md")]
+
+    stale = []
+    for path in docs:
+        text = path.read_text(encoding="utf-8")
+        local_names = _local_feed_names(text)
+        for line, token in _feed_name_misses(text, local_names, registry_names):
+            stale.append(
+                f"{path.relative_to(REPO)}:{line} references `{token}`, "
+                f"which names no feed the registry has and none this doc's "
+                f"own YAML declares.")
+    assert not stale, "\n".join(stale)
+
+
+def test_the_feed_name_scanner_catches_a_bad_reference():
+    """Proves the check above can fail: a stale `ingest_margin_call` (the bug
+    this plan item fixed in ADDING-A-FEED.md) against a doc that only
+    declares `treasury_margin_call` must be reported."""
+    misses = _feed_name_misses("trigger ingest_margin_call",
+                              {"treasury_margin_call"}, set())
+    assert misses == [(1, "ingest_margin_call")], misses

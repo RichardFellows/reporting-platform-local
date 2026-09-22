@@ -79,7 +79,7 @@ Four things that are easy to get wrong:
 
 - **`name` is a table name, an Airflow DAG id and an S3 prefix at once.**
   `treasury_margin_call` gives `lakehouse.raw.treasury_margin_call`, DAG
-  `ingest_margin_call` and landing prefix `landing/treasury_margin_call/`. Use
+  `ingest_treasury_margin_call` and landing prefix `landing/treasury_margin_call/`. Use
   lowercase with underscores regardless of what the upstream calls its files.
 - **`filename_pattern` must yield a `cob_date` named group**, and it is
   matched with `re.fullmatch`, not `search` — a pattern that does not cover
@@ -201,32 +201,109 @@ collide.
 
 Copy the nearest existing model rather than starting blank —
 `counterparty` for reference data, `trade` for transactional. The
-skeleton is fixed and the three macro calls are not optional:
+skeleton is fixed and the macro calls in it are not optional. This one is not
+hand-written — it is exactly what the console's scaffold emits for this
+feed's own YAML in section 1 above (`render_model()` in
+`reporting_platform/ui/scaffold.py`), and the console writes it for you.
+`tests/test_doc_claims.py` renders the same call and asserts the two agree,
+so this block cannot drift from the generator again.
 
 ```sql
-{{ config(materialized='incremental', incremental_strategy='insert_overwrite',
-          partition_by=['cob_date'], tags=['prepared','reference']) }}
+{{
+  config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    partition_by=['cob_date'],
+    tags=['prepared', 'reference']
+  )
+}}
+
+{#
+  Margin calls per counterparty and call type, from treasury.
+
+  SCAFFOLDED by the feed console from the registry entry -- conforming and
+  typing only. Anything that restates what the feed already says (a validity
+  flag derived from its own effective/expiry dates, a status normalisation)
+  belongs here and should be added deliberately. Anything that is a report
+  opinion -- utilisation, breach flags, anything needing a join -- belongs in
+  `reporting`, where it can be joined to exposure.
+#}
+
+{% set output_columns = ['cob_date', 'margin_call_id', 'counterparty_id', 'call_type', 'call_amount', 'currency', 'effective_date', 'due_date', 'status'] %}
 
 with raw_rows as (
-    select *, {{ dedupe_rank(['margin_call_id']) }} as _rn
+
+    {#
+      EVERY raw row the window and the as-of filter admit, unranked. The
+      rank happens after cleaning, on the CLEANED key -- see `ranked_rows`.
+    #}
+    select *
     from {{ source('raw', 'treasury_margin_call') }}
     where {{ incremental_window('_cob_date', 'cob_date') }}
+      and {{ known_as_of() }}
+
 ),
-deduped as (select * from raw_rows where _rn = 1),
+
 cleaned as (
+
     select
-        _cob_date                            as cob_date,
-        {{ clean_string('margin_call_id') }}       as margin_call_id,
+        _cob_date                                                     as cob_date,
+        {{ clean_string('margin_call_id') }}                          as margin_call_id,
+        {{ clean_string('counterparty_id') }}                         as counterparty_id,
+        upper({{ clean_string('call_type') }})                        as call_type,
         {{ safe_cast(clean_string('call_amount'), 'DECIMAL(18,2)') }} as call_amount,
-        {{ parse_date(clean_string('due_date')) }}                  as due_date,
-        _source_file                         as source_file,
-        _file_version                        as source_file_version,
-        {{ audit_columns() }}
-    from deduped
+        upper({{ clean_string('currency') }})                         as currency,
+        {{ parse_date(clean_string('effective_date')) }}              as effective_date,
+        {{ parse_date(clean_string('due_date')) }}                    as due_date,
+        upper({{ clean_string('status') }})                           as status,
+        _source_file                                                  as source_file,
+        _file_version                                                 as source_file_version,
+        {{ source_provenance() }}
+        {{ audit_columns() }},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number
+
+    from raw_rows
+
+),
+
+ranked_rows as (
+
+    {# THE IN-FILE DEDUPE IS ON THE CLEANED KEY: ' B' and 'B' are one key. #}
+    select
+        *,
+        {{ dedupe_rank(['margin_call_id']) }} as _rn
+    from cleaned
+
+),
+
+deduped as (
+
+    select
+        {%- for c in prepared_output_columns(output_columns) %}
+        {{ ident(c) }}{{ ',' if not loop.last }}
+        {%- endfor %}
+    from ranked_rows
+    where _rn = 1
+
 )
-select * from cleaned
+
+select * from deduped
 ```
 
+- **`raw_rows` is every row the window and the as-of filter admit,
+  unranked.** The rank happens after cleaning, in `ranked_rows`, on the
+  CLEANED key, not here — see the next point.
+- **`known_as_of()` is the as-of filter.** It compiles to `1 = 1` when
+  `knowledge_time` is unset, and refuses an incremental run when it is set —
+  see [DECISIONS.md#as-of-is-a-var-not-a-second-model](DECISIONS.md#as-of-is-a-var-not-a-second-model).
+- **`cleaned` casts and projects `source_provenance()` before anything is
+  ranked or deduplicated.** `dedupe_rank`, in `ranked_rows`, must run on the
+  CLEANED key: a raw `' B'` and `'B'` are the same key once cleaned, and
+  ranking the raw key kept both as distinct "newest" rows. See
+  [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 - **`incremental_window('_cob_date', 'cob_date')` takes two
   arguments here and one in reporting.** The source column is raw's
   `_cob_date`; the target column is the modelled `cob_date`. Passing
@@ -234,9 +311,9 @@ select * from cleaned
   the build fails with `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY`. It only
   fires on the *incremental* path, so a first build against a fresh branch
   will not show it — the first build after publishing to `main` will.
-- **`dedupe_rank(business_key)` is what picks the newest delivery for each
-  COB date** — all of it, so a key that delivery omits is gone. Omit it and a
-  re-delivery doubles the rows.
+- **`dedupe_rank(business_key)`, in `ranked_rows`, is what picks the newest
+  delivery for each COB date** — all of it, so a key that delivery omits is
+  gone. Omit it and a re-delivery doubles the rows.
 - **`incremental_strategy='insert_overwrite'` is what makes "gone" true on an
   incremental run.** A merge never deletes a row it merged before. The
   overwrite replaces each COB date the select returns, whole — so keep the
@@ -369,7 +446,7 @@ $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select path:models/prepared --vars "{nessie_ref: $branch}"
 
 # 5. the new DAG is created PAUSED -- it will never fire until you do this
-docker compose exec -T airflow airflow dags unpause ingest_margin_call
+docker compose exec -T airflow airflow dags unpause ingest_treasury_margin_call
 ```
 
 Step 5 is the one that gets forgotten. `airflow dags list` shows a paused DAG

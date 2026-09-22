@@ -6,7 +6,7 @@ it**, what done looks like, and a prompt to paste into a new session.
 Everything here was found by working on the platform rather than by reading it.
 Each item file carries the date its "What is wrong" was last verified:
 12–19 on 2026-09-14 against `main` at `fdb0784`, 20–24 against `cea4500`, and
-15, 16 and 18 — the three that were written conditional on 09 merging — re-checked on
+15 and 16 — the two that were written conditional on 09 merging — re-checked on
 2026-09-15 against `76bec9c`, after 09 merged. 21, and 22's `--full-refresh`
 claim, are reasoned from the code and say so. If an item looks stale, run its verification command first — the
 platform moves, and an item that no longer reproduces should be deleted rather
@@ -21,7 +21,6 @@ than worked.
 | [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high | 2–4 hours |
 | [16](16-exposure-change-removed-never-fires.md) | `exposure_change`'s `'REMOVED'` category can never be assigned | medium | ½ day |
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
-| [18](18-adding-a-feed-sample-model-is-missing-macros.md) | The sample prepared model in `ADDING-A-FEED.md` misses `known_as_of()` and `source_provenance()` | low–medium | 30 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
@@ -46,8 +45,9 @@ first.
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
 does after pruning) are reasoned from the code and say so — reproduce them
-first. **21–24** came out of 09's reviews and live runs. **16** and **18** describe models 09 changed, so re-read them
-against the current models before starting. The rest are independent.
+first. **21–24** came out of 09's reviews and live runs. **16** describes a
+model 09 changed, so re-read it against the current model before starting.
+The rest are independent.
 
 ## Done
 
