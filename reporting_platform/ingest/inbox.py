@@ -75,6 +75,11 @@ log = logging.getLogger("inbox")
 INBOX = Path(os.environ.get("REPORTING_INBOX", "/opt/platform/inbox"))
 PROCESSED = ".processed"
 REJECTED = ".rejected"
+# The --loop health server's port (deploy/helm/reporting-platform/inbox.yaml's
+# liveness/readiness probes). Not published as a host port in
+# docker-compose.yml: nothing outside the container needs it there, only a
+# Kubernetes probe does.
+INBOX_HEALTH_PORT = int(os.environ.get("INBOX_HEALTH_PORT", "8090"))
 # Two consecutive identical observations, so a file being written is not
 # uploaded half-finished. At the default interval that is a few seconds of
 # quiet, which every real delivery has and no partial write does.
@@ -550,6 +555,76 @@ def _promote(feed: Feed, path: Path,
     return results
 
 
+def health(last_poll_at: float | None, interval: float, now: float) -> tuple[int, str]:
+    """(HTTP status, body) for `--loop`'s /healthz -- a PURE function so
+    tests/test_healthz.py exercises it with no server, no thread and no clock.
+
+    Fresh means the last COMPLETED poll (a full `sweep()`, success or
+    exception -- see main()'s `except` below) finished less than 3x the loop
+    interval ago. THE WINDOW HAS TO CONTAIN THE THING IT DESCRIBES: at 1x a
+    poll that is merely running a little long would flap the probe every
+    cycle, and a fixed window unrelated to `--loop`'s own value would either
+    never fire (a short interval) or never stop firing (a long one) --
+    matching the interval is what makes one number describe "the loop is
+    stuck", not "the loop is mid-poll".
+    `last_poll_at is None` means no poll has EVER completed (the server
+    starts before the first `sweep()` returns), which is exactly as
+    unready as a stale one -- not a pass by omission.
+    """
+    if last_poll_at is None:
+        return 503, "no poll has completed yet"
+    age = now - last_poll_at
+    limit = 3 * interval
+    if age < limit:
+        return 200, f"ok: last poll {age:.1f}s ago"
+    return 503, f"stale: last poll {age:.1f}s ago, limit {limit:.0f}s"
+
+
+class _HealthState:
+    """The one piece of mutable state the health server and the poll loop
+    share -- `interval` never changes after `main()` sets it."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self.last_poll_at: float | None = None
+
+
+def _start_health_server(state: _HealthState, port: int):
+    """A tiny stdlib HTTP server on its own daemon thread, serving /healthz
+    from `state`. No framework: this is one route, and the watcher's own
+    dependencies stay `pyyaml`/`ruamel.yaml`/`requests`/boto3 -- the same
+    ~10s cheap-tier set CLAUDE.md pins, with nothing added for a probe.
+    """
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (stdlib's own naming)
+            if self.path != "/healthz":
+                self.send_response(404)
+                self.end_headers()
+                return
+            status, body = health(state.last_poll_at, state.interval, time.time())
+            payload = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):  # noqa: D102
+            # The default logs every probe hit to stderr at INFO -- a
+            # 10s-interval liveness probe would then outnumber every real
+            # sweep log line within minutes.
+            pass
+
+    server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True,
+                              name="inbox-healthz")
+    thread.start()
+    return server
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--loop", type=int, metavar="SECONDS",
@@ -575,7 +650,10 @@ def main(argv=None) -> int:
               or "inbox empty")
         return 0
 
-    log.info("watching %s every %ss", INBOX, a.loop)
+    health_state = _HealthState(a.loop)
+    _start_health_server(health_state, INBOX_HEALTH_PORT)
+    log.info("watching %s every %ss (health on :%s/healthz)",
+             INBOX, a.loop, INBOX_HEALTH_PORT)
     while True:
         try:
             sweep(seen, dry_run=a.dry_run)
@@ -583,6 +661,10 @@ def main(argv=None) -> int:
             # A watcher that dies on one bad pass stops watching, which is the
             # failure it exists to prevent.
             log.exception("sweep failed")
+        # AFTER the pass, success or exception: a poll that raised still
+        # completed one iteration of the loop, which is what health() means
+        # by "not stuck".
+        health_state.last_poll_at = time.time()
         time.sleep(a.loop)
 
 

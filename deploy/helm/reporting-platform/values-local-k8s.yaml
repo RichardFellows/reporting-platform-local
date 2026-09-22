@@ -16,6 +16,16 @@ endpoints:
   nessie: http://nessie:19120/api/v2
   warehouse: s3a://lakehouse/warehouse
   landing: s3a://lakehouse/landing
+# Not a real deployment, so not a real change record -- but every run
+# records these (docs/DECISIONS.md#a-change-is-a-deployment-event-not-a-run-event)
+# and the chart requires them in every environment, so a throwaway cluster
+# needs a placeholder rather than an exemption from the rule it exists to
+# smoke-test.
+provenance:
+  dbtProjectRef: k8s-smoke
+  dbtProjectDigest: k8s-smoke
+  deploymentChangeRef: k8s-smoke
+  deploymentPipelineRef: k8s-smoke
 secrets:
   create: true
   values:

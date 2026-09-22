@@ -1,0 +1,39 @@
+reporting-platform ({{ .Values.environment }}) deployed as {{ .Release.Name }}
+in namespace {{ .Release.Namespace }}.
+
+Deployed:
+  - Airflow ({{ .Values.airflow.airflowVersion }}, KubernetesExecutor) via the
+    official chart -- webserver, scheduler, triggerer.
+  - The platform ConfigMap/Secret every pod reads with envFrom
+    ({{ include "reporting-platform.envConfigMap" . }} /
+    {{ include "reporting-platform.envSecret" . }}).
+  - Spark RBAC ({{ .Values.spark.serviceAccount }}) for driver/executor pods.
+{{- if .Values.inbox.enabled }}
+  - The inbox watcher (legacy drop-folder path).
+{{- end }}
+{{- if .Values.feedConsole.enabled }}
+  - The feed console: http://{{ .Release.Name }}-feed-console:8082 (port-forward
+    to reach it from outside the cluster; dev only).
+{{- end }}
+{{- if .Values.localStores.enabled }}
+  - MinIO, Nessie and Postgres as in-release Deployments (throwaway cluster
+    only -- values-local-k8s.yaml).
+{{- end }}
+
+Check the init job (runs `airflow pools set lakehouse_write` and
+`registry schema` -- docs/DECISIONS.md#airflow-init-load-bearing-steps):
+
+  kubectl -n {{ .Release.Namespace }} logs job/{{ .Release.Name }}-platform-init
+
+A SKIPPED or FAILED job here means the `lakehouse_write` pool never got
+created, and every DAG task will sit `queued` forever with nothing in its own
+log to say why (docs/DECISIONS.md#one-shared-write-pool).
+
+Airflow webserver:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-webserver 8080:8080
+
+A new platform image needs the release upgraded (`helm upgrade` with the new
+digest) -- and rolls the inbox pod along with everything else, which is
+required, not incidental: see this chart's README, "A new platform image
+rolls the inbox pod".

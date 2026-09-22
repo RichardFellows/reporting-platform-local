@@ -120,6 +120,13 @@ airflow:
   # knows its own IP: a dbt build's driver runs IN the worker pod, and Spark's
   # executors call it back there. The names are fixed by this chart's
   # templates (reporting-platform.envConfigMap / .envSecret).
+  #
+  # THIS DEFAULT IS ONLY CORRECT WHEN `secrets.existingSecret` IS UNSET. Helm
+  # evaluates this string in the AIRFLOW SUBCHART's own scope, which cannot
+  # see this chart's `secrets` block -- see the comment on
+  # `reporting-platform.envSecret` in templates/_helpers.tpl. Any values file
+  # that sets `secrets.existingSecret` (values-dev/uat/prod.yaml) overrides
+  # this key too, naming the same secret literally.
   extraEnvFrom: |
     - configMapRef:
         name: '{{ .Release.Name }}-platform-env'

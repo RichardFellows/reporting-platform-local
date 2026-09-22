@@ -6,3 +6,10 @@ secrets:
 airflow:
   data:
     metadataSecretName: reporting-platform-uat-airflow-db
+  # Must name the same secret as `secrets.existingSecret` above -- see
+  # values-dev.yaml's comment on this same key.
+  extraEnvFrom: |
+    - configMapRef:
+        name: '{{ .Release.Name }}-platform-env'
+    - secretRef:
+        name: 'reporting-platform-uat'

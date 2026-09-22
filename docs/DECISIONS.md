@@ -90,6 +90,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move |
 | [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
+| [the-chart-is-the-only-place-settings-are-written](#the-chart-is-the-only-place-settings-are-written) | One ConfigMap, one Secret, envFrom everywhere; why `existingSecret` needs two literal names, not one computed value |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
 | [spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants) | `spark-defaults.conf` ships in the cluster image, so it may hold no host, TLS switch or credential source |
 | [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
@@ -5154,3 +5155,49 @@ always a live derivation from whether the new side has a registered Delivery
 and the legacy adapter returns non-`None`, computed fresh on every
 `migration_reconcile` pass -- the same "derive, never store the absence of
 evidence" principle `deliveries.reconcile()` already applies to Landing/Raw.
+
+## the-chart-is-the-only-place-settings-are-written
+
+**Decision (2c).** `deploy/helm/reporting-platform` writes exactly ONE
+ConfigMap (`<release>-platform-env`) and ONE Secret
+(`<release>-platform-secrets`, or `secrets.existingSecret`), and every
+platform pod -- Airflow's own (scheduler/webserver/triggerer/worker, via
+`airflow.extraEnvFrom`), the Spark driver pods `_spark_task.driver_pod`
+launches, the inbox watcher and the feed console -- reads both with
+`envFrom`. One pair, not one per consumer, for the same reason
+`REGISTRY_DSN` lives on one compose anchor rather than four service blocks:
+a setting two pods could each have their own copy of is a setting that can
+silently disagree.
+
+**Why `existingSecret` needs two literal names kept in step, not one computed
+value.** `airflow.extraEnvFrom` is a plain string that the AIRFLOW SUBCHART's
+own templates `tpl` at render time, in ITS OWN scope. `.Release.Name`
+resolves there because `Release` is shared by every chart in one release, but
+`.Values` in that scope is the airflow subchart's own values tree -- it never
+contains this chart's `secrets.existingSecret`, and Helm has no template hook
+that lets a parent chart hand a subchart a value computed from the parent's
+own values (short of `global.*`, which still has to be set by hand in the
+same values file for the same reason -- one more name to keep in step, not
+fewer). So `values.yaml`'s default `extraEnvFrom` names the fixed pattern
+(correct whenever `secrets.existingSecret` is unset), and each values file
+that sets a custom `secrets.existingSecret` (`values-dev.yaml`,
+`values-uat.yaml`, `values-prod.yaml`) overrides `extraEnvFrom` in the SAME
+file to name that same secret literally. `templates/_helpers.tpl`'s
+`reporting-platform.envSecret` -- used by every template THIS chart owns
+(inbox, feed-console, job-platform-init, rbac) -- resolves the same name from
+`secrets.existingSecret` directly, since those templates render in this
+chart's own scope and can see it. `tests/test_chart.py` checks that the base
+`values.yaml` file's default agrees with the helper's fallback; a
+per-environment override is checked by `helm template` actually resolving
+both to the same string, in the PR's Done-when transcript.
+
+**Refused in `uat`/`prod`** (`reporting-platform.controlled`,
+`_helpers.tpl`): `feedConsole.enabled` (docs/OPENSHIFT-MAPPING.md, "the feed
+console is not deployed above dev" -- it writes into the dbt project, which
+is exactly the drift `check_project_drift` exists to catch), and a platform
+or Spark image with a `.tag` but no `.digest` -- a tag can be re-pushed under
+a run already published, and `PLATFORM_CODE_REF` must be the identity a
+publication can still be traced back through
+(`#the-release-image-carries-the-code`). Both fail `helm template` naming the
+offending value, the same "fail loud at render, not quiet in the first pod
+that reads it" posture `required` gives every endpoint and image.
