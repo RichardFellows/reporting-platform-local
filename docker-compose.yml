@@ -318,6 +318,8 @@ services:
       - "${SPARK_UI_HOST_PORT:-8080}:8080"
     volumes:
       - ./reporting_platform:/opt/platform/reporting_platform:ro
+      # For scripts/spark-sql, the README's ad hoc query path.
+      - ./scripts:/opt/platform/scripts:ro
       - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
       - ivy-cache:/opt/spark/.ivy2
     depends_on:
