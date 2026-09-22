@@ -80,10 +80,23 @@ data:
       "name" "images.platform"
       "environment" .Values.environment
       "controlled" $controlled) | quote }}
-  DBT_PROJECT_REF: {{ required "provenance.dbtProjectRef is required" .Values.provenance.dbtProjectRef | quote }}
-  DBT_PROJECT_DIGEST: {{ required "provenance.dbtProjectDigest is required" .Values.provenance.dbtProjectDigest | quote }}
-  DEPLOYMENT_CHANGE_REF: {{ required "provenance.deploymentChangeRef is required" .Values.provenance.deploymentChangeRef | quote }}
-  DEPLOYMENT_PIPELINE_REF: {{ required "provenance.deploymentPipelineRef is required" .Values.provenance.deploymentPipelineRef | quote }}
+  # REQUIRED ONLY IN uat/prod. `dev` deliberately declares no project ref:
+  # the console edits the project there, which is the drift
+  # check_project_drift() must NOT refuse on (context.dbt_project_ref's
+  # docstring; it refuses only in CONTROLLED_ENVIRONMENTS). Empty is a
+  # legitimate value outside them, and the run records it as such.
+  {{- $p := .Values.provenance }}
+  {{- if eq $controlled "true" }}
+  DBT_PROJECT_REF: {{ required (printf "provenance.dbtProjectRef is required in %s" .Values.environment) $p.dbtProjectRef | quote }}
+  DBT_PROJECT_DIGEST: {{ required (printf "provenance.dbtProjectDigest is required in %s" .Values.environment) $p.dbtProjectDigest | quote }}
+  DEPLOYMENT_CHANGE_REF: {{ required (printf "provenance.deploymentChangeRef is required in %s" .Values.environment) $p.deploymentChangeRef | quote }}
+  DEPLOYMENT_PIPELINE_REF: {{ required (printf "provenance.deploymentPipelineRef is required in %s" .Values.environment) $p.deploymentPipelineRef | quote }}
+  {{- else }}
+  DBT_PROJECT_REF: {{ $p.dbtProjectRef | default "" | quote }}
+  DBT_PROJECT_DIGEST: {{ $p.dbtProjectDigest | default "" | quote }}
+  DEPLOYMENT_CHANGE_REF: {{ $p.deploymentChangeRef | default "" | quote }}
+  DEPLOYMENT_PIPELINE_REF: {{ $p.deploymentPipelineRef | default "" | quote }}
+  {{- end }}
 
   # ---------------------------------------------------------------- operational
   # The console and the inbox trigger/poll DAG runs through Airflow's own REST

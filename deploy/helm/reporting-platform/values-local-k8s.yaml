@@ -21,11 +21,6 @@ endpoints:
 # and the chart requires them in every environment, so a throwaway cluster
 # needs a placeholder rather than an exemption from the rule it exists to
 # smoke-test.
-provenance:
-  dbtProjectRef: k8s-smoke
-  dbtProjectDigest: k8s-smoke
-  deploymentChangeRef: k8s-smoke
-  deploymentPipelineRef: k8s-smoke
 secrets:
   create: true
   values:

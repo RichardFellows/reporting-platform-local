@@ -57,6 +57,9 @@ failing later, quietly, in whichever pod reads it first:
 - `provenance.{dbtProjectRef,dbtProjectDigest,deploymentChangeRef,deploymentPipelineRef}`
   -- the deployment's change identity, recorded by every run
   (`docs/DECISIONS.md#a-change-is-a-deployment-event-not-a-run-event`).
+  **Required in `uat` and `prod` only.** `dev` deliberately declares no
+  project ref, because the console edits the project there, and empty is
+  what a run then records.
 - `secrets.existingSecret` (or `secrets.create: true` with `secrets.values.*`
   for a throwaway cluster) -- see "Secrets" below.
 - `airflow.data.metadataSecretName` -- a Secret with a `connection` key, for
