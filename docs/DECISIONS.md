@@ -87,6 +87,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 
 | Anchor | The finding |
 |---|---|
+| [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
 | [spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants) | `spark-defaults.conf` ships in the cluster image, so it may hold no host, TLS switch or credential source |
@@ -617,6 +618,44 @@ anything shared needs a real identity layer in front of the console regardless.
 The webserver secret key is shared across replicas and restarts so sessions
 survive. Airflow 2 needs nothing like Airflow 3's execution-API URL or JWT
 secret — see [airflow-2-not-3](#airflow-2-not-3).
+
+## the-build-tier
+
+`.github/workflows/build.yml` is the only CI tier that BUILDS the dbt project
+against a real catalog. It exists because two classes of defect pass
+everything cheaper. `dbt parse` accepts an unknown generic test and an
+unknown column key, and `lineage --columns` without a catalog reads most
+tables as `not derivable` and exits 0 ([a-gate-that-cannot-fail](#a-gate-that-cannot-fail)).
+It is separate from `config.yml` and `parse.yml`, so those stay at seconds
+and minutes. It runs on PRs that touch the code or images, and nightly.
+
+The steps are `scripts/ci_build_tier.sh`, which the workflow only calls, so a
+developer runs exactly what CI runs. It brings up its own compose project,
+`-p rp-ci`, with `.github/compose.ci.yml` stripping every host port, so it
+runs beside a developer's stack. The sequence:
+
+1. Build the images; start MinIO, Postgres, Nessie and Spark; run
+   `airflow-init`.
+2. Seed with `generate_feeds.py --clean`, 3 months, and land it.
+3. Put the two qa_ fixtures through the inbox gate with `--no-trigger`.
+   Their control files are promoted only by the gate, and the stack has no
+   webserver to trigger.
+4. Run `bulk_ingest`, then `dbt build` on a throwaway branch.
+5. Merge to that stack's `main` only if the build is clean, then run
+   `lineage --columns --require-derivable`. **The merge is required:** the
+   lineage gate reads schemas through DuckDB, which addresses only the
+   default branch, so on a branch-only build every model is `not derivable`.
+
+Measured locally from a cold start with cached images, about 4.5 minutes:
+`dbt build` PASS=84 ERROR=0, `unresolved: none`, `derivable: 17 of 17
+tables`. With an unknown generic test on `fo_trade.trade_id`, `dbt parse`
+exits 0 and this tier fails.
+
+Building it found two bugs in the inbox gate. One-shot mode swept twice, but
+stability needs `STABLE_POLLS + 1` observations, so it reported "inbox
+empty" for every freshly dropped file. And a trigger failure escaped
+`sweep()`, abandoning the rest of the pass. `--no-trigger` exists for callers
+that ingest by themselves.
 
 ## spark-master-single-source
 
@@ -1627,8 +1666,8 @@ from a catalog, so every column is `sourced` by construction -- 28 of 28,
 measured -- and `unresolved` cannot arise at all: a tick that cannot fail,
 which is what this section is named after. With the flag it fails every time
 and says only "you have not built yet". The gate belongs to a post-build tier,
-there is not one, and `config.yml`'s header now says that instead of claiming
-the check. The tier that DOES exist above it, `parse.yml`, changes nothing
+which is now `build.yml` ([the-build-tier](#the-build-tier)), and
+`config.yml`'s header says that instead of claiming the check. The tier that DOES exist above it, `parse.yml`, changes nothing
 here: `dbt parse` writes no compiled SQL.
 
 The flag alone, without `--columns`, is an argparse error rather than a silent
