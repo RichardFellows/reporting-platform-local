@@ -27,13 +27,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
 import sys
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from reporting_platform.common.parsing import feed_format
 
+from reporting_platform.common import settings
 from reporting_platform.common.context import (
     CATALOG, Nessie, branch_name, feed as get_feed, new_run_id, spark_session,
 )
@@ -125,7 +125,7 @@ def _delivery_md5(manifest: dict) -> str:
 
 
 def _landing_uri(object_key: str) -> str:
-    bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
+    bucket = settings.landing()
     root = bucket.rsplit("/", 1)[0] if bucket.endswith("/landing") else bucket
     return f"{root}/{object_key}" if not object_key.startswith("s3a://") else object_key
 

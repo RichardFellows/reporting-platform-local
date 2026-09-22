@@ -19,9 +19,9 @@ per-environment value is read from the environment. What this checks:
   the conf file, unless it is one of the keys that are local by nature;
 - the extensions are in the same order everywhere they are written.
 
-`common/spark.py` still carries local DEFAULTS for three env reads; those move
-behind `common/settings.py` accessors (plan #5), and the host check covers it
-from then. No stack, no network.
+`common/spark.py` reads its endpoints through `common/settings.py`, whose
+local defaults are the only place compose's hosts are written
+(docs/DECISIONS.md#settings-refuse-outside-local). No stack, no network.
 See docs/DECISIONS.md#spark-defaults-hold-only-invariants
 """
 from __future__ import annotations
@@ -138,6 +138,19 @@ def test_profiles_name_no_local_host():
     assert not hits, f"{PROFILES} names a local host: {hits}"
     rendered = _render("spark_ocp", CLUSTER_ENV)
     assert not any(LOCAL_HOSTS.search(v) for v in rendered.values()), rendered
+
+
+# spark.py's own master default IS the compose cluster, as in profiles.yml,
+# so only the store hosts are checked there.
+STORE_HOSTS = re.compile(r"minio|nessie:19120")
+
+
+def test_spark_session_names_no_store_host():
+    code = [line.strip() for line in _text(SPARK_PY).splitlines()
+            if STORE_HOSTS.search(line) and not line.strip().startswith("#")]
+    assert not code, (
+        f"{SPARK_PY} names a store host {code}; read it through "
+        f"common/settings.py, which refuses outside REPORTING_ENV=local")
 
 
 def test_spark_ocp_turns_tls_on_for_an_https_endpoint():

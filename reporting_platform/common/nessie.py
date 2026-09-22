@@ -11,9 +11,10 @@ be driven from Airflow tasks that need no Spark session at all.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 from urllib.parse import quote as _urlquote
+
+from reporting_platform.common import settings
 
 log = logging.getLogger("nessie")
 
@@ -21,7 +22,9 @@ class Nessie:
     """Thin wrapper over Nessie's REST API."""
 
     def __init__(self, uri: str | None = None):
-        self.uri = (uri or os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")).rstrip("/")
+        # `uri` wins when given -- e.g. a test pointing at a fake server --
+        # settings.nessie_uri() is only the environment-derived fallback.
+        self.uri = (uri or settings.nessie_uri()).rstrip("/")
 
     def _req(self, method: str, path: str, **kwargs):
         import requests

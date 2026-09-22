@@ -48,8 +48,9 @@ Two things follow that are easy to get wrong:
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import contextmanager
+
+from reporting_platform.common import settings
 
 log = logging.getLogger("registry.db")
 
@@ -59,23 +60,8 @@ _ensured = False
 
 
 def dsn() -> str:
-    """The registry connection string, or a refusal.
-
-    NO DEFAULT, deliberately. Every other connection string in this stack is
-    written down in `docker-compose.yml` where it can be seen and changed;
-    a default buried here would let a container come up pointing at a
-    database nobody configured and report a healthy, empty registry. The
-    failure mode this avoids is the one `tag_retention_years` avoids by
-    refusing bad config rather than falling back.
-    """
-    value = os.environ.get("REGISTRY_DSN", "").strip()
-    if not value:
-        raise RuntimeError(
-            "REGISTRY_DSN is not set, so the delivery registry has no store. "
-            "It is set on the shared `x-airflow-common` environment block in "
-            "docker-compose.yml; a container started before that was added "
-            "needs recreating, not restarting.")
-    return value
+    """The registry connection string, or a refusal. See `settings.registry_dsn`."""
+    return settings.registry_dsn()
 
 
 @contextmanager

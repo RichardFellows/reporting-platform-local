@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from urllib.parse import urlparse
 
+from reporting_platform.common import settings
 from reporting_platform.common.settings import CATALOG
 
 def spark_session(app_name: str, ref: str = "main"):
@@ -32,9 +33,9 @@ def spark_session(app_name: str, ref: str = "main"):
     """
     from pyspark.sql import SparkSession
 
-    endpoint = os.environ.get("S3_ENDPOINT", "http://minio:9000")
-    warehouse = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
-    nessie_uri = os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")
+    endpoint = settings.s3_endpoint()
+    warehouse = settings.warehouse()
+    nessie_uri = settings.nessie_uri()
     # Hadoop's S3A connector does not infer TLS from the endpoint URL's own
     # scheme -- it has a separate switch, and it used to be hardcoded off
     # (fine for MinIO in http-only compose). A second env var for this would
