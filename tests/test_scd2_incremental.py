@@ -47,7 +47,9 @@ import re
 
 import duckdb
 
-from tests.test_dedupe_rank import D1, D2, DBT, PREPARED, _Config, _render, _run
+from tests.test_dedupe_rank import (
+    D1, D2, DBT, PREPARED, _SHIMS, _Config, _duck, _render, _run,
+)
 
 # (model, key columns, the attribute that changes, constant attributes)
 MODELS = (
@@ -63,21 +65,8 @@ DELETED = "0001-01-01"
 
 
 # ------------------------------------------------------------ engine shims
-_SHIMS = {
-    "sha2": "create macro spark_sha2(s, n) as sha256(s)",
-    "date_sub": "create macro spark_date_sub(d, n) as (d - n::integer)",
-    "trunc": "create macro spark_trunc(d, fmt) as date_trunc('month', d)::date",
-    "to_date": ("create macro spark_to_date(s, fmt) as (case fmt "
-                "when 'yyyy-MM-dd' then try_strptime(s, '%Y-%m-%d') "
-                "else try_strptime(s, '%Y%m%d') end)::date"),
-    "element_at": "create macro spark_element_at(l, i) as list_extract(l, i)",
-}
-
-
-def _duck(sql: str) -> str:
-    for fn in _SHIMS:
-        sql = re.sub(rf"\b{fn}\(", f"spark_{fn}(", sql, flags=re.I)
-    return sql
+# `_SHIMS` and `_duck` live in test_dedupe_rank, which needs them too now that
+# the date-partitioned models rank after cleaning.
 
 
 def _connect():

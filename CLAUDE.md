@@ -216,6 +216,11 @@ to run something for the first time, expect it to fail and read what it says.
   comparable there, a **row_count** is not (`at_ingest`), and `no run recorded`
   means Airflow trimmed its history, never "not ingested".
   (`#the-arrivals-view-is-a-join-not-a-record`)
+- **EVERY PREPARED MODEL RANKS THE CLEANED KEY, never the raw one** — clean,
+  then `dedupe_rank` in `ranked_rows`, then project
+  `prepared_output_columns()` to drop the carried `_cob_date`/`_file_version`/
+  `_row_number` (Spark 3.5 has no `SELECT * EXCEPT`). Ranked raw, ` T1` and
+  `T1` in one file both survive as one key. The scaffold emits this shape.
 - **ADDING A COLUMN TO AN EXISTING FEED IS THE COMMONEST CHANGE A LIVE FEED
   EVER HAS, and the raw table is the part not in the git diff.**
   `ensure_raw_schema` reconciles the declared contract on the branch;
