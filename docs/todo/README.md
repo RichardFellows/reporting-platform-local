@@ -25,7 +25,6 @@ than worked.
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
-| [23](23-date-partitioned-models-rank-the-raw-key.md) | `fo_trade` and `ref_collateral` dedupe on the raw key, then clean it | low–medium | 1–2 hours |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
 
 ## Where to start
@@ -216,7 +215,8 @@ first:
   **Found, not fixed:** `fo_trade` and `ref_collateral` rank raw `trade_id`
   and `collateral_id` the same way, so ` T1` and `T1` in one file would both
   survive; their uniqueness tests would fail that build rather than publish
-  it. Left for item [23](23-date-partitioned-models-rank-the-raw-key.md) — their path is live-verified as it stands.
+  it. Fixed since (plan #13): both, and the scaffold, rank in `ranked_rows`
+  after cleaning.
 - **A reopened seed row kept an earlier run's audit columns** (low): it now
   takes this run's `dbt_invocation_id`, `nessie_ref` and `dbt_updated_at`
   through `audit_columns()`, and keeps the target's `source_batch_id`.
