@@ -42,7 +42,10 @@ reporting_platform:
         spark.sql.catalog.lakehouse.s3.path-style-access: "true"
         spark.hadoop.fs.s3a.endpoint: "{{ env_var('S3_ENDPOINT') }}"
         spark.hadoop.fs.s3a.path.style.access: "true"
-        spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+        # Derived from S3_ENDPOINT's own scheme, mirroring spark_session() in
+        # common/spark.py -- must not diverge. See
+        # docs/DECISIONS.md#s3-ssl-follows-the-endpoint-scheme
+        spark.hadoop.fs.s3a.connection.ssl.enabled: "{{ 'true' if env_var('S3_ENDPOINT', 'http://minio:9000').startswith('https://') else 'false' }}"
         spark.sql.session.timeZone: UTC
         spark.sql.defaultCatalog: "{{ env_var('REPORTING_CATALOG', 'lakehouse') }}"
         # Driver-only heap: dbt runs no task work in this process.

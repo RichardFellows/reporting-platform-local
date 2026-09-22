@@ -86,6 +86,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | Anchor | The finding |
 |---|---|
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
+| [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
 | [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
 | [spark-worker-sizing](#spark-worker-sizing) | Cap each application, or standalone mode holds every free core until the session stops |
 | [spark-in-a-subprocess](#spark-in-a-subprocess) | The JVM keeps the task process alive; heartbeats stop; the scheduler zombie-reaps it |
@@ -518,6 +519,27 @@ quietly running the pipeline inside the Airflow container with the cluster idle.
 `feed-ui` sets it explicitly rather than relying on the default, because both
 readers default to the same address — which is exactly the silent divergence
 worth avoiding.
+
+## s3-ssl-follows-the-endpoint-scheme
+
+Hadoop's S3A connector does not infer TLS from `fs.s3a.endpoint`'s own
+scheme — it has a separate switch, `fs.s3a.connection.ssl.enabled`, and it
+used to be hardcoded to `"false"` in both `spark_session()`
+(`common/spark.py`) and `dbt/profiles.yml`'s `spark_local` target. That is
+correct for local MinIO over plain HTTP and silently wrong the moment
+`S3_ENDPOINT` points at a real, TLS-terminated S3-compatible store — see
+[OPENSHIFT-MAPPING.md](OPENSHIFT-MAPPING.md), "Object storage": only the
+endpoint URL and credentials are meant to change between local and the
+cluster target, not code.
+
+A second env var for the switch would just be one more value that has to be
+kept in sync with `S3_ENDPOINT`'s own scheme by hand — exactly the kind of
+divergence [spark-master-single-source](#spark-master-single-source) exists
+to avoid. So it derives from `S3_ENDPOINT` directly: `https://` turns TLS on,
+anything else leaves it off. Iceberg's own `S3FileIO` needs no equivalent
+flag — the AWS SDK it uses already reads the scheme off the endpoint URL
+itself; only the Hadoop S3A path (`spark.hadoop.fs.s3a.*`, used for reading
+landing CSVs) needed the fix.
 
 ## spark-worker-sizing
 
