@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-100 entries. They are grouped here by subject; the file itself is in the order
+101 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -73,6 +73,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [airflow-provider-constraints](#airflow-provider-constraints) | Providers install under Airflow's constraint file so pip cannot drag a version quietly |
 | [airflow-api-auth](#airflow-api-auth) | `session` alone authenticates only a browser |
 | [image-permissions-layer](#image-permissions-layer) | The permissions layer is last in the Dockerfile because it changes least |
+| [images-build-from-a-mirror](#images-build-from-a-mirror) | Every external URL a Dockerfile fetches is a build ARG, so a corporate mirror can redirect it |
 | [containers-run-as-the-host-uid](#containers-run-as-the-host-uid) | `user: "${AIRFLOW_UID:-50000}:0"`, and what a bind mount does to ownership |
 | [minio-host-ports](#minio-host-ports) | The published MinIO ports are the host side only |
 | [no-folder-markers](#no-folder-markers) | `minio-init` creates the bucket and nothing else |
@@ -495,6 +496,37 @@ more often than the pip installs above it, and Docker invalidates every layer
 after the one that changed — put it higher and editing a directory list costs a
 full reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
 whatever registry mirror is in front of pip. Nothing below it depends on it.
+
+## images-build-from-a-mirror
+
+The corporate build has egress only to an internal mirror, so every external
+URL a Dockerfile fetches must be a build ARG whose DEFAULT is today's public
+value — the mirror then only sets build args, never edits a Dockerfile. Five:
+`MAVEN_REPO` (`Dockerfile.spark`'s jars), `NESSIE_GC_URL` and
+`AIRFLOW_CONSTRAINTS_URL` (`Dockerfile.airflow`), `MARQUEZ_SOURCE_URL`
+(both Marquez images), `NPM_REGISTRY` (`Dockerfile.marquez-web`, told to
+every npm invocation, since an ARG is not itself an npm setting).
+`tests/test_offline_build.py` is the gate: a URL literal inside a
+RUN/COPY/ADD, including a continuation line, fails naming file:line.
+
+Two things this does NOT cover. `pip install` resolves through `pip.conf` /
+SSL cert config injected at build time in the corporate environment (see
+`Dockerfile.airflow`'s comment above the provider install) — no ARG needed,
+because pip's own resolution already goes through whatever index that config
+points at. And `FROM` base images are the deploying fork's concern, not this
+repo's: swapping `apache/airflow`, `apache/spark` or the UBI bases for
+mirrored copies is a registry/pull-through-cache setting, not a Dockerfile
+edit. Still NOT redirectable by anything here: `api`'s gradle build
+(`Dockerfile.marquez-api`) may reach repositories `build.gradle` declares
+beyond Maven Central — unknown without downloading Marquez's own build files,
+which this change deliberately did not do just to answer that.
+
+Also removed: the `|| pip install pyyaml boto3` fallback on
+`Dockerfile.spark`'s pynessie install. It silently dropped `pynessie` on
+failure and shipped an image that imports cleanly and lacks the package the
+platform needs at runtime — a build that "succeeds" with a different image
+than the one asked for. If `pynessie==0.65.0` stops installing, that must
+fail loudly at the `RUN`, not three layers of indirection later at import.
 
 ## the-release-image-carries-the-code
 
