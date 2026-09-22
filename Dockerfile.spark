@@ -14,17 +14,39 @@ ENV SCALA_VERSION=2.12
 
 # Pre-baked rather than resolved with --packages at submit time: no egress at
 # runtime. See docs/DECISIONS.md#spark-jars-prebaked
+#
+# MAVEN_REPO IS A BUILD ARG, NOT AN INLINE CONSTANT, because the corporate
+# build has egress only to an internal mirror: the mirror sets this one arg
+# and every URL below follows. Same arg name as the nessie-gc download in
+# Dockerfile.airflow, so a build only ever sets one Maven base for the whole
+# estate. See docs/DECISIONS.md#images-build-from-a-mirror
+ARG MAVEN_REPO=https://repo1.maven.org/maven2
 RUN set -eux; \
-    M2=https://repo1.maven.org/maven2; \
     JARS=/opt/spark/jars; \
     curl -fsSL -o $JARS/iceberg-spark-runtime.jar \
-      $M2/org/apache/iceberg/iceberg-spark-runtime-3.5_${SCALA_VERSION}/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_${SCALA_VERSION}-${ICEBERG_VERSION}.jar; \
+      ${MAVEN_REPO}/org/apache/iceberg/iceberg-spark-runtime-3.5_${SCALA_VERSION}/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_${SCALA_VERSION}-${ICEBERG_VERSION}.jar; \
     curl -fsSL -o $JARS/iceberg-aws-bundle.jar \
-      $M2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar; \
+      ${MAVEN_REPO}/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar; \
     curl -fsSL -o $JARS/nessie-spark-extensions.jar \
-      $M2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_${SCALA_VERSION}/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_${SCALA_VERSION}-${NESSIE_SPARK_EXT_VERSION}.jar
+      ${MAVEN_REPO}/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_${SCALA_VERSION}/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_${SCALA_VERSION}-${NESSIE_SPARK_EXT_VERSION}.jar
 
-RUN pip install --no-cache-dir pyyaml boto3 pynessie==0.65.0 || pip install --no-cache-dir pyyaml boto3
+# NO FALLBACK. `|| pip install pyyaml boto3` used to swallow a pynessie
+# install failure and ship an image that imports cleanly and lacks the
+# package the platform actually needs at runtime -- a build that "succeeds"
+# with a different image than the one asked for. If pynessie stops
+# installing, this must fail loudly here, not three layers of indirection
+# later at import time.
+RUN pip install --no-cache-dir pyyaml boto3 pynessie==0.65.0
 
 ENV PYTHONPATH=/opt/platform
+
+# Last in the file so it cannot invalidate the jar downloads or pip installs
+# above it. Group 0 with g+rwX so an arbitrary assigned uid in group 0
+# (OpenShift's restricted SCC, which picks a uid this compose file never
+# uses) can still write Spark's own work/log/ivy directories.
+# See docs/DECISIONS.md#image-permissions-layer
+RUN mkdir -p /opt/spark/work /opt/spark/logs /opt/spark/.ivy2 \
+    && chgrp -R 0 /opt/spark/work /opt/spark/logs /opt/spark/.ivy2 \
+    && chmod -R g+rwX /opt/spark/work /opt/spark/logs /opt/spark/.ivy2
+
 USER spark
