@@ -89,6 +89,12 @@ to run something for the first time, expect it to fail and read what it says.
   `spark_session()` and `dbt/profiles.yml`'s `spark_local` target. Pointing
   at a real TLS-terminated S3-compatible store needs only the URL changed,
   never a code change. (`#s3-ssl-follows-the-endpoint-scheme`)
+- **`conf/spark-defaults.conf` holds only what is the same everywhere** — the
+  cluster image ships it, so a host, TLS switch or credential source there is
+  one the cluster inherits. `spark_ocp` reads every per-environment key via
+  `env_var()`, like `spark_local`; `tests/test_spark_config.py` enforces
+  both. A bare `spark-sql` in spark-master no longer knows the catalog: use
+  `scripts/spark-sql`. (`#spark-defaults-hold-only-invariants`)
 - **Spark inside an Airflow task must go through `scripts/_spark_task.py`** (a
   subprocess), or the JVM keeps the task process alive, heartbeats stop and the
   scheduler zombie-reaps it. The *driver* lives in that process, so this holds

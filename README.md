@@ -628,7 +628,7 @@ branch is created and left behind.
 Now query the raw table and look at what landed:
 
 ```bash
-docker compose exec spark-master /opt/spark/bin/spark-sql -e \
+docker compose exec spark-master /opt/platform/scripts/spark-sql -e \
   "SELECT * FROM lakehouse.raw.ref_counterparty LIMIT 5"
 ```
 
@@ -651,7 +651,7 @@ docker compose exec airflow python -m reporting_platform.ingest.ingest_feed \
 docker compose exec airflow python -m reporting_platform.ingest.ingest_feed \
   --feed fo_trade --object landing/fo_trade/TRADE_20260813_v2.csv
 
-docker compose exec spark-master /opt/spark/bin/spark-sql -e \
+docker compose exec spark-master /opt/platform/scripts/spark-sql -e \
   "SELECT _cob_date, _file_version, count(*)
    FROM lakehouse.raw.fo_trade WHERE _cob_date = DATE '2026-08-13'
    GROUP BY 1,2 ORDER BY 2"
@@ -771,7 +771,7 @@ Alternatively skip the merge and query at the branch instead, by appending
 `@<branch>` to the table name as in step 13.
 
 ```bash
-docker compose exec spark-master /opt/spark/bin/spark-sql -e \
+docker compose exec spark-master /opt/platform/scripts/spark-sql -e \
   "SELECT cob_date, change_category, count(*), round(sum(mtm_change),0)
    FROM lakehouse.reporting.exposure_change
    GROUP BY 1,2 ORDER BY 1 DESC, 2 LIMIT 20"
@@ -873,7 +873,7 @@ curl -s http://localhost:19120/api/v2/trees | python3 -m json.tool | grep publis
 Every publication tagged `main`. Query as at a tag:
 
 ```bash
-docker compose exec spark-master /opt/spark/bin/spark-sql -e \
+docker compose exec spark-master /opt/platform/scripts/spark-sql -e \
   "SELECT count(*) FROM lakehouse.reporting.\`counterparty_exposure@published/2026-08-13/<run_id>\`"
 ```
 

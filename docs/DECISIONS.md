@@ -87,6 +87,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 |---|---|
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
+| [spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants) | `spark-defaults.conf` ships in the cluster image, so it may hold no host, TLS switch or credential source |
 | [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
 | [spark-worker-sizing](#spark-worker-sizing) | Cap each application, or standalone mode holds every free core until the session stops |
 | [spark-in-a-subprocess](#spark-in-a-subprocess) | The JVM keeps the task process alive; heartbeats stop; the scheduler zombie-reaps it |
@@ -541,6 +542,44 @@ flag — the AWS SDK it uses already reads the scheme off the endpoint URL
 itself; only the Hadoop S3A path (`spark.hadoop.fs.s3a.*`, used for reading
 landing CSVs) needed the fix.
 
+## spark-defaults-hold-only-invariants
+
+`conf/spark-defaults.conf` used to carry the whole catalog wiring, including
+`http://nessie:19120/api/v2`, `http://minio:9000` and
+`fs.s3a.connection.ssl.enabled false`, and `spark_ocp` in `dbt/profiles.yml`
+relied on it for everything but the Nessie ref. The cluster's Spark image
+ships that file, so the cluster target inherited compose's host names: the
+first build on a cluster would have gone looking for a MinIO that is not
+there, with nothing in the error saying "config".
+
+The file now holds only what is the same in every environment: the
+extensions, the catalog and io implementations, the S3A filesystem class,
+the timezone, AQE and Kryo. Every per-environment value (Nessie URI,
+warehouse, S3 endpoint, TLS, auth) is read from the environment, in
+`spark_session()` and in both dbt targets. `spark_ocp` carries the same
+`env_var()` keys as `spark_local`, without defaults, so a missing variable
+fails at dbt startup instead of pointing at a local host. It omits only what
+is local by nature: the master (spark-submit sets it), the jars (the image
+bakes them) and the driver and executor sizing.
+`tests/test_spark_config.py` enforces all of it, including that every
+`spark_local` key reaches `spark_ocp` directly or through the file.
+
+Two things in the old file were wrong, not just local:
+
+- The extensions were listed Iceberg first, the order `spark_session()`
+  documents as breaking `rewrite_data_files` ("Cannot parse order: parser is
+  not an Iceberg ExtendedParser"). `spark_local` had the same order. Both are
+  Nessie first now, and the test pins the three copies equal.
+- It pinned `SimpleAWSCredentialsProvider`, which reads `fs.s3a.access.key`,
+  and nothing sets that key. The credentials provider is a per-environment
+  choice (environment variables locally, web identity on a cluster), so it
+  is left to Hadoop's default chain.
+
+Locally, compose bind-mounts the file onto spark-master and spark-worker, so
+a bare `spark-sql` there no longer knows where the catalog is.
+`scripts/spark-sql` passes the per-environment values from the container's
+environment, and the README's ad hoc queries use it.
+
 ## spark-worker-sizing
 
 The worker is sized so several applications can hold cores at once. Every Spark
@@ -714,9 +753,12 @@ executors have baked in.
 
 For `spark_ocp`, dbt runs inside the driver pod that `spark-submit` created for
 the build, so there is one SparkSession per build and the Nessie ref is
-unambiguous. That target carries far less config on purpose: a driver pod built
-from the Spark image does have `spark-defaults.conf`, so only the per-run
-override belongs there. Duplicating the rest would be a forked copy that drifts.
+unambiguous. A driver pod built from the Spark image has `spark-defaults.conf`,
+but that file holds only the keys that are the same everywhere
+([spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants)).
+So `spark_ocp` carries the per-environment keys itself, from `env_var()`, and
+`tests/test_spark_config.py` checks that no `spark_local` key is missing from
+both.
 
 A connection method other than `session` was tried there and removed: it served
 no purpose the design had chosen and carried a silent-failure risk on the branch
