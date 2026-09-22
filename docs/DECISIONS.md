@@ -87,6 +87,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 
 | Anchor | The finding |
 |---|---|
+| [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images come from quay.io |
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
@@ -618,6 +619,20 @@ anything shared needs a real identity layer in front of the console regardless.
 The webserver secret key is shared across replicas and restarts so sessions
 survive. Airflow 2 needs nothing like Airflow 3's execution-API URL or JWT
 secret — see [airflow-2-not-3](#airflow-2-not-3).
+
+## minio-images-come-from-quay
+
+`minio/minio` and `minio/mc` on Docker Hub now refuse anonymous pulls: `pull
+access denied for minio/minio, repository does not exist or may require
+'docker login'`. Every machine that had pulled them before kept working from
+its cache, so nothing local noticed. The CI build tier, the first thing to
+pull on a clean runner, failed on it immediately. A fresh clone could not
+have started the stack.
+
+Both now come from `quay.io/minio/*` at the same release tags. It is the same
+image: the local Docker Hub copy and the quay.io pull have identical image IDs
+(`sha256:7d80fd23...` for minio, `sha256:a5399b66...` for mc). The nightly
+build tier is what notices the next registry doing this.
 
 ## the-build-tier
 
