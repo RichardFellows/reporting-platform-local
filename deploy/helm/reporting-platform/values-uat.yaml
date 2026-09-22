@@ -1,0 +1,8 @@
+# uat: CONTROLLED. The project digest must match what was deployed
+# (check_project_drift refuses otherwise) and the feed console is refused.
+environment: uat
+secrets:
+  existingSecret: reporting-platform-uat
+airflow:
+  data:
+    metadataSecretName: reporting-platform-uat-airflow-db

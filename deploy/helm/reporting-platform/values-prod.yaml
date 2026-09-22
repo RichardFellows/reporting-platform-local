@@ -1,0 +1,7 @@
+# prod: CONTROLLED, as uat.
+environment: prod
+secrets:
+  existingSecret: reporting-platform-prod
+airflow:
+  data:
+    metadataSecretName: reporting-platform-prod-airflow-db

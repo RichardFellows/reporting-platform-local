@@ -1,0 +1,35 @@
+# A throwaway kind/k3d cluster for `make k8s-smoke` (plan 2d): the whole
+# platform, with MinIO, Nessie and Postgres as in-release Deployments and the
+# images loaded into the cluster rather than pulled. Fully renderable on its
+# own -- nothing here is left for a pipeline to fill.
+environment: dev
+images:
+  platform:
+    repository: reporting-platform-airflow
+    tag: k8s-smoke      # kind loads by tag; see images in values.yaml
+  spark:
+    repository: reporting-platform-spark
+    tag: k8s-smoke
+  pullPolicy: Never
+endpoints:
+  s3: http://minio:9000
+  nessie: http://nessie:19120/api/v2
+  warehouse: s3a://lakehouse/warehouse
+  landing: s3a://lakehouse/landing
+secrets:
+  create: true
+  values:
+    awsAccessKeyId: minioadmin
+    awsSecretAccessKey: minioadmin123
+    registryDsn: postgresql://platform:platform@postgres:5432/platform
+localStores:
+  enabled: true
+airflow:
+  images:
+    airflow:
+      repository: reporting-platform-airflow
+      tag: k8s-smoke
+      pullPolicy: Never
+  data:
+    metadataSecretName: reporting-platform-airflow-db
+  webserverSecretKey: local-k8s-not-a-real-secret

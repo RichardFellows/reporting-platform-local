@@ -1,0 +1,13 @@
+# dev: the one shared environment the feed console and the inbox run in.
+# Endpoints, digests and provenance are set by the deploy pipeline
+# (--set / a generated values file); an empty one fails the render.
+environment: dev
+secrets:
+  existingSecret: reporting-platform-dev
+feedConsole:
+  enabled: true
+inbox:
+  enabled: true
+airflow:
+  data:
+    metadataSecretName: reporting-platform-dev-airflow-db
