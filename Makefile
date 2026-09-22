@@ -23,6 +23,11 @@ up: env ## Start the whole local stack
 	@echo "Airflow  http://localhost:8081   (admin / admin)"
 	@echo "Spark    http://localhost:8080"
 
+.PHONY: release-image
+release-image: ## Build the release image (code baked in) and write release.env. IMAGE=<ref>
+	scripts/release_image.sh $(or $(IMAGE),reporting-platform-airflow:release) > release.env
+	@cat release.env
+
 .PHONY: test
 test: ## Config-level tests (no stack needed, ~1s). See tests/README.md
 	python -m tests.run
