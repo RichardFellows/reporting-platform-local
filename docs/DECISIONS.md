@@ -117,6 +117,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [no-unused-config-paths](#no-unused-config-paths) | No `seeds:` block, and why an unused config path is a trap |
 | [identifiers-in-macros](#identifiers-in-macros) | Which macros call `ident()`, and why that is a decision |
 | [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps) | Migrate, admin user, the pool, the registry schema, `dbt deps` — miss the last and two DAGs do not import |
+| [the-release-image-carries-the-code](#the-release-image-carries-the-code) | `Dockerfile.airflow` has a `release` stage with the code and dbt packages baked in; compose builds `dev` and mounts the code |
 | [assets-are-or-not-and](#assets-are-or-not-and) | A bare schedule list is **AND**, which is almost never what you meant |
 | [retry-delay](#retry-delay) | Seconds, not the five minutes it used to be |
 
@@ -462,6 +463,36 @@ more often than the pip installs above it, and Docker invalidates every layer
 after the one that changed — put it higher and editing a directory list costs a
 full reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
 whatever registry mirror is in front of pip. Nothing below it depends on it.
+
+## the-release-image-carries-the-code
+
+Every service built from `Dockerfile.airflow` used to get its code from bind
+mounts: the DAGs, `reporting_platform`, `reporting_transport`, `scripts` and
+`dbt`. A cluster has no working tree to mount, so the image the platform
+deployed contained no platform at all. `airflow-init` also ran `dbt deps` at
+startup, which needs egress to the package hub.
+
+The Dockerfile now has two targets. `dev` is the old image, and compose pins
+`target: dev` on the airflow anchor, because a multi-stage build otherwise
+defaults to the LAST stage. `release` is `dev` plus a COPY of each mounted
+code directory to the path compose mounts it at, the dbt path variables as
+`ENV`, and `dbt deps` run at build time into the path `dbt_project.yml`
+already defaults to. Tests, seeds and notebooks stay out of it.
+
+Proved with no mounts: `docker run <release image> bash -c 'airflow db migrate
+&& python -m scripts.check_dag_imports'` reports 13 DAGs from 7 files. It
+needs only `NESSIE_URI`, `S3_ENDPOINT` and `REPORTING_WAREHOUSE`, which
+`profiles.yml` reads with no default
+([spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants))
+and the chart's ConfigMap supplies.
+
+`scripts/release_image.sh` (`make release-image`) is the pipeline step. It
+builds the image and prints `PLATFORM_CODE_REF` as the image DIGEST, never a
+tag, because a tag can be re-pushed. It also prints `DBT_PROJECT_DIGEST` from
+`registry provenance` run INSIDE the built image, so the digest is the
+platform's own computation over the project actually shipped.
+`tests/test_release_image.py` fails if the anchor mounts a code directory
+that the release stage does not copy, or if compose stops pinning `dev`.
 
 ## airflow-init-load-bearing-steps
 

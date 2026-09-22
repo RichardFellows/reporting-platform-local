@@ -56,6 +56,10 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: Dockerfile.airflow
+    # The code is bind-mounted below; `release` bakes it in for a cluster.
+    # Without this, compose would build the LAST stage, which is release.
+    # See docs/DECISIONS.md#the-release-image-carries-the-code
+    target: dev
     args:
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.108.1}
   # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own

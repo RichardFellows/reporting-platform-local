@@ -51,3 +51,4 @@ var/
 
 # Windows/msys crash dumps
 *.stackdump
+release.env

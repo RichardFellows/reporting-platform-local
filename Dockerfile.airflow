@@ -1,5 +1,11 @@
 # Airflow 2.x, deliberately, not 3.x. See docs/DECISIONS.md#airflow-2-not-3
-FROM apache/airflow:2.10.5-python3.11
+#
+# TWO TARGETS. `dev` (everything up to the permissions layer) is what compose
+# builds, with the code BIND-MOUNTED so an edit is live. `release` is `dev`
+# plus the code and the dbt packages, for a cluster with no mounts at all.
+# Compose pins `target: dev`; without it, a multi-stage build defaults to the
+# LAST stage. See docs/DECISIONS.md#the-release-image-carries-the-code
+FROM apache/airflow:2.10.5-python3.11 AS dev
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -95,3 +101,33 @@ RUN mkdir -p /opt/platform/run/dbt/logs /opt/platform/run/dbt/target \
     && chown -R airflow:0 /opt/platform/run \
     && chmod -R g+rwX /opt/platform/run
 USER airflow
+
+# ---------------------------------------------------------------------------
+# RELEASE: the same image with the code in it, at the paths compose mounts it.
+# Nothing a DAG, a task or the console reads may come from a mount here --
+# `docker run <image> python -m scripts.check_dag_imports` with no mounts is
+# the proof. Tests, seeds and docs stay out: this is a runtime image.
+FROM dev AS release
+
+COPY --chown=airflow:0 airflow/dags          /opt/airflow/dags
+COPY --chown=airflow:0 reporting_platform    /opt/platform/reporting_platform
+COPY --chown=airflow:0 reporting_transport   /opt/platform/reporting_transport
+COPY --chown=airflow:0 scripts               /opt/platform/scripts
+COPY --chown=airflow:0 dbt                   /opt/platform/dbt
+
+# Paths that are facts about THIS image, not about an environment, so they
+# live here rather than in a chart ConfigMap. The same values compose sets on
+# its airflow anchor. See docs/DECISIONS.md#dbt-working-directories
+ENV PYTHONPATH=/opt/platform \
+    DBT_PROJECT_DIR=/opt/platform/dbt \
+    DBT_PROFILES_DIR=/opt/platform/dbt \
+    DBT_LOG_PATH=/opt/platform/run/dbt/logs \
+    DBT_TARGET_PATH=/opt/platform/run/dbt/target
+
+# dbt packages AT BUILD TIME, into the path dbt_project.yml's
+# packages-install-path defaults to, so airflow-init needs no network for
+# them on a cluster. Without packages `dbt ls` cannot compile a dbt_utils
+# test and both build DAGs fail to IMPORT.
+# See docs/DECISIONS.md#airflow-init-load-bearing-steps
+RUN dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt \
+    && chmod -R g+rwX /opt/platform/run /opt/platform/dbt

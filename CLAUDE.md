@@ -130,6 +130,12 @@ to run something for the first time, expect it to fail and read what it says.
   `Dockerfile.airflow` smoke-tests `dbt --version`; re-run `pip install
   --dry-run` before moving `COSMOS_VERSION`.
   (`#cosmos-no-deps`)
+- **`Dockerfile.airflow` has two targets: compose builds `dev` and MOUNTS the
+  code; `release` bakes the code and dbt packages in, for a cluster.** A
+  directory added to the airflow anchor's mounts must be COPYed into
+  `release` too — `tests/test_release_image.py` fails otherwise. `make
+  release-image` prints `PLATFORM_CODE_REF` (the image digest) and
+  `DBT_PROJECT_DIGEST`. (`#the-release-image-carries-the-code`)
 - **`airflow-init` does five things**: db migrate, admin user, `pools set
   lakehouse_write 1`, the registry schema, `dbt deps`. Without packages,
   `dbt ls` cannot compile a `dbt_utils` test and the two build DAGs do not

@@ -35,6 +35,10 @@ through the pipeline to the change record and its approval.
 `PLATFORM_CODE_REF` already exists for the platform image and should be the
 image **digest**, not a tag: a tag can be re-pushed, and then the evidence
 changes underneath a run that has already been published.
+`make release-image IMAGE=<ref>` (`scripts/release_image.sh`) builds the
+`release` target of `Dockerfile.airflow` and prints both values: the digest,
+and `DBT_PROJECT_DIGEST` from `registry provenance` run inside that image.
+See `docs/DECISIONS.md#the-release-image-carries-the-code`.
 
 **`DBT_PROJECT_DIGEST` is computed with the platform's own command**, not
 reimplemented in the pipeline. A run recomputes it and compares; a mismatch

@@ -1,0 +1,16 @@
+# The build context is the repo root. Only Dockerfile.airflow's `release`
+# stage COPYs from it; this keeps local state out of that image.
+.git
+.ci
+**/__pycache__
+**/*.pyc
+dbt/target
+dbt/logs
+dbt/dbt_packages
+seed
+seed_clean
+inbox
+var
+spike
+notebooks
+.env
