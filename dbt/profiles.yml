@@ -25,9 +25,11 @@ reporting_platform:
         # What puts the build on the cluster. Must not diverge from SPARK_MASTER
         # in docker-compose.yml. See docs/DECISIONS.md#spark-master-single-source
         spark.master: "{{ env_var('SPARK_MASTER', 'spark://spark-master:7077') }}"
-        # Versions from the environment; must equal the jars baked into the
-        # Spark image. See docs/DECISIONS.md#jar-versions
-        spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{{ env_var('ICEBERG_VERSION', '1.6.1') }},org.apache.iceberg:iceberg-aws-bundle:{{ env_var('ICEBERG_VERSION', '1.6.1') }},org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:{{ env_var('NESSIE_SPARK_EXT_VERSION', '0.99.0') }},org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        # The driver's jars, baked into the Airflow image; the same variable
+        # spark_session() reads, so the two drivers cannot diverge. Set as
+        # spark.jars, which also ships them to the executors.
+        # See docs/DECISIONS.md#driver-jars-are-baked
+        spark.jars: "{{ env_var('PLATFORM_DRIVER_JARS') }}"
         # Nessie first, Iceberg last -- see conf/spark-defaults.conf.
         spark.sql.extensions: "org.projectnessie.spark.extensions.NessieSparkSessionExtensions,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
         spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog

@@ -49,7 +49,7 @@ LITERAL_SSL = re.compile(
 # driver pod's resources are the pod's.
 LOCAL_ONLY_KEYS = {
     "spark.master",
-    "spark.jars.packages",
+    "spark.jars",
     "spark.driver.memory",
     "spark.cores.max",
     "spark.executor.cores",

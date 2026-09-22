@@ -264,7 +264,7 @@ the notes in this table before moving one.
 | **Spark** | **3.5.3** (Scala 2.12, JDK 11) | `Dockerfile.spark` | Must match the Iceberg and Nessie Spark runtimes below, which are published per Spark minor. `pyspark` in the Airflow image is pinned to the same 3.5.3. |
 | **Nessie server** | **0.108.1** (`NESSIE_SERVER_VERSION`) | `.env` | Sets the server image **and** the `nessie-gc` jar, which must equal each other. Serves REST API v2 and an Iceberg REST catalog. It is allowed to be **newer** than the Spark extensions below, and here it is. |
 | **Nessie Spark extensions** | **0.99.0** (`NESSIE_SPARK_EXT_VERSION`) | `.env` | **Tracks Iceberg, not the server** — 0.103.3 ↔ Iceberg 1.8.1, 0.108.1 ↔ 1.11.0. Newer-than-your-Iceberg is the failing direction, which is why this trails the server. |
-| **Apache Iceberg** | **1.6.1** (`ICEBERG_VERSION`) | `.env` | `iceberg-spark-runtime-3.5_2.12` and `iceberg-aws-bundle`. Must be **identical** in the Spark image and in *both* drivers — `spark_session()` and `spark.jars.packages` in `dbt/profiles.yml` — because every submitting process runs a pip `pyspark` with no jars of its own. |
+| **Apache Iceberg** | **1.6.1** (`ICEBERG_VERSION`) | `.env` | `iceberg-spark-runtime-3.5_2.12` and `iceberg-aws-bundle`. Must be **identical** in the Spark image and the Airflow image, which bakes the jars for *both* drivers (`spark_session()` and `dbt/profiles.yml`, via `PLATFORM_DRIVER_JARS`) — because every submitting process runs a pip `pyspark` with no jars of its own. |
 | **Marquez** | **0.51.1** (`MARQUEZ_VERSION`) | `.env` | The OpenLineage consumer, off by default behind the `lineage` compose profile. **Both images are built here on UBI** from Marquez's own source (`Dockerfile.marquez-api`, `Dockerfile.marquez-web`) — upstream ships Ubuntu and Alpine. This is the *release tag the builders fetch*, so changing it triggers a gradle + npm build with egress, not a pull. |
 | **Postgres** | **16** | `docker-compose.yml` | Backs three databases: the Airflow metadata DB, the Nessie version store, and the `platform` database holding the delivery/run **registry**. Nessie is JDBC-backed rather than in-memory on purpose, so the local stack exercises the same version-store path as the cluster. |
 | **MinIO** | `RELEASE.2024-09-22T00-33-43Z` | `docker-compose.yml` | Stand-in for the on-prem S3-compatible store. `mc` is pinned separately for the bucket-init job. |
@@ -272,7 +272,7 @@ the notes in this table before moving one.
 | **dbt-spark** | **1.8.0** (`[PyHive]`) | `Dockerfile.airflow` | The only dbt adapter installed — see below. |
 | **astronomer-cosmos** | **1.15.1** | `Dockerfile.airflow` | Renders the dbt project into Airflow tasks. Installed `--no-deps`, and that is **not** an optimisation: installing it under Airflow's constraint file downgrades `typing_extensions` 4.16 -> 4.12, and dbt's `mashumaro` needs `evaluate_forward_ref` from 4.13+, so **every dbt invocation dies at import** — in dbt, not in cosmos, and not until something runs dbt. The image build now runs `dbt --version` as a smoke check so that can never ship silently again. |
 | **DuckDB** | **1.5.5** | `Dockerfile.airflow` | For `scripts/duckdb_console.py` only. 1.1.3's iceberg extension has no catalog `ATTACH` at all and fails with `Binder Error: Unrecognized storage type "ICEBERG"`. |
-| **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `dbt/profiles.yml`, `reporting_platform/common/spark.py` | S3A filesystem for reading landing CSVs. Deliberately **not** baked into `Dockerfile.spark`: the driver resolves it via `spark.jars.packages` and ships it to the executors, so there is one place the version is set. |
+| **Hadoop AWS / AWS SDK** | 3.3.4 / 1.12.262 | `Dockerfile.airflow` (`HADOOP_AWS_VERSION`, `AWS_SDK_BUNDLE_VERSION`) | S3A filesystem for reading landing CSVs. Deliberately **not** baked into `Dockerfile.spark`: the Airflow image bakes it for the driver, and `spark.jars` ships it to the executors, so there is one place the version is set. |
 
 **There is no `dbt-duckdb`, on purpose.** Spark is the only build engine —
 a build has to land on a Nessie branch and only the Spark path can address one
@@ -311,11 +311,9 @@ flowchart TB
     NS["NESSIE_SERVER_VERSION<br/>0.108.1"]
   end
   IV ==> SI["Dockerfile.spark<br/><i>baked into executors</i>"]
-  IV ==> D1["common/spark.py<br/>spark_session()"]
-  IV ==> D2["dbt/profiles.yml<br/>spark.jars.packages"]
+  IV ==> AI["Dockerfile.airflow<br/><i>baked for both drivers</i>"]
   NX --> SI
-  NX --> D1
-  NX --> D2
+  NX --> AI
   NS --> SRV["nessie server image"]
   NS --> GC["nessie-gc.jar<br/><i>Dockerfile.airflow</i>"]
   IV -. "must match the pairing<br/>0.103.3 ↔ 1.8.1<br/>0.108.1 ↔ 1.11.0" .- NX
@@ -326,7 +324,7 @@ flowchart TB
 dotted lines are the pairings — Iceberg and the Spark extensions must be a
 matching release pair, and the server is allowed to run ahead of the
 extensions. Everything a *driver* resolves is shipped to the executors, which
-is why the same Iceberg version has to appear in three places: every
+is why the same Iceberg version has to be baked into both images: every
 submitting process runs a pip `pyspark` with no jars of its own.
 
 

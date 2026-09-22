@@ -65,6 +65,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 |---|---|
 | [jar-versions](#jar-versions) | Three version values in `.env` reaching six consumers, and why the split is the finding rather than pedantry |
 | [spark-jars-prebaked](#spark-jars-prebaked) | The Spark image bakes its jars instead of resolving `--packages` at submit |
+| [driver-jars-are-baked](#driver-jars-are-baked) | The Airflow image bakes the drivers' jars; both drivers read `PLATFORM_DRIVER_JARS`, no Ivy at runtime |
 | [nessie-gc-jar](#nessie-gc-jar) | There is no server-side GC endpoint; collecting content needs the CLI jar |
 | [nessie-iceberg-rest](#nessie-iceberg-rest) | Nessie serves an Iceberg REST catalog, and what that does and does not replace |
 | [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) | Nessie logs Elastic Common Schema field names, which is why its logs read oddly |
@@ -217,16 +218,18 @@ finding, not pedantry.
 
 | Variable | Sets |
 |---|---|
-| `ICEBERG_VERSION` | the Iceberg runtime: baked into the Spark image's `/opt/spark/jars`, and resolved by both drivers |
+| `ICEBERG_VERSION` | the Iceberg runtime: baked into the Spark image's `/opt/spark/jars` for the executors, and into the Airflow image's `/opt/platform/jars` for both drivers |
 | `NESSIE_SPARK_EXT_VERSION` | the Nessie Spark SQL extensions, in the same three places |
 | `NESSIE_SERVER_VERSION` | the Nessie server image tag and the `nessie-gc` jar |
 
-`ICEBERG_VERSION` has to be identical in three places — `Dockerfile.spark`, and
-*both* drivers (`spark_session()` in `common/spark.py`, `spark.jars.packages`
-in `dbt/profiles.yml`) — because every process that submits work here runs a
-pip-installed pyspark with no jars of its own. `spark.jars.packages` ships the
-driver's jars to every executor, so what the executors load is what the driver
-resolved. Diverge and you get two Iceberg versions in one application, which
+`ICEBERG_VERSION` has to be identical in both images — `Dockerfile.spark` for
+the executors, and `Dockerfile.airflow` for the drivers (`spark_session()` in
+`common/spark.py` and `spark_local` in `dbt/profiles.yml`, which both read the
+baked jar list from `PLATFORM_DRIVER_JARS`) — because every process that
+submits work here runs a pip-installed pyspark with no jars of its own.
+`spark.jars` ships the driver's jars to every executor, so what the executors
+load is what the driver has. See
+[driver-jars-are-baked](#driver-jars-are-baked). Diverge and you get two Iceberg versions in one application, which
 surfaces as `NoSuchMethodError` on the first write rather than as anything
 saying "version".
 
@@ -243,7 +246,8 @@ also what decides the server's log format** — see
 [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) — which is why the server
 here is pinned ahead of the extensions rather than level with them.
 
-`hadoop-aws` and `aws-java-sdk-bundle` are deliberately not parameterised. They
+`hadoop-aws` and `aws-java-sdk-bundle` are build ARGs of `Dockerfile.airflow`
+only (`HADOOP_AWS_VERSION`, `AWS_SDK_BUNDLE_VERSION`), not `.env` values. They
 track Spark 3.5's Hadoop, not Iceberg.
 
 Defaults everywhere repeat the pinned combination, so a clone with no `.env`
@@ -260,9 +264,37 @@ The Spark image bakes its jars rather than resolving `--packages` at submit
 time. In the cluster they come from the internal registry; baking them means no
 egress at runtime.
 
-The drivers still resolve via Ivy (see [jar-versions](#jar-versions)) because
-they run pip-installed pyspark, which has none of these jars — the first
-Iceberg SQL statement would fail with `ClassNotFoundException` before it ran.
+The drivers used to resolve theirs via Ivy at session start; they are baked
+too now — see [driver-jars-are-baked](#driver-jars-are-baked).
+
+## driver-jars-are-baked
+
+Every driver here is a pip-installed pyspark with none of the Iceberg, Nessie
+or S3A jars, so without them the first Iceberg statement fails with
+`ClassNotFoundException`. Both drivers used to fetch them from Maven Central
+through `spark.jars.packages` on every cold start. That is a runtime
+dependency on egress, which a cluster behind a mirror does not have, and a
+second copy of every version in two files.
+
+`Dockerfile.airflow` now downloads the five jars at build time (through
+`MAVEN_REPO`, so a mirror redirects them) into `/opt/platform/jars`, and
+exports the list as `PLATFORM_DRIVER_JARS`. `spark_session()` and
+`spark_local` both set `spark.jars` from that one variable, so the drivers
+cannot diverge, and the versions live once, in the Dockerfile's ARGs, which
+`tests/test_versions.py` pins against `Dockerfile.spark`. `spark.jars` ships
+the jars to every executor, exactly as `spark.jars.packages` did, which is
+still how `hadoop-aws` (not baked into the Spark image) reaches them.
+
+A process outside the image has no `PLATFORM_DRIVER_JARS`. `spark_session()`
+refuses naming it, and names any listed jar that is missing, rather than
+failing later with `ClassNotFoundException`. dbt refuses with `Env var
+required but not provided`. CI's parse tier sets it to an inert path,
+because it renders the profile but starts no session.
+
+Verified live: a session on a Nessie branch showed `spark.jars.packages`
+unset and no Ivy resolution in the log. An Iceberg write and read, a sorted
+`rewrite_data_files`, and an S3A read of landing across 2 executor partitions
+all worked, and a dbt branch build ran as before.
 
 ## nessie-logs-are-ecs-json
 
@@ -1562,8 +1594,9 @@ refused: a setting that cannot apply must not look like one that did.
 
 [jar-versions](#jar-versions) has been documented in CLAUDE.md, `.env.example`
 and here for as long as it has existed, and was checked by nothing.
-`common/spark.py` reads two of the three and interpolates them straight into
-`spark.jars.packages`; the failure is `NoSuchMethodError` on the first write,
+`common/spark.py` read two of the three and interpolated them straight into
+`spark.jars.packages` (the driver jars are baked now,
+[driver-jars-are-baked](#driver-jars-are-baked)); the failure is `NoSuchMethodError` on the first write,
 after the image builds and the stack comes up, naming no version.
 
 `tests/test_versions.py` pins what is actually checkable, which is not the

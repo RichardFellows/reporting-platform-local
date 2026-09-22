@@ -87,6 +87,41 @@ RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
     && dbt --version >/dev/null \
     && python -c "import marimo, duckdb; print('marimo', marimo.__version__)"
 
+# THE DRIVER'S JARS, baked in rather than resolved by Ivy at session start.
+# Every submitting process here -- spark_session() and dbt's spark_local
+# target -- is a pip pyspark with NO Iceberg, Nessie or S3A jars of its own.
+# It used to fetch them from Maven Central through spark.jars.packages on
+# every cold start, which is a runtime dependency on egress that a cluster
+# does not have. Both drivers now read PLATFORM_DRIVER_JARS below, set as
+# spark.jars, which also SHIPS them to the executors -- how hadoop-aws, which
+# Dockerfile.spark does not bake, reaches them at all.
+#
+# The versions must equal Dockerfile.spark's, and tests/test_versions.py
+# checks that they do. hadoop-aws tracks the Hadoop that pyspark 3.5.3
+# bundles, and aws-java-sdk-bundle tracks hadoop-aws.
+# See docs/DECISIONS.md#jar-versions, docs/DECISIONS.md#driver-jars-are-baked
+ARG MAVEN_REPO=https://repo1.maven.org/maven2
+ARG ICEBERG_VERSION=1.6.1
+ARG NESSIE_SPARK_EXT_VERSION=0.99.0
+ARG HADOOP_AWS_VERSION=3.3.4
+ARG AWS_SDK_BUNDLE_VERSION=1.12.262
+USER root
+RUN set -eux; \
+    J=/opt/platform/jars; mkdir -p $J; \
+    curl -fsSL -o $J/iceberg-spark-runtime.jar \
+      "${MAVEN_REPO}/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar"; \
+    curl -fsSL -o $J/iceberg-aws-bundle.jar \
+      "${MAVEN_REPO}/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar"; \
+    curl -fsSL -o $J/nessie-spark-extensions.jar \
+      "${MAVEN_REPO}/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_2.12-${NESSIE_SPARK_EXT_VERSION}.jar"; \
+    curl -fsSL -o $J/hadoop-aws.jar \
+      "${MAVEN_REPO}/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
+    curl -fsSL -o $J/aws-java-sdk-bundle.jar \
+      "${MAVEN_REPO}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"; \
+    chown -R airflow:0 $J; chmod -R g+rX $J
+ENV PLATFORM_DRIVER_JARS=/opt/platform/jars/iceberg-spark-runtime.jar,/opt/platform/jars/iceberg-aws-bundle.jar,/opt/platform/jars/nessie-spark-extensions.jar,/opt/platform/jars/hadoop-aws.jar,/opt/platform/jars/aws-java-sdk-bundle.jar
+USER airflow
+
 # ---------------------------------------------------------------------------
 USER root
 # dbt's working directories, outside the ./dbt bind mount because a bind mount
