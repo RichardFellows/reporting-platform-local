@@ -144,6 +144,24 @@ airflow:
     enabled: false
   data:
     metadataSecretName: ""
+  # PLAIN JOBS, NOT HELM HOOKS. As hooks they are post-install, and
+  # `helm install --wait` -- which any pipeline wants -- runs post-install
+  # hooks only once every pod is ready, while every Airflow pod's init
+  # container waits for exactly these migrations: a deadlock that ends in
+  # "There are still unapplied migrations ... MigrationHead(s) in DB: set()"
+  # and Init:CrashLoopBackOff. Found by the local-k8s smoke test.
+  migrateDatabaseJob:
+    useHelmHooks: false
+  createUserJob:
+    useHelmHooks: false
+  # basic_auth as well as session, as compose sets it: without it the feed
+  # console and the inbox watcher -- which call Airflow's REST API with
+  # AIRFLOW_API_USER/PASSWORD -- get 401 UNAUTHORIZED on every call against a
+  # healthy webserver. Found by the local-k8s smoke (the inbox's triggers).
+  # See docs/DECISIONS.md#airflow-api-auth
+  config:
+    api:
+      auth_backends: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
   # DAGs are baked into the release image, not git-synced.
   dags:
     gitSync:

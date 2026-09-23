@@ -45,15 +45,22 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # DELETECOLLECTION ON ALL OF THESE, not only pods. Spark's cleanup at
+  # SparkContext.stop() deletes its services, executor ConfigMaps and PVCs by
+  # label selector. Without the verb that cleanup is Forbidden -- logged, not
+  # raised -- and the ConfigMap survives. Spark 3.5 names the executor
+  # ConfigMap once per JVM, so the NEXT context in the same process (bulk
+  # ingest restarts one per feed) fails to start with 409 `configmaps
+  # "spark-exec-...-conf-map" already exists`. Found by the local-k8s smoke.
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "get", "delete"]
+    verbs: ["create", "get", "list", "delete", "deletecollection"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "list", "delete", "deletecollection"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["list"]
+    verbs: ["list", "delete", "deletecollection"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

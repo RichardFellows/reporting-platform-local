@@ -38,3 +38,9 @@ airflow:
   data:
     metadataSecretName: reporting-platform-airflow-db
   webserverSecretKey: local-k8s-not-a-real-secret
+  # Lean for a laptop-sized cluster: no metrics sidecar, and no redis --
+  # KubernetesExecutor has no Celery broker.
+  statsd:
+    enabled: false
+  redis:
+    enabled: false

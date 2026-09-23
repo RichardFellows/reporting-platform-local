@@ -97,6 +97,7 @@ CLUSTER_ENV = {
     "SPARK_EXECUTOR_IMAGE": "registry.example/spark@sha256:abc",
     "SPARK_SERVICE_ACCOUNT": "spark",
     "POD_IP": "10.0.0.7",
+    "PLATFORM_ENV_SECRET": "platform-secrets",
 }
 
 

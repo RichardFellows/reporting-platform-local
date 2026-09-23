@@ -135,6 +135,12 @@ def test_kubernetes_mode_puts_the_executors_in_pods():
     assert conf["spark.executor.instances"] == "1"
     # cores.max is a standalone-mode cap; instances x cores is the cap here
     assert "spark.cores.max" not in conf
+    # executor pods inherit nothing: region by value, credentials by
+    # reference to the platform Secret, never as values in the conf
+    assert conf["spark.executorEnv.AWS_REGION"]
+    assert conf["spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID"] == \
+        "platform-secrets:AWS_ACCESS_KEY_ID"
+    assert not [v for v in conf.values() if "minioadmin" in str(v)]
 
 
 def test_the_mode_and_the_master_must_agree():

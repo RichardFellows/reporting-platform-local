@@ -88,6 +88,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | Anchor | The finding |
 |---|---|
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
+| [the-local-k8s-smoke](#the-local-k8s-smoke) | `make k8s-smoke` runs the chart in kind through a merged `prepared_build`; its first run found four cluster-only defects |
 | [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move |
 | [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
 | [the-chart-is-the-only-place-settings-are-written](#the-chart-is-the-only-place-settings-are-written) | One ConfigMap, one Secret, envFrom everywhere; why `existingSecret` needs two literal names, not one computed value |
@@ -620,6 +621,49 @@ anything shared needs a real identity layer in front of the console regardless.
 The webserver secret key is shared across replicas and restarts so sessions
 survive. Airflow 2 needs nothing like Airflow 3's execution-API URL or JWT
 secret — see [airflow-2-not-3](#airflow-2-not-3).
+
+## the-local-k8s-smoke
+
+`make k8s-smoke` (`scripts/k8s_smoke.sh`) runs the platform in a kind cluster
+from the chart, `values-local-k8s.yaml`, with MinIO, Nessie and Postgres
+in-release. It is the first place the chart, the release image and
+`PLATFORM_EXECUTION=kubernetes` run together. The sequence:
+
+1. Install with `--wait`, then check the init hook (the pool, the registry
+   schema), that every DAG imports from the baked image, and `config check`.
+2. Bulk-ingest the reference feeds: drivers in the scheduler pod, executors
+   as pods.
+3. The inbox gate lands the qa_ fixtures and triggers their ingest DAGs
+   through Airflow's API.
+4. An `ingest_fo_trade` DAG run launches its driver as a pod
+   (`spark-task-ingest-*`, which creates `...-exec-1`).
+5. `prepared_build` builds on a branch, audits and merges. The script
+   asserts Nessie `main`'s head is its `publish(prepared)` commit, and that
+   `registry runs` shows the run `published`.
+
+It waits on specific run ids, never `dags test`.
+
+Its first run found four defects that nothing short of a cluster could:
+
+- **A `--wait` deadlock.** The Airflow chart's migrate and create-user jobs
+  are post-install hooks by default, and `--wait` runs those only when every
+  pod is ready. Every Airflow pod's init container waits for exactly those
+  migrations, so the pods crash-loop on `There are still unapplied
+  migrations ... MigrationHead(s) in DB: set()`. Both are now plain Jobs
+  (`useHelmHooks: false`).
+- **RBAC without `deletecollection`** on services, configmaps and pvcs.
+  Spark's cleanup at `stop()` deletes by label selector; Forbidden, it left
+  the executor ConfigMap behind. Spark 3.5 names that ConfigMap once per JVM,
+  so the next SparkContext in the same process failed to start with a 409:
+  `configmaps "spark-exec-...-conf-map" already exists`.
+- **Executor pods get none of the platform's environment.** The first S3
+  read on an executor failed with `Unable to load region from any of the
+  providers in the chain`. Both drivers now pass `spark.executorEnv.AWS_REGION`,
+  and the credentials by `spark.kubernetes.executor.secretKeyRef.*` to the
+  platform Secret, so they never appear in the Spark conf.
+- **Airflow's API was session-only**, so the inbox's triggers (and the
+  console's calls) got `401 UNAUTHORIZED`. The chart now sets `basic_auth,
+  session`, as compose does ([airflow-api-auth](#airflow-api-auth)).
 
 ## execution-mode-is-configuration
 

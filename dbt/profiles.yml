@@ -73,7 +73,8 @@ reporting_platform:
     # is spark_local exactly, merged below, with a k8s:// master and the keys
     # that put the EXECUTORS in pods. Nothing here comes from
     # conf/spark-defaults.conf: this driver runs in the platform image, which
-    # does not have it. STILL UNPROVEN -- no cluster has ever run it.
+    # does not have it. Proven by `make k8s-smoke`: a prepared_build on kind,
+    # executors as pods, merged into main (docs/DECISIONS.md#the-local-k8s-smoke).
     # See docs/DECISIONS.md#execution-mode-is-configuration,
     # docs/DECISIONS.md#dbt-spark-session-mode
     spark_ocp:
@@ -98,3 +99,9 @@ reporting_platform:
         # sets from the downward API.
         spark.driver.host: "{{ env_var('POD_IP') }}"
         spark.driver.bindAddress: 0.0.0.0
+        # Executor pods get none of the platform's environment: region by
+        # value, credentials by reference to the platform Secret. Same keys
+        # as session_conf() in common/spark.py.
+        spark.executorEnv.AWS_REGION: "{{ env_var('AWS_REGION', 'us-east-1') }}"
+        spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID: "{{ env_var('PLATFORM_ENV_SECRET') }}:AWS_ACCESS_KEY_ID"
+        spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY: "{{ env_var('PLATFORM_ENV_SECRET') }}:AWS_SECRET_ACCESS_KEY"
