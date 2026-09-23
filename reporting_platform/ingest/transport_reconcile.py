@@ -122,7 +122,7 @@ def raw_pending(candidates_by_feed: dict[str, list[tuple[str, str]]],
 
     Pure set difference -- no I/O -- so the caller does exactly one Raw query
     per feed (:func:`reporting_platform.ingest.ingest_feed.raw_delivered_ids`,
-    via ``scripts._spark_task raw-delivery-ids``) and hands the result here,
+    via ``spark_task raw-delivery-ids``) and hands the result here,
     rather than one Spark call per candidate Delivery.
     """
     pending: list[str] = []

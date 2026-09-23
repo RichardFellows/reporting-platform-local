@@ -93,7 +93,7 @@ def _spark_subprocess(*args: str) -> dict:
     in-process SparkSession keeps the JVM alive past the task returning, and
     the scheduler zombie-reaps it. See docs/DECISIONS.md#spark-in-a-subprocess.
     """
-    from scripts._spark_task import run
+    from reporting_platform.common.spark_task import run
 
     return run(*args)
 

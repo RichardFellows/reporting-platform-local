@@ -270,14 +270,14 @@ def _trigger(feed: Feed, key: str | None) -> dict:
     -triggered run that hit `normalize.NotReady` and was skipped rather than
     retried into it.
 
-    Imports the console's orchestration module rather than opening a second
+    Imports the console's Airflow client (`common/airflow_api.py`) rather than opening a second
     HTTP client: there is one definition of how this platform talks to
     Airflow's API, and a copy here would drift from it.
     """
     if not TRIGGER:
         return {"triggered": False,
                 "reason": "--no-trigger: the caller ingests"}
-    from reporting_platform.ui import orchestration
+    from reporting_platform.common import airflow_api as orchestration
 
     dag_id = f"ingest_{feed.name}"
     dag = orchestration.get_dag(dag_id)

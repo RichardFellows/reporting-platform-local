@@ -102,7 +102,7 @@ to run something for the first time, expect it to fail and read what it says.
   `tests/test_spark_config.py` enforces both. A bare `spark-sql` in spark-master no longer knows the catalog: use
   `scripts/spark-sql`. (`#spark-defaults-hold-only-invariants`)
 - **`PLATFORM_EXECUTION=local|kubernetes` decides where a Spark driver
-  runs**, and `_spark_task.run` is the only launcher. In `kubernetes` it
+  runs**, and `spark_task.run` is the only launcher. In `kubernetes` it
   starts the driver as a POD (same module, same args, same JSON) with
   executors as pods. **dbt keeps its driver in the task (Cosmos LOCAL) in both
   modes**, because the artifact archive and the publish gate read its
@@ -110,10 +110,18 @@ to run something for the first time, expect it to fail and read what it says.
   `common/` needs the SCHEDULER restarted too: LocalExecutor forks tasks from
   it, and a stale module fails with `has no attribute`.
   (`#execution-mode-is-configuration`)
-- **Spark inside an Airflow task must go through `scripts/_spark_task.py`** (a
-  subprocess), or the JVM keeps the task process alive, heartbeats stop and the
-  scheduler zombie-reaps it. The *driver* lives in that process, so this holds
-  on a cluster too. (`#spark-in-a-subprocess`)
+- **Spark inside an Airflow task must go through
+  `reporting_platform/common/spark_task.py`** (a subprocess), or the JVM keeps
+  the task process alive, heartbeats stop and the scheduler zombie-reaps it.
+  The *driver* lives in that process, so this holds on a cluster too. A new
+  op goes in its component's `spark_ops.py` and in `spark_task.OPS`;
+  `python -m scripts._spark_task` is a shim. (`#spark-in-a-subprocess`)
+- **THE REPO SHIPS AS SEPARATE COMPONENTS, and `components.yml` says which
+  module is in which.** `tests/test_components.py` fails on an import —
+  lazy ones too — into a component the owner does not `depends_on`, and on a
+  module no component claims. Nothing packaged may import `scripts/` or
+  `ui/`. A new module or DAG file needs a line there.
+  (`#components-are-declared-and-enforced`, `docs/PACKAGING.md`)
 - **THREE jar versions live in `.env`**, and diverging them gives
   `NoSuchMethodError` on the first write, never anything saying "version".
   `ICEBERG_VERSION` must be identical in the Spark image and the Airflow

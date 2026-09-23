@@ -98,7 +98,7 @@ def _published() -> dict[str, list[tuple[str, str]]]:
 
 
 def _describe_all() -> dict[str, list[tuple[str, str]]]:
-    from scripts.duckdb_console import ALIAS, connect
+    from reporting_platform.common.duckdb_catalog import ALIAS, connect
 
     con = connect()
     try:

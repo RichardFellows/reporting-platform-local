@@ -473,8 +473,8 @@ def committed_rows_from_raw(spark, fd, table: str | None = None) -> list[dict]:
     `main` already holds for this Feed -- the BACKFILL source for
     `registry.delivery_committed` (registry/db.py's header). A Delivery
     ingested before that table existed committed just as durably; this is
-    how `python -m scripts._spark_task reconcile-committed <feed>` recovers
-    that fact without re-ingesting anything. One bulk query, the same shape
+    how `python -m reporting_platform.common.spark_task reconcile-committed
+    <feed>` recovers that fact without re-ingesting anything. One bulk query, the same shape
     as `raw_delivered_ids`.
     """
     target = table or fd.raw_table

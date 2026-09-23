@@ -139,10 +139,10 @@ def session_conf(app_name: str, ref: str = "main") -> tuple[str, dict[str, str]]
 
     if kubernetes:
         # EXECUTORS AS PODS, the driver where this process is: in its own pod
-        # when `_spark_task.run` launched it, in the Airflow task's pod for a
+        # when `spark_task.run` launched it, in the Airflow task's pod for a
         # dbt build. Client mode, so the executors call back to THIS pod,
         # which is why its IP -- from the downward API, set by the pod spec
-        # `_spark_task` builds and by the chart -- is required rather than
+        # `spark_task` builds and by the chart -- is required rather than
         # guessed. spark.cores.max means nothing here; instances x cores is
         # the same 2-core cap. See docs/DECISIONS.md#execution-mode-is-configuration
         pod_ip = os.environ.get("POD_IP", "").strip()

@@ -1,0 +1,99 @@
+# THE DEPLOYABLE COMPONENTS, and what each may import.
+#
+# One repo, several separately built, versioned and deployed packages. This
+# file is the single statement of which module belongs to which, and
+# `tests/test_components.py` fails on any import that crosses a boundary the
+# wrong way -- including a lazy one inside a function, because a lazy import
+# of a package that is not installed fails exactly as hard, just later, in a
+# task, on the first run that reaches it.
+#
+# OWNERSHIP IS BY LONGEST MODULE PREFIX, so a component can claim one module
+# inside a package another owns: `registry.deliveries` is ingest's because the
+# delivery index is rebuilt by the code that writes it
+# (docs/DECISIONS.md#the-registry-records-observations-not-verdicts), while
+# `registry.db` and the run/lifecycle records are core's. A module no entry
+# claims is a failure, not a default.
+#
+# `dags` are Airflow DAG files. They ship in their component's DAG bundle and
+# are held to the same `depends_on` as its modules.
+#
+# `packaged: false` marks what runs in the local stack only and is never
+# built for an environment. It may import anything; nothing packaged may
+# import it.
+#
+# See docs/PACKAGING.md.
+
+components:
+  transport:
+    distribution: reporting-transport
+    description: Copies files from a source location into the on-prem S3 bucket and writes the Transport manifest.
+    modules:
+      - reporting_transport
+    depends_on: []
+
+  core:
+    distribution: reporting-core
+    description: Settings, feed registry loading, Nessie/Spark wrappers, the Spark task launcher, and the Postgres registry's schema and run records.
+    modules:
+      - reporting_platform
+      - reporting_platform.common
+      - reporting_platform.config
+      - reporting_platform.registry
+    depends_on: []
+
+  ingest:
+    distribution: reporting-ingest
+    description: Reads Transport manifests and deliveries from S3, normalizes them and writes the raw Iceberg tables.
+    modules:
+      - reporting_platform.ingest
+      - reporting_platform.registry.deliveries
+      - reporting_platform.registry.rejections
+      - reporting_platform.registry.transports
+    dags:
+      - airflow/dags/_transport_trigger.py
+      - airflow/dags/feed_ingest.py
+      - airflow/dags/transport_ingest.py
+      - airflow/dags/transport_reconcile.py
+      - airflow/dags/transport_watch.py
+    # transport: the Transport manifest's parser is `reporting_transport.
+    # contract`, shared unmodified with the publisher so there is one
+    # implementation of what a marker means (ingest/transport.py's header).
+    # Pin a compatible range, not an exact version.
+    depends_on: [core, transport]
+
+  dbt:
+    distribution: reporting-dbt
+    description: The dbt project (prepared and reporting layers) and the DAGs that build, test and publish it.
+    modules: []
+    dags:
+      - airflow/dags/dbt_builds.py
+    depends_on: [core]
+
+  ops:
+    distribution: reporting-ops
+    description: Monitoring, retention, table maintenance, lineage export and the registry admin CLI.
+    modules:
+      - reporting_platform.monitoring
+      - reporting_platform.retention
+      - reporting_platform.maintenance
+      - reporting_platform.lineage
+      - reporting_platform.registry.__main__
+    dags:
+      - airflow/dags/platform_housekeeping.py
+    depends_on: [core, transport, ingest]
+
+  dev:
+    packaged: false
+    description: The feed console and the legacy-migration harness. Local stack only.
+    modules:
+      - reporting_platform.ui
+      - reporting_platform.migration
+      # Feed ONBOARDING, not ingestion: they infer a feed definition from a
+      # sample file for the console's form, and nothing that runs a delivery
+      # calls them. They live in ingest/ because they parse the way ingest
+      # parses.
+      - reporting_platform.ingest.sniff
+      - reporting_platform.ingest.sample_diagnostics
+    dags:
+      - airflow/dags/migration_reconcile.py
+    depends_on: [core, transport, ingest, ops]
