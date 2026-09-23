@@ -242,14 +242,14 @@ def _operator_args(branch_task_id: str) -> dict:
 
 
 def _spark_run(*args: str) -> dict:
-    """One Spark operation in a child process. See scripts/_spark_task.run.
+    """One Spark operation in a child process. See common/spark_task.run.
 
     The build DAG needs Spark exactly once -- to read its own input set off
     the branch -- and it needs it the same way everything else here does: in a
     subprocess, or the JVM keeps the task process alive and the scheduler
     zombie-reaps it. See docs/DECISIONS.md#spark-in-a-subprocess.
     """
-    from scripts._spark_task import run
+    from reporting_platform.common.spark_task import run
 
     return run(*args)
 

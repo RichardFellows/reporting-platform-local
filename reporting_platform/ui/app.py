@@ -23,8 +23,9 @@ from fastapi.staticfiles import StaticFiles
 
 from reporting_platform.common.context import (CATALOG, conventions, feeds,
                                                retention_classes)
-from . import (arrivals, dbt_check, feeddata, feedtest, jobs, orchestration,
-               registry, sampledata, scaffold)
+from reporting_platform.common import airflow_api as orchestration
+from . import (arrivals, dbt_check, feeddata, feedtest, jobs, registry,
+               sampledata, scaffold)
 from .registry import FeedSpec, FeedValidationError
 
 STATIC = Path(__file__).resolve().parent / "static"

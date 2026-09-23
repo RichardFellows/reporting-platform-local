@@ -1,0 +1,58 @@
+# The packaging tier: each deployable component builds as its own wheel, and
+# installs and imports on its own.
+#
+# WHAT THIS PROVES THAT config.yml DOES NOT. `tests/test_components.py` (in
+# the cheap tier) reads the SOURCE and fails on an import that crosses a
+# component boundary. This installs the BUILT WHEEL into an empty virtualenv,
+# outside the checkout, with only that component's declared `requires` and
+# its sibling wheels, and imports every module it ships. A module-level import
+# of an undeclared dependency, or of a file the staging missed, fails here
+# and nowhere else -- locally every module sits on one PYTHONPATH.
+#
+# What it deliberately does NOT do: install the extras (pyspark, duckdb,
+# kubernetes -- all lazy imports, carried by the images) or publish anything.
+# Publishing to Nexus is the release pipeline's job, from a tag, not a PR's.
+# See docs/PACKAGING.md.
+name: components
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - components.yml
+      - reporting_platform/**
+      - reporting_transport/**
+      - scripts/build_components.py
+      - .github/workflows/components.yml
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # One job per component, so a red one names the package that broke.
+      # tests/test_components.py fails when this list and components.yml's
+      # packaged components disagree.
+      matrix:
+        component: [transport, core, ingest, ops]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'          # the image's interpreter
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install the build script's one dependency
+        run: pip install --quiet pyyaml
+
+      - name: Build ${{ matrix.component }} and its dependencies, install in a clean venv, import every module
+        run: python -m scripts.build_components ${{ matrix.component }} --check --version "0.0.0.dev0+g${GITHUB_SHA::8}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.component }}
+          path: dist/*.whl
+          retention-days: 7

@@ -235,10 +235,10 @@ def test_a_backfill_is_one_event_and_not_n_missed_deadlines():
 def test_the_lateness_check_needs_no_spark():
     """`received_at` is the landing object's LastModified, which the registry
     already holds -- so this runs in the Airflow task process directly rather
-    than through `scripts/_spark_task.py`. A Spark import here would make a
+    than through `common/spark_task.py`. A Spark import here would make a
     monitoring check cost a JVM start, and `platform_housekeeping` runs it
     nightly alongside the completeness check."""
     src = (REPO / "reporting_platform" / "monitoring" / "lateness.py").read_text(
         encoding="utf-8")
-    for token in ("pyspark", "spark_session", "_spark_task"):
+    for token in ("pyspark", "spark_session", "spark_task"):
         assert token not in src, token

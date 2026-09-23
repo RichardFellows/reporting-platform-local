@@ -169,13 +169,13 @@ def test_bearer_auth_reaches_the_catalog():
 
 # ------------------------------------------------------------ the driver pod
 def test_the_driver_pod_runs_the_same_module_with_the_same_arguments():
-    from scripts._spark_task import driver_pod
+    from reporting_platform.common.spark_task import driver_pod
 
     with _env(**CLEAR), _env(**K8S):
         pod = driver_pod(("ingest", "fo_trade", "ready/x.json", "r1", ""), "p1")
     spec = pod["spec"]
     container = spec["containers"][0]
-    assert container["command"] == ["python", "-m", "scripts._spark_task",
+    assert container["command"] == ["python", "-m", "reporting_platform.common.spark_task",
                                     "ingest", "fo_trade", "ready/x.json", "r1", ""]
     assert container["image"] == K8S["SPARK_DRIVER_IMAGE"]
     assert spec["restartPolicy"] == "Never"
@@ -188,7 +188,7 @@ def test_the_driver_pod_runs_the_same_module_with_the_same_arguments():
 
 
 def test_run_goes_to_a_pod_in_kubernetes_mode_and_parses_its_log():
-    import scripts._spark_task as task
+    import reporting_platform.common.spark_task as task
 
     calls = []
 
@@ -206,7 +206,7 @@ def test_run_goes_to_a_pod_in_kubernetes_mode_and_parses_its_log():
 
 
 def test_a_failed_driver_reports_the_head_of_its_traceback():
-    from scripts._spark_task import parse_result
+    from reporting_platform.common.spark_task import parse_result
 
     log = ("x" * 5000 + "\nTraceback (most recent call last)\n  ...\n"
            "ValueError: the actual message\n" + "java frame\n" * 400)

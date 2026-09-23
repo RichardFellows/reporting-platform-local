@@ -225,7 +225,7 @@ def test_report_version_trace_keeps_missing_delivery_evidence_visible():
     import sys
 
     sys.path.insert(0, str(REPO))
-    from reporting_platform.registry import deliveries, runs
+    from reporting_platform.registry import delivery_reads, runs
 
     columns = [
         "report", "as_at_date", "version_no", "tag", "created_at", "run_id",
@@ -265,13 +265,13 @@ def test_report_version_trace_keeps_missing_delivery_evidence_visible():
     def connect():
         yield Connection()
 
-    original = runs.db.connect, runs.inputs_for_run, deliveries.deliveries_by_id
+    original = runs.db.connect, runs.inputs_for_run, delivery_reads.deliveries_by_id
     runs.db.connect = connect
     runs.inputs_for_run = lambda run_id: [
         {"feed": "feed_a", "delivery_id": "dlv_A"},
         {"feed": "feed_b", "delivery_id": "dlv_missing"},
     ]
-    deliveries.deliveries_by_id = lambda pairs: [
+    delivery_reads.deliveries_by_id = lambda pairs: [
         {"feed": pairs[0][0], "delivery_id": pairs[0][1], "registered": True,
          "manifest_key": "deliveries/DCM/t-a/delivery-manifest.json",
          "source_object": "received/t-a/source.csv"},
@@ -281,7 +281,7 @@ def test_report_version_trace_keeps_missing_delivery_evidence_visible():
     try:
         traced = runs.trace_version("risk", BD, 3)
     finally:
-        runs.db.connect, runs.inputs_for_run, deliveries.deliveries_by_id = original
+        runs.db.connect, runs.inputs_for_run, delivery_reads.deliveries_by_id = original
     assert traced["report_version"]["run_id"] == "run-3"
     assert traced["run"]["dbt_artifacts_ref"].endswith("/run-3/")
     assert traced["inputs"][0]["manifest_key"].endswith("delivery-manifest.json")

@@ -56,12 +56,12 @@ def _spark_subprocess(*args: str) -> dict:
     KubernetesPodOperator issuing spark-submit -- same module, same arguments,
     a different execution wrapper, and the same process-isolation property.
 
-    The implementation moved to `scripts/_spark_task.run` when the build DAG
+    The implementation moved to `common/spark_task.run` when the build DAG
     needed the same launcher: the argument list and the dispatch table it
     feeds belong in one file, or two copies of this eventually parse the same
     output differently.
     """
-    from scripts._spark_task import run
+    from reporting_platform.common.spark_task import run
 
     return run(*args)
 
@@ -114,7 +114,7 @@ def build_feed_dag(feed):
             """Landing object -> a manifest in `ready/`. No Spark.
 
             Plain Python -- boto3 and json -- so it runs in the task process
-            rather than through `scripts/_spark_task.py`. The moment a
+            rather than through `common/spark_task.py`. The moment a
             normalizer needs Spark it must move there, for the reason that
             module's header gives.
 

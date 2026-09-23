@@ -1,0 +1,6 @@
+# CHECKSUMMED BYTES ARE NEVER LINE-ENDING-CONVERTED. A fixture's control file
+# declares the md5 of the data file as committed; with core.autocrlf=true (the
+# Git for Windows default) a checkout rewrites LF to CRLF, the md5 no longer
+# matches, and ingest refuses the delivery -- correctly, since that is the
+# integrity check doing its job. Linux CI never sees it.
+tests/fixtures/** -text

@@ -1,0 +1,147 @@
+# THE DEPLOYABLE COMPONENTS, and what each may import.
+#
+# One repo, several separately built, versioned and deployed packages. This
+# file is the single statement of which module belongs to which, and
+# `tests/test_components.py` fails on any import that crosses a boundary the
+# wrong way -- including a lazy one inside a function, because a lazy import
+# of a package that is not installed fails exactly as hard, just later, in a
+# task, on the first run that reaches it.
+#
+# OWNERSHIP IS BY LONGEST MODULE PREFIX, so a component can claim one module
+# inside a package another owns: `registry.deliveries` is ingest's because the
+# delivery index is rebuilt by the code that writes it
+# (docs/DECISIONS.md#the-registry-records-observations-not-verdicts), while
+# `registry.db` and the run/lifecycle records are core's. A module no entry
+# claims is a failure, not a default.
+#
+# `dags` are Airflow DAG files. They ship in their component's DAG bundle and
+# are held to the same `depends_on` as its modules.
+#
+# `packaged: false` marks what runs in the local stack only and is never
+# built for an environment. It may import anything; nothing packaged may
+# import it.
+#
+# THIRD-PARTY DEPENDENCIES, as `scripts/build_components.py` writes them into
+# each wheel:
+#   requires  -- installed with the wheel. Only what an ordinary import path
+#                needs; the Airflow worker that parses a DAG gets these.
+#   extras    -- `pip install reporting-core[spark]`: the heavy engines, all
+#                imported lazily, installed in the images that run them.
+#   host      -- supplied by the Airflow the code runs INSIDE (DAG files, the
+#                OpenLineage extractor), never installed by the wheel: pulling
+#                Airflow in through a dependency is how pip replaces the
+#                estate's own Airflow.
+# Ranges, not pins. Dockerfile.airflow's exact pins remain the authority for
+# what an image contains (tests/test_ci_pins.py); a wheel states what it is
+# compatible with. tests/test_components.py fails on a third-party import
+# none of these covers.
+#
+# `scripts` are console entry points, `name: module:function`.
+#
+# See docs/PACKAGING.md.
+
+components:
+  transport:
+    distribution: reporting-transport
+    description: Copies files from a source location into the on-prem S3 bucket and writes the Transport manifest.
+    modules:
+      - reporting_transport
+    depends_on: []
+    requires: [boto3]
+    extras:
+      # requirements-transport-smb.txt pins the publisher's exact version.
+      smb: ["smbprotocol[kerberos]>=1.17,<2"]
+    scripts:
+      reporting-transport: reporting_transport.cli:main
+
+  core:
+    distribution: reporting-core
+    description: Settings, feed registry loading, Nessie/Spark wrappers, the Spark task launcher, and the Postgres registry's schema and run records.
+    modules:
+      - reporting_platform
+      - reporting_platform.common
+      - reporting_platform.config
+      - reporting_platform.registry
+    depends_on: []
+    requires: [pyyaml, ruamel.yaml, requests]
+    extras:
+      s3: [boto3]
+      registry: [psycopg2-binary]
+      # 3.5 because the baked Iceberg/Nessie jars are built for it
+      # (docs/DECISIONS.md#driver-jars-are-baked).
+      spark: ["pyspark>=3.5,<3.6"]
+      kubernetes: [kubernetes]
+      # 1.5 because 1.1.3 cannot ATTACH an Iceberg catalog at all.
+      duckdb: ["duckdb>=1.5"]
+    scripts:
+      reporting-spark-task: reporting_platform.common.spark_task:main
+      reporting-config: reporting_platform.config.__main__:main
+
+  ingest:
+    distribution: reporting-ingest
+    description: Reads Transport manifests and deliveries from S3, normalizes them and writes the raw Iceberg tables.
+    modules:
+      - reporting_platform.ingest
+      - reporting_platform.registry.deliveries
+      - reporting_platform.registry.rejections
+      - reporting_platform.registry.transports
+    dags:
+      - airflow/dags/_transport_trigger.py
+      - airflow/dags/feed_ingest.py
+      - airflow/dags/transport_ingest.py
+      - airflow/dags/transport_reconcile.py
+      - airflow/dags/transport_watch.py
+    # transport: the Transport manifest's parser is `reporting_transport.
+    # contract`, shared unmodified with the publisher so there is one
+    # implementation of what a marker means (ingest/transport.py's header).
+    # Pin a compatible range, not an exact version.
+    depends_on: [core, transport]
+    requires: [boto3, psycopg2-binary]
+    extras:
+      spark: ["pyspark>=3.5,<3.6"]
+    host: [apache-airflow]
+
+  dbt:
+    distribution: reporting-dbt
+    description: The dbt project (prepared and reporting layers) and the DAGs that build, test and publish it.
+    modules: []
+    dags:
+      - airflow/dags/dbt_builds.py
+    depends_on: [core]
+    host: [apache-airflow, astronomer-cosmos]
+
+  ops:
+    distribution: reporting-ops
+    description: Monitoring, retention, table maintenance, lineage export and the registry admin CLI.
+    modules:
+      - reporting_platform.monitoring
+      - reporting_platform.retention
+      - reporting_platform.maintenance
+      - reporting_platform.lineage
+      - reporting_platform.registry.__main__
+    dags:
+      - airflow/dags/platform_housekeeping.py
+    depends_on: [core, transport, ingest]
+    requires: [boto3, psycopg2-binary]
+    extras:
+      lineage: ["sqlglot>=30.18,<31"]
+    host: [apache-airflow, apache-airflow-providers-openlineage]
+    scripts:
+      reporting-registry: reporting_platform.registry.__main__:main
+      reporting-lineage: reporting_platform.lineage.__main__:main
+
+  dev:
+    packaged: false
+    description: The feed console and the legacy-migration harness. Local stack only.
+    modules:
+      - reporting_platform.ui
+      - reporting_platform.migration
+      # Feed ONBOARDING, not ingestion: they infer a feed definition from a
+      # sample file for the console's form, and nothing that runs a delivery
+      # calls them. They live in ingest/ because they parse the way ingest
+      # parses.
+      - reporting_platform.ingest.sniff
+      - reporting_platform.ingest.sample_diagnostics
+    dags:
+      - airflow/dags/migration_reconcile.py
+    depends_on: [core, transport, ingest, ops]

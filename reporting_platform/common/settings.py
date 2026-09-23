@@ -120,9 +120,9 @@ def registry_dsn() -> str:
 
 # ------------------------------------------------------------ execution mode
 # WHERE A SPARK DRIVER RUNS, AND WHERE ITS EXECUTORS DO. `local` is compose:
-# `_spark_task.run` starts the driver as a child process and the executors
+# `spark_task.run` starts the driver as a child process and the executors
 # run on the standalone spark-worker. `kubernetes` is a cluster:
-# `_spark_task.run` starts the driver as its own POD (same image, same module,
+# `spark_task.run` starts the driver as its own POD (same image, same module,
 # same arguments) and the executors are pods too, through a `k8s://` master.
 # dbt is the exception, and deliberately: Cosmos stays LOCAL + SUBPROCESS in
 # both modes, because its artifact archive, validation capture and the
