@@ -118,13 +118,114 @@ def registry_dsn() -> str:
     return value
 
 
-def missing() -> list[str]:
-    """Every variable this environment requires that is unset.
+# ------------------------------------------------------------ execution mode
+# WHERE A SPARK DRIVER RUNS, AND WHERE ITS EXECUTORS DO. `local` is compose:
+# `_spark_task.run` starts the driver as a child process and the executors
+# run on the standalone spark-worker. `kubernetes` is a cluster:
+# `_spark_task.run` starts the driver as its own POD (same image, same module,
+# same arguments) and the executors are pods too, through a `k8s://` master.
+# dbt is the exception, and deliberately: Cosmos stays LOCAL + SUBPROCESS in
+# both modes, because its artifact archive, validation capture and the
+# publish gate read dbt's target/ from the task's own filesystem. In
+# `kubernetes` its child process is the driver and only the executors move.
+# See docs/DECISIONS.md#execution-mode-is-configuration
 
-    Empty in `local`, where the endpoints have defaults and REGISTRY_DSN is
-    left to registry_dsn()'s own refusal: `config check` runs in the cheap CI
-    tier with no registry, and must not need one.
+EXECUTION_MODES = ("local", "kubernetes")
+
+# Required when PLATFORM_EXECUTION=kubernetes, in every environment -- there
+# is no compose default for a namespace or an image.
+KUBERNETES_REQUIRED = (
+    "SPARK_K8S_NAMESPACE",      # where driver and executor pods run
+    "SPARK_DRIVER_IMAGE",       # the platform RELEASE image (Dockerfile.airflow)
+    "SPARK_EXECUTOR_IMAGE",     # the Spark image (Dockerfile.spark)
+    "SPARK_SERVICE_ACCOUNT",    # may create executor pods (the chart's RBAC)
+    "PLATFORM_ENV_CONFIGMAP",   # every setting a driver pod needs, by envFrom
+    "PLATFORM_ENV_SECRET",      # the credentials it needs, by envFrom
+)
+
+
+def execution() -> str:
+    """PLATFORM_EXECUTION, validated. An unknown value is refused rather than
+    read as `local`: a typo on a cluster would otherwise run every driver
+    inside the Airflow task and look like success."""
+    value = os.environ.get("PLATFORM_EXECUTION", "local").strip() or "local"
+    if value not in EXECUTION_MODES:
+        raise MissingSetting(
+            f"PLATFORM_EXECUTION is {value!r}; it must be one of "
+            f"{', '.join(EXECUTION_MODES)}.")
+    return value
+
+
+def kubernetes(name: str) -> str:
+    """One of KUBERNETES_REQUIRED, or a refusal naming it."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise MissingSetting(
+            f"{name} is not set and PLATFORM_EXECUTION is 'kubernetes'. The "
+            f"chart's ConfigMap sets it; see docs/DECISIONS.md"
+            f"#execution-mode-is-configuration.")
+    return value
+
+
+# ----------------------------------------------------------------- Nessie auth
+# How the Nessie catalog authenticates, read by all four of its clients:
+# spark_session(), both dbt targets and the Python `Nessie` REST client. The
+# shared Nessie has NO auth today, so NONE is the default in every
+# environment, not only `local` -- it is a real value, not a fallback.
+# BEARER takes a token from a Secret.
+#
+# The token's name carries dbt's DBT_ENV_SECRET_ prefix, and the Python side
+# reads the SAME name: dbt scrubs a variable with that prefix from its logs
+# and refuses it outside profiles.yml, and one secret with two names is two
+# things to keep in step. See docs/DECISIONS.md#nessie-auth-is-a-setting
+NESSIE_AUTH_TYPES = ("NONE", "BEARER")
+NESSIE_TOKEN_VAR = "DBT_ENV_SECRET_NESSIE_AUTH_TOKEN"
+
+
+def nessie_auth_type() -> str:
+    value = (os.environ.get("NESSIE_AUTH_TYPE", "NONE").strip() or "NONE").upper()
+    if value not in NESSIE_AUTH_TYPES:
+        raise MissingSetting(
+            f"NESSIE_AUTH_TYPE is {value!r}; it must be one of "
+            f"{', '.join(NESSIE_AUTH_TYPES)}.")
+    return value
+
+
+def nessie_auth_token() -> str | None:
+    """The bearer token when NESSIE_AUTH_TYPE is BEARER, else None."""
+    if nessie_auth_type() != "BEARER":
+        return None
+    value = os.environ.get(NESSIE_TOKEN_VAR, "").strip()
+    if not value:
+        raise MissingSetting(
+            f"NESSIE_AUTH_TYPE is BEARER and {NESSIE_TOKEN_VAR} is not set. "
+            f"It comes from the platform Secret.")
+    return value
+
+
+def missing() -> list[str]:
+    """Every variable this environment requires that is unset, or is set to
+    a value it refuses.
+
+    The endpoints are empty in `local`, where they have defaults, and
+    REGISTRY_DSN is left to registry_dsn()'s own refusal: `config check`
+    runs in the cheap CI tier with no registry, and must not need one. The
+    execution-mode and Nessie-auth requirements apply in EVERY environment,
+    because neither has a compose default to fall back to.
     """
-    if env() == "local":
-        return []
-    return [n for n in REQUIRED if not os.environ.get(n, "").strip()]
+    out = []
+    if env() != "local":
+        out += [n for n in REQUIRED if not os.environ.get(n, "").strip()]
+    try:
+        if execution() == "kubernetes":
+            out += [n for n in KUBERNETES_REQUIRED
+                    if not os.environ.get(n, "").strip()]
+    except MissingSetting:
+        out.append("PLATFORM_EXECUTION (unknown value)")
+    try:
+        if (nessie_auth_type() == "BEARER"
+                and not os.environ.get(NESSIE_TOKEN_VAR, "").strip()):
+            out.append(NESSIE_TOKEN_VAR)
+    except MissingSetting:
+        out.append("NESSIE_AUTH_TYPE (unknown value)")
+    return out

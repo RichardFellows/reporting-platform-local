@@ -116,11 +116,10 @@ Two things carry over rather than being re-decided:
   JVM inside the task process to be zombie-reaped. Under
   `ExecutionMode.KUBERNETES` the pod boundary supplies the same isolation and
   the setting stops applying.
-- **The `lakehouse_write` pool is a local capacity guard**, sized against one
-  6-core standalone worker. In the cluster the constraint is different — the
-  serialisation that still matters is *writer* exclusion (maintenance must not
-  run alongside a write), not core starvation, so keep the pool but revisit
-  the slot count alongside the Spark execution model below.
+- **The `lakehouse_write` pool is a writer-exclusion guard**, not a capacity
+  one: maintenance must not run alongside a write. Its slot count is
+  `LAKEHOUSE_WRITE_SLOTS` (default 1), and above 1 it excludes nothing, so
+  keep it at 1 on the cluster too. See `DECISIONS.md#one-shared-write-pool`.
 
 **UNPROVEN: no cluster has ever run this.** The same caveat as the `spark_ocp`
 dbt target it would use.

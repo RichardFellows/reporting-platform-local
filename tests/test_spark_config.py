@@ -15,8 +15,9 @@ per-environment value is read from the environment. What this checks:
   -- it derives from `S3_ENDPOINT`'s scheme;
 - `spark_ocp` RENDERS with TLS on for an `https://` endpoint and names no
   local host, which is the check the plan's "Done when" asks for;
-- every key `spark_local` sets reaches `spark_ocp` either directly or through
-  the conf file, unless it is one of the keys that are local by nature;
+- every key `spark_local` sets reaches `spark_ocp` (a YAML anchor merges
+  them: its driver runs in the platform image, which has no conf file), and
+  `spark_ocp` puts the executors in pods;
 - the extensions are in the same order everywhere they are written.
 
 `common/spark.py` reads its endpoints through `common/settings.py`, whose
@@ -43,18 +44,6 @@ LOCAL_HOSTS = re.compile(r"minio|nessie:19120|localhost:9000|spark-master")
 # syntaxes: conf whitespace, YAML `key: "false"`, Python `.config("...", "false")`.
 LITERAL_SSL = re.compile(
     r"""ssl\.enabled["']?\s*[:,\s]\s*["']?(true|false)\b""", re.IGNORECASE)
-
-# spark_local keys that are local BY NATURE and must not reach the cluster
-# target: spark-submit sets the master, the image bakes the jars, and the
-# driver pod's resources are the pod's.
-LOCAL_ONLY_KEYS = {
-    "spark.master",
-    "spark.jars",
-    "spark.driver.memory",
-    "spark.cores.max",
-    "spark.executor.cores",
-    "spark.executor.memory",
-}
 
 EXTENSIONS_KEY = "spark.sql.extensions"
 
@@ -102,6 +91,12 @@ CLUSTER_ENV = {
     "S3_ENDPOINT": "https://s3.example",
     "NESSIE_URI": "https://nessie.example/api/v2",
     "REPORTING_WAREHOUSE": "s3a://lakehouse/warehouse",
+    "PLATFORM_DRIVER_JARS": "/opt/platform/jars/a.jar",
+    "SPARK_MASTER": "k8s://https://kubernetes.default.svc:443",
+    "SPARK_K8S_NAMESPACE": "reporting",
+    "SPARK_EXECUTOR_IMAGE": "registry.example/spark@sha256:abc",
+    "SPARK_SERVICE_ACCOUNT": "spark",
+    "POD_IP": "10.0.0.7",
 }
 
 
@@ -177,12 +172,26 @@ def test_spark_ocp_refuses_to_render_without_the_environment():
 
 
 def test_every_spark_local_key_reaches_spark_ocp():
+    # spark_ocp's driver is the Airflow task's dbt child process, in the
+    # platform image, which has no spark-defaults.conf -- so it must carry
+    # EVERY key spark_local does. It merges them through a YAML anchor.
+    # See docs/DECISIONS.md#execution-mode-is-configuration
     local = set(_targets()["spark_local"]["server_side_parameters"])
     ocp = set(_targets()["spark_ocp"]["server_side_parameters"])
-    missing = local - ocp - set(_conf()) - LOCAL_ONLY_KEYS
-    assert not missing, (
-        f"spark_local sets {sorted(missing)} and spark_ocp gets them from "
-        f"neither itself nor {CONF}")
+    assert not local - ocp, (
+        f"spark_local sets {sorted(local - ocp)} and spark_ocp does not")
+
+
+def test_spark_ocp_puts_the_executors_in_pods():
+    rendered = _render("spark_ocp", CLUSTER_ENV)
+    assert rendered["spark.master"].startswith("k8s://"), rendered["spark.master"]
+    assert rendered["spark.kubernetes.namespace"] == "reporting"
+    assert rendered["spark.kubernetes.container.image"] == CLUSTER_ENV["SPARK_EXECUTOR_IMAGE"]
+    assert rendered["spark.driver.host"] == "10.0.0.7"
+    # and spark_local stays on the standalone cluster
+    local = _render("spark_local", {k: v for k, v in CLUSTER_ENV.items()
+                                    if k != "SPARK_MASTER"})
+    assert local["spark.master"] == "spark://spark-master:7077"
 
 
 def _extensions(value: str) -> list[str]:
@@ -193,7 +202,7 @@ def test_extensions_are_in_the_same_order_everywhere():
     conf = _extensions(_conf()[EXTENSIONS_KEY])
     local = _extensions(_targets()["spark_local"]["server_side_parameters"][EXTENSIONS_KEY])
     # spark.py writes the value as adjacent string literals after the key
-    m = re.search(r'"spark\.sql\.extensions",\s*((?:"[^"]*"\s*)+),?\s*\)', _text(SPARK_PY))
+    m = re.search(r'"spark\.sql\.extensions"[,:]\s*((?:"[^"]*"\s*)+)', _text(SPARK_PY))
     assert m, f"{SPARK_PY}: spark.sql.extensions not found"
     py = _extensions("".join(re.findall(r'"([^"]*)"', m.group(1))))
     assert conf == local == py, (conf, local, py)

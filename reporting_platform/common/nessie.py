@@ -29,6 +29,12 @@ class Nessie:
     def _req(self, method: str, path: str, **kwargs):
         import requests
 
+        # Same auth setting as the Spark catalog and both dbt targets.
+        # See docs/DECISIONS.md#nessie-auth-is-a-setting
+        token = settings.nessie_auth_token()
+        if token:
+            kwargs["headers"] = {**kwargs.get("headers", {}),
+                                 "Authorization": f"Bearer {token}"}
         r = requests.request(method, f"{self.uri}{path}", timeout=30, **kwargs)
         if not r.ok:
             # requests' default raise_for_status() drops the response body,

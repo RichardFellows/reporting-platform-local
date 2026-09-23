@@ -90,6 +90,8 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images come from quay.io |
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
+| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move |
+| [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
 | [spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants) | `spark-defaults.conf` ships in the cluster image, so it may hold no host, TLS switch or credential source |
 | [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
@@ -620,6 +622,76 @@ The webserver secret key is shared across replicas and restarts so sessions
 survive. Airflow 2 needs nothing like Airflow 3's execution-API URL or JWT
 secret — see [airflow-2-not-3](#airflow-2-not-3).
 
+## execution-mode-is-configuration
+
+`PLATFORM_EXECUTION` (`local` | `kubernetes`, default `local`, anything else
+refused) says where a Spark driver runs, and where its executors run.
+
+- **`local`** is compose. `_spark_task.run` starts the driver as a child
+  process and the executors run on the standalone spark-worker.
+- **`kubernetes`**: `_spark_task.run` starts the driver as its own **pod** of
+  the platform release image (`SPARK_DRIVER_IMAGE`). The pod runs the same
+  module with the same arguments and prints the same JSON, which `run` reads
+  off the pod log with the same parser. Its executors are pods through a
+  `k8s://` master (`SPARK_EXECUTOR_IMAGE`). The pod gets its whole
+  environment from the platform ConfigMap and Secret (`envFrom`), plus its own
+  IP from the downward API, which executors need to call back in client mode.
+  The pod is deleted in `finally`, so a killed Airflow task does not leave a
+  driver holding executors after the `lakehouse_write` slot is released.
+
+Every DAG already called `_spark_task.run` and nothing else, apart from
+`platform_housekeeping`, whose private copy of it is gone. So no DAG changed
+shape, and pools, retries and the logic around each call are untouched. The
+plan had proposed a `KubernetesPodOperator` per Spark call instead. That
+would have split the conditional Python in `resolve_arrival` and friends
+across operators, for a pod that is only visible in the UI, not more
+isolated.
+
+**dbt is the exception.** Cosmos stays `ExecutionMode.LOCAL` +
+`InvocationMode.SUBPROCESS` in both modes. Its `KUBERNETES` mode would run
+dbt in another pod, where `_archive_dbt_artifacts` cannot read `target/`.
+That callback archives the artifacts and captures validation evidence, and
+`publish` refuses to merge a build it cannot verify, so the switch would
+never publish. Instead `spark_ocp` merges every `spark_local` key through a
+YAML anchor and adds a `k8s://` master and the executor-pod keys. The dbt
+child process stays the driver, in the Airflow task's pod, and only the
+executors move. That driver is only isolated if the Airflow task is its own
+pod, so the chart runs the **KubernetesExecutor**.
+
+`session_conf()` in `common/spark.py` holds a session's whole configuration
+as a pure function, so both modes are tested without a JVM
+(`tests/test_execution_mode.py`). It refuses a `k8s://` master outside
+`kubernetes` mode and the reverse, and it refuses a missing `POD_IP`. `config
+check` lists every `KUBERNETES_REQUIRED` setting that is unset.
+
+Verified in `local` mode on the stack: a real `ingest_fo_trade` run, the
+housekeeping launcher, and `check_dag_imports` (13 DAGs). In `kubernetes`
+mode, `check_dag_imports` also gives 13 DAGs, which renders `spark_ocp` under
+dbt. No pod has run yet; that is the local-k8s smoke test.
+
+**A deploy trap this found.** The LocalExecutor forks tasks from the
+scheduler, so a task inherits the scheduler's already-imported modules. New
+`_spark_task.py` code with a stale `settings` failed with `module
+'reporting_platform.common.settings' has no attribute 'execution'`, until the
+scheduler was restarted. The CLAUDE.md rule about long-running processes
+covers the scheduler too.
+
+## nessie-auth-is-a-setting
+
+`NESSIE_AUTH_TYPE` (`NONE` | `BEARER`, default `NONE` in every environment,
+because the shared Nessie has no auth today) is read by all four Nessie
+clients: `spark_session()`, both dbt targets, and the Python `Nessie` REST
+client (an `Authorization: Bearer` header). BEARER takes its token from
+`DBT_ENV_SECRET_NESSIE_AUTH_TOKEN`, one name for both sides. dbt scrubs the
+`DBT_ENV_SECRET_` prefix from its logs and allows it only in
+`profiles.yml`, and one secret under two names would be two things to keep
+in step. An unknown type, or BEARER without a token, is listed by `config
+check`.
+
+Not wired, deliberately: `nessie-gc`. Retention's GC refuses to run under
+BEARER rather than try client options nobody has seen work, on a path that
+deletes data. The read-only DuckDB console's Iceberg REST catalog is also
+not wired for auth.
 ## minio-images-come-from-quay
 
 `minio/minio` and `minio/mc` on Docker Hub now refuse anonymous pulls: `pull
@@ -719,13 +791,13 @@ The file now holds only what is the same in every environment: the
 extensions, the catalog and io implementations, the S3A filesystem class,
 the timezone, AQE and Kryo. Every per-environment value (Nessie URI,
 warehouse, S3 endpoint, TLS, auth) is read from the environment, in
-`spark_session()` and in both dbt targets. `spark_ocp` carries the same
+`spark_session()` and in both dbt targets. `spark_ocp` reads the same
 `env_var()` keys as `spark_local`, without defaults, so a missing variable
-fails at dbt startup instead of pointing at a local host. It omits only what
-is local by nature: the master (spark-submit sets it), the jars (the image
-bakes them) and the driver and executor sizing.
-`tests/test_spark_config.py` enforces all of it, including that every
-`spark_local` key reaches `spark_ocp` directly or through the file.
+fails at dbt startup instead of pointing at a local host.
+`tests/test_spark_config.py` enforces all of it. (Since
+[execution-mode-is-configuration](#execution-mode-is-configuration),
+`spark_ocp` merges every `spark_local` key and relies on this file for
+nothing: its driver runs in the platform image, which has no copy of it.)
 
 Two things in the old file were wrong, not just local:
 
@@ -943,14 +1015,14 @@ than relying on `conf/spark-defaults.conf`, which is not mounted into the
 Airflow container -- and the driver needs the jars regardless of what the
 executors have baked in.
 
-For `spark_ocp`, dbt runs inside the driver pod that `spark-submit` created for
-the build, so there is one SparkSession per build and the Nessie ref is
-unambiguous. A driver pod built from the Spark image has `spark-defaults.conf`,
-but that file holds only the keys that are the same everywhere
-([spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants)).
-So `spark_ocp` carries the per-environment keys itself, from `env_var()`, and
-`tests/test_spark_config.py` checks that no `spark_local` key is missing from
-both.
+For `spark_ocp`, dbt runs where it runs locally, as the child process of a
+Cosmos task, now in the Airflow task's pod. So there is still one
+SparkSession per build and the Nessie ref is unambiguous. It merges every
+`spark_local` key and adds a `k8s://` master and the executor-pod keys; see
+[execution-mode-is-configuration](#execution-mode-is-configuration). An
+earlier design had it inside a spark-submit driver pod that took its
+invariant keys from the Spark image's `spark-defaults.conf`. It doesn't:
+this driver runs in the platform image, which has no such file.
 
 A connection method other than `session` was tried there and removed: it served
 no purpose the design had chosen and carried a silent-failure risk on the branch
@@ -1215,6 +1287,15 @@ the last publication of the day, and a feed is late, not lost
 Without the pool, every task sits `queued` forever with nothing to say why,
 which is why `airflow-init` creates it -- see
 [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps).
+
+**The slot count is `LAKEHOUSE_WRITE_SLOTS` (default 1), and above 1 the pool
+no longer excludes anything.** It is configurable so a deployment can size it
+without editing `airflow-init`. It is NOT a throughput knob. Two slots let
+maintenance's `remove_orphan_files` run beside an ingest, which is the
+corruption this pool exists to prevent. Raise it only once maintenance is
+excluded from writers some other way, and never by adding a second pool: an
+Airflow task belongs to exactly one pool, so a second pool does not exclude
+anything.
 
 ## gc-lag-and-assertions
 

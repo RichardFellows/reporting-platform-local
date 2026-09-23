@@ -41,41 +41,155 @@ from datetime import date
 
 
 def run(*args: str) -> dict:
-    """Launch one of the operations below in a child process; parse its JSON.
+    """Launch one of the operations below as its own driver; parse its JSON.
 
     THE CALLER SIDE LIVES BESIDE THE CALLEE SIDE, so the argument list and the
     dispatch table below cannot drift. It was a private helper in
     `feed_ingest.py`, and the build DAG needed the same thing -- a second copy
     is how two launchers end up parsing output two different ways.
 
+    WHERE THE DRIVER RUNS is PLATFORM_EXECUTION's answer, and nothing else
+    changes with it -- same module, same arguments, same JSON on the last
+    line, same error text. `local`: a child process, the JVM dies with it.
+    `kubernetes`: a pod of the platform image, so the driver is off the
+    Airflow worker entirely and its executors are pods through a k8s://
+    master. Every DAG calls this and nothing else, so no DAG changes shape.
+    See docs/DECISIONS.md#execution-mode-is-configuration
+
     Importing this module costs nothing: it pulls in json, sys and datetime,
     and every Spark import is inside the branch that needs it. Nothing here
     starts a JVM in the calling process, which is the whole point of the
     module (docs/DECISIONS.md#spark-in-a-subprocess).
     """
-    import subprocess
+    from reporting_platform.common import settings
 
-    proc = subprocess.run(
-        [sys.executable, "-m", "scripts._spark_task", *args],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
+    if settings.execution() == "kubernetes":
+        code, stdout, stderr = _run_in_pod(args)
+    else:
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "scripts._spark_task", *args],
+            capture_output=True, text=True,
+        )
+        code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+    return parse_result(args, code, stdout, stderr)
+
+
+def parse_result(args, code: int, stdout: str, stderr: str) -> dict:
+    """The JSON a run printed last, or the error it died with.
+
+    One parser for both launchers. In a pod, stdout and stderr arrive as one
+    log, so `stdout` carries both and `stderr` is empty; the JSON is still the
+    last line starting with `{`.
+    """
+    if code != 0:
         # Head of the last traceback as well as the tail: a Py4JJavaError's
         # Java stack pushes the exception MESSAGE off the front of a tail-only
         # budget. See docs/DECISIONS.md#log-tail-plus-head
-        err = proc.stderr or ""
+        err = stderr or stdout or ""
         cut = err.rfind("Traceback (most recent call last)")
         head = err[cut:cut + 2500] if cut >= 0 else ""
-        tail = ((proc.stdout or "")[-1500:] + "\n" + head
+        tail = ((stdout or "")[-1500:] + "\n" + head
                 + "\n...\n" + err[-2000:])
         raise RuntimeError(
-            f"spark task {args!r} failed (exit {proc.returncode})\n{tail}")
-    for line in reversed((proc.stdout or "").strip().splitlines()):
+            f"spark task {tuple(args)!r} failed (exit {code})\n{tail}")
+    for line in reversed((stdout or "").strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
             return json.loads(line)
     raise RuntimeError(
-        f"spark task {args!r} produced no JSON:\n{(proc.stdout or '')[-1500:]}")
+        f"spark task {tuple(args)!r} produced no JSON:\n{(stdout or '')[-1500:]}")
+
+
+def driver_pod(args, name: str) -> dict:
+    """The driver pod for one run, as a plain manifest -- no kubernetes import,
+    so the cheap test tier can check it.
+
+    Its whole environment comes from the platform ConfigMap and Secret the
+    chart writes (envFrom), the same ones the Airflow pods read, so a driver
+    cannot be configured differently from the task that launched it. The
+    two things only a pod knows are added: its own IP, which executors call
+    back to in client mode, and PLATFORM_EXECUTION itself, so the driver
+    builds a k8s:// session rather than looping back here.
+    """
+    from reporting_platform.common import settings
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "labels": {"app.kubernetes.io/name": "reporting-platform",
+                       "app.kubernetes.io/component": "spark-driver",
+                       "reporting-platform/spark-task": str(args[0])},
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "serviceAccountName": settings.kubernetes("SPARK_SERVICE_ACCOUNT"),
+            "containers": [{
+                "name": "driver",
+                "image": settings.kubernetes("SPARK_DRIVER_IMAGE"),
+                "command": ["python", "-m", "scripts._spark_task", *args],
+                "envFrom": [
+                    {"configMapRef": {"name": settings.kubernetes("PLATFORM_ENV_CONFIGMAP")}},
+                    {"secretRef": {"name": settings.kubernetes("PLATFORM_ENV_SECRET")}},
+                ],
+                "env": [
+                    {"name": "PLATFORM_EXECUTION", "value": "kubernetes"},
+                    {"name": "POD_IP",
+                     "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}},
+                ],
+                # The driver's heap is spark_session()'s 2g plus headroom for
+                # the Python process.
+                "resources": {"requests": {"cpu": "500m", "memory": "3Gi"},
+                              "limits": {"memory": "3Gi"}},
+            }],
+        },
+    }
+
+
+def _run_in_pod(args) -> tuple[int, str, str]:
+    """Create the driver pod, wait for it, return (exit code, log, "").
+
+    THE POD IS ALWAYS DELETED, including when the Airflow task is killed
+    under it (a timeout, a mark-failed): `finally` runs on the SIGTERM
+    Airflow sends. An orphaned driver holds its executors, and the
+    `lakehouse_write` slot is released while the write it guards is still
+    going -- the failure the feed console's process-group kill exists to
+    prevent locally.
+    """
+    import time
+    import uuid
+
+    from kubernetes import client, config
+
+    from reporting_platform.common import settings
+
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        config.load_kube_config()
+    api = client.CoreV1Api()
+    namespace = settings.kubernetes("SPARK_K8S_NAMESPACE")
+    op = str(args[0]).lower().replace("_", "-")[:30]
+    name = f"spark-task-{op}-{uuid.uuid4().hex[:8]}"
+    api.create_namespaced_pod(namespace, driver_pod(args, name))
+    try:
+        while True:
+            pod = api.read_namespaced_pod(name, namespace)
+            if pod.status.phase in ("Succeeded", "Failed"):
+                break
+            time.sleep(5)
+        state = pod.status.container_statuses[0].state.terminated
+        code = state.exit_code if state else 1
+        log = api.read_namespaced_pod_log(name, namespace, container="driver")
+        return code, log, ""
+    finally:
+        try:
+            api.delete_namespaced_pod(name, namespace, grace_period_seconds=0)
+        except Exception:                                     # noqa: BLE001
+            pass
 
 
 def main() -> int:
