@@ -64,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     publish.add_argument("--control", action="append", default=[],
                          metavar="PATH",
                          help="control source path; repeat when present")
+    publish.add_argument("--source-access", choices=("local", "smb"),
+                         default="local", help="source access mode; SMB uses "
+                         "an existing Kerberos credential cache")
     publish.add_argument("--s3-endpoint",
                          help="override REPORTING_TRANSPORT_S3_ENDPOINT/"
                               "S3_ENDPOINT")
@@ -107,6 +110,12 @@ def main(argv: list[str] | None = None) -> int:
 
     files = [("data", path) for path in args.data]
     files.extend(("control", path) for path in args.control)
+    if args.source_access == "smb":
+        from reporting_transport.sources import SMBSourceReader
+        try:
+            files = [(role, SMBSourceReader(path)) for role, path in files]
+        except TransportContractError as exc:
+            return _fail(EXIT_INVALID_INPUT, "invalid_input", exc)
 
     try:
         config = _config_from_args(args)
