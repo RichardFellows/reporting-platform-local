@@ -312,12 +312,16 @@ def _declared(feed_name: str) -> list[str]:
 
 
 def _prepared_date_models():
-    """The two date-partitioned prepared models, each with its own key and
-    the raw columns its feed declares."""
+    """The date-partitioned prepared models, each with its own key and the
+    raw columns its feed declares."""
     return [(PREPARED / "fo_trade.sql", "raw_fo_trade", "trade_id",
              _declared("fo_trade")),
             (PREPARED / "ref_collateral.sql", "raw_ref_collateral", "collateral_id",
-             _declared("ref_collateral"))]
+             _declared("ref_collateral")),
+            (PREPARED / "qa_happy_position.sql", "raw_qa_happy_position",
+             "position_id", _declared("qa_happy_position")),
+            (PREPARED / "qa_headerless_position.sql", "raw_qa_headerless_position",
+             "position_id", _declared("qa_headerless_position"))]
 
 
 # ------------------------------------------- (a) the item's case, real rank

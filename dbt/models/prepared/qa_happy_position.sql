@@ -18,19 +18,20 @@
   `reporting`, where it can be joined to exposure.
 #}
 
+{% set output_columns = ['cob_date', 'position_id', 'desk_code', 'amount', 'currency', 'effective_date', 'is_active', 'description'] %}
+
 with raw_rows as (
 
-    select
-        *,
-        {{ dedupe_rank(['position_id']) }} as _rn
+    {#
+      EVERY raw row the window and the as-of filter admit, unranked. The
+      rank happens after cleaning, on the CLEANED key -- see `ranked_rows`
+      (plan #13; this model was scaffolded before that fix).
+    #}
+    select *
     from {{ source('raw', 'qa_happy_position') }}
     where {{ incremental_window('_cob_date', 'cob_date') }}
       and {{ known_as_of() }}
 
-),
-
-deduped as (
-    select * from raw_rows where _rn = 1
 ),
 
 cleaned as (
@@ -51,10 +52,36 @@ cleaned as (
         _source_file                                             as source_file,
         _file_version                                            as source_file_version,
         {{ source_provenance() }}
-        {{ audit_columns() }}
+        {{ audit_columns() }},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number
 
-    from deduped
+
+    from raw_rows
+
+),
+
+ranked_rows as (
+
+    {# THE IN-FILE DEDUPE IS ON THE CLEANED KEY: ' B' and 'B' are one key. #}
+    select
+        *,
+        {{ dedupe_rank(['position_id']) }} as _rn
+    from cleaned
+
+),
+
+deduped as (
+
+    select
+        {%- for c in prepared_output_columns(output_columns) %}
+        {{ ident(c) }}{{ ',' if not loop.last }}
+        {%- endfor %}
+    from ranked_rows
+    where _rn = 1
 
 )
 
-select * from cleaned
+select * from deduped

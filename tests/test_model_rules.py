@@ -40,17 +40,11 @@ encode that one model's exception into the general rule, this test leaves
 supersession tests already drew, and (c) -- the only one of the three with no
 such exception -- is the one written to scan every layer.
 
-FOUND, NOT FIXED (report, don't repair -- the same instruction (a)/(b) were
-built under): `dbt/models/prepared/qa_happy_position.sql` and
-`qa_headerless_position.sql` both rank the RAW key inside `raw_rows`, the CTE
-that reads `source('raw', ...)` directly -- the shape `fo_trade.sql` and
-`ref_collateral.sql` were fixed out of. They are QA fixtures scaffolded before
-that fix and never regenerated; `qa_happy_position_scd2.sql`, scaffolded
-later, already has the correct shape. `KNOWN_RANK_BEFORE_CLEANING` below is
-that finding, named rather than silently fixed, and the test fails again the
-moment either file's actual behaviour no longer matches the entry -- in
-either direction, so an unrelated future edit that happens to fix one of them
-must delete the entry rather than leave it stale.
+FOUND BY (b), AND FIXED: `qa_happy_position.sql` and
+`qa_headerless_position.sql` ranked the RAW key inside `raw_rows` -- the shape
+plan #13 fixed out of `fo_trade.sql` and `ref_collateral.sql`. They were
+scaffolded before that fix and never regenerated. The rule's first catch; the
+allowlist below is empty and stays that way.
 """
 from __future__ import annotations
 
@@ -251,10 +245,7 @@ def rank_shape_issues(text: str) -> list[str]:
 # changes the shape removes the issue, which the "stale" half of the test
 # below turns into a required edit here rather than a silently widening
 # allowlist.
-KNOWN_RANK_BEFORE_CLEANING: dict[str, list[str]] = {
-    "dbt/models/prepared/qa_happy_position.sql": ["raw_rows:['position_id']"],
-    "dbt/models/prepared/qa_headerless_position.sql": ["raw_rows:['position_id']"],
-}
+KNOWN_RANK_BEFORE_CLEANING: dict[str, list[str]] = {}
 
 
 def test_the_dedupe_rank_is_on_the_cleaned_key():
