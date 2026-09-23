@@ -346,3 +346,25 @@ def test_the_packaging_workflow_builds_every_packaged_component():
     assert sorted(matrix) == sorted(packaged), (
         f"components.yml packages {sorted(packaged)}; the workflow matrix "
         f"builds {sorted(matrix)}")
+
+
+def test_an_op_whose_component_is_not_installed_is_refused_by_name():
+    """A driver image built without the owning component says so, naming the
+    module -- not a bare ModuleNotFoundError. A dependency missing from INSIDE
+    an installed op is a different failure and must not be reworded as this."""
+    from reporting_platform.common import spark_task
+
+    saved = dict(spark_task.OPS)
+    spark_task.OPS["absent"] = "reporting_platform.not_installed.spark_ops:op_x"
+    try:
+        try:
+            spark_task.main(["absent"])
+        except SystemExit as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("an op with no module ran")
+    finally:
+        spark_task.OPS.clear()
+        spark_task.OPS.update(saved)
+    assert "reporting_platform.not_installed.spark_ops" in message, message
+    assert "not installed" in message, message
