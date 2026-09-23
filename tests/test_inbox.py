@@ -295,3 +295,18 @@ def test_one_bad_member_does_not_stop_the_others():
     # The container is still processed -- a good member landed out of it.
     assert (d / ".processed" / "trs_position" / "weekly.zip").is_file()
     assert not (d / ".rejected").exists()
+
+
+def test_no_trigger_lands_without_calling_airflow():
+    """`--no-trigger` (the CI build tier) must not reach for Airflow at all:
+    the stack it runs on has no webserver."""
+    from reporting_platform.ingest import inbox
+
+    before = inbox.TRIGGER
+    inbox.TRIGGER = False
+    try:
+        out = inbox._trigger(object(), "landing/x/y.csv")
+    finally:
+        inbox.TRIGGER = before
+    assert out == {"triggered": False,
+                   "reason": "--no-trigger: the caller ingests"}, out
