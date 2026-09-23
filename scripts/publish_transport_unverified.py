@@ -8,6 +8,11 @@ same object keys, same ``_COMPLETE.json``. What it leaves out:
   automatic CRC trailers and response validation are switched off;
 - no post-upload confirmation (neither the HEAD checksum nor the GET +
   rehash) -- the object is trusted to hold what was sent;
+- the request body is sent UNSIGNED (``x-amz-content-sha256:
+  UNSIGNED-PAYLOAD``), so the store does not raise
+  ``XAmzContentSHA256Mismatch`` when something between here and the store
+  (typically a TLS-inspecting proxy) re-frames the upload -- use an
+  ``https://`` endpoint, some stores refuse unsigned bodies over http;
 - single PUT only (no multipart), so each file must be under 5 GiB.
 
 The manifest still declares each file's size and SHA-256, computed from the
@@ -77,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     s3 = boto3.client(
         "s3", endpoint_url=args.s3_endpoint, region_name=args.region,
         config=Config(request_checksum_calculation="when_required",
-                      response_checksum_validation="when_required"))
+                      response_checksum_validation="when_required",
+                      s3={"payload_signing_enabled": False}))
 
     files = [("data", Path(x)) for x in args.data]
     files += [("control", Path(x)) for x in args.control]
