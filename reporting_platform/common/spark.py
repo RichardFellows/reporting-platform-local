@@ -162,6 +162,17 @@ def session_conf(app_name: str, ref: str = "main") -> tuple[str, dict[str, str]]
             "spark.driver.host": pod_ip,
             "spark.driver.bindAddress": "0.0.0.0",
         })
+        # EXECUTOR PODS GET NONE OF THE PLATFORM'S ENVIRONMENT. Locally the
+        # spark-worker container carries AWS_*, and its executors inherit it;
+        # a pod Spark creates has only what these keys give it. Without them
+        # the first S3 read on an executor fails with "Unable to load region
+        # from any of the providers in the chain" (found by the local-k8s
+        # smoke). The credentials come from the platform Secret by
+        # reference, so they never appear in the Spark conf or its UI.
+        secret = settings.kubernetes("PLATFORM_ENV_SECRET")
+        conf["spark.executorEnv.AWS_REGION"] = os.environ.get("AWS_REGION", "us-east-1")
+        for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+            conf[f"spark.kubernetes.executor.secretKeyRef.{var}"] = f"{secret}:{var}"
     return master, conf
 
 

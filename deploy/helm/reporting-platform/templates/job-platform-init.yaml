@@ -8,10 +8,10 @@ the RELEASE image bakes dbt's packages in at build time
 does not need to be made self-sufficient the way a bind-mounted dev image
 does.
 
-Hook weight 2, AFTER the subchart's own `migrate-database-job` (weight 1):
-`pools set` and `registry schema` both need the Airflow metadata schema (the
-first through the `airflow` CLI, the second only in the sense that a cold
-stack should have both schemas before anything parses) to exist first.
+A post-install/post-upgrade hook, so it runs once every resource is ready.
+The subchart's migrate job is a PLAIN Job, not a hook (values.yaml says why),
+and the Airflow pods are not ready until it has finished, so the metadata
+schema `pools set` needs always exists by the time this runs.
 */ -}}
 apiVersion: batch/v1
 kind: Job

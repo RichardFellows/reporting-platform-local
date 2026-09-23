@@ -28,6 +28,10 @@ release-image: ## Build the release image (code baked in) and write release.env.
 	scripts/release_image.sh $(or $(IMAGE),reporting-platform-airflow:release) > release.env
 	@cat release.env
 
+.PHONY: k8s-smoke
+k8s-smoke: ## The platform in a local kind cluster, from the chart: ingest + prepared_build, merged. K8S_SMOKE_DOWN=1 deletes the cluster after
+	PATH="$$HOME/.local/bin:$$PATH" scripts/k8s_smoke.sh
+
 .PHONY: test
 test: ## Config-level tests (no stack needed, ~1s). See tests/README.md
 	python -m tests.run
