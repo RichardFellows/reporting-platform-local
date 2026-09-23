@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Sequence
 
 from reporting_transport import contract, storage
+from reporting_transport.sources import source_reader
 from reporting_transport.contract import (
     Transport, TransportConflictError, TransportContractError,
     TransportEvidenceError,
@@ -229,7 +230,7 @@ def _ordered_local_files(
         if role not in contract.ROLES:
             raise TransportContractError(
                 f"transport {transport_id}: unsupported file role {role!r}")
-        path = Path(value)
+        path = source_reader(value)
         if not path.is_file():
             raise TransportContractError(
                 f"transport {transport_id}: source file not found: {path}")
