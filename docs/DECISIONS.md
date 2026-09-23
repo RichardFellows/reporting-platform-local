@@ -88,6 +88,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | Anchor | The finding |
 |---|---|
 | [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images come from quay.io |
+| [scd2-is-one-macro](#scd2-is-one-macro) | The three SCD2 models are one `scd2_prepared()` call each, moved with a 0-row EXCEPT both ways |
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [the-local-k8s-smoke](#the-local-k8s-smoke) | `make k8s-smoke` runs the chart in kind through a merged `prepared_build`; its first run found four cluster-only defects |
@@ -750,6 +751,46 @@ Both now come from `quay.io/minio/*` at the same release tags. It is the same
 image: the local Docker Hub copy and the quay.io pull have identical image IDs
 (`sha256:7d80fd23...` for minio, `sha256:a5399b66...` for mc). The nightly
 build tier is what notices the next registry doing this.
+
+## scd2-is-one-macro
+
+The three SCD2 prepared models (`ref_counterparty`, `ref_rating`,
+`qa_happy_position_scd2`) each repeated the same sequence by hand:
+`newest_file_version`, `raw_rows`, `cleaned`, `ranked_rows`, `scd2_replay`,
+the hash, `scd2_changes`, `ranged` and `scd2_retractions`. It is the subtlest
+logic in the platform, and a fourth model copied from one of them and edited
+was how it would go wrong. Each model is now its config, its documentation and
+one `scd2_prepared()` call (`dbt/macros/scd2.sql`):
+
+- `keys`: a list; `ref_rating`'s is two columns.
+- `cleaning`: column -> SQL, in output order.
+- `hashed`: the source facts whose change opens a version. The macro refuses
+  a key or a derived column there.
+- `derived`: optional, columns computed after cleaning (`ref_rating`'s rank
+  and band).
+
+The business-column order is derived from `cleaning` and `derived`, so it
+cannot drift from the expressions. `yes_no_flag()` replaces the Y/N `CASE`
+two models spelled out.
+
+Moved with its output proved identical. On a CI stack seeded with every feed,
+the old models were built into `main`, then a new day of `ref_counterparty`
+and `ref_rating` was landed. On four branches from that `main`, the old and
+new models were built full-refresh and incremental. EXCEPT in both
+directions, per model, excluding only the per-invocation audit columns,
+returned **0 rows** for every pair, with identical column order. The
+incremental delta changed 4 `ref_rating` rows. A `ref_counterparty`
+re-delivery renaming CP00001 then opened a new version and closed the old one,
+identically under both. `dbt test` gave 31/31 on both new builds.
+
+Things that read model TEXT had to learn the macro's spelling.
+`context.model_sources()`, which feeds lineage, now reads
+`scd2_prepared(source_name=...)` as `source('raw', ...)`. The structural
+tests accept the call because `test_the_scd2_macro_carries_both` pins that the
+macro calls `known_as_of()` and `dedupe_rank()`. The newest-version test now
+checks the RENDERED SQL. One pre-existing gap, not widened here:
+`feeds_behind_report()` maps a prepared model to a feed by NAME, so
+`qa_happy_position_scd2` resolves to no feed. No report depends on it today.
 
 ## the-build-tier
 

@@ -252,6 +252,12 @@ to run something for the first time, expect it to fail and read what it says.
   comparable there, a **row_count** is not (`at_ingest`), and `no run recorded`
   means Airflow trimmed its history, never "not ingested".
   (`#the-arrivals-view-is-a-join-not-a-record`)
+- **An SCD2 prepared model is ONE `scd2_prepared()` call**
+  (`dbt/macros/scd2.sql`): `keys` (a list), `cleaning` (column -> SQL, output
+  order), `hashed` (source facts only; a key or derived column is refused),
+  optional `derived`. Never hand-write the sequence again. Anything that reads
+  model TEXT must know the call: `model_sources()` reads its `source_name`.
+  (`#scd2-is-one-macro`)
 - **EVERY PREPARED MODEL RANKS THE CLEANED KEY, never the raw one** — clean,
   then `dedupe_rank` in `ranked_rows`, then project
   `prepared_output_columns()` to drop the carried `_cob_date`/`_file_version`/
