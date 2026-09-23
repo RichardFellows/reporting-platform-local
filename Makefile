@@ -78,20 +78,44 @@ deps: ## Re-install dbt packages (airflow-init already did this)
 # it is NOT the write-audit-publish pattern the platform is built around: a
 # failed build leaves its partial output on main rather than on an abandoned
 # branch. The real orchestration (airflow/dags/dbt_builds.py) always opens a
-# branch and merges only when the test task passes, and README section 8 shows
-# the manual equivalent via scripts/_open_build_branch.py. Prefer that when the
-# state of main matters.
-.PHONY: build
-build: ## Full dbt build (run + test) -- on main, see note above
+# branch and merges only when the test task passes. Kept for when you
+# deliberately want to build on main (e.g. `make nuke` then a clean rebuild of
+# an empty catalog); prefer the plain `build`/`prepared`/`reporting` targets
+# below otherwise -- those are the safe, branch-building path.
+.PHONY: build-on-main
+build-on-main: ## Full dbt build (run + test) -- on main, see note above
 	$(DBT) build $(DBT_ARGS)
 
-.PHONY: prepared
-prepared: ## Build the prepared layer only -- on main, see note above
+.PHONY: prepared-on-main
+prepared-on-main: ## Build the prepared layer only -- on main, see note above
 	$(DBT) build $(DBT_ARGS) --select path:models/prepared
 
-.PHONY: reporting
-reporting: ## Build the reporting layer only -- on main, see note above
+.PHONY: reporting-on-main
+reporting-on-main: ## Build the reporting layer only -- on main, see note above
 	$(DBT) build $(DBT_ARGS) --select path:models/reporting
+
+# The safe path: opens a throwaway Nessie branch (scripts/_open_build_branch),
+# builds with nessie_ref pointed at it, and NEVER merges -- see
+# scripts/build_branch.sh. Merging is the Airflow builds' job
+# (prepared_build / reporting_build), or a deliberate manual step per
+# CLAUDE.md's "Build on a throwaway branch, never main".
+SELECT ?= path:models/prepared path:models/reporting
+
+.PHONY: build-branch
+build-branch: ## Build SELECT (default: prepared+reporting) on a THROWAWAY branch. Never merges -- prints the branch and a diff-vs-main command
+	@scripts/build_branch.sh $(SELECT)
+
+.PHONY: build
+build: ## Full dbt build (run + test), SAFELY -- alias for build-branch, never touches main
+	@scripts/build_branch.sh path:models/prepared path:models/reporting
+
+.PHONY: prepared
+prepared: ## Build the prepared layer only, SAFELY -- alias for build-branch, never touches main
+	@scripts/build_branch.sh path:models/prepared
+
+.PHONY: reporting
+reporting: ## Build the reporting layer only, SAFELY -- alias for build-branch, never touches main
+	@scripts/build_branch.sh path:models/reporting
 
 .PHONY: lineage
 lineage: ## Generate and serve the dbt lineage docs
