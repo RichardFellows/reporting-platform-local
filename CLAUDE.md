@@ -418,11 +418,11 @@ them.
   failure look identical.
 - **`unresolved` is a DEFECT that does not fail a build**: nothing in this
   package may raise, an export must never gain the power to stop the pipeline.
-  The seam is MEANT to be CI — `lineage --columns` exits 1 on any — but **no
-  tier runs it**, and that is deliberate: without a catalog the column list
-  falls back to the feed's declared columns, so every column reads `sourced`
-  and `unresolved` cannot arise. The gate needs a post-build tier.
-  (`#a-gate-that-cannot-fail`)
+  The seam is CI — `lineage --columns --require-derivable` exits 1 on any,
+  and only the BUILD tier (`build.yml`) runs it: without a catalog the column
+  list falls back to the feed's declared columns, so every column reads
+  `sourced` and `unresolved` cannot arise. (`#a-gate-that-cannot-fail`,
+  `#the-build-tier`)
 - **No value this package emits may contain a credential word.** Facet values
   pass through Airflow's SecretsMasker and this estate's Postgres user and
   password are both `platform`, so a class called `platform_column` reached
@@ -476,15 +476,15 @@ them.
 - **`dbt parse` catches a bad `ref()`, uncompilable Jinja and unloadable YAML
   — and NOT an unknown generic test or an unknown key in a column block**,
   both of which parse green. Measured, not assumed: those resolve when a test
-  is BUILT, which is the tier that still does not exist.
+  is BUILT, which is what `build.yml` does.
 - **The parse tier's pins are a second copy of `Dockerfile.airflow`'s, and
   `tests/test_ci_pins.py` fails when they diverge** — versions, the provider
   set, the constraint-file URL, `--no-deps` on cosmos and the `dbt --version`
   smoke test after it. It reads the workflow's `run:` blocks as YAML, never
   the file text: matching prose is how its first two versions passed with the
   thing they checked deleted.
-- **`lineage --columns` is run by NEITHER tier, and that is not an
-  oversight.** Without compiled SQL and a catalog it reports 7 of 11 tables as
+- **`lineage --columns` is run by NEITHER cheap tier, and that is not an
+  oversight** — only `build.yml`, after a build, runs it. Without compiled SQL and a catalog it reports 7 of 11 tables as
   `not derivable` and exits **0** — and the 4 it does read come from
   `feeds.yml`, every column `sourced`, so it cannot fail. `--require-derivable`
   makes it fail every time instead. `unresolved` is a column it READ and could
@@ -507,11 +507,17 @@ them.
   Both go false SILENTLY, because building the feature is what falsifies them
   and whoever builds it is reading code, not the docs. Backticked identifiers
   are deliberately NOT checked — too noisy to gate.
-- **Still ungated**: the image BUILD itself (`parse.yml` reproduces its
-  dependency set with pip rather than building it, so the apt layers, the
-  nessie-gc jar and the layer ordering are proven by nothing but a local
-  build), and anything needing a built catalog — `dbt build`, and
-  `lineage --columns --require-derivable`, the post-build tier.
+- **`.github/workflows/build.yml` is the BUILD tier**, and the only one that
+  builds: images, a throwaway stack (`.github/compose.ci.yml`, no host
+  ports), a `--clean` seed plus the qa_ fixtures through the inbox gate,
+  `bulk_ingest`, `dbt build` on a branch, merge to that stack's `main` if
+  clean, then `lineage --columns --require-derivable`. Path-filtered PRs and
+  nightly. It is `scripts/ci_build_tier.sh`, so a developer runs exactly what
+  CI runs, beside their own stack (`-p rp-ci`). The lineage gate needs the
+  MERGE: DuckDB reads only `main`. (`#the-build-tier`)
+- **Still ungated**: nothing builds the images in the cheap tiers, and the
+  build tier builds them but does not push or scan them. A cluster run is
+  the local-k8s smoke test, not CI.
 
 ```powershell
 # config-level tests: registry resolution + the console's write-back.

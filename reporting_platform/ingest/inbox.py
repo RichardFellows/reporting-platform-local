@@ -73,6 +73,13 @@ from reporting_platform.ingest.arrival import (
 log = logging.getLogger("inbox")
 
 INBOX = Path(os.environ.get("REPORTING_INBOX", "/opt/platform/inbox"))
+
+# Whether a landed delivery triggers its ingest DAG. `--no-trigger` turns it
+# off for a caller that ingests by itself and has no Airflow to call --
+# scripts/ci_build_tier.sh, which runs the gate then `bulk_ingest`. Without it
+# a stack with no webserver logs a traceback per delivery, and the exception
+# abandons the rest of that pass.
+TRIGGER = True
 PROCESSED = ".processed"
 REJECTED = ".rejected"
 # The --loop health server's port (deploy/helm/reporting-platform/inbox.yaml's
@@ -267,6 +274,9 @@ def _trigger(feed: Feed, key: str | None) -> dict:
     HTTP client: there is one definition of how this platform talks to
     Airflow's API, and a copy here would drift from it.
     """
+    if not TRIGGER:
+        return {"triggered": False,
+                "reason": "--no-trigger: the caller ingests"}
     from reporting_platform.ui import orchestration
 
     dag_id = f"ingest_{feed.name}"
@@ -632,7 +642,12 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="report what would be ingested; move and upload nothing")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--no-trigger", action="store_true",
+                   help="land only; do not trigger the ingest DAG (for a "
+                        "caller that ingests itself)")
     a = p.parse_args(argv)
+    global TRIGGER
+    TRIGGER = not a.no_trigger
 
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -640,9 +655,14 @@ def main(argv=None) -> int:
     seen: dict[str, tuple[int, float, int]] = {}
     if not a.loop:
         results = sweep(seen, dry_run=a.dry_run)
-        # Once-off cannot observe stability across passes, so give it the two
-        # observations it needs rather than reporting an empty inbox.
-        if not results:
+        # Once-off cannot observe stability across passes, so give it the
+        # observations it needs rather than reporting an empty inbox. That is
+        # STABLE_POLLS + 1 passes, not two: the first records a file, the next
+        # STABLE_POLLS confirm it. This used to stop after two and reported
+        # "inbox empty" for every freshly dropped file.
+        for _ in range(STABLE_POLLS):
+            if results:
+                break
             time.sleep(1)
             results = sweep(seen, dry_run=a.dry_run)
         print(json.dumps(results, indent=2) if a.json else

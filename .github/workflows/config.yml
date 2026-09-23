@@ -25,7 +25,7 @@
 # is the one thing `--columns` exits 1 on, and here it is UNREACHABLE: the
 # step would be a tick that cannot fail. `--require-derivable` inverts it into
 # a failure that can only ever mean "you have not built yet". Both belong to a
-# post-build tier, and there is not one.
+# post-build tier, which is build.yml.
 # See docs/DECISIONS.md#a-gate-that-cannot-fail
 name: config
 
