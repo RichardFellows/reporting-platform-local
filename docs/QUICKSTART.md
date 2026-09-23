@@ -129,8 +129,20 @@ PowerShell mangles the quoting and the DAG `--conf` flags will not parse. Plain
 ```bash
 git clone <repo> reporting-platform && cd reporting-platform
 cp .env.example .env
+python3 scripts/doctor.py     # or: make doctor
 docker compose up -d --build
 ```
+
+`doctor` is the first thing to run, not `docker compose up`: a new clone's
+first failures are almost always environmental -- a missing `.env`, an
+`AIRFLOW_UID` that doesn't match your uid, too little memory given to Docker
+Desktop, a port this stack wants that something else already holds -- and
+none of them produce a message that says so. `doctor` checks all four (plus
+the Git Bash `MSYS_NO_PATHCONV` trap on Windows) against this repo's own
+`docker-compose.yml`, states the exact fix for whatever fails, and exits
+non-zero if anything did. It needs Python 3 on the host -- nothing else here
+does (see the prerequisites table above) -- so skip it if that's not
+available and read the platform's own error text instead.
 
 `.env` holds no real credentials — it is copied verbatim from
 `.env.example`. Check everything came up:
