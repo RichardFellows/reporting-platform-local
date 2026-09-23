@@ -1,0 +1,20 @@
+apiVersion: v2
+name: reporting-platform
+description: >-
+  The reporting platform on Kubernetes/OpenShift: Airflow (the official chart,
+  as a dependency) running the platform's release image with the
+  KubernetesExecutor, Spark drivers and executors as pods, and the platform's
+  own configuration, secrets, RBAC and init job.
+type: application
+version: 0.1.0
+# The platform release this chart deploys is an IMAGE DIGEST in values, not
+# this string -- see images.platform.digest.
+appVersion: "0.1.0"
+dependencies:
+  # 1.16.0 is the last chart line whose default Airflow is 2.10.5. Airflow is
+  # 2.x deliberately (docs/DECISIONS.md#airflow-2-not-3); a newer chart
+  # defaults to 3.x.
+  - name: airflow
+    version: 1.16.0
+    repository: https://airflow.apache.org
+    alias: airflow

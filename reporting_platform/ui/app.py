@@ -62,6 +62,19 @@ async def _airflow_handler(_request, exc: orchestration.AirflowError):
     return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 
+@app.get("/healthz")
+def healthz():
+    """Liveness/readiness probe (deploy/helm/reporting-platform's
+    feed-console.yaml): 200 once this process is serving requests at all.
+
+    DELIBERATELY CHEAP -- no Airflow call, no S3 call, no feeds() read.
+    `/api/airflow/health` already exists for "is Airflow reachable"; a k8s
+    probe hitting that instead would mark this pod unready whenever Airflow
+    is slow or restarting, which is a different pod's problem.
+    """
+    return {"ok": True}
+
+
 def _feed_or_404(name: str):
     try:
         return feeds()[name]

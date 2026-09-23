@@ -1,0 +1,62 @@
+{{- /*
+The two platform-specific steps of `airflow-init` that the official chart's
+own `migrateDatabaseJob`/`createUserJob` hooks do not cover -- see
+docs/DECISIONS.md#airflow-init-load-bearing-steps. `db migrate` and `users
+create` are the subchart's job; `dbt deps` is not needed here at all, because
+the RELEASE image bakes dbt's packages in at build time
+(docs/DECISIONS.md#the-release-image-carries-the-code) -- a cluster clone
+does not need to be made self-sufficient the way a bind-mounted dev image
+does.
+
+Hook weight 2, AFTER the subchart's own `migrate-database-job` (weight 1):
+`pools set` and `registry schema` both need the Airflow metadata schema (the
+first through the `airflow` CLI, the second only in the sense that a cold
+stack should have both schemas before anything parses) to exist first.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-platform-init
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "2"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "reporting-platform.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: platform-init
+          image: {{ include "reporting-platform.image" (dict
+              "repo" .Values.images.platform.repository
+              "digest" .Values.images.platform.digest
+              "tag" .Values.images.platform.tag
+              "name" "images.platform"
+              "environment" .Values.environment
+              "controlled" (include "reporting-platform.controlled" .)) | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["bash", "-euc"]
+          args:
+            - >
+              airflow pools set lakehouse_write "$LAKEHOUSE_WRITE_SLOTS"
+              'serialise all Iceberg writers, incl. maintenance' &&
+              python -m reporting_platform.registry schema
+          envFrom:
+            - configMapRef:
+                name: {{ include "reporting-platform.envConfigMap" . }}
+            - secretRef:
+                name: {{ include "reporting-platform.envSecret" . }}
+          env:
+            # `airflow pools set` needs the metadata database -- the same
+            # Secret the subchart's own jobs and pods read (data.metadataSecretName).
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "airflow.data.metadataSecretName is required" .Values.airflow.data.metadataSecretName }}
+                  key: connection
