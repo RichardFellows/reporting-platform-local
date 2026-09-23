@@ -5354,3 +5354,14 @@ parser is `reporting_transport.contract`, shared unmodified with the
 publisher, so there is one implementation of what a marker means. The
 alternative -- a copy on the consumer side -- is two parsers of one contract
 drifting apart. Pin a compatible range, not an exact version.
+
+**Wheels are built from a staging directory, not a pyproject per
+directory**, because ownership is by module. `scripts/build_components.py`
+copies exactly a component's files, generates its `pyproject.toml` from
+`components.yml` and builds it. `--check` installs the result into an empty
+virtualenv outside the checkout, with its sibling wheels installed BY FILE (a
+name could be answered by a public package of the same name) and none of the
+extras, and imports every module. The static test cannot see a module-level
+import of an undeclared third-party package or a file the staging missed;
+this does, and removing `requests` from core's `requires` fails it on
+`common/airflow_api.py`, measured.

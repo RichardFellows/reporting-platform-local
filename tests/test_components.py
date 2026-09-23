@@ -239,3 +239,110 @@ def test_every_dag_launches_only_ops_its_component_may_import():
     # what it keys on, and renaming one would silently turn this off.
     assert seen >= 10, f"found only {seen} Spark-task launches in the DAGs"
     assert not bad, "\n".join(bad)
+
+
+# ------------------------------------------------------ third-party packaging
+# The import name is not always the distribution name, and a few imports come
+# in transitively through a declared distribution rather than being one.
+IMPORT_TO_DIST = {
+    "yaml": "pyyaml",
+    "ruamel": "ruamel.yaml",
+    "psycopg2": "psycopg2-binary",
+    "botocore": "boto3",
+    "smbclient": "smbprotocol",
+    "gssapi": "smbprotocol",          # through smbprotocol[kerberos]
+    "airflow": "apache-airflow",
+    "pendulum": "apache-airflow",
+    "attr": "apache-airflow",
+    "cosmos": "astronomer-cosmos",
+    "openlineage": "apache-airflow-providers-openlineage",
+}
+
+
+def _dist_name(requirement: str) -> str:
+    import re
+    return re.split(r"[\[<>=!~ ;]", requirement, 1)[0].strip().lower()
+
+
+def _declared(components: dict, name: str) -> set[str]:
+    """Every distribution `name` or anything it depends on declares."""
+    out, stack, seen = set(), [name], set()
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        c = components[n]
+        out |= {_dist_name(r) for r in c.get("requires", [])}
+        out |= {_dist_name(r) for rs in c.get("extras", {}).values() for r in rs}
+        out |= {_dist_name(r) for r in c.get("host", [])}
+        stack.extend(c.get("depends_on", []))
+    return out
+
+
+def test_every_third_party_import_is_declared():
+    import sys
+    repo = repo_file("components.yml").parent
+    components = _components()
+    table = _owner_table(components)
+    dag_files = {p.stem for p in (repo / "airflow" / "dags").glob("*.py")}
+    subjects = [(m, p, _owner(m, table)) for m, p in _source_files(repo)]
+    subjects += [(d, repo_file(d), n) for n, c in components.items()
+                 for d in c.get("dags", [])]
+    bad = set()
+    for module, path, owner in subjects:
+        if not components[owner].get("packaged", True):
+            continue
+        declared = _declared(components, owner)
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module or ""]
+            else:
+                continue
+            for name in names:
+                top = name.split(".")[0]
+                if (not top or top in sys.stdlib_module_names or top == "__future__"
+                        or top in FIRST_PARTY or top in dag_files):
+                    continue
+                dist = IMPORT_TO_DIST.get(top, top).lower()
+                if dist not in declared:
+                    bad.add(f"{path.relative_to(repo)} ({owner}) imports {top}: "
+                            f"declare {dist} in requires, extras or host")
+    assert not bad, "\n".join(sorted(bad))
+
+
+def test_a_modules_parent_packages_ship_with_it_or_a_dependency():
+    """`registry.deliveries` ships in ingest's wheel, but `registry/__init__.py`
+    in core's -- which is only sound because ingest depends on core. An owner
+    that did not would install a module into a package that does not exist."""
+    repo = repo_file("components.yml").parent
+    components = _components()
+    table = _owner_table(components)
+    modules = {m for m, _ in _source_files(repo)}
+    bad = []
+    for module in sorted(modules):
+        owner = _owner(module, table)
+        if not components[owner].get("packaged", True):
+            continue
+        parts = module.split(".")
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[:i])
+            if parent in modules and _owner(parent, table) not in _allowed(components, owner):
+                bad.append(f"{module} ({owner}) sits in {parent} "
+                           f"({_owner(parent, table)}), which {owner} does not depend on")
+    assert not bad, "\n".join(bad)
+
+
+def test_the_packaging_workflow_builds_every_packaged_component():
+    """A second list, so it is checked: a component missing from the matrix
+    is one no CI job ever builds on its own."""
+    workflow = yaml.safe_load(
+        repo_file(".github/workflows/components.yml").read_text())
+    matrix = workflow["jobs"]["wheel"]["strategy"]["matrix"]["component"]
+    packaged = [n for n, c in _components().items()
+                if c.get("packaged", True) and c.get("modules")]
+    assert sorted(matrix) == sorted(packaged), (
+        f"components.yml packages {sorted(packaged)}; the workflow matrix "
+        f"builds {sorted(matrix)}")

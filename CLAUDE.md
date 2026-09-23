@@ -532,6 +532,10 @@ them.
 # No stack, ~6s. Everything else is verified by running it. tests/README.md
 python -m tests.run
 
+# one wheel per component in components.yml; --check installs each in a clean
+# 3.11 venv outside the repo and imports every module it ships. docs/PACKAGING.md
+python -m scripts.build_components --check
+
 # every DAG file imports, and produced the DAGs it should have. What CI's
 # parse tier runs; in the container it needs no argument.
 docker compose exec -T airflow python -m scripts.check_dag_imports
