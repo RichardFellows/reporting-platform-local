@@ -19,7 +19,6 @@ than worked.
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
 | [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high | 2–4 hours |
-| [16](16-exposure-change-removed-never-fires.md) | `exposure_change`'s `'REMOVED'` category can never be assigned | medium | ½ day |
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
@@ -45,9 +44,8 @@ first.
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
 does after pruning) are reasoned from the code and say so — reproduce them
-first. **21–24** came out of 09's reviews and live runs. **16** describes a
-model 09 changed, so re-read it against the current model before starting.
-The rest are independent.
+first. **21–24** came out of 09's reviews and live runs. The rest are
+independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
 
