@@ -61,6 +61,7 @@ x-airflow-common: &airflow-common
     # See docs/DECISIONS.md#the-release-image-carries-the-code
     target: dev
     args:
+      <<: *versions
       NESSIE_SERVER_VERSION: ${NESSIE_SERVER_VERSION:-0.108.1}
   # RUN AS THE HOST USER, IN GROUP 0. Set AIRFLOW_UID in .env to your own
   # `id -u`; `.env.example` says how and why, and

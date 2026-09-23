@@ -88,6 +88,9 @@ jobs:
       NESSIE_URI: http://nessie.invalid/api/v2
       S3_ENDPOINT: http://minio.invalid:9000
       REPORTING_WAREHOUSE: s3a://lakehouse/warehouse
+      # The driver's baked jars (Dockerfile.airflow sets it in the image).
+      # Inert here: nothing starts a Spark session.
+      PLATFORM_DRIVER_JARS: /nonexistent/driver.jar
 
       AIRFLOW_HOME: ${{ github.workspace }}/.ci/airflow
       AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/airflow/dags

@@ -107,8 +107,11 @@ to run something for the first time, expect it to fail and read what it says.
   on a cluster too. (`#spark-in-a-subprocess`)
 - **THREE jar versions live in `.env`**, and diverging them gives
   `NoSuchMethodError` on the first write, never anything saying "version".
-  `ICEBERG_VERSION` must be identical in the Spark image and in *both* drivers
-  — every submitting process runs a pip pyspark with no jars of its own.
+  `ICEBERG_VERSION` must be identical in the Spark image and the Airflow
+  image, which bakes the jars for *both* drivers — every submitting process
+  runs a pip pyspark with no jars of its own. Both drivers read
+  `PLATFORM_DRIVER_JARS`; nothing resolves jars through Ivy at runtime.
+  (`#driver-jars-are-baked`)
   `NESSIE_SPARK_EXT_VERSION` tracks **Iceberg, not the server**;
   `NESSIE_SERVER_VERSION` sets the server image and the `nessie-gc` jar and may
   be newer than the extensions. `tests/test_versions.py` pins all three.

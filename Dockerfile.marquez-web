@@ -13,13 +13,24 @@ ARG MARQUEZ_VERSION
 USER root
 WORKDIR /src
 
+# MARQUEZ_SOURCE_URL IS A BUILD ARG so the corporate mirror can redirect the
+# fetch, same as Dockerfile.marquez-api. See
+# docs/DECISIONS.md#images-build-from-a-mirror
+ARG MARQUEZ_SOURCE_URL=https://github.com/MarquezProject/marquez/archive/refs/tags/${MARQUEZ_VERSION}.tar.gz
 # Only `web/` from the tarball -- the api tree is a separate image.
-RUN curl -fsSL "https://github.com/MarquezProject/marquez/archive/refs/tags/${MARQUEZ_VERSION}.tar.gz" \
+RUN curl -fsSL "${MARQUEZ_SOURCE_URL}" \
     | tar xz --strip-components=2 "marquez-${MARQUEZ_VERSION}/web"
 
+# NPM_REGISTRY IS A BUILD ARG for the same reason: registry.npmjs.org is a
+# literal the corporate egress policy blocks. TWO npm installs read it, here
+# and for the runtime deps below, because an ARG is not itself an npm setting
+# -- each invocation is told explicitly, rather than relying on a global
+# `.npmrc` written by the first to still be in force for the second.
+# See docs/DECISIONS.md#images-build-from-a-mirror
+ARG NPM_REGISTRY=https://registry.npmjs.org/
 # `npm install`, as upstream does, NOT `npm ci`: package.json carries a
 # `file:./libs/graph` dependency that a lockfile install resolves differently.
-RUN npm install --no-audit --no-fund \
+RUN npm install --no-audit --no-fund --registry "${NPM_REGISTRY}" \
     && npm run build
 
 # The runtime dependency set, resolved separately so the 702 MB build tree is
@@ -33,7 +44,7 @@ ARG EXPRESS_VERSION=4.19.2
 ARG HTTP_PROXY_MIDDLEWARE_VERSION=2.0.6
 RUN mkdir -p /runtime \
     && cd /runtime \
-    && npm install --no-audit --no-fund --omit=dev \
+    && npm install --no-audit --no-fund --omit=dev --registry "${NPM_REGISTRY}" \
          "express@${EXPRESS_VERSION}" \
          "http-proxy-middleware@${HTTP_PROXY_MIDDLEWARE_VERSION}"
 

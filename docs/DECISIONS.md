@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-100 entries. They are grouped here by subject; the file itself is in the order
+101 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -65,6 +65,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 |---|---|
 | [jar-versions](#jar-versions) | Three version values in `.env` reaching six consumers, and why the split is the finding rather than pedantry |
 | [spark-jars-prebaked](#spark-jars-prebaked) | The Spark image bakes its jars instead of resolving `--packages` at submit |
+| [driver-jars-are-baked](#driver-jars-are-baked) | The Airflow image bakes the drivers' jars; both drivers read `PLATFORM_DRIVER_JARS`, no Ivy at runtime |
 | [nessie-gc-jar](#nessie-gc-jar) | There is no server-side GC endpoint; collecting content needs the CLI jar |
 | [nessie-iceberg-rest](#nessie-iceberg-rest) | Nessie serves an Iceberg REST catalog, and what that does and does not replace |
 | [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) | Nessie logs Elastic Common Schema field names, which is why its logs read oddly |
@@ -72,6 +73,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [airflow-provider-constraints](#airflow-provider-constraints) | Providers install under Airflow's constraint file so pip cannot drag a version quietly |
 | [airflow-api-auth](#airflow-api-auth) | `session` alone authenticates only a browser |
 | [image-permissions-layer](#image-permissions-layer) | The permissions layer is last in the Dockerfile because it changes least |
+| [images-build-from-a-mirror](#images-build-from-a-mirror) | Every external URL a Dockerfile fetches is a build ARG, so a corporate mirror can redirect it |
 | [containers-run-as-the-host-uid](#containers-run-as-the-host-uid) | `user: "${AIRFLOW_UID:-50000}:0"`, and what a bind mount does to ownership |
 | [minio-host-ports](#minio-host-ports) | The published MinIO ports are the host side only |
 | [no-folder-markers](#no-folder-markers) | `minio-init` creates the bucket and nothing else |
@@ -217,16 +219,18 @@ finding, not pedantry.
 
 | Variable | Sets |
 |---|---|
-| `ICEBERG_VERSION` | the Iceberg runtime: baked into the Spark image's `/opt/spark/jars`, and resolved by both drivers |
+| `ICEBERG_VERSION` | the Iceberg runtime: baked into the Spark image's `/opt/spark/jars` for the executors, and into the Airflow image's `/opt/platform/jars` for both drivers |
 | `NESSIE_SPARK_EXT_VERSION` | the Nessie Spark SQL extensions, in the same three places |
 | `NESSIE_SERVER_VERSION` | the Nessie server image tag and the `nessie-gc` jar |
 
-`ICEBERG_VERSION` has to be identical in three places — `Dockerfile.spark`, and
-*both* drivers (`spark_session()` in `common/spark.py`, `spark.jars.packages`
-in `dbt/profiles.yml`) — because every process that submits work here runs a
-pip-installed pyspark with no jars of its own. `spark.jars.packages` ships the
-driver's jars to every executor, so what the executors load is what the driver
-resolved. Diverge and you get two Iceberg versions in one application, which
+`ICEBERG_VERSION` has to be identical in both images — `Dockerfile.spark` for
+the executors, and `Dockerfile.airflow` for the drivers (`spark_session()` in
+`common/spark.py` and `spark_local` in `dbt/profiles.yml`, which both read the
+baked jar list from `PLATFORM_DRIVER_JARS`) — because every process that
+submits work here runs a pip-installed pyspark with no jars of its own.
+`spark.jars` ships the driver's jars to every executor, so what the executors
+load is what the driver has. See
+[driver-jars-are-baked](#driver-jars-are-baked). Diverge and you get two Iceberg versions in one application, which
 surfaces as `NoSuchMethodError` on the first write rather than as anything
 saying "version".
 
@@ -243,7 +247,8 @@ also what decides the server's log format** — see
 [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) — which is why the server
 here is pinned ahead of the extensions rather than level with them.
 
-`hadoop-aws` and `aws-java-sdk-bundle` are deliberately not parameterised. They
+`hadoop-aws` and `aws-java-sdk-bundle` are build ARGs of `Dockerfile.airflow`
+only (`HADOOP_AWS_VERSION`, `AWS_SDK_BUNDLE_VERSION`), not `.env` values. They
 track Spark 3.5's Hadoop, not Iceberg.
 
 Defaults everywhere repeat the pinned combination, so a clone with no `.env`
@@ -260,9 +265,37 @@ The Spark image bakes its jars rather than resolving `--packages` at submit
 time. In the cluster they come from the internal registry; baking them means no
 egress at runtime.
 
-The drivers still resolve via Ivy (see [jar-versions](#jar-versions)) because
-they run pip-installed pyspark, which has none of these jars — the first
-Iceberg SQL statement would fail with `ClassNotFoundException` before it ran.
+The drivers used to resolve theirs via Ivy at session start; they are baked
+too now — see [driver-jars-are-baked](#driver-jars-are-baked).
+
+## driver-jars-are-baked
+
+Every driver here is a pip-installed pyspark with none of the Iceberg, Nessie
+or S3A jars, so without them the first Iceberg statement fails with
+`ClassNotFoundException`. Both drivers used to fetch them from Maven Central
+through `spark.jars.packages` on every cold start. That is a runtime
+dependency on egress, which a cluster behind a mirror does not have, and a
+second copy of every version in two files.
+
+`Dockerfile.airflow` now downloads the five jars at build time (through
+`MAVEN_REPO`, so a mirror redirects them) into `/opt/platform/jars`, and
+exports the list as `PLATFORM_DRIVER_JARS`. `spark_session()` and
+`spark_local` both set `spark.jars` from that one variable, so the drivers
+cannot diverge, and the versions live once, in the Dockerfile's ARGs, which
+`tests/test_versions.py` pins against `Dockerfile.spark`. `spark.jars` ships
+the jars to every executor, exactly as `spark.jars.packages` did, which is
+still how `hadoop-aws` (not baked into the Spark image) reaches them.
+
+A process outside the image has no `PLATFORM_DRIVER_JARS`. `spark_session()`
+refuses naming it, and names any listed jar that is missing, rather than
+failing later with `ClassNotFoundException`. dbt refuses with `Env var
+required but not provided`. CI's parse tier sets it to an inert path,
+because it renders the profile but starts no session.
+
+Verified live: a session on a Nessie branch showed `spark.jars.packages`
+unset and no Ivy resolution in the log. An Iceberg write and read, a sorted
+`rewrite_data_files`, and an S3A read of landing across 2 executor partitions
+all worked, and a dbt branch build ran as before.
 
 ## nessie-logs-are-ecs-json
 
@@ -463,6 +496,50 @@ more often than the pip installs above it, and Docker invalidates every layer
 after the one that changed — put it higher and editing a directory list costs a
 full reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
 whatever registry mirror is in front of pip. Nothing below it depends on it.
+
+`Dockerfile.spark` has the same layer, last for the same reason, and it
+learned the other half of the rule the hard way. **Own the directories as the
+image's user, in group 0 (`spark:0`, like `airflow:0`), not as root.** Group 0
+with `g+rwX` serves an arbitrary OpenShift UID, but compose runs the image's
+own `spark` user (uid 185), which is not in group 0. With root-owned
+directories every executor launch failed with `java.io.IOException: Failed to
+create directory /opt/spark/work/app-...`, and the driver reported
+`Master removed our application: FAILED`, and then the misleading
+`spark.sql.catalog.lakehouse is not defined`, because the session was
+half-dead. The layer passed a random-UID check and failed the default user,
+so check both.
+
+## images-build-from-a-mirror
+
+The corporate build has egress only to an internal mirror, so every external
+URL a Dockerfile fetches must be a build ARG whose DEFAULT is today's public
+value — the mirror then only sets build args, never edits a Dockerfile. Five:
+`MAVEN_REPO` (the executor jars in `Dockerfile.spark` and the driver jars in
+`Dockerfile.airflow`, [driver-jars-are-baked](#driver-jars-are-baked)), `NESSIE_GC_URL` and
+`AIRFLOW_CONSTRAINTS_URL` (`Dockerfile.airflow`), `MARQUEZ_SOURCE_URL`
+(both Marquez images), `NPM_REGISTRY` (`Dockerfile.marquez-web`, told to
+every npm invocation, since an ARG is not itself an npm setting).
+`tests/test_offline_build.py` is the gate: a URL literal inside a
+RUN/COPY/ADD, including a continuation line, fails naming file:line.
+
+Two things this does NOT cover. `pip install` and `apt-get` resolve through
+`pip.conf`, apt sources and SSL cert config injected at build time in the
+corporate environment (see `Dockerfile.airflow`'s comment above the provider
+install) — no ARG needed, because their own resolution already goes through
+whatever index that config points at. And `FROM` base images are the deploying fork's concern, not this
+repo's: swapping `apache/airflow`, `apache/spark` or the UBI bases for
+mirrored copies is a registry/pull-through-cache setting, not a Dockerfile
+edit. Still NOT redirectable by anything here: `api`'s gradle build
+(`Dockerfile.marquez-api`) may reach repositories `build.gradle` declares
+beyond Maven Central — unknown without downloading Marquez's own build files,
+which this change deliberately did not do just to answer that.
+
+Also removed: the `|| pip install pyyaml boto3` fallback on
+`Dockerfile.spark`'s pynessie install. It silently dropped `pynessie` on
+failure and shipped an image that imports cleanly and lacks the package the
+platform needs at runtime — a build that "succeeds" with a different image
+than the one asked for. If `pynessie==0.65.0` stops installing, that must
+fail loudly at the `RUN`, not three layers of indirection later at import.
 
 ## the-release-image-carries-the-code
 
@@ -1562,8 +1639,9 @@ refused: a setting that cannot apply must not look like one that did.
 
 [jar-versions](#jar-versions) has been documented in CLAUDE.md, `.env.example`
 and here for as long as it has existed, and was checked by nothing.
-`common/spark.py` reads two of the three and interpolates them straight into
-`spark.jars.packages`; the failure is `NoSuchMethodError` on the first write,
+`common/spark.py` read two of the three and interpolated them straight into
+`spark.jars.packages` (the driver jars are baked now,
+[driver-jars-are-baked](#driver-jars-are-baked)); the failure is `NoSuchMethodError` on the first write,
 after the image builds and the stack comes up, naming no version.
 
 `tests/test_versions.py` pins what is actually checkable, which is not the

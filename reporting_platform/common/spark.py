@@ -59,36 +59,36 @@ def spark_session(app_name: str, ref: str = "main"):
 
     # `pyspark` here is the pip-installed runtime baked into
     # Dockerfile.airflow, and it is the DRIVER. It has NONE of the
-    # Iceberg/Nessie/S3A jars Dockerfile.spark curls into the workers'
-    # /opt/spark/jars, so it must resolve every one via Ivy or the first
-    # Iceberg SQL statement fails with ClassNotFoundException.
+    # Iceberg/Nessie/S3A jars Dockerfile.spark bakes into the workers'
+    # /opt/spark/jars, so without them the first Iceberg SQL statement fails
+    # with ClassNotFoundException.
     #
-    # Keep this list even though the executors bake most of it in:
-    # spark.jars.packages ships the DRIVER's jars to every executor, so what
-    # the executors load is what is resolved here -- which is why these
-    # versions must stay equal to Dockerfile.spark's, and how hadoop-aws (not
-    # baked) reaches them at all. Versions come from the environment, set once
-    # in docker-compose.yml from .env, so this and dbt/profiles.yml cannot
-    # drift. The defaults repeat theirs, for a process started outside
-    # compose.
-    iceberg = os.environ.get("ICEBERG_VERSION", "1.6.1")
-    nessie_ext = os.environ.get("NESSIE_SPARK_EXT_VERSION", "0.99.0")
-    packages = ",".join([
-        f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{iceberg}",
-        f"org.apache.iceberg:iceberg-aws-bundle:{iceberg}",
-        "org.projectnessie.nessie-integrations:"
-        f"nessie-spark-extensions-3.5_2.12:{nessie_ext}",
-        # Needed separately from iceberg-aws-bundle: reading landing CSVs via
-        # spark.read.csv("s3a://...") goes through Hadoop's S3A connector, not
-        # Iceberg's own S3FileIO, and Spark's binaries don't bundle it.
-        "org.apache.hadoop:hadoop-aws:3.3.4",
-        "com.amazonaws:aws-java-sdk-bundle:1.12.262",
-    ])
+    # They are BAKED INTO THE IMAGE, and PLATFORM_DRIVER_JARS lists them --
+    # the same variable dbt/profiles.yml reads, so the two drivers cannot
+    # diverge, and the versions live once, in the Dockerfile's ARGs. They are
+    # set as spark.jars, which ships them to every executor as well: that is
+    # how hadoop-aws (not baked into the Spark image) reaches them at all.
+    # This used to be spark.jars.packages, resolved from Maven Central by Ivy
+    # on every cold start -- a runtime dependency on egress.
+    # See docs/DECISIONS.md#driver-jars-are-baked
+    jars = os.environ.get("PLATFORM_DRIVER_JARS", "").strip()
+    if not jars:
+        raise RuntimeError(
+            "PLATFORM_DRIVER_JARS is not set, so this driver has no Iceberg, "
+            "Nessie or S3A jars. Dockerfile.airflow sets it in the image; a "
+            "process started outside that image has to set it itself.")
+    missing = [p for p in jars.split(",") if not os.path.isfile(p)]
+    if missing:
+        raise RuntimeError(
+            f"PLATFORM_DRIVER_JARS names jars that are not here: {missing}. "
+            f"Rebuild the image (Dockerfile.airflow bakes them) rather than "
+            f"pointing this at another copy -- their versions must equal "
+            f"Dockerfile.spark's.")
 
     builder = (
         SparkSession.builder.appName(app_name)
         .master(master)
-        .config("spark.jars.packages", packages)
+        .config("spark.jars", jars)
         # The driver does no task work, so it needs far less heap than a
         # local[*] session would -- but not the 1g default, which is tight once
         # Iceberg/Nessie/aws-sdk-bundle classes are loaded and exercised.

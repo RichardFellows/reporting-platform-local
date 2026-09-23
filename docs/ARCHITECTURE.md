@@ -485,7 +485,7 @@ flowchart LR
   DR -->|"SPARK_MASTER"| M
   M --> E1
   M --> E2
-  DR -. "ships spark.jars.packages<br/>(incl. hadoop-aws, which the<br/>Spark image does NOT bake)" .-> E1
+  DR -. "ships spark.jars<br/>(incl. hadoop-aws, which the<br/>Spark image does NOT bake)" .-> E1
   DR -. .-> E2
 ```
 
@@ -511,12 +511,11 @@ Three consequences worth knowing before changing any of it:
   successfully* with the cluster sitting idle — the failure mode that is worth
   a guard is the one that isn't red anywhere.
 - **The driver ships the jars.** `Dockerfile.spark` bakes the Iceberg and
-  Nessie runtimes into the executors, but `spark.jars.packages` jars are
-  served from the driver to every executor, so what the executors load is what
-  the driver resolved. That is why the package list in `common/spark.py` and
-  `profiles.yml` must stay at `Dockerfile.spark`'s versions, and why
-  `hadoop-aws` — which the Spark image does *not* bake — reaches the executors
-  at all.
+  Nessie runtimes into the executors; `Dockerfile.airflow` bakes the drivers'
+  copies, listed in `PLATFORM_DRIVER_JARS`, and `spark.jars` serves them from
+  the driver to every executor. That is why the two Dockerfiles' versions must
+  match, and why `hadoop-aws` — which the Spark image does *not* bake —
+  reaches the executors at all. See `DECISIONS.md#driver-jars-are-baked`.
 - **Each application caps itself at 2 cores / 2g.** A standalone application
   takes every free core by default and holds it until the session stops, so an
   uncapped job would leave the next one waiting forever on *"Initial job has

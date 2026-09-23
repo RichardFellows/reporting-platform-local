@@ -23,7 +23,12 @@ WORKDIR /src
 # from tar's grandchild and says nothing about the missing package.
 RUN microdnf install -y gzip \
     && microdnf clean all
-RUN curl -fsSL "https://github.com/MarquezProject/marquez/archive/refs/tags/${MARQUEZ_VERSION}.tar.gz" \
+
+# MARQUEZ_SOURCE_URL IS A BUILD ARG so the corporate mirror can redirect the
+# fetch; gradle's own repositories are a separate concern this arg does not
+# touch. See docs/DECISIONS.md#images-build-from-a-mirror
+ARG MARQUEZ_SOURCE_URL=https://github.com/MarquezProject/marquez/archive/refs/tags/${MARQUEZ_VERSION}.tar.gz
+RUN curl -fsSL "${MARQUEZ_SOURCE_URL}" \
     | tar xz --strip-components=1
 
 # `clients/java` is in the build because `api` depends on it; `web` is not,
