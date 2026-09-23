@@ -1,0 +1,52 @@
+# The BUILD tier: the dbt project built against a real catalog, on a
+# throwaway stack. The tier above parse.yml, and SEPARATE from it and from
+# config.yml so those stay fast (~10s and ~3 min); this one is measured in
+# tens of minutes, so it runs only where it can find something.
+#
+# What only this tier catches, because only it BUILDS:
+#   - an unknown generic test, or an unknown key in a column block -- both
+#     parse green (`dbt parse` resolves neither until a test is built);
+#   - a column the lineage parser cannot trace (`unresolved`), and a model it
+#     cannot read at all (`not derivable`) -- `lineage --columns
+#     --require-derivable` is the post-build gate CLAUDE.md said did not exist;
+#   - anything that only fails at run time: a macro that renders but does not
+#     execute on Spark, a relationships test that fails on real data.
+#
+# The steps are scripts/ci_build_tier.sh, so a developer runs exactly what CI
+# runs (it brings up its own compose project with no host ports).
+# See docs/DECISIONS.md#the-build-tier
+name: build
+
+on:
+  pull_request:
+    paths:
+      - "dbt/**"
+      - "reporting_platform/**"
+      - "scripts/**"
+      - "airflow/**"
+      - "conf/**"
+      - "Dockerfile.*"
+      - "docker-compose.yml"
+      - ".github/compose.ci.yml"
+      - ".github/workflows/build.yml"
+  schedule:
+    # Nightly on main: catches what no PR touched -- a moved upstream image,
+    # a pin a dependency stopped honouring.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, seed, ingest, dbt build on a branch, merge, lineage gate
+        env:
+          CI_DOWN: "1"
+        run: scripts/ci_build_tier.sh
