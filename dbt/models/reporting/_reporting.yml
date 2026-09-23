@@ -83,6 +83,13 @@ models:
       - name: counterparty_id
         tests: [not_null]
       - name: change_category
+        description: >-
+          NEW: no row on the previous retained date. REMOVED: a row on the
+          previous date and none on this one -- absent entirely, its row in
+          THIS date's partition, current values null and the change the whole
+          of what it had (tests/exposure_change_removed_matches_disappearance.sql).
+          MATERIAL_CHANGE: MTM moved by more than the threshold. CHANGED: MTM
+          differs, an MTM that became unknown included. UNCHANGED otherwise.
         tests:
           - accepted_values:
               values: ['NEW', 'REMOVED', 'MATERIAL_CHANGE', 'CHANGED', 'UNCHANGED']
