@@ -96,7 +96,7 @@ models:
       - name: cob_date
         tests: [not_null]
       - name: trade_id
-        tests: [not_null]
+        tests: [not_null, not_a_real_generic_test]
       - name: counterparty_id
         tests:
           - not_null
