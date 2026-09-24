@@ -27,7 +27,7 @@ than worked.
 | [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
 | [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
-| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | COB Status reads a failed or refused raw ingest as `PROCESSING`, and cannot see a failed validation | medium | ½–1 day |
+| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and reconcile resets its receipt within 20 minutes | medium | ½–1 day |
 
 ## Where to start
 
@@ -76,17 +76,20 @@ stage. `AIRFLOW-ORCHESTRATION.md` links to §6. Every name was taken from
 and `monitoring/feed_status.py`, and the captions cite them. §6's
 `create_delivery_task` citation now points at `transport_steps.deliver`,
 where that code moved.
-*Verified* by rendering each block with mermaid-cli 11, both standalone and
-out of the doc itself, and looking at the PNGs. `python -m tests.run`: 1000
+*Verified* by rendering each block out of the doc itself with mermaid-cli 11
+and 10, and looking at the PNGs. `python -m tests.run`: 1000
 passed, 1 skipped (fastapi).
 *What the item got wrong.* It said a successful retry moves a `failed`
-receipt on again. That holds for `validate_transport`, `create_delivery`
-and `normalize_delivery`. It does not hold for `ingest_raw`, which writes
-the receipt only when it fails, so a receipt that failed at `ingest_raw`
-stays `failed` after the retry succeeds. The item also treated `RECEIVED`
-as "any receipt". Receipts without a `feed` are dropped first, so a
-`discovered` or `validated` Transport never reads `RECEIVED`. Drawing this
-exposed todo 50.
+receipt on again. That is roughly right, but the retry is not what usually
+does it. `transport_reconcile`'s `sync_receipts` (every 20 minutes) records
+`normalized` for every Transport past its NormalizationManifest, and
+`record_stage` accepts that on a `failed` row. So a receipt failed by
+`ingest_raw` is reset to `normalized`, with `failure_reason` cleared, within
+about one interval, retried or not. The first version of this PR said the
+opposite, that such a receipt stays `failed`, and code review caught it. The
+item also treated `RECEIVED` as "any receipt". Receipts without a `feed` are
+dropped first, so a `discovered` or `validated` Transport never reads
+`RECEIVED`. Drawing this exposed todo 50.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the

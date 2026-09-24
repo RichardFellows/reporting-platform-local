@@ -144,7 +144,9 @@ follow, and none of them is obvious from the vocabulary:
 - **`registry.delivery` is written at normalize**, so from
   `normalize_delivery` onwards the feed reads `PROCESSING` until
   `delivery_committed` has a row. That includes an `ingest_raw` that failed
-  or was refused.
+  or was refused. Its `failed` receipt would not survive anyway:
+  `transport_reconcile` sets it back to `normalized` within about 20
+  minutes (§6).
 - **A Delivery ingested before `_delivery_id` existed on its raw table
   reads `PROCESSING` until that table is rebuilt** or the date ages out.
   `reconcile-committed` cannot find the column to backfill from (§11).
@@ -187,36 +189,42 @@ each stage *produced*, not that a particular attempt is in flight.
   (identity/date conflict) can occur *after* the Feed itself was resolved,
   and a `FAILED` row with no feed attached would never surface on that
   feed's COB Status row, which is exactly the case an operator most needs to
-  see (`ingest/transport_steps.py::deliver`, which `create_delivery`
-  calls).
+  see `ingest/transport_steps.py::deliver`, which the `create_delivery`
+  task calls).
 
 This one *is* a state diagram, because `status` is a stored, mutable
 column. Each edge is labelled with what writes it: a `transport_ingest`
-task id, or the discovery path.
+task id, or `transport_reconcile`'s `sync_receipts` task.
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> discovered: record_discovered (insert-once)<br/>transport_watch trigger_discovered<br/>transport_reconcile sync_receipts<br/>validate_transport (self-heal)
+    [*] --> discovered: record_discovered (insert-once)<br/>transport_watch trigger_discovered<br/>transport_reconcile sync_receipts<br/>validate_transport, on success only
     discovered --> validated: validate_transport
     validated --> delivered: create_delivery<br/>sets feed, delivery_id
     delivered --> normalized: normalize_delivery
-    discovered --> normalized: transport_reconcile sync_receipts<br/>(sync_from_progress)
-    discovered --> failed: validate_transport<br/>(only when conf carries transport_id)
+    discovered --> normalized: sync_receipts
+    validated --> normalized: sync_receipts
+    delivered --> normalized: sync_receipts
+    discovered --> failed: validate_transport<br/>(conf has transport_id)
     validated --> failed: create_delivery<br/>(feed best effort)
     delivered --> failed: normalize_delivery
     normalized --> failed: ingest_raw<br/>(row found by feed, delivery_id)
-    failed --> validated: retry succeeds
-    failed --> delivered: retry succeeds
-    failed --> normalized: retry succeeds
+    failed --> validated: validate_transport retry
+    failed --> delivered: create_delivery retry
+    failed --> normalized: sync_receipts, within ~20 min<br/>(or normalize_delivery retry)
     note right of normalized
-        Last stage. ingest_raw writes nothing here on success:
+        Last stage. ingest_raw writes nothing on success:
         reaching Raw is registry.delivery_committed,
         written by ingest_feed._ingest_manifest.
-        A failed ingest_raw retried to success
-        therefore leaves this row at failed.
+        A row failed by ingest_raw is set back to normalized,
+        failure_reason NULL, by the next sync_receipts run
+        (every 20 min, 7-day window), retried or not.
     end note
     note left of discovered
+        record_stage is UPDATE-only. A validate_transport
+        failure with no row yet writes nothing here,
+        only registry.validation_result.
         stage_rank: a write ranked below the row is dropped,
         so a stale or racing retry cannot move status back.
         failed is always written and keeps stage_rank;
@@ -226,17 +234,31 @@ stateDiagram-v2
 
 *Read from the code*: the stages and the rank rule are
 `registry/transports.py` (`STAGES`, `FAILED`, and `record_stage`'s `WHERE`
-clause). The writers are `ingest/transport_steps.py` (`validate`,
-`deliver`, `normalize`, `ingest_raw`), which the task ids in
-`airflow/dags/transport_ingest.py` call. Discovery writes come from
-`airflow/dags/transport_watch.py` and from `transport_reconcile`'s
-`sync_receipts` task (`sync_from_progress`). That task records a Transport
-found past its NormalizationManifest as `normalized` directly. No stage says
-the Delivery reached Raw: `ingest_raw` writes the receipt only when it
-fails. Whether the Delivery reached Raw is answered by
-`registry.delivery_committed` (§7). So a row left at `failed` by an
-`ingest_raw` attempt stays `failed` after a retry succeeds, and COB Status
-still reads `COMPLETE`, because `committed` outranks the receipt.
+clause). The `transport_ingest` task ids in
+`airflow/dags/transport_ingest.py` call the writers in
+`ingest/transport_steps.py` (`validate`, `deliver`, `normalize`,
+`ingest_raw`). Discovery rows come from `airflow/dags/transport_watch.py`
+and from `transport_reconcile`'s `sync_receipts` task. `record_discovered`
+is an insert. Every other write is `record_stage`, an `UPDATE`, so a failure
+before any row exists records nothing on the receipt. That happens when
+`validate_transport` fails for a Transport nothing discovered first, such as
+a manual replay. `validate` calls `record_discovered` only after validation
+succeeds, then moves the row to `validated` at once.
+
+`sync_receipts` calls `sync_from_progress`. That records `normalized` for
+every Transport in the scanned window that has a NormalizationManifest,
+whatever its current stage, **`failed` included**, and whether or not it
+reached Raw (`transport_reconcile.discover_transport_progress` returns
+these as `candidates_by_feed`). `transport_reconcile` runs every 20
+minutes and scans `TRANSPORT_RECONCILE_WINDOW_DAYS` (default 7). So a
+receipt failed by `ingest_raw` reads `normalized` again within about one
+interval, with `failure_reason` cleared, whether or not anything retried
+it. That is the bullet above ("a successful retry must not stay stuck
+reading FAILED forever") applied by a writer that does not know whether
+there was a retry. The failure's durable record is the
+`registry.validation_result` row `ingest_raw` wrote, not the receipt. No
+stage says the Delivery reached Raw. That is
+`registry.delivery_committed` (§7).
 
 ## 7. Delivery persistence: `delivery_committed`
 

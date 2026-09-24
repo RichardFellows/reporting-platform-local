@@ -144,9 +144,6 @@ branch name, `AirflowFailException` for a refusal, and the raw asset event.
 `tests/test_transport_steps.py` fails if a task grows its own copy of a step.
 No step reimplements Transport parsing, Feed resolution, control parsing, or
 manifest creation.
-Which task writes which `registry.transport_receipt` stage, and how `failed`
-and a retry move it, is drawn in
-[OPERATIONAL-CONTROL-PLANE.md §6](OPERATIONAL-CONTROL-PLANE.md#6-transportreceipt-semantics).
 Failure attribution therefore matches the Phase 6 brief's list exactly: an
 invalid Transport fails `validate_transport`, an unknown Feed id or identity
 conflict fails `create_delivery`, an unsafe archive fails
@@ -159,6 +156,11 @@ row count or md5 that does not match -- fail the task once, with
 `AirflowFailException`, because the same evidence fails the same check every
 time. The legacy `ingest` task does the same. See
 `docs/DECISIONS.md#a-refusal-is-not-retried`.
+
+Which task writes which `registry.transport_receipt` stage, and how
+`failed` is later overwritten (by a retry, or by `transport_reconcile`), is
+drawn in
+[OPERATIONAL-CONTROL-PLANE.md §6](OPERATIONAL-CONTROL-PLANE.md#6-transportreceipt-semantics).
 
 `transport_ingest` itself is triggered only -- `schedule=None` -- by
 `transport_watch`, `transport_reconcile`, or a manual replay. It never
