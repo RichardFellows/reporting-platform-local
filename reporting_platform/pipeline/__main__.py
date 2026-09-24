@@ -4,6 +4,7 @@
     python -m reporting_platform.pipeline setup        # registry schema, dbt deps
     python -m reporting_platform.pipeline run FILE...  # land -> raw -> prepared -> reporting
     python -m reporting_platform.pipeline run FILE... --through raw
+    python -m reporting_platform.pipeline run --transport [MARKER...]  # Transports, not files
     python -m reporting_platform.pipeline ingest|transform ...  # one stage
 
 GLUE, NOT A THIRD IMPLEMENTATION. Each stage is its component's own entry
@@ -11,6 +12,7 @@ point, runnable on its own and with the same code the Airflow DAGs call:
 
     land       python -m reporting_platform.ingest land FILE...     (ingest)
     ingest     python -m reporting_platform.ingest ingest FEED...   (ingest)
+      or       python -m reporting_platform.ingest transport ...    (ingest)
     prepared   python -m reporting_platform.transform build prepared  (dbt)
     reporting  python -m reporting_platform.transform build reporting (dbt)
 
@@ -111,7 +113,6 @@ def run(files: list[Path], *, through: str, change_ref: str | None,
         label: str | None) -> tuple[int, dict]:
     from reporting_platform.common.context import new_run_id
     from reporting_platform.ingest import steps
-    from reporting_platform.transform.dbt import build_layer
 
     report: dict = {}
     label = label or f"pipeline-{new_run_id()}"
@@ -134,9 +135,72 @@ def run(files: list[Path], *, through: str, change_ref: str | None,
     if any("error" in r for rs in report["ingest"].values() for r in rs):
         log.error("ingest: a delivery failed -- not building on it")
         return 1, report
+    return _build(report, through=through, change_ref=change_ref,
+                  label=label, refused=bool(refused))
+
+
+def run_transports(markers: list[str], *, cob_dates: list[str] | None,
+                   through: str, change_ref: str | None,
+                   label: str | None) -> tuple[int, dict]:
+    """Transports -> raw -> prepared -> reporting. The Transport twin of `run`.
+
+    `markers` names the Transports; empty means every one not yet in raw
+    over `cob_dates` (None: all of `received/`). Nothing to land: DCM, or
+    `runner transport publish`, already completed them under `received/`.
+
+    THE SAME RULE `run` APPLIES TO A QUARANTINED FILE. A REFUSED Transport --
+    wrong checksum, missing control, an identity conflict -- never reached
+    raw, so building on the ones that did is safe: it is reported, the
+    builds go ahead, and the exit is 1. Any OTHER failure stops before the
+    builds, as a failed file ingest does, because raw may be missing
+    something that was meant to be there.
+    """
+    from reporting_platform.common.context import new_run_id
+    from reporting_platform.ingest import transport_steps
+
+    report: dict = {}
+    label = label or f"pipeline-{new_run_id()}"
+    unreadable: list = []
+    if not markers:
+        log.info("== pending Transports: %s",
+                 "all of received/" if cob_dates is None
+                 else f"{len(cob_dates)} COB date(s)")
+        found = transport_steps.pending(cob_dates)
+        markers, unreadable = found["marker_keys"], found["unreadable"]
+        report["unreadable"] = unreadable
+        if unreadable:
+            log.error("%d Transport marker(s) could not be read -- see report",
+                      len(unreadable))
+    if not markers:
+        log.info("nothing to ingest")
+        return (1 if unreadable else 0), report
+
+    log.info("== transport ingest: %d Transport(s)", len(markers))
+    results = [transport_steps.ingest_transport(m) for m in markers]
+    report["transport"] = results
+    failed = [r for r in results if "error" in r and not r["refused"]]
+    refused = [r for r in results if "error" in r and r["refused"]]
+    if failed:
+        log.error("transport ingest: %d failed -- not building on it",
+                  len(failed))
+        return 1, report
+    if refused:
+        log.error("transport ingest: %d refused (not in raw) -- building on "
+                  "the rest", len(refused))
+    if len(refused) == len(results):
+        return 1, report
+    return _build(report, through=through, change_ref=change_ref,
+                  label=label, refused=bool(refused or unreadable))
+
+
+def _build(report: dict, *, through: str, change_ref: str | None,
+           label: str, refused: bool) -> tuple[int, dict]:
+    """prepared then reporting, stopping at `through` or the first failure.
+    `refused` only sets the exit code: something upstream needs a look."""
+    from reporting_platform.transform.dbt import build_layer
+
     if through == "raw":
         return (1 if refused else 0), report
-
     for purpose in ("prepared", "reporting"):
         log.info("== %s build", purpose)
         result = build_layer(purpose, label, change_ref=change_ref)
@@ -157,6 +221,11 @@ def run(files: list[Path], *, through: str, change_ref: str | None,
 COMPONENT_CLIS = {
     "ingest": "reporting_platform.ingest.__main__",
     "transform": "reporting_platform.transform.__main__",
+    # The PRODUCER's CLI, what DCM runs: `transport publish` completes a
+    # Transport under received/, so the runner can make its own to take in.
+    # Its storage settings fall back to S3_ENDPOINT / REPORTING_WAREHOUSE /
+    # REPORTING_RECEIVED_PREFIX, which the runner already sets.
+    "transport": "reporting_transport.cli",
 }
 
 
@@ -174,8 +243,21 @@ def main(argv=None) -> int:
     sub.add_parser("setup", help="registry schema + dbt deps (idempotent)")
     sub.add_parser("ingest", help="-> python -m reporting_platform.ingest ...")
     sub.add_parser("transform", help="-> python -m reporting_platform.transform ...")
+    sub.add_parser("transport", help="-> python -m reporting_transport ... (publish)")
     r = sub.add_parser("run", help="land -> ingest -> prepared -> reporting")
-    r.add_argument("files", nargs="+", type=Path)
+    r.add_argument("files", nargs="*",
+                   help="files to land; with --transport, _COMPLETE.json keys")
+    r.add_argument("--transport", action="store_true",
+                   help="take Transports from received/ instead of landing "
+                        "files; with no keys, every one not yet in raw")
+    scope = r.add_mutually_exclusive_group()
+    scope.add_argument("--window", type=int, metavar="DAYS",
+                       help="--transport, no keys: the last DAYS COB dates "
+                            "(default 7)")
+    scope.add_argument("--cob-date", action="append", metavar="YYYY-MM-DD",
+                       help="--transport, no keys: these COB dates")
+    scope.add_argument("--all", action="store_true", dest="full_sweep",
+                       help="--transport, no keys: all of received/")
     r.add_argument("--through", choices=STAGES, default="reporting",
                    help="stop after this layer (default: reporting)")
     r.add_argument("--change-ref", help="the ticket authorising the builds")
@@ -193,8 +275,23 @@ def main(argv=None) -> int:
     if a.cmd == "setup":
         print(json.dumps(setup(), indent=2))
         return 0
-    code, report = run(a.files, through=a.through, change_ref=a.change_ref,
-                       label=a.label)
+    if a.transport:
+        if a.files and (a.window or a.cob_date or a.full_sweep):
+            p.error("name the markers, or give a window -- not both")
+        from reporting_platform.ingest.transport_steps import window_cob_dates
+
+        cob_dates = (None if a.full_sweep
+                     else a.cob_date or window_cob_dates(a.window or 7))
+        code, report = run_transports(
+            [str(f) for f in a.files], cob_dates=cob_dates, through=a.through,
+            change_ref=a.change_ref, label=a.label)
+    else:
+        if not a.files:
+            p.error("name the files to land, or --transport")
+        if a.window or a.cob_date or a.full_sweep:
+            p.error("--window/--cob-date/--all go with --transport")
+        code, report = run([Path(f) for f in a.files], through=a.through,
+                           change_ref=a.change_ref, label=a.label)
     print(json.dumps(report, indent=2, default=str))
     return code
 
