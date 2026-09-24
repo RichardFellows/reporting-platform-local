@@ -73,8 +73,20 @@ from reporting_platform.ingest.arrival import (
 log = logging.getLogger("inbox")
 
 INBOX = Path(os.environ.get("REPORTING_INBOX", "/opt/platform/inbox"))
+
+# Whether a landed delivery triggers its ingest DAG. `--no-trigger` turns it
+# off for a caller that ingests by itself and has no Airflow to call --
+# scripts/ci_build_tier.sh, which runs the gate then `bulk_ingest`. Without it
+# a stack with no webserver logs a traceback per delivery, and the exception
+# abandons the rest of that pass.
+TRIGGER = True
 PROCESSED = ".processed"
 REJECTED = ".rejected"
+# The --loop health server's port (deploy/helm/reporting-platform/inbox.yaml's
+# liveness/readiness probes). Not published as a host port in
+# docker-compose.yml: nothing outside the container needs it there, only a
+# Kubernetes probe does.
+INBOX_HEALTH_PORT = int(os.environ.get("INBOX_HEALTH_PORT", "8090"))
 # Two consecutive identical observations, so a file being written is not
 # uploaded half-finished. At the default interval that is a few seconds of
 # quiet, which every real delivery has and no partial write does.
@@ -258,11 +270,14 @@ def _trigger(feed: Feed, key: str | None) -> dict:
     -triggered run that hit `normalize.NotReady` and was skipped rather than
     retried into it.
 
-    Imports the console's orchestration module rather than opening a second
+    Imports the console's Airflow client (`common/airflow_api.py`) rather than opening a second
     HTTP client: there is one definition of how this platform talks to
     Airflow's API, and a copy here would drift from it.
     """
-    from reporting_platform.ui import orchestration
+    if not TRIGGER:
+        return {"triggered": False,
+                "reason": "--no-trigger: the caller ingests"}
+    from reporting_platform.common import airflow_api as orchestration
 
     dag_id = f"ingest_{feed.name}"
     dag = orchestration.get_dag(dag_id)
@@ -375,6 +390,52 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
                  f" (NOT triggered: {outcome.get('reason')})")
         results.append(outcome)
 
+    return results
+
+
+def land_files(paths: list[Path]) -> list[dict]:
+    """The inbox gate for files NAMED, rather than a directory watched.
+
+    The same `sweep` -- routing, conformance, control-file promotion,
+    quarantine -- over a private copy of exactly these files, so a person or a
+    script can land a delivery without a watcher, a mounted inbox or an
+    Airflow to trigger. Nothing is triggered: the caller ingests.
+
+    The originals are never moved. A file the gate could not act on yet --
+    a data file whose control file was not among `paths` -- is reported as
+    `not landed` rather than left behind somewhere to be forgotten.
+    """
+    import tempfile
+
+    global INBOX, TRIGGER
+    names = [p.name for p in paths]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"two files named {dupes}: one inbox holds one of each")
+    saved = INBOX, TRIGGER
+    with tempfile.TemporaryDirectory(prefix="inbox-") as d:
+        staging = Path(d)
+        for p in paths:
+            shutil.copy2(p, staging / p.name)
+        INBOX, TRIGGER = staging, False
+        try:
+            # Named files are complete by assertion: no stability wait.
+            seen = {p.name: (p.stat().st_size, p.stat().st_mtime, STABLE_POLLS)
+                    for p in staging.iterdir()}
+            results = sweep(seen)
+            left = {p.name for p in staging.iterdir() if not _skip(p)}
+        finally:
+            INBOX, TRIGGER = saved
+    # A legacy control file is "held" when the pass meets it and consumed when
+    # the pass reaches its data file. One still here was not -- and the copy
+    # it was held in is gone, so it did NOT land and must not say it did.
+    results = [r for r in results
+               if r["status"] != "held (control file)" or r["file"] not in left]
+    reported = {r["file"] for r in results}
+    results += [{"file": n, "status": "not landed",
+                 "reason": "the gate is waiting for something not given with "
+                           "it -- usually its control file"}
+                for n in sorted(left - reported)]
     return results
 
 
@@ -550,6 +611,76 @@ def _promote(feed: Feed, path: Path,
     return results
 
 
+def health(last_poll_at: float | None, interval: float, now: float) -> tuple[int, str]:
+    """(HTTP status, body) for `--loop`'s /healthz -- a PURE function so
+    tests/test_healthz.py exercises it with no server, no thread and no clock.
+
+    Fresh means the last COMPLETED poll (a full `sweep()`, success or
+    exception -- see main()'s `except` below) finished less than 3x the loop
+    interval ago. THE WINDOW HAS TO CONTAIN THE THING IT DESCRIBES: at 1x a
+    poll that is merely running a little long would flap the probe every
+    cycle, and a fixed window unrelated to `--loop`'s own value would either
+    never fire (a short interval) or never stop firing (a long one) --
+    matching the interval is what makes one number describe "the loop is
+    stuck", not "the loop is mid-poll".
+    `last_poll_at is None` means no poll has EVER completed (the server
+    starts before the first `sweep()` returns), which is exactly as
+    unready as a stale one -- not a pass by omission.
+    """
+    if last_poll_at is None:
+        return 503, "no poll has completed yet"
+    age = now - last_poll_at
+    limit = 3 * interval
+    if age < limit:
+        return 200, f"ok: last poll {age:.1f}s ago"
+    return 503, f"stale: last poll {age:.1f}s ago, limit {limit:.0f}s"
+
+
+class _HealthState:
+    """The one piece of mutable state the health server and the poll loop
+    share -- `interval` never changes after `main()` sets it."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self.last_poll_at: float | None = None
+
+
+def _start_health_server(state: _HealthState, port: int):
+    """A tiny stdlib HTTP server on its own daemon thread, serving /healthz
+    from `state`. No framework: this is one route, and the watcher's own
+    dependencies stay `pyyaml`/`ruamel.yaml`/`requests`/boto3 -- the same
+    ~10s cheap-tier set CLAUDE.md pins, with nothing added for a probe.
+    """
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (stdlib's own naming)
+            if self.path != "/healthz":
+                self.send_response(404)
+                self.end_headers()
+                return
+            status, body = health(state.last_poll_at, state.interval, time.time())
+            payload = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):  # noqa: D102
+            # The default logs every probe hit to stderr at INFO -- a
+            # 10s-interval liveness probe would then outnumber every real
+            # sweep log line within minutes.
+            pass
+
+    server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True,
+                              name="inbox-healthz")
+    thread.start()
+    return server
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--loop", type=int, metavar="SECONDS",
@@ -557,7 +688,12 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="report what would be ingested; move and upload nothing")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--no-trigger", action="store_true",
+                   help="land only; do not trigger the ingest DAG (for a "
+                        "caller that ingests itself)")
     a = p.parse_args(argv)
+    global TRIGGER
+    TRIGGER = not a.no_trigger
 
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -565,9 +701,14 @@ def main(argv=None) -> int:
     seen: dict[str, tuple[int, float, int]] = {}
     if not a.loop:
         results = sweep(seen, dry_run=a.dry_run)
-        # Once-off cannot observe stability across passes, so give it the two
-        # observations it needs rather than reporting an empty inbox.
-        if not results:
+        # Once-off cannot observe stability across passes, so give it the
+        # observations it needs rather than reporting an empty inbox. That is
+        # STABLE_POLLS + 1 passes, not two: the first records a file, the next
+        # STABLE_POLLS confirm it. This used to stop after two and reported
+        # "inbox empty" for every freshly dropped file.
+        for _ in range(STABLE_POLLS):
+            if results:
+                break
             time.sleep(1)
             results = sweep(seen, dry_run=a.dry_run)
         print(json.dumps(results, indent=2) if a.json else
@@ -575,7 +716,10 @@ def main(argv=None) -> int:
               or "inbox empty")
         return 0
 
-    log.info("watching %s every %ss", INBOX, a.loop)
+    health_state = _HealthState(a.loop)
+    _start_health_server(health_state, INBOX_HEALTH_PORT)
+    log.info("watching %s every %ss (health on :%s/healthz)",
+             INBOX, a.loop, INBOX_HEALTH_PORT)
     while True:
         try:
             sweep(seen, dry_run=a.dry_run)
@@ -583,6 +727,10 @@ def main(argv=None) -> int:
             # A watcher that dies on one bad pass stops watching, which is the
             # failure it exists to prevent.
             log.exception("sweep failed")
+        # AFTER the pass, success or exception: a poll that raised still
+        # completed one iteration of the loop, which is what health() means
+        # by "not stuck".
+        health_state.last_poll_at = time.time()
         time.sleep(a.loop)
 
 

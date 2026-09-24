@@ -23,6 +23,11 @@ What is emulated, and it is deliberately little:
   * Spark's identifier quote. `ident()` emits backticks and DuckDB reads
     double quotes; the rendered SQL has its backticks swapped, and nothing
     else is rewritten.
+  * Five Spark functions DuckDB spells differently (`_SHIMS`), renamed at
+    call sites by `_run` and defined as DuckDB macros by `_shim`. The rank
+    runs AFTER cleaning, so every cleaning expression -- `parse_date()`'s
+    two-argument `TO_DATE`, `delivery_ref()`'s `element_at` -- has to bind
+    for the rank to be reached at all.
 
 What this CANNOT prove is the materialisation: that `insert_overwrite` on
 Iceberg through dbt-spark replaces exactly the COB dates the select returns.
@@ -166,12 +171,14 @@ def _render(template_text: str, *, incremental: bool = False,
                        adapter=adapter, invocation_id=invocation_id,
                        nessie_ref=nessie_ref)
     env = _environment()
-    model_globals = dict(context, **_macro_modules(env, context))
-    model_globals.update(
+    # source()/ref() reach MACROS too, as in dbt, where a macro called from a
+    # model runs in that model's context -- scd2_prepared() calls source().
+    context.update(
         source=lambda schema, table: f"{schema}_{table}",
         ref=lambda name: f"prepared_{name}",
-        config=config,
     )
+    model_globals = dict(context, **_macro_modules(env, context))
+    model_globals.update(config=config)
     sql = env.from_string(template_text, globals=model_globals).render()
     return sql.replace("`", '"')
 
@@ -211,8 +218,35 @@ def _ctes(sql: str) -> dict[str, str]:
     return out
 
 
+# ------------------------------------------------------------ engine shims
+_SHIMS = {
+    "sha2": "create macro spark_sha2(s, n) as sha256(s)",
+    "date_sub": "create macro spark_date_sub(d, n) as (d - n::integer)",
+    "trunc": "create macro spark_trunc(d, fmt) as date_trunc('month', d)::date",
+    "to_date": ("create macro spark_to_date(s, fmt) as (case fmt "
+                "when 'yyyy-MM-dd' then try_strptime(s, '%Y-%m-%d') "
+                "else try_strptime(s, '%Y%m%d') end)::date"),
+    "element_at": "create macro spark_element_at(l, i) as list_extract(l, i)",
+}
+
+
+def _duck(sql: str) -> str:
+    """Rename the shimmed Spark functions to their DuckDB macros. Idempotent:
+    `spark_to_date(` has no word boundary before `to_date`."""
+    for fn in _SHIMS:
+        sql = re.sub(rf"\b{fn}\(", f"spark_{fn}(", sql, flags=re.I)
+    return sql
+
+
+def _shim(con):
+    for ddl in _SHIMS.values():
+        con.execute(ddl.replace("create macro", "create or replace macro", 1))
+    return con
+
+
 def _run(con, sql: str, upto: str, select: str):
     """Every CTE of `sql` up to and including `upto`, then `select`."""
+    sql = _duck(sql)
     ctes = _ctes(sql)
     assert upto in ctes, f"no CTE {upto!r} in {list(ctes)}"
     names = list(ctes)[:list(ctes).index(upto) + 1]
@@ -233,6 +267,7 @@ def _raw_trades(con, table="raw_fo_trade", key="trade_id"):
     `_ingest_ts`. D2 has a single delivery and must be untouched by D1's
     re-delivery -- the rank is per COB date, not across the table.
     """
+    _shim(con)
     con.execute(f"""
         create or replace table {table} as
         select _cob_date::date as _cob_date, _file_version::int as _file_version,
@@ -250,23 +285,56 @@ def _raw_trades(con, table="raw_fo_trade", key="trade_id"):
     """)
 
 
-DEDUPED = "select _cob_date::varchar, {key}, _file_version, mtm from deduped order by 1, 2"
+# The rows the rank KEPT, identified by where they sat in their file: the
+# models clean every column before ranking, so the fixture's `mtm` is not a
+# column every model's output has, and `_row_number` is.
+DEDUPED = ("select _cob_date::varchar, {key}, _file_version, _row_number "
+           "from ranked_rows where _rn = 1 order by 1, 2")
+
+# Raw's own columns beyond the feed's declared ones -- ingest_feed.py's
+# ensure_raw_table. `_cob_date`, `_file_version`, `_row_number`,
+# `_received_at` and `_ingest_ts` are in every fixture already.
+RAW_METADATA = ("_source_file", "_batch_id", "_delivery_id",
+                "_schema_version", "_source_system")
+
+
+def _widen(con, table: str, columns: list[str]):
+    """Give a fixture every raw column the model reads, as NULL strings, so
+    its cleaning binds. The columns are the feed's DECLARED ones -- the same
+    list ensure_raw_table creates raw from -- not a copy kept here."""
+    have = {r[0] for r in con.execute(f"describe {table}").fetchall()}
+    for c in [*columns, *RAW_METADATA]:
+        if c not in have:
+            con.execute(f'alter table {table} add column "{c}" varchar')
+
+
+def _declared(feed_name: str) -> list[str]:
+    from reporting_platform.common.context import feed
+    return list(feed(feed_name).columns)
 
 
 def _prepared_date_models():
-    """The two date-partitioned prepared models, each with its own key."""
-    return [(PREPARED / "fo_trade.sql", "raw_fo_trade", "trade_id"),
-            (PREPARED / "ref_collateral.sql", "raw_ref_collateral", "collateral_id")]
+    """The date-partitioned prepared models, each with its own key and the
+    raw columns its feed declares."""
+    return [(PREPARED / "fo_trade.sql", "raw_fo_trade", "trade_id",
+             _declared("fo_trade")),
+            (PREPARED / "ref_collateral.sql", "raw_ref_collateral", "collateral_id",
+             _declared("ref_collateral")),
+            (PREPARED / "qa_happy_position.sql", "raw_qa_happy_position",
+             "position_id", _declared("qa_happy_position")),
+            (PREPARED / "qa_headerless_position.sql", "raw_qa_headerless_position",
+             "position_id", _declared("qa_headerless_position"))]
 
 
 # ------------------------------------------- (a) the item's case, real rank
 def test_a_key_the_newest_delivery_omits_is_absent():
-    for path, table, key in _prepared_date_models():
+    for path, table, key, columns in _prepared_date_models():
         con = duckdb.connect()
         _raw_trades(con, table, key)
-        got = _run(con, _render(_model(path)), "deduped", DEDUPED.format(key=key))
-        assert got == [(D1, "T1", 2, "13"),     # v2, last occurrence in file
-                       (D2, "T3", 1, "30")], (path.name, got)
+        _widen(con, table, columns)
+        got = _run(con, _render(_model(path)), "ranked_rows", DEDUPED.format(key=key))
+        assert got == [(D1, "T1", 2, 2),        # v2, last occurrence in file
+                       (D2, "T3", 1, 1)], (path.name, got)
 
 
 def test_the_newest_delivery_is_per_cob_date_not_per_table():
@@ -274,8 +342,9 @@ def test_the_newest_delivery_is_per_cob_date_not_per_table():
     every date that was not re-delivered."""
     con = duckdb.connect()
     _raw_trades(con)
+    _widen(con, "raw_fo_trade", _declared("fo_trade"))
     got = _run(con, _render(_model(PREPARED / "fo_trade.sql")), "deduped",
-               "select distinct _cob_date::varchar from deduped order by 1")
+               "select distinct cob_date::varchar from deduped order by 1")
     assert got == [(D1,), (D2,)], got
 
 
@@ -301,15 +370,16 @@ def test_the_incremental_select_returns_each_date_whole():
     `this` holds a max cob_date of D2, so the window is D2 - 3 days: D1 and D2
     are in it, D0 is not.
     """
-    for path, table, key in _prepared_date_models():
+    for path, table, key, columns in _prepared_date_models():
         con = duckdb.connect()
         _raw_trades(con, table, key)
         con.execute(f"""insert into {table} values
             ('{D0}', 1, 1, 'T0', '1', null, '2026-08-21 06:05')""")
+        _widen(con, table, columns)
         con.execute(f"create table this_table as select date '{D2}' as cob_date")
         sql = _render(_model(path), incremental=True)
-        got = _run(con, sql, "deduped", DEDUPED.format(key=key))
-        assert got == [(D1, "T1", 2, "13"), (D2, "T3", 1, "30")], (path.name, got)
+        got = _run(con, sql, "ranked_rows", DEDUPED.format(key=key))
+        assert got == [(D1, "T1", 2, 2), (D2, "T3", 1, 1)], (path.name, got)
 
 
 # ------------------------------------------------------------- (b) as-of
@@ -317,22 +387,24 @@ def test_as_of_before_the_redelivery_keeps_the_first_deliverys_population():
     """Computed AFTER `known_as_of()`: at 09-02 12:00 only v1 existed, so v1
     is the newest delivery and T2 is in it. Ranking before the filter would
     pick v2 as newest, filter it out, and return nothing for D1."""
-    for path, table, key in _prepared_date_models():
+    for path, table, key, columns in _prepared_date_models():
         con = duckdb.connect()
         _raw_trades(con, table, key)
+        _widen(con, table, columns)
         sql = _render(_model(path), knowledge_time="2026-09-02 12:00")
-        got = _run(con, sql, "deduped", DEDUPED.format(key=key))
-        assert got == [(D1, "T1", 1, "11"),     # v1, last occurrence in file
-                       (D1, "T2", 1, "20")], (path.name, got)
+        got = _run(con, sql, "ranked_rows", DEDUPED.format(key=key))
+        assert got == [(D1, "T1", 1, 3),        # v1, last occurrence in file
+                       (D1, "T2", 1, 2)], (path.name, got)
 
 
 def test_as_of_after_the_redelivery_matches_the_ordinary_build():
     con = duckdb.connect()
     _raw_trades(con)
+    _widen(con, "raw_fo_trade", _declared("fo_trade"))
     path = PREPARED / "fo_trade.sql"
     as_of = _run(con, _render(_model(path), knowledge_time="2026-09-04"),
-                 "deduped", DEDUPED.format(key="trade_id"))
-    now = _run(con, _render(_model(path)), "deduped", DEDUPED.format(key="trade_id"))
+                 "ranked_rows", DEDUPED.format(key="trade_id"))
+    now = _run(con, _render(_model(path)), "ranked_rows", DEDUPED.format(key="trade_id"))
     assert as_of == now
 
 
@@ -390,9 +462,54 @@ def test_a_scaffolded_model_drops_a_key_the_newest_delivery_omits():
     with the old rank."""
     con = duckdb.connect()
     _raw_trades(con, "raw_t_new", "trade_id")
-    got = _run(con, _render(_scaffolded("t_new", "trade_id")), "deduped",
+    _widen(con, "raw_t_new", ["trade_id", "mtm"])
+    got = _run(con, _render(_scaffolded("t_new", "trade_id")), "ranked_rows",
                DEDUPED.format(key="trade_id"))
-    assert got == [(D1, "T1", 2, "13"), (D2, "T3", 1, "30")], got
+    assert got == [(D1, "T1", 2, 2), (D2, "T3", 1, 1)], got
+
+
+# ------------------------------------ (e) the rank is on the CLEANED key
+def _padded_key_file(con, table: str, key: str, columns: list[str], first: str,
+                     second: str):
+    """One delivery, one COB date, the same key twice -- once padded."""
+    _shim(con)
+    con.execute(f"""
+        create or replace table {table} as
+        select date '{D1}' as _cob_date, 1 as _file_version,
+               _row_number::bigint as _row_number, k as {key},
+               null::timestamp as _received_at,
+               timestamp '2026-09-02 06:05' as _ingest_ts
+        from (values (1, '{first}'), (2, '{second}')) t(_row_number, k)
+    """)
+    _widen(con, table, columns)
+
+
+def _padded_key_cases():
+    return [(path, table, key, columns) for path, table, key, columns
+            in _prepared_date_models()] + [
+        (None, "raw_t_new", "trade_id", ["trade_id", "mtm"])]
+
+
+def test_a_padded_and_an_unpadded_key_in_one_file_are_one_row():
+    """todo 23 and plan #13: ' T1' and 'T1' are one key once cleaned, so one
+    file carrying both must produce ONE prepared row -- the later one, the
+    legacy "last occurrence in file wins" rule -- in either order. Ranked on
+    the raw key, both were "last in file" and both survived."""
+    for path, table, key, columns in _padded_key_cases():
+        model = (_model(path) if path else
+                 _scaffolded("t_new", "trade_id"))
+        for first, second in ((" T1", "T1"), ("T1", " T1")):
+            con = duckdb.connect()
+            _padded_key_file(con, table, key, columns, first, second)
+            sql = _duck(_render(model))
+            name = path.name if path else "scaffold"
+            got = con.execute(
+                f"select {key}, source_file_version from ({sql})").fetchall()
+            assert got == [("T1", 1)], (name, first, second, got)
+            # ...and it is the LATER row: the rank ran over the cleaned key.
+            rows = _run(con, _render(model), "ranked_rows",
+                        "select _row_number from ranked_rows where _rn = 1")
+            assert rows == [(2,)], (name, first, second, rows)
 
 
 # ------------------------------------------------- the strategy, per model
@@ -438,9 +555,17 @@ def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():
     retraction guard reads that CTE and a key-scoped filter reintroduced
     before the rank must not quietly make the default window wrong again.
     Their replay is tested end to end in `test_scd2_incremental.py`."""
-    scd2 = [p for p in sorted(PREPARED.glob("*.sql")) if "scd2_replay(" in _model(p)]
-    assert len(scd2) == 2, scd2
+    # Read off the RENDERED model, so it holds however the model is written --
+    # by hand or through scd2_prepared() (dbt/macros/scd2.sql). An SCD2 model
+    # is one whose config asks for the retraction merge.
+    scd2 = [p for p in sorted(PREPARED.glob("*.sql"))
+            if "scd2_retractions=true" in _model(p)]
+    assert scd2, "no SCD2 models found; the assertions below would prove nothing"
     for path in scd2:
-        text = _model(path)
-        assert "newest_file_version(" in text, path.name
-        assert "newest_version='_newest_file_version'" in text, path.name
+        ctes = _ctes(_render(_model(path)))
+        assert "newest_file_version" in ctes, (path.name, list(ctes))
+        # the rank's "newest" is the unjoined aggregate, not a window over
+        # the rows the query happened to admit
+        assert re.search(r"_file_version\s*=\s*_newest_file_version",
+                         ctes["ranked_rows"]), path.name
+        assert "MAX(_file_version) OVER" not in ctes["ranked_rows"], path.name

@@ -252,6 +252,12 @@ def test_run_inputs_are_not_foreign_keyed_to_deliveries():
     assert "REFERENCES registry.delivery" not in ddl
 
 
+def test_run_references_durable_dbt_artifacts_separately_from_project_identity():
+    ddl = _table_ddl("run")
+    assert "dbt_manifest_ref" in ddl
+    assert "dbt_artifacts_ref" in ddl
+
+
 def test_a_report_version_is_keyed_per_report_and_as_at_date():
     """Decision 5. Numbering per run would move a report's version when an
     unrelated report was rebuilt; numbering per family would move it when a

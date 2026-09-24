@@ -15,6 +15,8 @@ labelled with what it costs.
 """
 from __future__ import annotations
 
+from reporting_platform.common.parsing import csv_rows, feed_format, raw_values
+
 import csv
 import io
 import os
@@ -22,6 +24,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from reporting_platform.common import settings
 from reporting_platform.common.context import Feed
 from reporting_platform.ingest.arrival import find_pending, list_landing, put_landing
 
@@ -122,10 +125,9 @@ def preview(feed: Feed, filename: str, rows: int = 5) -> dict[str, Any]:
     much cheaper to see here.
     """
     path = _seed_path(feed, filename)
-    with path.open(encoding=feed.file_encoding, newline="") as fh:
-        reader = csv.reader(fh, delimiter=feed.delimiter, quotechar=feed.quote_char)
-        header = next(reader, [])
-        sample = [row for _, row in zip(range(rows), reader)]
+    reader = csv_rows(path.read_bytes(), feed_format(feed), source=filename)
+    header = next(reader, []) if feed.header else feed.file_header
+    sample = [raw_values(row) for _, row in zip(range(rows), reader)]
     return {"header": header, "rows": sample, **compare_header(feed, header)}
 
 
@@ -142,9 +144,9 @@ def compare_header(feed: Feed, header: list[str]) -> dict[str, list[str]]:
 
 
 def header_of(content: bytes, feed: Feed) -> list[str]:
-    text = content.decode(feed.file_encoding, errors="replace")
-    reader = csv.reader(io.StringIO(text), delimiter=feed.delimiter,
-                        quotechar=feed.quote_char)
+    if not feed.header:
+        return feed.file_header
+    reader = csv_rows(content, feed_format(feed))
     return [h.strip() for h in next(reader, [])]
 
 
@@ -154,8 +156,7 @@ def columns_from_csv(content: bytes, encoding: str = "utf-8",
 
     Used before the feed exists, so it cannot go through a Feed object.
     """
-    text = content.decode(encoding, errors="replace")
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    reader = csv_rows(content, {"encoding": encoding, "delimiter": delimiter})
     return [h.strip() for h in next(reader, [])]
 
 
@@ -173,6 +174,7 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
     leaving the caller to work out which half.
     """
     import boto3
+    from reporting_platform.ingest.normalize import is_control_file
 
     checked = []
     for filename, content in payloads:
@@ -183,29 +185,36 @@ def deliver(feed: Feed, payloads: list[tuple[str, bytes]]) -> list[dict[str, Any
             raise DataError(f"{filename} is larger than "
                             f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
         parsed = feed.parse_filename(filename)
-        if parsed is None:
+        control = parsed is None and is_control_file(feed, filename)
+        if parsed is None and not control:
             raise DataError(
                 f"{filename} does not match {feed.name}'s filename pattern "
                 f"({feed.filename_pattern}), so it would land and never be "
                 f"ingested. Rename it, or fix the pattern.")
-        checked.append((filename, content, parsed[0]))
+        checked.append((filename, content, parsed[0] if parsed else None, control))
 
     # Oldest COB date first, for the same reason land() does it: the
     # prepared layer's relationships tests compare against whatever reference
     # data has arrived.
-    checked.sort(key=lambda t: (t[2], t[0]))
+    # Land controls first, including controls uploaded separately after data.
+    # They have no independent COB date and are never parsed as data headers.
+    checked.sort(key=lambda t: (not t[3], str(t[2] or ""), t[0]))
 
-    s3 = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT"))
-    bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
-    bucket = bucket.split("//", 1)[-1].split("/", 1)[0]
+    # Was os.environ.get("S3_ENDPOINT") with NO default -- None quietly sent
+    # boto3 at real AWS instead of MinIO. settings.s3_endpoint() fixes that: it
+    # falls back to the compose default in `local` and refuses elsewhere.
+    s3 = boto3.client("s3", endpoint_url=settings.s3_endpoint())
+    bucket = settings.bucket_of(settings.landing())
     out = []
-    for filename, content, cob_date in checked:
+    for filename, content, cob_date, control in checked:
         key = f"{feed.landing_prefix}/{feed.name}/{filename}"
         s3.put_object(Bucket=bucket, Key=key, Body=content)
         out.append({"filename": filename, "key": key,
-                    "cob_date": cob_date.isoformat(),
+                    "cob_date": cob_date.isoformat() if cob_date else None,
+                    "control_file": control,
                     "bytes": len(content),
-                    **compare_header(feed, header_of(content, feed))})
+                    **({"missing_columns": [], "extra_columns": []} if control
+                       else compare_header(feed, header_of(content, feed)))})
     return out
 
 

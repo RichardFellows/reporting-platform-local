@@ -27,28 +27,23 @@ import re
 from tests.support import repo_file
 
 # EVERY DECLARATION SITE, with the pattern that finds the version in it. Each
-# is a real second copy, not a reference: `common/spark.py` and
-# `dbt/profiles.yml` are the TWO DRIVERS CLAUDE.md warns must not diverge from
-# the image, because every submitting process runs a pip pyspark with no jars
-# of its own and resolves these coordinates itself.
+# is a real second copy, not a reference. The DRIVER's jars used to be
+# resolved by `common/spark.py` and `dbt/profiles.yml` from these versions;
+# they are baked into the Airflow image now, so `Dockerfile.airflow` is the
+# driver-side copy and the two drivers read the jar list from its ENV
+# (docs/DECISIONS.md#driver-jars-are-baked).
 ICEBERG_SITES = {
     ".env.example": r"^ICEBERG_VERSION=(\S+)",
     "docker-compose.yml": r"ICEBERG_VERSION:\s*\$\{ICEBERG_VERSION:-([^}]+)\}",
     "Dockerfile.spark": r"^ARG ICEBERG_VERSION=(\S+)",
-    "reporting_platform/common/spark.py":
-        r'os\.environ\.get\("ICEBERG_VERSION",\s*"([^"]+)"\)',
-    "dbt/profiles.yml":
-        r"env_var\('ICEBERG_VERSION',\s*'([^']+)'\)",
+    "Dockerfile.airflow": r"^ARG ICEBERG_VERSION=(\S+)",
 }
 EXT_SITES = {
     ".env.example": r"^NESSIE_SPARK_EXT_VERSION=(\S+)",
     "docker-compose.yml":
         r"NESSIE_SPARK_EXT_VERSION:\s*\$\{NESSIE_SPARK_EXT_VERSION:-([^}]+)\}",
     "Dockerfile.spark": r"^ARG NESSIE_SPARK_EXT_VERSION=(\S+)",
-    "reporting_platform/common/spark.py":
-        r'os\.environ\.get\("NESSIE_SPARK_EXT_VERSION",\s*"([^"]+)"\)',
-    "dbt/profiles.yml":
-        r"env_var\('NESSIE_SPARK_EXT_VERSION',\s*'([^']+)'\)",
+    "Dockerfile.airflow": r"^ARG NESSIE_SPARK_EXT_VERSION=(\S+)",
 }
 SERVER_SITES = {
     ".env.example": r"^NESSIE_SERVER_VERSION=(\S+)",
@@ -100,10 +95,10 @@ def _parts(version: str) -> tuple[int, ...]:
 
 
 def test_iceberg_version_agrees_everywhere_it_is_declared():
-    """FIVE COPIES. The image bakes the jars in; `spark_session()` and
-    `dbt/profiles.yml` each resolve the coordinates again, because every
-    submitting process runs a pip pyspark with no jars of its own. A bump that
-    touches four of the five is the realistic mistake."""
+    """FOUR COPIES. Both images bake the jars in -- the Spark image for the
+    executors, the Airflow image for every driver -- and `.env.example` and
+    `docker-compose.yml` pass the version to both builds. A bump that touches
+    three of the four is the realistic mistake."""
     assert _agree(ICEBERG_SITES, "ICEBERG_VERSION")
 
 
@@ -159,3 +154,17 @@ def test_the_quarkus_json_logging_keys_match_the_server_they_need():
             f"docker-compose.yml sets quarkus.log.console.json.* but the "
             f"server is {server}, below 0.104 where the build-time extension "
             f"first appears. Those keys change nothing and say nothing there.")
+
+
+def test_the_driver_only_jars_are_pinned_once():
+    """hadoop-aws and the AWS SDK bundle are baked only into the Airflow
+    image (the Spark image lacks them; spark.jars ships them to executors).
+    One ARG each -- and no driver may resolve them itself any more."""
+    for arg in ("HADOOP_AWS_VERSION", "AWS_SDK_BUNDLE_VERSION"):
+        _version("Dockerfile.airflow", rf"^ARG {arg}=(\S+)")
+    for driver in ("reporting_platform/common/spark.py", "dbt/profiles.yml"):
+        text = repo_file(driver).read_text(encoding="utf-8")
+        assert "spark.jars.packages" not in text.replace(
+            "used to be spark.jars.packages", ""), (
+            f"{driver} resolves jars through spark.jars.packages again -- "
+            f"a runtime fetch from Maven. Read PLATFORM_DRIVER_JARS instead.")

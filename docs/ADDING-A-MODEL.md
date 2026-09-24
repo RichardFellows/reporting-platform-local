@@ -13,15 +13,11 @@ That is the same property `feeds.yml` gives the ingest DAGs, and it is the
 answer to "where do I wire this up?" — you don't.
 
 > **The commands below are PowerShell**, because that is what the Windows
-> stack this was built on uses. Only two constructs differ elsewhere: a
-> continuation is `` ` `` in PowerShell and `\` in bash, and capturing the
-> build branch is
->
-> ```bash
-> branch=$(docker compose exec -T airflow python -m scripts._open_build_branch | tr -d '\r')
-> ```
->
-> instead of `$branch = (...).Trim()`. `$branch` then reads the same in both.
+> stack this was built on uses. The one construct that differs elsewhere is a
+> line continuation: `` ` `` in PowerShell, `\` in bash. Building
+> (`make build-branch` below) sidesteps the branch-capturing incantation
+> entirely — `make` reads the same on both, when you have it; see
+> QUICKSTART.md's Prerequisites for the case where you don't.
 > On Windows, use Git Bash for anything with single-quoted JSON in it —
 > PowerShell mangles the quoting.
 
@@ -100,14 +96,25 @@ Five things that are not optional:
   three models is the defect that file exists to prevent. Note also that Spark
   3.x rejects bare `VARCHAR` without a length: use `string`.
 - **A prepared model reading `raw` must have `{{ known_as_of() }}` in its
-  `where`, and `{{ source_provenance() }}` in its select.** Both are checked by
-  `tests/test_supersession.py`, which greps the model files rather than
-  trusting that a macro reached them. The first is the as-of filter: with no
-  `knowledge_time` var it compiles to `1 = 1`, and a model that omits it
-  silently returns everything whatever an as-of query asked for. The second
-  carries `delivery_id` through, which is what a published run enumerates its
-  inputs from — and `_prepared.yml` needs `- name: delivery_id` /
-  `tests: [not_null]` to prove the table was built after that macro existed.
+  `where`, and `{{ source_provenance() }}` in its select.** `known_as_of()` is
+  checked by `tests/test_supersession.py`; both it and `source_provenance()`
+  are checked again by `tests/test_model_rules.py` (plan #24), which greps the
+  model files rather than trusting that a macro reached them. The first is the
+  as-of filter: with no `knowledge_time` var it compiles to `1 = 1`, and a
+  model that omits it silently returns everything whatever an as-of query
+  asked for. The second carries `delivery_id` through, which is what a
+  published run enumerates its inputs from — and `_prepared.yml` needs
+  `- name: delivery_id` / `tests: [not_null]` to prove the table was built
+  after that macro existed.
+- **The dedupe rank runs on the CLEANED key, in a CTE built from `cleaned`
+  (or whatever CTE holds the `clean_string(<key>)` projection) — never in the
+  CTE that reads `source('raw', ...)` directly.** Ranked on the raw key,
+  `' T1'` and `'T1'` in one file both survive as distinct partitions.
+  `tests/test_model_rules.py` greps for this shape too, covering the scaffold
+  template's output as well as the hand-written models, and
+  `.github/pull_request_template.md` is the checklist this and the rule above
+  are two lines of — most of it a human review item no test can stand in for.
+  See [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 - **Aggregates must `ref()` the detail model, not re-derive from `prepared`.**
   `exposure_by_country` reads `counterparty_exposure` so the rollup reconciles
   to the detail *by construction*. Two independent derivations eventually
@@ -184,14 +191,15 @@ files, so the new task appears when the scheduler next parses, not instantly.
 ## Building it
 
 On a throwaway branch, which is the point of the platform — never straight at
-`main`:
+`main`. `make build-branch` opens the branch, builds `SELECT` against it, and
+prints the branch name plus a command to diff it against `main` — it never
+merges:
 
-```powershell
-$branch = (docker compose exec -T airflow python -m scripts._open_build_branch).Trim()
-docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select exposure_by_country+ --vars "{nessie_ref: $branch}"
+```bash
+make build-branch SELECT=exposure_by_country+
 ```
 
-`--select <model>+` builds the model and everything downstream of it, which is
+`SELECT <model>+` builds the model and everything downstream of it, which is
 what you want: a change to a shared model like `counterparty_exposure` moves
 every mart that `ref()`s it, and building it alone proves nothing about them.
 

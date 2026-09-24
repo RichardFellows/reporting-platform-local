@@ -1,5 +1,13 @@
 # Four deliveries, end to end
 
+**Legacy compatibility path.** These four worked examples trace the legacy
+`inbox` → `landing` → `ready` v1 conformance gate. The current Transport
+path's shapes are worked through in
+[TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md) and
+[DELIVERY-CONTRACT.md](DELIVERY-CONTRACT.md); its live-verified command
+sequence is in
+[AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally).
+
 One file per shape, traced from the moment it appears in `inbox/` to the rows
 it becomes in `raw.<feed>` — **every filename, every rename, every object
 written, and the full content of every metadata and manifest object**.

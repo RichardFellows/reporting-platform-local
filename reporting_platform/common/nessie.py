@@ -11,9 +11,10 @@ be driven from Airflow tasks that need no Spark session at all.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 from urllib.parse import quote as _urlquote
+
+from reporting_platform.common import settings
 
 log = logging.getLogger("nessie")
 
@@ -21,11 +22,19 @@ class Nessie:
     """Thin wrapper over Nessie's REST API."""
 
     def __init__(self, uri: str | None = None):
-        self.uri = (uri or os.environ.get("NESSIE_URI", "http://nessie:19120/api/v2")).rstrip("/")
+        # `uri` wins when given -- e.g. a test pointing at a fake server --
+        # settings.nessie_uri() is only the environment-derived fallback.
+        self.uri = (uri or settings.nessie_uri()).rstrip("/")
 
     def _req(self, method: str, path: str, **kwargs):
         import requests
 
+        # Same auth setting as the Spark catalog and both dbt targets.
+        # See docs/DECISIONS.md#nessie-auth-is-a-setting
+        token = settings.nessie_auth_token()
+        if token:
+            kwargs["headers"] = {**kwargs.get("headers", {}),
+                                 "Authorization": f"Bearer {token}"}
         r = requests.request(method, f"{self.uri}{path}", timeout=30, **kwargs)
         if not r.ok:
             # requests' default raise_for_status() drops the response body,
@@ -115,13 +124,23 @@ class Nessie:
             json=body,
         )
 
-    def create_tag(self, name: str, from_ref: str = "main") -> dict[str, Any]:
+    def create_tag(self, name: str, from_ref: str = "main",
+                   hash: str | None = None) -> dict[str, Any]:
+        """POST /v2/trees?name=<tag>&type=TAG, at `from_ref`'s head -- or at
+        `hash`, a commit on `from_ref`, when given.
+
+        Pass `hash` whenever the tag means "the state THIS write left": the
+        head is only that state until the next merge lands, and a tag cut
+        after the writer let go of the write pool can name somebody else's
+        merge. See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+        """
         src = self.get_reference(from_ref)["reference"]
         return self._req(
             "POST",
             "/trees",
             params={"name": name, "type": "TAG"},
-            json={"type": src["type"], "name": src["name"], "hash": src["hash"]},
+            json={"type": src["type"], "name": src["name"],
+                  "hash": hash or src["hash"]},
         )
 
     def delete_reference(self, name: str) -> None:

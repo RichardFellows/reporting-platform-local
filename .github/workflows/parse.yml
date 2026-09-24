@@ -23,7 +23,7 @@
 #     MEASURED, BECAUSE THE LIMIT MATTERS AS MUCH AS THE COVERAGE: it does
 #     NOT reject an unknown generic test (`dbt_utils.not_a_real_test` parses
 #     green) or an unknown key in a column block. Those are resolved when a
-#     test is built, which is the tier that does not exist yet.
+#     test is built, which is build.yml's job.
 #   * A DAG that does not import -- a syntax error, and equally
 #     `dbt_builds.py` REFUSING A NON-SPARK `DBT_TARGET`, which it does at
 #     import precisely so it surfaces here. Both build DAGs render their task
@@ -36,8 +36,8 @@
 # is: the image BUILD itself (this installs the same pins by hand, and
 # `tests/test_ci_pins.py` is what stops the two drifting), and column-level
 # lineage, which needs compiled SQL and a catalog --
-# `lineage --columns --require-derivable` is the post-build tier and there is
-# no post-build tier yet.
+# `lineage --columns --require-derivable` is the post-build gate, which
+# build.yml runs.
 #
 # HOW THIS ENVIRONMENT DIFFERS FROM THE IMAGE, in the one way that could
 # produce a false alarm: `apache/airflow:2.10.5-python3.11` ships a few dozen
@@ -88,6 +88,9 @@ jobs:
       NESSIE_URI: http://nessie.invalid/api/v2
       S3_ENDPOINT: http://minio.invalid:9000
       REPORTING_WAREHOUSE: s3a://lakehouse/warehouse
+      # The driver's baked jars (Dockerfile.airflow sets it in the image).
+      # Inert here: nothing starts a Spark session.
+      PLATFORM_DRIVER_JARS: /nonexistent/driver.jar
 
       AIRFLOW_HOME: ${{ github.workspace }}/.ci/airflow
       AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/airflow/dags

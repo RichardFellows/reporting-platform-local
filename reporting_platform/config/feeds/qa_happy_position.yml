@@ -1,0 +1,45 @@
+name: qa_happy_position
+description: Dummy QA positions for pipe CSV and control-file end-to-end verification.
+source_system: QA
+source_identifiers:
+  DCM: qa-happy-position
+delivery_identity: [control, filename]
+filename_pattern: 'qa_happy_position_(?P<cob_date>\d{8})(?:_v(?P<version>\d+))?\.csv'
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: delimited
+      delimiter: '|'
+    cob_date: 'BUSINESS_DATE'
+    version: 'FILE_VERSION'
+    row_count: 'RECORD_COUNT'
+    md5: 'CHECKSUM'
+delimiter: '|'
+business_key: [position_id]
+expected_min_rows: 1
+delivery_expected: false
+columns:
+  - position_id
+  - desk_code
+  - amount
+  - currency
+  - effective_date
+  - is_active
+  - description
+# Phase 8: the representative "simple snapshot" migration fixture (section
+# 26) -- proves row-count/key-set/row-hash/aggregate comparison end to end
+# against a local fixture legacy adapter. See docs/MIGRATION.md.
+migration:
+  mode: dual_run
+  compare:
+    checkpoint: raw
+    key: [position_id]
+    columns: []  # row-count + key-set + aggregate at this checkpoint; see docs/MIGRATION.md
+    aggregates:
+      - column: amount
+        function: sum
+        tolerance: {absolute: 0.01}
+  acceptance:
+    consecutive_successes: 3
+    allow_warnings: false

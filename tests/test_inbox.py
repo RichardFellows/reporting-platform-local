@@ -295,3 +295,68 @@ def test_one_bad_member_does_not_stop_the_others():
     # The container is still processed -- a good member landed out of it.
     assert (d / ".processed" / "trs_position" / "weekly.zip").is_file()
     assert not (d / ".rejected").exists()
+
+
+def test_no_trigger_lands_without_calling_airflow():
+    """`--no-trigger` (the CI build tier) must not reach for Airflow at all:
+    the stack it runs on has no webserver."""
+    from reporting_platform.ingest import inbox
+
+    before = inbox.TRIGGER
+    inbox.TRIGGER = False
+    try:
+        out = inbox._trigger(object(), "landing/x/y.csv")
+    finally:
+        inbox.TRIGGER = before
+    assert out == {"triggered": False,
+                   "reason": "--no-trigger: the caller ingests"}, out
+
+
+# ================================ land_files: named files, nothing watching ==
+def _named(files: dict) -> list[pathlib.Path]:
+    src = pathlib.Path(tempfile.mkdtemp(prefix="rp-named-"))
+    for name, body in files.items():
+        (src / name).write_bytes(body)
+    return [src / n for n in files]
+
+
+def test_land_files_lands_named_files_in_one_call_and_triggers_nothing():
+    """No stability polls (the files are complete by assertion), the SAME
+    gate as the watcher, the originals untouched, and the watcher's own
+    INBOX/TRIGGER put back afterwards."""
+    inbox, d, fd, puts, _ = _wired(GATE_FEED)
+    seen_trigger: list = []
+    inbox._trigger = lambda feed, key: (
+        seen_trigger.append(inbox.TRIGGER) or {"triggered": False})
+    paths = _named({"positions.csv": DATA,
+                    "positions.ctl": b"DATE=20260901\nROWS=1\n"})
+
+    results = inbox.land_files(paths)
+    assert [r["status"] for r in results] == ["conformed"], results
+    assert puts == ["trs_position_20260901.ctl",
+                    "trs_position_20260901.csv",
+                    "trs_position_20260901.csv.meta.json"], puts
+    assert seen_trigger == [False], seen_trigger
+    assert all(p.is_file() for p in paths), "an original was moved"
+    assert inbox.INBOX == d and inbox.TRIGGER is True
+
+
+def test_land_files_reports_what_it_could_not_land():
+    """The private copy is thrown away, so a file the gate is waiting on must
+    SAY it did not land rather than vanish with it."""
+    inbox, d, fd, puts, _ = _wired(GATE_FEED)
+    results = inbox.land_files(_named({"positions.csv": DATA}))
+    assert [(r["file"], r["status"]) for r in results] == [
+        ("positions.csv", "not landed")], results
+    assert puts == []
+
+
+def test_land_files_refuses_two_files_with_one_name():
+    inbox, d, *_ = _wired(GATE_FEED)
+    a, b = _named({"positions.csv": DATA}), _named({"positions.csv": DATA})
+    try:
+        inbox.land_files(a + b)
+    except ValueError as exc:
+        assert "positions.csv" in str(exc)
+    else:
+        raise AssertionError("two files with one name were both accepted")

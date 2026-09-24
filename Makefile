@@ -8,7 +8,7 @@ DBT_ARGS := --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
 
 .PHONY: help
 help:
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	 awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: env
@@ -23,9 +23,22 @@ up: env ## Start the whole local stack
 	@echo "Airflow  http://localhost:8081   (admin / admin)"
 	@echo "Spark    http://localhost:8080"
 
+.PHONY: release-image
+release-image: ## Build the release image (code baked in) and write release.env. IMAGE=<ref>
+	scripts/release_image.sh $(or $(IMAGE),reporting-platform-airflow:release) > release.env
+	@cat release.env
+
+.PHONY: k8s-smoke
+k8s-smoke: ## The platform in a local kind cluster, from the chart: ingest + prepared_build, merged. K8S_SMOKE_DOWN=1 deletes the cluster after
+	PATH="$$HOME/.local/bin:$$PATH" scripts/k8s_smoke.sh
+
 .PHONY: test
 test: ## Config-level tests (no stack needed, ~1s). See tests/README.md
 	python -m tests.run
+
+.PHONY: doctor
+doctor: ## Check this host is set up right BEFORE `make up` -- .env, uid, memory, ports
+	python3 scripts/doctor.py
 
 .PHONY: down
 down: ## Stop the stack, keep volumes
@@ -69,20 +82,44 @@ deps: ## Re-install dbt packages (airflow-init already did this)
 # it is NOT the write-audit-publish pattern the platform is built around: a
 # failed build leaves its partial output on main rather than on an abandoned
 # branch. The real orchestration (airflow/dags/dbt_builds.py) always opens a
-# branch and merges only when the test task passes, and README section 8 shows
-# the manual equivalent via scripts/_open_build_branch.py. Prefer that when the
-# state of main matters.
-.PHONY: build
-build: ## Full dbt build (run + test) -- on main, see note above
+# branch and merges only when the test task passes. Kept for when you
+# deliberately want to build on main (e.g. `make nuke` then a clean rebuild of
+# an empty catalog); prefer the plain `build`/`prepared`/`reporting` targets
+# below otherwise -- those are the safe, branch-building path.
+.PHONY: build-on-main
+build-on-main: ## Full dbt build (run + test) -- on main, see note above
 	$(DBT) build $(DBT_ARGS)
 
-.PHONY: prepared
-prepared: ## Build the prepared layer only -- on main, see note above
+.PHONY: prepared-on-main
+prepared-on-main: ## Build the prepared layer only -- on main, see note above
 	$(DBT) build $(DBT_ARGS) --select path:models/prepared
 
-.PHONY: reporting
-reporting: ## Build the reporting layer only -- on main, see note above
+.PHONY: reporting-on-main
+reporting-on-main: ## Build the reporting layer only -- on main, see note above
 	$(DBT) build $(DBT_ARGS) --select path:models/reporting
+
+# The safe path: opens a throwaway Nessie branch (scripts/_open_build_branch),
+# builds with nessie_ref pointed at it, and NEVER merges -- see
+# scripts/build_branch.sh. Merging is the Airflow builds' job
+# (prepared_build / reporting_build), or a deliberate manual step per
+# CLAUDE.md's "Build on a throwaway branch, never main".
+SELECT ?= path:models/prepared path:models/reporting
+
+.PHONY: build-branch
+build-branch: ## Build SELECT (default: prepared+reporting) on a THROWAWAY branch. Never merges -- prints the branch and a diff-vs-main command
+	@scripts/build_branch.sh $(SELECT)
+
+.PHONY: build
+build: ## Full dbt build (run + test), SAFELY -- alias for build-branch, never touches main
+	@scripts/build_branch.sh path:models/prepared path:models/reporting
+
+.PHONY: prepared
+prepared: ## Build the prepared layer only, SAFELY -- alias for build-branch, never touches main
+	@scripts/build_branch.sh path:models/prepared
+
+.PHONY: reporting
+reporting: ## Build the reporting layer only, SAFELY -- alias for build-branch, never touches main
+	@scripts/build_branch.sh path:models/reporting
 
 .PHONY: lineage
 lineage: ## Generate and serve the dbt lineage docs

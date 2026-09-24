@@ -121,18 +121,125 @@ metadata catalog gap called out in the PoC review, closed by dbt's manifest.
 
 ---
 
-## Per-feed processing, not a nightly batch
+## Identity model
+
+Several identities exist and are deliberately different:
+
+```
+TransportID  →  DeliveryID  →  RunID  →  ReportVersion
+   (a producer's         (this platform's      (one processing/       (one published
+   transfer occurrence)  accepted Delivery)     publication execution)  version of a report)
+```
+
+- **TransportID** names one producer handoff into `received/` — the source/
+  acquisition transfer occurrence, evidenced by `_COMPLETE.json`.
+- **DeliveryID** names this platform's accepted interpretation of a Transport
+  — created once, immutably, in the DeliveryManifest. **Transport != Delivery**:
+  a Transport is what arrived; a Delivery is what the platform decided it
+  means (which Feed, which business date, which version).
+- **RunID** names one `prepared_build` or `reporting_build` execution.
+  **Delivery != Run**: a run's input set (`run_input`) is derived from the
+  Deliveries whose rows survive into what it publishes, not from Deliveries
+  one-to-one.
+- **ReportVersion** names one published version of one report for one as-at
+  date — `registry.report_version`, gated by the as-at lifecycle below.
+
+Raw provenance carries a related but distinct set of identities, in the exact
+names the code uses:
+
+| Column | Meaning | Not to be confused with |
+|---|---|---|
+| `_delivery_id` | the logical Delivery identity (v2 path); joinable to `registry.delivery` | not `_source_file` — that is physical, this is logical |
+| `_source_file` | the physical object Spark actually read | not the Delivery identity; a v2 row also carries `_delivery_id`, a legacy/historical row only has this |
+| `_file_version` | this platform's ordering of restatements for a Feed/business date (1, 2, 3…) | not an identity — two different Deliveries can each be `_file_version=1` for different dates |
+| `_batch_id` | the Raw ingestion execution identity (≈ the Nessie branch suffix) | not a Delivery identity — one batch can ingest several Deliveries |
+| `_ingest_ts` | when Raw ingestion observed the row | not `_received_at` (Transport-path: when the Delivery was received) |
+
+Explicit non-equivalences worth keeping in mind everywhere in this document
+set:
+
+- Transport != Delivery. Delivery != Run. DeliveryID != a filename. DeliveryID
+  != `_file_version`. `_source_file` != Delivery identity.
+- Ready (either version) != source evidence authority — it is a rebuildable
+  cache derived from `received/`/`landing/`.
+- Airflow task state != data state — a `RUNNING` task in Marquez does not mean
+  data is still being written; see [Lineage is an export](#lineage-is-an-export-not-an-authority)
+  below.
+- `registry.delivery` != mutable ingestion/load-control status — see
+  [The registry](#the-registry-what-is-recorded-and-what-stays-derived) below.
+- `validation_result` != processing status — see [Validation architecture](#validation-architecture)
+  below.
+
+## Object-store namespaces
+
+| Namespace | Purpose | Authority |
+|---|---|---|
+| `received/<TransportID>/` | original source objects + `_COMPLETE.json` | durable **source** evidence (current, primary) |
+| `deliveries/` | immutable DeliveryManifest — this platform's interpretation of a Transport | durable **Delivery** evidence (current, primary) |
+| `ready/` v2 (`normalize_delivery`) | NormalizationManifest — Spark-reader instructions derived from a Delivery | rebuildable cache — reconstructible from `deliveries/` on demand |
+| `landing/` | legacy evidence copy, conformed by the inbox gate or written directly by an approved sender | **legacy compatibility path only** — not required by, and not the primary namespace for, the Transport path |
+| `ready/` v1 (`normalize.py`) | legacy normalization manifest, one per delivery | legacy compatibility path only — rebuildable from `landing/` |
+| `quarantine/` | refused legacy deliveries, evidence kept | legacy compatibility path |
+| Iceberg warehouse (`raw`/`prepared`/`reporting`) | the queryable data, on Nessie branches, merged to `main` only if tests pass | durable data state, both paths write the same tables |
+
+`received/`/`deliveries/` have **no retention policy implemented yet** — see
+[RETENTION.md](RETENTION.md) for what is and is not enforced today.
+
+## End-to-end traceability example
+
+How to trace a published report back to the Transport DCM handed off, using
+the identities above:
+
+```
+Transport                DCM / transport-123
+      │
+      ▼
+Delivery                 dlv_abcd...           (DeliveryManifest, deliveries/)
+      │
+      ▼
+Raw                       _delivery_id = dlv_abcd...
+      │
+      ▼
+Prepared build            run_id = prepared-...
+      │
+      ▼
+run_input                 (ref_collateral, dlv_abcd...)
+      │
+      ▼
+Reporting build            run_id = reporting-...
+      │
+      ▼
+report_version              ExposureReport / 2026-09-20 / v3
+```
+
+Worked with the actual CLI in [`REGISTRY.md`](REGISTRY.md) (`registry trace`,
+`registry inputs --run-id`, `registry versions`) and cross-checked against
+[`LINEAGE.md`](LINEAGE.md)'s column-level lineage, which answers the same
+question from the dbt/Spark side and legitimately disagrees with `run_input`
+in scope (Marquez reports every Delivery *read*; `run_input` reports what
+*contributed to what was published* — see
+[Lineage is an export](#lineage-is-an-export-not-an-authority) below).
+
+---
+
+## Legacy compatibility path: per-feed processing
+
+**This section describes the legacy `landing/` path, retained for backwards
+compatibility, existing local workflows/tests, and Phase 8's dual-run
+migration comparisons — not the current primary architecture.** New Feeds
+should onboard onto the Transport path below; see
+[ADDING-A-FEED.md](ADDING-A-FEED.md).
 
 Requirement: *each feed must be processed as soon as it is received.*
 
-The DAG topology is therefore:
+The legacy DAG topology is:
 
 ```
                      (file arrival)
                            │
         ┌──────────────────┼──────────────────┐
         ▼                  ▼                  ▼
-  ingest_fo_trade      ingest_ref_counterparty   ingest_ref_rating      ← one DAG per feed,
+  ingest_fo_trade      ingest_ref_counterparty   ingest_ref_rating      ← LEGACY: one DAG per feed,
         │                  │                  │                generated from feeds.yml
         ▼                  ▼                  ▼
    Asset: raw.fo_trade   Asset: raw.ref_counterparty  Asset: raw.ref_rating
@@ -152,7 +259,9 @@ The DAG topology is therefore:
 Airflow **assets** (datasets in Airflow 2) do the coupling. No feed waits for
 any other feed to arrive. `prepared_build` is scheduled on the asset condition
 and runs as soon as anything upstream changes; dbt's own `state:modified+` and
-model selection keep the rebuild proportionate.
+model selection keep the rebuild proportionate. This asset-triggered coupling
+is shared with the Transport path below — only how a Delivery reaches `raw`
+differs between the two paths.
 
 A feed that is late does not block the ones that arrived; the reporting layer
 simply carries forward the last good version of that dimension and the
@@ -176,6 +285,35 @@ holiday can never be reported as a gap. Its blind spot is a day on which every
 feed missed; that is the orchestrator's and the watchdog's territory.
 
 ---
+
+## The Transport-driven path (Phase 6) — current, primary architecture
+
+`received/<transport-id>/_COMPLETE.json` ->
+`transport_ingest` (one generic Airflow DAG, not one per Feed) ->
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+-> report_drift -> record_snapshot`.
+It shares the SAME Raw layer, the SAME `lakehouse_write` pool, and the SAME
+asset-triggered `prepared_build`/`reporting_build` chain as the legacy diagram
+above -- only how a Delivery reaches Raw differs. A single deferrable sensor
+(`transport_watch`) and an independent evidence-driven reconciliation DAG
+(`transport_reconcile`) trigger it; see `docs/AIRFLOW-ORCHESTRATION.md` for
+the full design and `docs/TRANSPORT-CONTRACT.md`/`docs/DELIVERY-CONTRACT.md`/
+`docs/NORMALIZATION-CONTRACT.md`/`docs/RAW-INGESTION-CONTRACT.md` for the
+domain contracts it orchestrates. The legacy `landing/` path above is
+unchanged and remains fully operational as a compatibility path.
+
+## Dual-run migration (Phase 8)
+
+A Feed does not cut over to this platform by decree: `migration:` config on
+the Feed (`common/context.py`) puts it in `dual_run`, an independent
+`migration_reconcile` DAG compares its new-platform output against the true
+legacy estate (SQL Server/the legacy ETL tool -- **not** the Landing/Ready-v1
+path above, which stays "new"), and `registry.migration_comparison` records
+what it found. Readiness is derived from that evidence, never declared, and
+crossing into `new_primary` is a human config edit, never automatic. This is
+implemented and current, not a future phase. See
+[`MIGRATION.md`](MIGRATION.md) for the full design — this section only
+summarises it.
 
 ## Nessie: write-audit-publish
 
@@ -348,7 +486,7 @@ flowchart LR
   DR -->|"SPARK_MASTER"| M
   M --> E1
   M --> E2
-  DR -. "ships spark.jars.packages<br/>(incl. hadoop-aws, which the<br/>Spark image does NOT bake)" .-> E1
+  DR -. "ships spark.jars<br/>(incl. hadoop-aws, which the<br/>Spark image does NOT bake)" .-> E1
   DR -. .-> E2
 ```
 
@@ -374,12 +512,11 @@ Three consequences worth knowing before changing any of it:
   successfully* with the cluster sitting idle — the failure mode that is worth
   a guard is the one that isn't red anywhere.
 - **The driver ships the jars.** `Dockerfile.spark` bakes the Iceberg and
-  Nessie runtimes into the executors, but `spark.jars.packages` jars are
-  served from the driver to every executor, so what the executors load is what
-  the driver resolved. That is why the package list in `common/spark.py` and
-  `profiles.yml` must stay at `Dockerfile.spark`'s versions, and why
-  `hadoop-aws` — which the Spark image does *not* bake — reaches the executors
-  at all.
+  Nessie runtimes into the executors; `Dockerfile.airflow` bakes the drivers'
+  copies, listed in `PLATFORM_DRIVER_JARS`, and `spark.jars` serves them from
+  the driver to every executor. That is why the two Dockerfiles' versions must
+  match, and why `hadoop-aws` — which the Spark image does *not* bake —
+  reaches the executors at all. See `DECISIONS.md#driver-jars-are-baked`.
 - **Each application caps itself at 2 cores / 2g.** A standalone application
   takes every free core by default and holds it until the session stops, so an
   uncapped job would leave the next one waiting forever on *"Initial job has
@@ -517,8 +654,9 @@ work against it:
 
 - **The delivery half records no verdicts.** There is no `ingested`, no
   `superseded`, no `status`. Whether a delivery reached raw stays derived from
-  `_source_file` in the raw table; whether it supersedes another stays
-  `dedupe_rank`'s answer. This is the single difference from the legacy `stg`
+  `_delivery_id` in the raw table for v2 (with the explicit historical
+  `_source_file` basename fallback in `delivery_ref()`); whether it supersedes
+  another stays `dedupe_rank`'s answer. This is the single difference from the legacy `stg`
   load-control tables this platform replaces — those held a status that could
   disagree with the data, and eventually did.
 - **`run_input` carries no foreign key to `delivery`.** A run is an event and a
@@ -526,6 +664,10 @@ work against it:
   delivery row was rebuilt, renumbered, or not yet reconciled. The input set is
   *derived* — read out of the prepared models on the branch, before the merge,
   using the same `delivery_ref()` the rows themselves carry.
+- **A report version reaches evidence through its run.** `report_version.run_id`
+  leads to `run_input`; each pair may resolve through the rebuildable delivery
+  observation to its DeliveryManifest, Transport marker and original received
+  objects. A missing observation is reported as coverage debt, never dropped.
 - **A run has a mutable status. A delivery may not.** For the same reason.
 
 Postgres rather than Iceberg because `sequence_no` — the order in which the
@@ -538,6 +680,66 @@ The CLI is `python -m reporting_platform.registry`; [`REGISTRY.md`](REGISTRY.md)
 is the operator's guide to it, and
 [`DECISIONS.md#the-registry-records-observations-not-verdicts`](DECISIONS.md#the-registry-records-observations-not-verdicts)
 carries the reasoning.
+
+**A third kind sits beside both halves (Phase 7).**
+`registry.validation_result` is neither a rebuildable observation nor a
+one-off event about the platform's own process — it is durable, queryable
+evidence of what a Delivery/Raw/dbt control *decided* when it ran, append-only
+and keyed so a retry cannot duplicate itself. It is not a verdict column on
+`delivery`, and it is not a second engine: every control it records evidence
+for already ran in RPL, Spark or dbt. See [`VALIDATION.md`](VALIDATION.md).
+
+**A fourth pair answers "where is this feed right now" (the operational
+control plane).** `registry.transport_receipt` is an EVENT record like `run`
+— a mutable `status` tracking how far one Transport occurrence has been
+carried through `transport_ingest`, because nothing else durably records an
+attempt in flight. `registry.delivery_committed` is an OBSERVATION like
+`delivery_part` — one fact, "this Delivery reached Raw", recorded once by the
+function that performs the commit, identically for the legacy and Transport
+paths. Together with `Feed.delivery_expected`/`cadence`/`expected_by` they are
+what `monitoring/feed_status.py` derives COB Feed Status from — see
+[`OPERATIONAL-CONTROL-PLANE.md`](OPERATIONAL-CONTROL-PLANE.md) for the full
+design and why the Airflow DAG list is no longer the feed-monitoring surface
+under generic ingestion.
+
+---
+
+## Validation architecture
+
+Validation is a first-class platform capability attached at three stages,
+each owned by a different engine:
+
+```
+Transport / Delivery
+       │
+       ├── integrity and Delivery controls (RPL: row_count, md5, expected_min_rows)
+       ▼
+Normalization / Raw
+       │
+       ├── ingestion controls (Spark: scalable ingestion observations)
+       ▼
+dbt Prepared / Reporting
+       │
+       ├── data/business tests (dbt: not_null, relationships, accepted_range, ...)
+       ▼
+Publication
+```
+
+| Owner | What it validates |
+|---|---|
+| RPL (this platform's own code) | delivery/ingestion controls — row_count, md5, expected_min_rows |
+| Spark | scalable ingestion-time observations |
+| dbt | data/business validation — tests that gate a merge to `main` |
+| Airflow | execution — runs the above, records task state |
+| Registry (Postgres `platform`) | durable operational evidence — `validation_result`, `run`, `run_input` |
+
+**`validation_result` records what a control observed when it ran. It is not
+a processing status, and it is not the same thing as `registry.delivery`,
+which is likewise never a mutable ingestion-status table** — see
+[Identity model](#identity-model) above and [`VALIDATION.md`](VALIDATION.md)
+for the full detail; this section only summarises it. Phase 8's migration
+comparisons reuse this evidence vocabulary but write to a distinct table,
+`registry.migration_comparison` — see [`MIGRATION.md`](MIGRATION.md).
 
 ---
 
@@ -643,6 +845,11 @@ asserts the two agree.
 and the two legitimately differ: an SCD2 dimension may contribute 10 of 40
 deliveries to a published figure while OpenLineage correctly reports all 40 as
 read. **Do not reconcile them** — they answer different questions.
+
+Cosmos also retains each rendered dbt task's `manifest.json` and
+`run_results.json` under the object-store prefix recorded on the run (and
+`catalog.json` when a task generates it). The project digest, deployed project
+identity and per-task execution artifacts remain separate evidence.
 
 Three operational facts that are easy to lose an afternoon to:
 

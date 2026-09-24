@@ -16,17 +16,11 @@ write story when Nessie's OWN message names this table's content key
 below: the key present (claim made, live 409 shape) and the key absent (no
 claim, message quoted verbatim instead).
 
-Also pinned: the message must not contradict what Airflow actually does.
-`feed_ingest.py`'s `DEFAULT_ARGS` sets `retries: 2`, so after this exception
-the scheduler retries the SAME task automatically -- it does not wait to be
-told. Both retries reuse the same branch name (deterministic from
-feed/cob_date/run_id) and `ingest()`'s `nessie.create_branch` has no
-`exist_ok`, so both 409 with a bare "already exists" that never mentions
-`_file_version` or this conflict. So the message must say: the cause is in
-THIS attempt's log because Airflow's own retries will fail elsewhere: and
-recovery is a NEW run (new DAG run or CLI invocation, each with its own run
-id and so its own branch) -- not deleting the old branch, which is optional
-inspection, not a precondition.
+Also pinned: the message must not contradict what a retry does. Each
+Airflow attempt cuts its own branch (`context.ingest_attempt_id`), so the
+retry `retries: 2` fires re-reads `_file_version` on a fresh branch from the
+new `main` and recovers -- the message says so, and says a hand-run ingest is
+re-run, instead of predicting a `create_branch` 409 that no longer happens.
 """
 from __future__ import annotations
 
@@ -90,15 +84,11 @@ def test_a_conflict_naming_the_table_blames_a_concurrent_write():
         assert "another write" in msg and "merged" in msg, msg
         # Nessie's own words are quoted, not paraphrased away.
         assert "raw.fo_trade" in msg, msg
-        # Must not contradict Airflow's own retries: they WILL fire, and
-        # they WILL fail elsewhere (create_branch), not recover anything.
-        assert "retry" in msg.lower() or "retries" in msg.lower(), msg
-        assert "create_branch" in msg, msg
-        assert "already exists" in msg.lower(), msg
-        # Recovery is a new run, not "delete the branch first".
-        assert "new" in msg.lower() and "run" in msg.lower(), msg
-        assert "after deleting" not in msg.lower(), msg
-        assert branch in msg, msg
+        # A retry recovers (a fresh branch per attempt); the message must not
+        # predict the create_branch 409 the old shared branch name produced.
+        assert "fresh branch" in msg and "re-run" in msg, msg
+        assert "create_branch" not in msg, msg
+        assert "left for inspection" in msg, msg
         import requests
         assert isinstance(exc.__cause__, requests.exceptions.HTTPError), exc.__cause__
     else:
@@ -124,9 +114,7 @@ def test_a_conflict_not_naming_the_table_makes_no_claim():
         assert "another write" not in msg, msg
         assert "merged into main since" not in msg, msg
         # The retry/recovery guidance is unconditional -- present either way.
-        assert "new" in msg.lower() and "run" in msg.lower(), msg
-        assert "create_branch" in msg, msg
-        assert "after deleting" not in msg.lower(), msg
+        assert "fresh branch" in msg and "re-run" in msg, msg
     else:
         raise AssertionError(
             "a 409 REFERENCE_CONFLICT merged silently instead of raising")

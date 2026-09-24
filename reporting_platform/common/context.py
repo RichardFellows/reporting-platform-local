@@ -52,7 +52,7 @@ _CONFIG_CACHE = 16
 @lru_cache(maxsize=_CONFIG_CACHE)
 def _load_at(name: str, mtime_ns: int) -> dict[str, Any]:
     """Parse a config file. Cached on (name, mtime) rather than name alone."""
-    with open(CONFIG_DIR / name) as fh:
+    with open(CONFIG_DIR / name, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
@@ -80,7 +80,7 @@ def _load(name: str) -> dict[str, Any]:
 
 def _read_one(path: Path) -> dict[str, Any]:
     """Parse one registry file, refusing a shape that is not a mapping."""
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         loaded = yaml.safe_load(fh)
     if loaded is None:
         return {}
@@ -156,6 +156,12 @@ class Feed:
     business_key: list[str]
     columns: list[str]
     expected_min_rows: int = 0
+    # REQ-unlabelled, Phase 7. The ceiling next to `expected_min_rows`'s
+    # floor -- None (the default) declares no ceiling, same convention as
+    # `expected_by`'s absence meaning "not judged". Distinct from
+    # `declared_row_count`: this is a PLATFORM expectation about the feed,
+    # not a producer's assertion about one delivery. See docs/VALIDATION.md.
+    expected_max_rows: int | None = None
     landing_prefix: str = "landing"
     # Where normalization puts a delivery's manifest and any derived parts.
     # Separate from `landing_prefix`, and not a subfolder of it: the landing
@@ -169,6 +175,9 @@ class Feed:
     quote_char: str = '"'
     header: bool = True
     file_encoding: str = "utf-8"
+    # None preserves the historical data-encoding fallback for controls.
+    control_encoding: str | None = None
+    csv_options: dict[str, Any] = field(default_factory=dict)
     schema_drift: str = "warn"
     # Per-column prepared-layer treatment, e.g. {"haircut_pct": "decimal"}.
     # Sparse: only columns whose treatment differs from what
@@ -260,6 +269,29 @@ class Feed:
     # keep-set per feed from that feed's landing prefix.
     # See docs/DECISIONS.md#retention-classes-name-the-obligation
     retention_class: str = "standard"
+    # External identities used by acquisition/transport systems. The key is
+    # the Transport.source value (for example ``DCM``) and the value is that
+    # source's explicit feed id. This is deliberately separate from
+    # filename_pattern: routing a Transport by guessing from a producer name
+    # would make the transport metadata decorative rather than authoritative.
+    source_identifiers: dict[str, str] = field(default_factory=dict)
+    # Ordered evidence sources used to resolve business date and version for
+    # Transport -> Delivery. Both sources are still inspected so conflicting
+    # evidence is refused; ordering selects provenance when they agree.
+    delivery_identity: list[str] = field(default_factory=lambda: ["filename"])
+    # Phase 8. Dual-run migration state -- what mode this feed is being
+    # strangled in, and how its new-platform output is compared against the
+    # true external legacy system (the enterprise SQL/ETL estate this whole
+    # platform replaces -- NOT the legacy Landing/Ready-v1 ingestion path
+    # inside this repo, which stays part of "new"). Absent means
+    # `mode: legacy` -- this feed has not entered migration at all. Validated
+    # at load by `resolve_migration_config`. See docs/MIGRATION.md.
+    migration: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def migration_mode(self) -> str:
+        """`legacy` | `dual_run` | `new_primary`. See `resolve_migration_config`."""
+        return (self.migration or {}).get("mode", "legacy")
 
     @property
     def needs_conforming(self) -> bool:
@@ -401,12 +433,14 @@ DELIVERY_KINDS = ("file", "archive")
 COB_DATE_FROM = ("container",)
 PARTS_MODES = ("concat",)
 DELIVERY_KEYS = {"kind", "member_pattern", "cob_date_from", "parts", "control"}
-CONTROL_KEYS = {"pattern", "format", "row_count", "md5"}
+CONTROL_KEYS = {"pattern", "format", "cob_date", "version", "row_count", "md5"}
 
 # WHAT a control file may declare, and the regex group each field's pattern
-# must capture under `kind: regex`. One table, because both control blocks
-# read one file: `arrival.control` takes the identity pair at the door,
-# `delivery.control` the integrity pair on the landing side.
+# must capture under `kind: regex`. One table, because both control blocks and
+# Phase 2 Delivery interpretation use the same parser: `arrival.control` takes
+# identity at the legacy inbox door; `delivery.control` keeps its legacy
+# integrity fields and may additionally expose identity directly from accepted
+# Transport evidence.
 CONTROL_FIELD_GROUPS = {"cob_date": "cob_date", "version": "version",
                         "row_count": "rows", "md5": "md5"}
 
@@ -414,8 +448,8 @@ CONTROL_FIELD_GROUPS = {"cob_date": "cob_date", "version": "version",
 # only place a control file is parsed -- and the choice CHANGES WHAT THE
 # FIELDS ABOVE MEAN: a regex with a named group under `regex`, a column name
 # under `delimited`. That is why the format is resolved before them.
-CONTROL_FORMATS = ("regex", "delimited")
-CONTROL_FORMAT_KEYS = {"kind", "delimiter", "quote_char", "header", "columns"}
+CONTROL_FORMATS = ("regex", "delimited", "key_value")
+CONTROL_FORMAT_KEYS = {"kind", "delimiter", "quote_char", "header", "columns", "separator"}
 
 # Values named in docs/DELIVERY-SHAPES.md that are NOT built yet. Listed so the
 # error can say "not built" rather than "unknown": one is a typo, the other a
@@ -547,6 +581,16 @@ def resolve_control_format(feed_name: str, block: str,
             f"{where(feed_name)}: `{block}.format.kind: {kind!r}` "
             f"is not recognised. Valid: {', '.join(CONTROL_FORMATS)}")
 
+    if kind == "key_value":
+        if set(fmt) - {"kind", "separator"}:
+            raise ValueError(f"{where(feed_name)}: key_value format accepts only separator")
+        separator = fmt.get("separator", "=")
+        if not isinstance(separator, str) or len(separator) != 1 or separator in "\r\n":
+            raise ValueError(f"{where(feed_name)}: key_value separator must be one non-newline character")
+        return {"kind": kind, "separator": separator}
+
+    if "separator" in fmt:
+        raise ValueError(f"{where(feed_name)}: separator is only valid for key_value format")
     if kind == "regex":
         extra = set(fmt) - {"kind"}
         if extra:
@@ -632,7 +676,7 @@ def _resolve_control_field(feed_name: str, block: str, key: str, value: Any,
     and it was two copies of one loop before a second format made the
     difference between them matter.
     """
-    if fmt["kind"] == "delimited":
+    if fmt["kind"] in ("delimited", "key_value"):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(
                 f"{where(feed_name)}: `{block}.{key}` is "
@@ -710,17 +754,80 @@ def _resolve_control(feed_name: str, control: Any) -> dict[str, Any]:
                                  control.get("format"))
     if fmt["kind"] != "regex":
         out["format"] = fmt
-    # The INTEGRITY checks, both optional -- a control file may be a pure
-    # readiness gate. Read on the landing side and checked at ingest, so they
-    # run once for every delivery however it arrived.
+    # The complete set of assertions this control may make. COB date and
+    # version are ignored by legacy normalization (the conformant Landing name
+    # remains authoritative there) but are read directly from Transport
+    # evidence when this feed opts into control identity. Row count and MD5
+    # retain their existing legacy integrity semantics.
     # See docs/DECISIONS.md#the-inbox-is-the-conformance-gate
-    for key in ("row_count", "md5"):
+    for key in ("cob_date", "version", "row_count", "md5"):
         value = control.get(key)
         if value is None:
             continue
         out[key] = _resolve_control_field(feed_name, "delivery.control", key,
                                           value, fmt, "normalize")
     return out
+
+
+IDENTITY_SOURCES = ("control", "filename")
+
+
+def resolve_source_identifiers(feed_name: str, value: Any) -> dict[str, str]:
+    """Validate one feed's explicit acquisition-system identifiers."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{where(feed_name)}: `source_identifiers` must be a mapping of "
+            f"transport source to external feed id")
+    out: dict[str, str] = {}
+    for source, external_id in value.items():
+        if (not isinstance(source, str) or not source.strip()
+                or source != source.strip()):
+            raise ValueError(
+                f"{where(feed_name)}: source identifier key {source!r} must "
+                f"be a non-empty transport source without surrounding whitespace")
+        if (not isinstance(external_id, str) or not external_id.strip()
+                or external_id != external_id.strip()):
+            raise ValueError(
+                f"{where(feed_name)}: source identifier for {source!r} must "
+                f"be a non-empty string without surrounding whitespace")
+        out[source] = external_id
+    return out
+
+
+def resolve_delivery_identity(feed_name: str, value: Any) -> list[str]:
+    """Validate the small ordered Transport identity strategy."""
+    if value is None:
+        return ["filename"]
+    if (not isinstance(value, list) or not value
+            or not all(isinstance(v, str) for v in value)):
+        raise ValueError(
+            f"{where(feed_name)}: `delivery_identity` must be a non-empty "
+            f"ordered list containing: {', '.join(IDENTITY_SOURCES)}")
+    unknown = [v for v in value if v not in IDENTITY_SOURCES]
+    if unknown:
+        raise ValueError(
+            f"{where(feed_name)}: `delivery_identity` has unknown source(s) "
+            f"{', '.join(unknown)}. Valid: {', '.join(IDENTITY_SOURCES)}")
+    if len(set(value)) != len(value):
+        raise ValueError(
+            f"{where(feed_name)}: `delivery_identity` names a source more than once")
+    return list(value)
+
+
+def check_source_identifiers_are_unique(registry: dict[str, Feed]) -> None:
+    """Reject ambiguous external Feed ids across the resolved registry."""
+    claimed: dict[tuple[str, str], str] = {}
+    for name, fd in registry.items():
+        for source, external_id in fd.source_identifiers.items():
+            key = (source, external_id)
+            if key in claimed:
+                raise ValueError(
+                    f"feed {name!r}: source identifier {source}={external_id!r} "
+                    f"is already mapped by feed {claimed[key]!r}. An external "
+                    f"feed id must resolve exactly one Feed.")
+            claimed[key] = name
 
 
 # -------------------------------------------------------------- supersession
@@ -793,6 +900,166 @@ def resolve_supersession_config(feed_name: str, supersession: Any) -> dict[str, 
             f"not recognised. Valid: {', '.join(SUPERSESSION_MODES)} "
             f"(not built: {', '.join(sorted(SUPERSESSION_NOT_BUILT))})")
     return {"mode": mode}
+
+
+# -------------------------------------------------------------- migration
+# Phase 8. Migration is FEED CONFIGURATION, not DAG topology: one generic
+# comparison/orchestration machinery reads this block, so onboarding a feed
+# into dual-run never means writing a per-feed DAG, sensor or workflow.
+#
+# `mode` is the only thing that changes PRODUCTION OWNERSHIP, and it is a
+# document a human edits, never a value comparison evidence flips by itself --
+# see docs/MIGRATION.md#cutover. Comparison behaviour (`compare`) and the
+# readiness bar (`acceptance`) are independent of mode so they can be tuned
+# without touching ownership, and so historical comparison results stay
+# meaningful even after `mode` changes.
+MIGRATION_MODES = ("legacy", "dual_run", "new_primary")
+MIGRATION_CHECKPOINTS = ("raw", "prepared", "reporting")
+MIGRATION_KEYS = {"mode", "compare", "acceptance"}
+MIGRATION_COMPARE_KEYS = {"checkpoint", "table", "key", "columns", "aggregates"}
+MIGRATION_AGGREGATE_KEYS = {"column", "function", "tolerance"}
+MIGRATION_AGGREGATE_FUNCTIONS = ("sum", "count", "count_distinct", "min", "max")
+MIGRATION_ACCEPTANCE_KEYS = {"consecutive_successes", "allow_warnings"}
+
+
+def _migration_error(feed_name: str, msg: str) -> ValueError:
+    return ValueError(f"{where(feed_name)}: `migration:` {msg}")
+
+
+def resolve_migration_config(feed_name: str, migration: Any) -> dict[str, Any]:
+    """Validate a `migration:` block and fill its defaults.
+
+    Absent means `{"mode": "legacy"}` -- this feed has not entered the
+    strangler pattern at all, which is the behaviour every feed already has
+    and costs no config to declare.
+
+    Checked at LOAD, same reasoning as `supersession:` and `delivery:`: an
+    unrecognised mode or an aggregate naming a tolerance nobody can parse
+    should fail before a comparison run ever tries to use it, not silently
+    compare nothing and report green.
+    """
+    if not migration:
+        return {"mode": "legacy"}
+    if not isinstance(migration, dict):
+        raise _migration_error(
+            feed_name, f"must be a mapping, got {type(migration).__name__}")
+    unknown = set(migration) - MIGRATION_KEYS
+    if unknown:
+        raise _migration_error(
+            feed_name, f"has unknown key(s) {', '.join(sorted(unknown))}. "
+            f"Valid: {', '.join(sorted(MIGRATION_KEYS))}")
+
+    mode = migration.get("mode", "legacy")
+    if mode not in MIGRATION_MODES:
+        raise _migration_error(
+            feed_name, f"mode: {mode!r} is not recognised. "
+            f"Valid: {', '.join(MIGRATION_MODES)}")
+
+    out: dict[str, Any] = {"mode": mode}
+
+    compare = migration.get("compare")
+    if compare is not None:
+        if not isinstance(compare, dict):
+            raise _migration_error(
+                feed_name, f"compare: must be a mapping, got "
+                f"{type(compare).__name__}")
+        unknown = set(compare) - MIGRATION_COMPARE_KEYS
+        if unknown:
+            raise _migration_error(
+                feed_name, f"compare: has unknown key(s) "
+                f"{', '.join(sorted(unknown))}. Valid: "
+                f"{', '.join(sorted(MIGRATION_COMPARE_KEYS))}")
+        checkpoint = compare.get("checkpoint", "raw")
+        table = compare.get("table")
+        if table is not None and not isinstance(table, str):
+            raise _migration_error(feed_name, "compare.table: must be a string")
+        if checkpoint not in MIGRATION_CHECKPOINTS:
+            raise _migration_error(
+                feed_name, f"compare.checkpoint: {checkpoint!r} is not "
+                f"recognised. Valid: {', '.join(MIGRATION_CHECKPOINTS)}")
+        key = compare.get("key") or []
+        if not isinstance(key, list) or not all(isinstance(k, str) for k in key):
+            raise _migration_error(
+                feed_name, "compare.key: must be a list of column names")
+        columns = compare.get("columns") or []
+        if not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
+            raise _migration_error(
+                feed_name, "compare.columns: must be a list of column names")
+        aggregates_in = compare.get("aggregates") or []
+        if not isinstance(aggregates_in, list):
+            raise _migration_error(feed_name, "compare.aggregates: must be a list")
+        aggregates: list[dict[str, Any]] = []
+        for agg in aggregates_in:
+            if not isinstance(agg, dict):
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: each entry must be a "
+                    f"mapping, got {type(agg).__name__}")
+            unknown = set(agg) - MIGRATION_AGGREGATE_KEYS
+            if unknown:
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: has unknown key(s) "
+                    f"{', '.join(sorted(unknown))}. Valid: "
+                    f"{', '.join(sorted(MIGRATION_AGGREGATE_KEYS))}")
+            column = agg.get("column")
+            if not column or not isinstance(column, str):
+                raise _migration_error(
+                    feed_name, "compare.aggregates: each entry needs a "
+                    "`column`")
+            function = agg.get("function", "sum")
+            if function not in MIGRATION_AGGREGATE_FUNCTIONS:
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: function {function!r} "
+                    f"is not recognised. Valid: "
+                    f"{', '.join(MIGRATION_AGGREGATE_FUNCTIONS)}")
+            tolerance = agg.get("tolerance") or {}
+            if not isinstance(tolerance, dict):
+                raise _migration_error(
+                    feed_name, "compare.aggregates: tolerance must be a mapping "
+                    "of 'absolute' and/or 'relative'")
+            unknown = set(tolerance) - {"absolute", "relative"}
+            if unknown:
+                raise _migration_error(
+                    feed_name, f"compare.aggregates: tolerance has unknown "
+                    f"key(s) {', '.join(sorted(unknown))}. Valid: absolute, "
+                    f"relative")
+            for tkey, tval in tolerance.items():
+                if not isinstance(tval, (int, float)) or tval < 0:
+                    raise _migration_error(
+                        feed_name, f"compare.aggregates: tolerance.{tkey} "
+                        f"must be a non-negative number")
+            aggregates.append({"column": column, "function": function,
+                              "tolerance": {k: float(v) for k, v in tolerance.items()}})
+        out["compare"] = {"checkpoint": checkpoint, "table": table,
+                          "key": list(key), "columns": list(columns),
+                          "aggregates": aggregates}
+    else:
+        out["compare"] = {"checkpoint": "raw", "table": None, "key": [],
+                          "columns": [], "aggregates": []}
+
+    acceptance = migration.get("acceptance")
+    if acceptance is not None:
+        if not isinstance(acceptance, dict):
+            raise _migration_error(
+                feed_name, f"acceptance: must be a mapping, got "
+                f"{type(acceptance).__name__}")
+        unknown = set(acceptance) - MIGRATION_ACCEPTANCE_KEYS
+        if unknown:
+            raise _migration_error(
+                feed_name, f"acceptance: has unknown key(s) "
+                f"{', '.join(sorted(unknown))}. Valid: "
+                f"{', '.join(sorted(MIGRATION_ACCEPTANCE_KEYS))}")
+        consecutive = acceptance.get("consecutive_successes", 10)
+        if not isinstance(consecutive, int) or isinstance(consecutive, bool) or consecutive < 1:
+            raise _migration_error(
+                feed_name, "acceptance.consecutive_successes: must be a "
+                "positive integer")
+        allow_warnings = bool(acceptance.get("allow_warnings", False))
+        out["acceptance"] = {"consecutive_successes": consecutive,
+                             "allow_warnings": allow_warnings}
+    else:
+        out["acceptance"] = {"consecutive_successes": 10, "allow_warnings": False}
+
+    return out
 
 
 # ------------------------------------------------------------- expected_by
@@ -910,6 +1177,31 @@ def check_expected_min_rows(feed_name: str, value: Any) -> int:
     return rows
 
 
+def check_expected_max_rows(feed_name: str, value: Any) -> int | None:
+    """The ceiling above which an ingest abandons its branch. None = no ceiling.
+
+    Not cross-checked against `expected_min_rows` here: VALUE_CHECKS runs each
+    key independently and neither is guaranteed to have loaded first. An
+    inverted pair (max < min) still fails, just at the first delivery rather
+    than at load -- the same place a config error in `schema.yml`'s dbt tests
+    would surface.
+    """
+    if value is None:
+        return None
+    try:
+        rows = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{where(feed_name)}: `expected_max_rows: {value!r}` is not a "
+            f"whole number.") from None
+    if rows < 0:
+        raise ValueError(
+            f"{where(feed_name)}: `expected_max_rows: {rows}` is negative, so "
+            f"the ceiling can never NOT fire. Omit the key to declare no "
+            f"ceiling.")
+    return rows
+
+
 def check_single_char(feed_name: str, key: str, value: Any) -> str:
     """`delimiter` and `quote_char` reach Spark's `sep` and `quote`.
 
@@ -932,11 +1224,7 @@ def check_single_char(feed_name: str, key: str, value: Any) -> str:
 
 
 def check_file_encoding(feed_name: str, value: Any) -> str:
-    """The codec the delivery is read with.
-
-    `codecs.lookup` rather than a list, because the set of valid encodings is
-    Python's and restating a subset of it would refuse something that works.
-    """
+    """The data codec must have a tested Python/Java reader mapping."""
     text = str(value).strip()
     try:
         codecs.lookup(text)
@@ -944,7 +1232,29 @@ def check_file_encoding(feed_name: str, value: Any) -> str:
         raise ValueError(
             f"{where(feed_name)}: `file_encoding: {value!r}` is not an "
             f"encoding Python knows. Try utf-8, latin-1 or cp1252.") from None
+    from reporting_platform.common.parsing import spark_encoding
+    try:
+        spark_encoding(text)
+    except ValueError as exc:
+        raise ValueError(f"{where(feed_name)}: file_encoding: {exc}") from exc
     return text
+
+
+def check_control_encoding(feed_name: str, value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        codecs.lookup(text)
+        b"".decode(text)
+    except (LookupError, ValueError) as exc:
+        raise ValueError(f"{where(feed_name)}: control_encoding {value!r} is not a Python text codec") from exc
+    return text
+
+
+def check_csv_options(feed_name: str, value: Any) -> dict:
+    from reporting_platform.common.parsing import check_csv_options as check
+    return check(feed_name, value)
 
 
 # DECLARED-ONLY, and that is what keeps the defaults in one place. A key
@@ -956,7 +1266,10 @@ VALUE_CHECKS = (
     ("cadence", check_cadence),
     ("schema_drift", check_schema_drift),
     ("expected_min_rows", check_expected_min_rows),
+    ("expected_max_rows", check_expected_max_rows),
     ("file_encoding", check_file_encoding),
+    ("control_encoding", check_control_encoding),
+    ("csv_options", check_csv_options),
 )
 
 
@@ -1490,6 +1803,12 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
             block["name"], merged.get("expected_by"))
         merged["retention_class"] = check_retention_class(
             block["name"], merged.get("retention_class"))
+        merged["source_identifiers"] = resolve_source_identifiers(
+            block["name"], merged.get("source_identifiers"))
+        merged["delivery_identity"] = resolve_delivery_identity(
+            block["name"], merged.get("delivery_identity"))
+        merged["migration"] = resolve_migration_config(
+            block["name"], merged.get("migration"))
         for key, check in VALUE_CHECKS:
             if key in merged:
                 merged[key] = check(name, merged[key])
@@ -1509,6 +1828,7 @@ def _feeds_at(key: tuple[tuple[str, int], ...]) -> dict[str, Feed]:
     # registry rather than about a feed: whether two feeds can be told apart
     # is not a question either of them can answer alone.
     check_control_patterns_are_distinguishable(out)
+    check_source_identifiers_are_unique(out)
     return out
 
 
@@ -1886,7 +2206,12 @@ def model_sources(layer: str, model: str) -> list[tuple[str, str]]:
     model name == feed name it already knows the feed -- but a lineage graph
     has to name the raw table that prepared model actually reads.
     """
-    return _SOURCE_RE.findall(_model_sql(layer, model))
+    sql = _model_sql(layer, model)
+    # An SCD2 model names its raw table as scd2_prepared()'s `source_name`,
+    # and the macro calls source('raw', <it>) -- the same input, spelled
+    # through the one macro that builds such a model (dbt/macros/scd2.sql).
+    return (_SOURCE_RE.findall(sql)
+            + [("raw", t) for t in _SCD2_SOURCE_RE.findall(sql)])
 
 
 def _model_sql(layer: str, model: str) -> str:
@@ -1900,6 +2225,8 @@ _REF_RE = re.compile(r"""\bref\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
 _SOURCE_RE = re.compile(
     r"""\bsource\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*,"""
     r"""\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
+_SCD2_SOURCE_RE = re.compile(
+    r"""\bscd2_prepared\(\s*source_name\s*=\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]""")
 
 
 def retention_policy(layer: str) -> dict[str, Any]:
@@ -2153,6 +2480,20 @@ def new_run_id() -> str:
 def branch_name(purpose: str, scope: str, cob_date: date, run_id: str) -> str:
     """<purpose>/<scope>/<cob_date>/<run_id> — see docs/ARCHITECTURE.md."""
     return f"{purpose}/{scope}/{cob_date:%Y-%m-%d}/{run_id}"
+
+
+def ingest_attempt_id(airflow_run_id: str, try_number: int) -> str:
+    """The run id an ingest ATTEMPT names its branch with: `<run>-a<n>`.
+
+    One per attempt, not per Airflow run. A failed ingest keeps its branch
+    for inspection, so a retry reusing the name died on Nessie's 409 and
+    could never succeed. Reusing the branch instead (`exist_ok`, as the dbt
+    builds do) is wrong HERE: an attempt that failed after its append would
+    leave rows the retry appends again. A fresh branch starts from `main`.
+    See docs/DECISIONS.md#a-refusal-is-not-retried
+    """
+    base = airflow_run_id.replace(":", "").replace("+", "")[-21:]
+    return f"{base}-a{int(try_number)}"
 
 
 def published_tag(report: str, cob_date: date, run_id: str) -> str:

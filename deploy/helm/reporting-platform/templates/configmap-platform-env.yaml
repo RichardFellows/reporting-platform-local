@@ -1,0 +1,106 @@
+{{- /*
+Every NON-SECRET variable `reporting_platform/common/settings.py` reads
+outside `local`, in one ConfigMap that every platform pod -- Airflow's own
+(via `airflow.extraEnvFrom`), the Spark driver pods `_spark_task.driver_pod`
+launches, the inbox watcher and the console -- reads with envFrom, so no two
+can disagree. See values.yaml's banner comment and
+docs/DECISIONS.md#the-chart-is-the-only-place-settings-are-written.
+
+`required` on every endpoint and image: settings.py refuses a missing one
+outside `local` with a message naming the variable, and a chart that let a
+render succeed with an empty S3_ENDPOINT would just move that failure from
+`helm template` (loud, at deploy time) to the first pod that starts (quiet,
+at 3am). REGISTRY_DSN is on settings.REQUIRED too, but it is a CREDENTIAL --
+see secret-platform.yaml.
+*/ -}}
+{{- $controlled := include "reporting-platform.controlled" . -}}
+{{- include "reporting-platform.refuseFeedConsole" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "reporting-platform.envConfigMap" . }}
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+data:
+  REPORTING_ENV: {{ required "environment is required" .Values.environment | quote }}
+
+  # -------------------------------------------------------------- endpoints
+  S3_ENDPOINT: {{ required "endpoints.s3 (S3_ENDPOINT) is required outside `local`" .Values.endpoints.s3 | quote }}
+  AWS_REGION: {{ required "endpoints.region (AWS_REGION) is required" .Values.endpoints.region | quote }}
+  NESSIE_URI: {{ required "endpoints.nessie (NESSIE_URI) is required" .Values.endpoints.nessie | quote }}
+  REPORTING_WAREHOUSE: {{ required "endpoints.warehouse (REPORTING_WAREHOUSE) is required" .Values.endpoints.warehouse | quote }}
+  REPORTING_LANDING: {{ required "endpoints.landing (REPORTING_LANDING) is required" .Values.endpoints.landing | quote }}
+  REPORTING_CATALOG: {{ required "endpoints.catalog (REPORTING_CATALOG) is required" .Values.endpoints.catalog | quote }}
+
+  # docs/DECISIONS.md#nessie-auth-is-a-setting
+  NESSIE_AUTH_TYPE: {{ required "nessie.authType is required" .Values.nessie.authType | quote }}
+
+  # ------------------------------------------------------------ execution mode
+  # docs/DECISIONS.md#execution-mode-is-configuration
+  PLATFORM_EXECUTION: "kubernetes"
+  SPARK_MASTER: {{ required "spark.master is required" .Values.spark.master | quote }}
+  SPARK_K8S_NAMESPACE: {{ .Release.Namespace | quote }}
+  SPARK_DRIVER_IMAGE: {{ include "reporting-platform.image" (dict
+      "repo" .Values.images.platform.repository
+      "digest" .Values.images.platform.digest
+      "tag" .Values.images.platform.tag
+      "name" "images.platform"
+      "environment" .Values.environment
+      "controlled" $controlled) | quote }}
+  SPARK_EXECUTOR_IMAGE: {{ include "reporting-platform.image" (dict
+      "repo" .Values.images.spark.repository
+      "digest" .Values.images.spark.digest
+      "tag" .Values.images.spark.tag
+      "name" "images.spark"
+      "environment" .Values.environment
+      "controlled" $controlled) | quote }}
+  SPARK_SERVICE_ACCOUNT: {{ required "spark.serviceAccount is required" .Values.spark.serviceAccount | quote }}
+  PLATFORM_ENV_CONFIGMAP: {{ include "reporting-platform.envConfigMap" . | quote }}
+  PLATFORM_ENV_SECRET: {{ include "reporting-platform.envSecret" . | quote }}
+  SPARK_APP_CORES: {{ required "spark.appCores is required" .Values.spark.appCores | quote }}
+  SPARK_APP_MEMORY: {{ required "spark.appMemory is required" .Values.spark.appMemory | quote }}
+  SPARK_APP_EXECUTORS: {{ required "spark.appExecutors is required" .Values.spark.appExecutors | quote }}
+
+  # dbt is the exception to execution mode: its driver stays LOCAL in the
+  # Airflow task/worker pod in every mode, only its executors move.
+  # See docs/DECISIONS.md#execution-mode-is-configuration
+  DBT_TARGET: "spark_ocp"
+
+  # docs/DECISIONS.md#one-shared-write-pool -- ABOVE 1 THE POOL EXCLUDES NOTHING
+  LAKEHOUSE_WRITE_SLOTS: {{ .Values.lakehouseWriteSlots | required "lakehouseWriteSlots is required" | quote }}
+
+  # ---------------------------------------------------------- change provenance
+  # docs/DECISIONS.md#a-change-is-a-deployment-event-not-a-run-event
+  # The platform release image IS the code identity every run records --
+  # a tag can be re-pushed under a run already published, a digest cannot.
+  PLATFORM_CODE_REF: {{ include "reporting-platform.image" (dict
+      "repo" .Values.images.platform.repository
+      "digest" .Values.images.platform.digest
+      "tag" .Values.images.platform.tag
+      "name" "images.platform"
+      "environment" .Values.environment
+      "controlled" $controlled) | quote }}
+  # REQUIRED ONLY IN uat/prod. `dev` deliberately declares no project ref:
+  # the console edits the project there, which is the drift
+  # check_project_drift() must NOT refuse on (context.dbt_project_ref's
+  # docstring; it refuses only in CONTROLLED_ENVIRONMENTS). Empty is a
+  # legitimate value outside them, and the run records it as such.
+  {{- $p := .Values.provenance }}
+  {{- if eq $controlled "true" }}
+  DBT_PROJECT_REF: {{ required (printf "provenance.dbtProjectRef is required in %s" .Values.environment) $p.dbtProjectRef | quote }}
+  DBT_PROJECT_DIGEST: {{ required (printf "provenance.dbtProjectDigest is required in %s" .Values.environment) $p.dbtProjectDigest | quote }}
+  DEPLOYMENT_CHANGE_REF: {{ required (printf "provenance.deploymentChangeRef is required in %s" .Values.environment) $p.deploymentChangeRef | quote }}
+  DEPLOYMENT_PIPELINE_REF: {{ required (printf "provenance.deploymentPipelineRef is required in %s" .Values.environment) $p.deploymentPipelineRef | quote }}
+  {{- else }}
+  DBT_PROJECT_REF: {{ $p.dbtProjectRef | default "" | quote }}
+  DBT_PROJECT_DIGEST: {{ $p.dbtProjectDigest | default "" | quote }}
+  DEPLOYMENT_CHANGE_REF: {{ $p.deploymentChangeRef | default "" | quote }}
+  DEPLOYMENT_PIPELINE_REF: {{ $p.deploymentPipelineRef | default "" | quote }}
+  {{- end }}
+
+  # ---------------------------------------------------------------- operational
+  # The console and the inbox trigger/poll DAG runs through Airflow's own REST
+  # API, the same way locally and here -- only the host changes. `-webserver`
+  # is the official chart's own Service name (verified with `helm template`);
+  # it is not one of this chart's own resources so there is no helper for it.
+  AIRFLOW_API_URL: "http://{{ .Release.Name }}-webserver:8080/api/v1"

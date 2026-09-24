@@ -84,7 +84,7 @@ def platform_names(headers: list[str]) -> tuple[list[str], dict[str, str]]:
 # `raw_namespace` set by hand survives an edit through the UI.
 BLOCK_ORDER = ["name", "description", "source_system", "convention",
                "filename_pattern", "arrival", "delivery",
-               "delimiter", "quote_char", "header", "file_encoding",
+               "delimiter", "quote_char", "header", "file_encoding", "control_encoding", "csv_options",
                "business_key", "expected_min_rows", "cadence",
                "delivery_expected", "expected_by", "retention_class",
                "schema_drift", "columns", "column_types"]
@@ -102,7 +102,7 @@ BLOCK_ORDER = ["name", "description", "source_system", "convention",
 OPTIONAL_WITH_DEFAULT = {"cadence": "daily", "delivery_expected": True,
                          "schema_drift": "warn", "delimiter": ",",
                          "quote_char": '"', "header": True,
-                         "file_encoding": "utf-8", "expected_by": "",
+                         "file_encoding": "utf-8", "control_encoding": None, "csv_options": {}, "expected_by": "",
                          "retention_class": "standard"}
 
 # Two-character sequences a person types into a one-character field, because
@@ -182,6 +182,8 @@ class FeedSpec:
     quote_char: str = '"'
     header: bool = True
     file_encoding: str = "utf-8"
+    control_encoding: str | None = None
+    csv_options: dict[str, Any] = field(default_factory=dict)
     # Sparse: ONLY the columns whose type disagrees with infer_type()'s guess.
     # The caller reduces it (scaffold.overrides_only) before handing it over,
     # so this module stays ignorant of how a type is guessed.
@@ -216,6 +218,8 @@ class FeedSpec:
             quote_char=unescape_char(str(payload.get("quote_char") or '"')),
             header=bool(payload.get("header", True)),
             file_encoding=str(payload.get("file_encoding") or "utf-8").strip(),
+            control_encoding=payload.get("control_encoding") or None,
+            csv_options=payload.get("csv_options", {}),
             column_types={str(k): str(v) for k, v in
                           (payload.get("column_types") or {}).items() if v},
             source_columns={str(k): str(v) for k, v in
@@ -290,7 +294,8 @@ def _delivery_from_payload(raw: Any) -> dict[str, Any]:
     if parts:
         out["parts"] = parts
     control = _control_from_payload(raw.get("control"),
-                                    ("pattern", "row_count", "md5"))
+                                    ("pattern", "cob_date", "version",
+                                     "row_count", "md5"))
     if control:
         out["control"] = control
     return out
@@ -320,8 +325,11 @@ def _control_from_payload(raw: Any, keys: tuple[str, ...]) -> dict[str, Any]:
     # `context.resolve_control_format`'s to decide, in `validate()`, which is
     # the same function feeds.yml load calls.
     fmt = raw.get("format")
-    if out and isinstance(fmt, dict) and str(fmt.get("kind") or "") == "delimited":
-        out["format"] = _format_from_payload(fmt)
+    if out and isinstance(fmt, dict):
+        if fmt.get("kind") == "delimited":
+            out["format"] = _format_from_payload(fmt)
+        elif fmt.get("kind") == "key_value":
+            out["format"] = dict(fmt)
     return out
 
 
@@ -548,6 +556,7 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
     # alongside the two that were already shared.
     from reporting_platform.common.context import (
         check_cadence, check_expected_min_rows, check_file_encoding,
+        check_control_encoding, check_csv_options,
         check_retention_class, check_schema_drift, check_single_char,
         parse_expected_by,
     )
@@ -561,7 +570,9 @@ def validate(spec: FeedSpec, *, existing: set[str], updating: bool = False) -> N
              spec.expected_min_rows),
             ("delimiter", named("delimiter"), spec.delimiter),
             ("quote_char", named("quote_char"), spec.quote_char),
-            ("file_encoding", check_file_encoding, spec.file_encoding)):
+            ("file_encoding", check_file_encoding, spec.file_encoding),
+            ("control_encoding", check_control_encoding, spec.control_encoding),
+            ("csv_options", check_csv_options, spec.csv_options)):
         try:
             check(spec.name or "this feed", value)
         except ValueError as exc:
@@ -674,6 +685,8 @@ def _control_block(control: dict[str, Any], fields: tuple[str, ...]) -> Commente
         # inherited values. `header: false` is never a default and always
         # travels, because `columns` alone is rejected without it.
         fv["kind"] = fmt.get("kind", "delimited")
+        if "separator" in fmt:
+            fv["separator"] = SQ(fmt["separator"])
         if fmt.get("delimiter"):
             fv["delimiter"] = SQ(fmt["delimiter"])
         if fmt.get("quote_char", '"') != '"':
@@ -708,7 +721,8 @@ def _delivery_block(value: dict[str, Any]) -> CommentedMap:
         dv["parts"] = value["parts"]
     control = value.get("control")
     if isinstance(control, dict) and control:
-        dv["control"] = _control_block(control, ("row_count", "md5"))
+        dv["control"] = _control_block(
+            control, ("cob_date", "version", "row_count", "md5"))
     return dv
 
 
@@ -894,6 +908,7 @@ def spec_from_feed(fd: Feed) -> FeedSpec:
         filename_pattern=fd.filename_pattern,
         delimiter=fd.delimiter, quote_char=fd.quote_char,
         header=fd.header, file_encoding=fd.file_encoding, business_key=list(fd.business_key),
+        control_encoding=fd.control_encoding, csv_options=dict(fd.csv_options),
         columns=list(fd.columns), expected_min_rows=fd.expected_min_rows,
         cadence=fd.cadence, delivery_expected=fd.delivery_expected,
         schema_drift=fd.schema_drift, convention=fd.convention,

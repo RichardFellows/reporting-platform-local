@@ -106,6 +106,7 @@
 <main>
   <aside>
     <button class="newbtn" id="new-feed">+ New feed</button>
+    <button class="newbtn" id="cob-status-btn">COB Status</button>
     <button class="newbtn" id="arrivals-btn">Arrivals</button>
     <button class="newbtn" id="unclaimed-btn">Unclaimed deliveries</button>
     <div id="feed-list"></div>
@@ -392,6 +393,8 @@ function feedForm(f, creating) {
                              value: f?.quote_char ?? '"'});
   const encoding = el("input", {class: "mono", style: "width:10em",
                                 value: f?.file_encoding ?? "utf-8"});
+  let csvOptions = {...(f?.csv_options ?? {})};
+  const controlEncoding = el("input", {class: "mono", value: f?.control_encoding ?? "", placeholder: "same as data"});
   const hasHeader = el("input", {type: "checkbox"});
   hasHeader.checked = f ? f.header : true;
 
@@ -642,10 +645,11 @@ function feedForm(f, creating) {
   const ctlFormat0 = f?.delivery?.control?.format ?? f?.arrival?.control?.format;
   const isDelimited0 = ctlFormat0?.kind === "delimited";
   const ctlFormat = el("select", {}, [
-    el("option", {value: "regex", selected: isDelimited0 ? null : "selected"},
+    el("option", {value: "regex", selected: !ctlFormat0 || ctlFormat0.kind === "regex" ? "selected" : null},
        "text \u2014 a pattern per field"),
     el("option", {value: "delimited", selected: isDelimited0 ? "selected" : null},
        "delimited \u2014 a column per field"),
+    el("option", {value: "key_value", selected: ctlFormat0?.kind === "key_value" ? "selected" : null}, "key/value — a key per field"),
   ]);
   const ctlDelimiter = el("input", {class: "mono", style: "max-width:90px",
     value: ctlFormat0?.delimiter ?? "|", placeholder: "|"});
@@ -736,14 +740,15 @@ function feedForm(f, creating) {
   // label. Retitled rather than duplicated: it is the same setting either way.
   function syncControlFormat() {
     const delimited = ctlFormat.value === "delimited";
+    const keyValue = ctlFormat.value === "key_value";
     ctlFormatFields.style.display = delimited ? "" : "none";
-    arrCtlDateLabel.textContent = delimited ? "COB date column" : "COB date pattern";
-    arrCtlDateHelp.style.display = delimited ? "none" : "";
+    arrCtlDateLabel.textContent = delimited ? "COB date column" : keyValue ? "COB date key" : "COB date pattern";
+    arrCtlDateHelp.style.display = delimited || keyValue ? "none" : "";
     arrCtlDate.placeholder = delimited
       ? "BUSINESS_DATE" : "ReportingDate\\|(?P<cob_date>\\d{8})";
     controlRowCountLabel.textContent = delimited
       ? "Declared row count column (optional)"
-      : "Declared row count pattern (optional)";
+      : keyValue ? "Declared row count key (optional)" : "Declared row count pattern (optional)";
     controlRowCount.placeholder = delimited
       ? "RECORD_COUNT  (optional)" : "ROWS=(?P<rows>\\d+)  (optional)";
     controlMd5Label.textContent = delimited
@@ -855,6 +860,8 @@ function feedForm(f, creating) {
     setDelimiterField(r.delimiter);
     quote.value = r.quote_char;
     encoding.value = r.file_encoding;
+    csvOptions = {...(r.csv_options ?? {})};
+    if (r.control_encoding) controlEncoding.value = r.control_encoding;
     hasHeader.checked = r.header;
     colsBox.textContent = "";
     for (const c of r.columns)
@@ -1079,6 +1086,7 @@ function feedForm(f, creating) {
         "Leave as \" unless the source quotes with something else."),
     ]),
     el("div", {class: "grid2"}, [
+      field("control_encoding", "Control file encoding", controlEncoding, "Leave blank to use the data file encoding. Changing it requires validating the paired samples again."),
       field("file_encoding", "File encoding", encoding,
         "utf-8 unless the source says otherwise \u2014 latin-1 and cp1252 are the usual others."),
       el("div", {class: "field"}, [
@@ -1118,6 +1126,7 @@ function feedForm(f, creating) {
   // Null when the format is the default, so an ordinary feed's block keeps
   // the shape it has always had in the diff.
   const readControlFormat = () => {
+    if (ctlFormat.value === "key_value") return {kind: "key_value", separator: ctlFormat0?.separator ?? "="};
     if (ctlFormat.value !== "delimited") return null;
     const out = {kind: "delimited", delimiter: ctlDelimiter.value};
     const cols = ctlColumns.value.split(",").map(c => c.trim()).filter(Boolean);
@@ -1195,6 +1204,8 @@ function feedForm(f, creating) {
       delimiter: readDelim(),
       quote_char: quote.value,
       file_encoding: encoding.value.trim(),
+      control_encoding: controlEncoding.value.trim() || null,
+      csv_options: csvOptions,
       header: hasHeader.checked,
       delivery: readDelivery(),
       arrival: readArrival(),
@@ -1503,6 +1514,132 @@ function ingestPill(a) {
                               ? "\n\n" + g.runs.length + " runs name this " +
                                 "delivery; the newest is shown."
                               : "")}, r.state || "—");
+}
+
+// -------------------------------------------------------------- cob status
+// The reporting-platform's own operational view, replacing the Airflow DAG
+// list as the place an operator answers "what is missing for this COB
+// date". A read of durable facts (registry.transport_receipt,
+// registry.delivery, registry.delivery_committed) assembled server-side by
+// monitoring/feed_status.py -- this page renders it, it does not compute it.
+const STATUS_CLASS = {
+  COMPLETE: "ok", PROCESSING: "warn", RECEIVED: "warn", WAITING: "",
+  MISSING: "bad", FAILED: "bad", NOT_EXPECTED: "",
+};
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function showCobStatus() {
+  STATE.selected = null;
+  loadFeeds();
+  const d = $("#detail");
+  d.textContent = "";
+  d.append(
+    el("h2", {}, "COB Status"),
+    el("div", {class: "sub"},
+      "For one COB date: which feeds were expected, which arrived, which " +
+      "are processing, which completed, which failed, and which have not " +
+      "shown up. Derived from durable platform facts, not from the Airflow " +
+      "DAG list -- generic ingestion means a DAG run no longer corresponds " +
+      "to one feed."));
+  const body = el("div");
+  d.append(body);
+  renderCobStatus(body);
+}
+
+async function renderCobStatus(target) {
+  target.textContent = "";
+  const controls = el("div", {class: "row", style: "margin:16px 0 8px"});
+  const dateInput = el("input", {type: "date", value: todayIso()});
+  const today = el("button", {class: "act"}, "Today");
+  const refresh = el("button", {class: "act"}, "Refresh");
+  const summary = el("div", {class: "row", style: "gap:6px;margin:10px 0"});
+  const box = el("div");
+  controls.append(
+    el("div", {}, [el("label", {}, "COB date"), dateInput]), today, refresh);
+  target.append(controls, summary, box);
+
+  // Recent dates are offered as a datalist rather than a second control, so
+  // picking one is optional and typing any date always works.
+  const options = el("datalist", {id: "cob-dates"});
+  target.append(options);
+  dateInput.setAttribute("list", "cob-dates");
+  api("/api/cob-status/dates").then(r => {
+    for (const dt of r.dates || [])
+      options.append(el("option", {value: dt}));
+  }).catch(() => {});
+
+  const draw = async () => {
+    box.textContent = "";
+    box.append(el("div", {class: "empty"}, "Loading…"));
+    summary.textContent = "";
+    let data;
+    try {
+      data = await api("/api/cob-status?cob_date=" +
+                       encodeURIComponent(dateInput.value || todayIso()));
+    } catch (err) {
+      box.textContent = "";
+      box.append(el("div", {class: "note warn"}, err.message));
+      return;
+    }
+    const s = data.summary;
+    const pill = (label, n, cls) =>
+      el("span", {class: "pill" + (n && cls ? " " + cls : "")}, n + " " + label);
+    summary.append(
+      pill("expected", s.expected, ""), pill("complete", s.complete, "ok"),
+      pill("processing", s.processing, "warn"),
+      pill("received", s.received, "warn"),
+      pill("waiting", s.waiting, ""), pill("missing", s.missing, "bad"),
+      pill("failed", s.failed, "bad"));
+
+    box.textContent = "";
+    if (!data.systems.length) {
+      box.append(el("div", {class: "empty"}, "No feeds are configured."));
+      return;
+    }
+    for (const sys of data.systems) {
+      box.append(el("h3", {}, sys.source_system));
+      const t = el("table");
+      t.append(el("thead", {}, el("tr", {}, [
+        el("th", {}, "Feed"), el("th", {}, "Expected by"),
+        el("th", {}, "Received"), el("th", {}, "Completed"),
+        el("th", {}, "Status")])));
+      const tb = el("tbody");
+      for (const f of sys.feeds) {
+        const clickable = !!f.delivery_id;
+        const statusCell = el("span",
+          {class: "pill " + (STATUS_CLASS[f.status] || ""),
+           title: f.status === "FAILED" ? (f.failure_reason || "") : ""},
+          f.status + (f.late ? " (late)" : ""));
+        const tr = el("tr", {}, [
+          el("td", {}, f.name && f.name !== f.feed
+              ? [el("div", {}, f.feed), el("div", {class: "sub"}, f.name)]
+              : f.feed),
+          el("td", {class: "muted"}, f.expected_by || "—"),
+          el("td", {class: "muted"}, f.received_at ? ts(f.received_at) : "—"),
+          el("td", {class: "muted"}, f.completed_at ? ts(f.completed_at) : "—"),
+          el("td", {}, statusCell),
+        ]);
+        if (clickable) {
+          tr.style.cursor = "pointer";
+          tr.title = "open this delivery";
+          tr.addEventListener("click", () => showArrival(f.feed, f.delivery_id));
+        } else if (f.transport_id) {
+          tr.title = "transport " + f.transport_id +
+            (f.airflow_run_id ? " · Airflow run " + f.airflow_run_id : "");
+        }
+        tb.append(tr);
+      }
+      t.append(tb);
+      box.append(el("div", {class: "scroll", style: "margin-bottom:18px"}, t));
+    }
+  };
+  dateInput.addEventListener("change", draw);
+  today.addEventListener("click", () => { dateInput.value = todayIso(); draw(); });
+  refresh.addEventListener("click", (e) => withBusy(e.target, draw));
+  await draw();
 }
 
 async function showArrivals() {
@@ -2400,6 +2537,7 @@ async function health() {
     }
   }).catch(() => { /* the hardcoded defaults stand */ });
   $("#new-feed").addEventListener("click", () => newFeed());
+  $("#cob-status-btn").addEventListener("click", showCobStatus);
   $("#arrivals-btn").addEventListener("click", showArrivals);
   $("#unclaimed-btn").addEventListener("click", showUnclaimed);
   await loadFeeds();

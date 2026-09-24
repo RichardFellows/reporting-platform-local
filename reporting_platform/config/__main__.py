@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import sys
 
 
@@ -67,8 +68,22 @@ def _check() -> int:
     names its file -- this just provides the seam to run them in CI without
     starting a container, and reports the counts so a config that loads but
     resolves to nothing cannot pass quietly.
+
+    It also refuses an environment that lacks a setting it requires. Outside
+    `local` the endpoints have no defaults, and a deployment missing one
+    should fail HERE, naming the variable, not in the first task to connect.
+    See docs/DECISIONS.md#settings-refuse-outside-local
     """
+    from reporting_platform.common import settings
     from reporting_platform.common.context import conventions, feeds
+    unset = settings.missing()
+    if unset:
+        print(f"REPORTING_ENV is {settings.env()!r}, PLATFORM_EXECUTION is "
+              f"{os.environ.get('PLATFORM_EXECUTION', 'local')!r}, and these "
+              f"required settings are unset or invalid: {', '.join(unset)}. "
+              f"Only the endpoints have defaults, and only in `local`.",
+              file=sys.stderr)
+        return 1
     try:
         registry, known = feeds(), conventions()
     except Exception as exc:                                 # noqa: BLE001
@@ -90,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     show.add_argument("--origin", action="store_true",
                       help="name the tier each value came from")
     sub.add_parser("list", help="every feed, with its convention")
-    sub.add_parser("check", help="load the registry; exit 1 if it will not")
+    sub.add_parser("check", help="load the registry and the settings "
+                   "this REPORTING_ENV requires; exit 1 if either fails")
     args = parser.parse_args(argv)
     if args.cmd == "show":
         return _show(args.feed, args.origin)

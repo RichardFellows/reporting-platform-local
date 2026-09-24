@@ -1,0 +1,4 @@
+position_id|desk_code|amount|currency|effective_date|is_active|description
+HP001| rates |1250.50|gbp|2026-09-14|Y|First dummy position
+HP002|credit|249.50|GBP|2026-09-14|N|Second dummy position
+HP003|rates|-100.00|usd|2026-09-14|true|"Quoted | pipe"

@@ -47,7 +47,9 @@ import re
 
 import duckdb
 
-from tests.test_dedupe_rank import D1, D2, DBT, PREPARED, _Config, _render, _run
+from tests.test_dedupe_rank import (
+    D1, D2, DBT, PREPARED, _SHIMS, _Config, _duck, _render, _run,
+)
 
 # (model, key columns, the attribute that changes, constant attributes)
 MODELS = (
@@ -63,21 +65,8 @@ DELETED = "0001-01-01"
 
 
 # ------------------------------------------------------------ engine shims
-_SHIMS = {
-    "sha2": "create macro spark_sha2(s, n) as sha256(s)",
-    "date_sub": "create macro spark_date_sub(d, n) as (d - n::integer)",
-    "trunc": "create macro spark_trunc(d, fmt) as date_trunc('month', d)::date",
-    "to_date": ("create macro spark_to_date(s, fmt) as (case fmt "
-                "when 'yyyy-MM-dd' then try_strptime(s, '%Y-%m-%d') "
-                "else try_strptime(s, '%Y%m%d') end)::date"),
-    "element_at": "create macro spark_element_at(l, i) as list_extract(l, i)",
-}
-
-
-def _duck(sql: str) -> str:
-    for fn in _SHIMS:
-        sql = re.sub(rf"\b{fn}\(", f"spark_{fn}(", sql, flags=re.I)
-    return sql
+# `_SHIMS` and `_duck` live in test_dedupe_rank, which needs them too now that
+# the date-partitioned models rank after cleaning.
 
 
 def _connect():
@@ -169,10 +158,18 @@ def _assert_merge_cardinality(con, merge_sql: str):
             f"{bad} target row(s) of {target} matched by more than one source row")
 
 
+def _pointed_at_src(name: str) -> str:
+    """The model's text with its raw source renamed to the fixture's `src`,
+    in both spellings a model may use: a hand-written model's
+    `source('raw', ...)` and an scd2_prepared() call's `source_name=`."""
+    return ((PREPARED / f"{name}.sql").read_text(encoding="utf-8")
+            .replace(f"source('raw', '{name}')", "source('raw', 'src')")
+            .replace(f"source_name='{name}'", "source_name='src'"))
+
+
 def _build(con, name: str, target: str, incremental: bool,
            invocation_id: str = "test-invocation", nessie_ref: str | None = None):
-    text = (PREPARED / f"{name}.sql").read_text(encoding="utf-8").replace(
-        f"source('raw', '{name}')", "source('raw', 'src')")
+    text = _pointed_at_src(name)
     config = _Config({})
     exists = con.execute(
         f"select count(*) from information_schema.tables where table_name = '{target}'"
@@ -206,7 +203,7 @@ def _build(con, name: str, target: str, incremental: bool,
 
 # -------------------------------------------------------------------- data
 def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts,
-             second_key="AGENCY1"):
+             second_key="AGENCY1", delivery_id=None, source_file=None):
     """Append one delivery to `raw_src`. `rows` maps the first key AS RAW HAS
     IT (padding included) to the changing attribute; any second key is
     `second_key`, also as raw has it."""
@@ -215,10 +212,12 @@ def _deliver(con, keys, attr, constants, cob_date, version, rows, ingest_ts,
     for n, (key, value) in enumerate(rows.items(), 1):
         record = [key] + [second_key for _ in keys[1:]] + [value] + list(constants.values())
         lits = ", ".join("null" if v is None else f"'{v}'" for v in record)
+        physical = source_file or f"landing/x_{cob_date}_v{version}.csv"
+        delivery = delivery_id or f"x_{cob_date}_v{version}.csv"
         values.append(f"(date '{cob_date}', {version}, {n}, {lits}, "
-                      f"'landing/x_{cob_date}_v{version}.csv', 'b{version}', "
+                      f"'{physical}', 'b{version}', "
                       f"null::timestamp, timestamp '{ingest_ts}', "
-                      f"'x_{cob_date}_v{version}.csv', 'sv1', 'X')")
+                      f"'{delivery}', 'sv1', 'X')")
     exists = con.execute("select count(*) from information_schema.tables "
                          "where table_name = 'raw_src'").fetchone()[0]
     if not exists:
@@ -500,8 +499,7 @@ def _replay_case(con, name, keys, attr, constants):
         from (values ('{D2}', 'A', false), ('2026-09-10', 'A', true),
                      ('2026-06-01', 'B', true)) t(effective_from, k, is_current)
     """)
-    return (PREPARED / f"{name}.sql").read_text(encoding="utf-8").replace(
-        f"source('raw', '{name}')", "source('raw', 'src')")
+    return _pointed_at_src(name)
 
 
 REPLAYED = "select cob_date::varchar, counterparty_id, source_file_version from replayed order by 1, 2"
@@ -618,6 +616,36 @@ def test_a_reopened_seed_row_carries_this_runs_audit_columns():
         ).fetchall()
         assert w == [("2026-08-31", "run3", "build/run3",
                       "landing/x_2026-07-01_v1.csv")], (name, w)
+
+
+def test_changed_versions_keep_the_delivery_that_created_each_version():
+    """A replay may revisit old rows, but it must not rewrite their source."""
+    name, keys, attr, constants = MODELS[0]
+    con = _connect()
+    _deliver(con, keys, attr, constants, "2026-09-01", 1, {"B": "X"},
+             "2026-09-02 06:00", delivery_id="dlv_A")
+    _build(con, name, INC, incremental=True)
+    _deliver(con, keys, attr, constants, "2026-09-02", 1, {"B": "Y"},
+             "2026-09-03 06:00", delivery_id="dlv_B")
+    _build(con, name, INC, incremental=True)
+    assert con.execute(
+        f"select legal_name, delivery_id from {INC} "
+        "where counterparty_id = 'B' order by effective_from"
+    ).fetchall() == [("X", "dlv_A"), ("Y", "dlv_B")]
+
+
+def test_unchanged_delivery_is_not_a_published_scd2_input():
+    """Delivery B was scanned, but no version in the result came from it."""
+    name, keys, attr, constants = MODELS[0]
+    con = _connect()
+    _deliver(con, keys, attr, constants, "2026-09-01", 1, {"B": "X"},
+             "2026-09-02 06:00", delivery_id="dlv_A")
+    _deliver(con, keys, attr, constants, "2026-09-02", 1, {"B": "X"},
+             "2026-09-03 06:00", delivery_id="dlv_B")
+    _build(con, name, FULL, incremental=False)
+    assert con.execute(
+        f"select distinct delivery_id from {FULL} order by delivery_id"
+    ).fetchall() == [("dlv_A",)]
 
 
 def test_the_harness_refuses_a_merge_spark_would_refuse():

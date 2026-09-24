@@ -25,7 +25,9 @@ from tests.support import DAGS, config_dir
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 LIFECYCLE = REPO / "reporting_platform" / "registry" / "lifecycle.py"
-DBT_BUILDS = DAGS / "dbt_builds.py"
+# The publish sequence. It was the body of a task in dbt_builds.py, which
+# now calls it (tests/test_transform.py checks that it only calls it).
+WAP = REPO / "reporting_platform" / "transform" / "wap.py"
 
 
 def _ctx():
@@ -86,7 +88,7 @@ def test_nothing_in_the_lifecycle_branches_on_what_kind_of_report_it_is():
     control. Same shape as test_supersession's grep for `known_as_of()`: the
     claim is structural, so it is checked structurally rather than asserted in
     a comment."""
-    for path in (LIFECYCLE, DBT_BUILDS):
+    for path in (LIFECYCLE, WAP, DAGS / "dbt_builds.py"):
         text = path.read_text(encoding="utf-8")
         for token in ('"type"', "'type'", '"maturity"', "'maturity'",
                       ".type ==", "exposure_type"):
@@ -148,7 +150,7 @@ def test_locking_an_unknown_report_is_refused_before_anything_is_written():
 
 def test_the_states_are_the_ones_the_cli_and_the_gate_agree_on():
     """Three modules name these strings -- the state machine, the registry CLI
-    and the publish gate in dbt_builds.py. They are constants here so a fourth
+    and the publish gate in transform/wap.py. They are constants here so a fourth
     caller cannot introduce a fifth spelling."""
     lc = _lifecycle()
     assert lc.CLOSED == (lc.LOCKED, lc.SUBMITTED)
@@ -164,7 +166,7 @@ def test_the_publish_gate_runs_before_the_merge_not_with_the_versioning():
     moved -- the refusal would be honest and useless. It has to sit between
     reading the input set (which is what makes the as-at date knowable) and the
     merge, so a refusal leaves `main` untouched and the branch retained."""
-    text = DBT_BUILDS.read_text(encoding="utf-8")
+    text = WAP.read_text(encoding="utf-8")
     # `n.merge(` is the call that moves `main`. Matching on the bare word
     # "merge" would hit the module docstring and pass for the wrong reason.
     gate = text.index("check_publishable")

@@ -210,6 +210,7 @@ def _select_expression(column: str, kind: str) -> str:
 
 def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
     key_list = ", ".join(f"'{c}'" for c in spec.business_key)
+    output_list = ", ".join(f"'{c}'" for c in ["cob_date", *spec.columns])
     tag = "reference" if len(spec.business_key) == 1 else "transactional"
 
     # `source_provenance()` goes in beside `audit_columns()` below rather than
@@ -264,19 +265,19 @@ def render_model(spec: FeedSpec, types: dict[str, str]) -> str:
   `reporting`, where it can be joined to exposure.
 #}}
 
+{{% set output_columns = [{output_list}] %}}
+
 with raw_rows as (
 
-    select
-        *,
-        {{{{ dedupe_rank([{key_list}]) }}}} as _rn
+    {{#
+      EVERY raw row the window and the as-of filter admit, unranked. The
+      rank happens after cleaning, on the CLEANED key -- see `ranked_rows`.
+    #}}
+    select *
     from {{{{ source('raw', '{spec.name}') }}}}
     where {{{{ incremental_window('_cob_date', 'cob_date') }}}}
       and {{{{ known_as_of() }}}}
 
-),
-
-deduped as (
-    select * from raw_rows where _rn = 1
 ),
 
 cleaned as (
@@ -284,13 +285,38 @@ cleaned as (
     select
 {body}
         {{{{ source_provenance() }}}}
-        {{{{ audit_columns() }}}}
+        {{{{ audit_columns() }}}},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number
 
-    from deduped
+    from raw_rows
+
+),
+
+ranked_rows as (
+
+    {{# THE IN-FILE DEDUPE IS ON THE CLEANED KEY: ' B' and 'B' are one key. #}}
+    select
+        *,
+        {{{{ dedupe_rank([{key_list}]) }}}} as _rn
+    from cleaned
+
+),
+
+deduped as (
+
+    select
+        {{%- for c in prepared_output_columns(output_columns) %}}
+        {{{{ ident(c) }}}}{{{{ ',' if not loop.last }}}}
+        {{%- endfor %}}
+    from ranked_rows
+    where _rn = 1
 
 )
 
-select * from cleaned
+select * from deduped
 """
 
 

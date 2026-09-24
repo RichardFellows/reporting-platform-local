@@ -48,8 +48,9 @@ Two things follow that are easy to get wrong:
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import contextmanager
+
+from reporting_platform.common import settings
 
 log = logging.getLogger("registry.db")
 
@@ -59,23 +60,8 @@ _ensured = False
 
 
 def dsn() -> str:
-    """The registry connection string, or a refusal.
-
-    NO DEFAULT, deliberately. Every other connection string in this stack is
-    written down in `docker-compose.yml` where it can be seen and changed;
-    a default buried here would let a container come up pointing at a
-    database nobody configured and report a healthy, empty registry. The
-    failure mode this avoids is the one `tag_retention_years` avoids by
-    refusing bad config rather than falling back.
-    """
-    value = os.environ.get("REGISTRY_DSN", "").strip()
-    if not value:
-        raise RuntimeError(
-            "REGISTRY_DSN is not set, so the delivery registry has no store. "
-            "It is set on the shared `x-airflow-common` environment block in "
-            "docker-compose.yml; a container started before that was added "
-            "needs recreating, not restarting.")
-    return value
+    """The registry connection string, or a refusal. See `settings.registry_dsn`."""
+    return settings.registry_dsn()
 
 
 @contextmanager
@@ -104,11 +90,11 @@ def connect(ensure: bool = True):
 SCHEMA = """
 CREATE SCHEMA IF NOT EXISTS registry;
 
--- One row per DELIVERY: a set of bytes this platform accepted into landing/
--- for one feed and one COB date. The natural key is the landing
--- filename, because that is what identity means here -- `_v2` is a different
--- delivery from the file it corrects, and that is the whole point of the
--- versioning `conform._free_name` does.
+-- One row per DELIVERY: a set of producer bytes accepted for one feed and one
+-- COB date. Legacy rows identify the conformant landing filename (`_v2` is a
+-- distinct delivery); Phase 3 rows use the transport-derived `dlv_...` ID.
+-- Both are stable within their own evidence contract, so the additive natural
+-- key remains (feed, delivery_id).
 CREATE TABLE IF NOT EXISTS registry.delivery (
     feed               TEXT        NOT NULL,
     delivery_id        TEXT        NOT NULL,
@@ -117,8 +103,8 @@ CREATE TABLE IF NOT EXISTS registry.delivery (
     sequence_no        BIGSERIAL   NOT NULL UNIQUE,
     source_system      TEXT        NOT NULL,
     cob_date      DATE        NOT NULL,
-    -- The DELIVERY's arrival time -- the landing object's LastModified, the
-    -- same value the manifest carries -- not the moment this row was written.
+    -- The DELIVERY's durable arrival time -- legacy Landing LastModified or
+    -- v2 Transport uploaded_at -- not the moment this row was written.
     received_at        TIMESTAMPTZ NOT NULL,
     -- The moment the registry first saw it. The gap between the two is how
     -- far behind the registry was running, and it is the only clock in this
@@ -170,6 +156,28 @@ CREATE TABLE IF NOT EXISTS registry.delivery_part (
 
 CREATE INDEX IF NOT EXISTS delivery_part_object
     ON registry.delivery_part (object_key);
+
+-- Phase 3 NormalizationManifest v2 parts. These are deliberately not written
+-- to delivery_part: that legacy table is coupled to legacy Ready v1 semantics,
+-- while this table describes the v2 rebuildable normalization plan. Phase 4
+-- writes these physical keys to Raw without collapsing the two evidence kinds.
+-- `materialized=false` is the plain-file pass-through into received/;
+-- `materialized=true` is a rebuildable object extracted below ready/.
+CREATE TABLE IF NOT EXISTS registry.normalization_part (
+    feed          TEXT    NOT NULL,
+    delivery_id   TEXT    NOT NULL,
+    part_no       INT     NOT NULL,
+    object_key    TEXT    NOT NULL,
+    bytes         BIGINT,
+    source_member TEXT,
+    materialized  BOOLEAN NOT NULL,
+    PRIMARY KEY (feed, delivery_id, part_no),
+    FOREIGN KEY (feed, delivery_id)
+        REFERENCES registry.delivery (feed, delivery_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS normalization_part_object
+    ON registry.normalization_part (object_key);
 
 -- REQ-106. A delivery that arrived and could not be accepted is evidence too,
 -- and until now it was a file moved into a folder on one container's bind
@@ -235,6 +243,11 @@ CREATE TABLE IF NOT EXISTS registry.run (
     code_ref          TEXT        NOT NULL,
     code_ref_kind     TEXT        NOT NULL,
     dbt_manifest_ref  TEXT        NOT NULL,
+    -- Object-store prefix containing each Cosmos/dbt task's manifest.json and
+    -- run_results.json (plus catalog.json when generated).  Separate from the
+    -- project digest above: one identifies model source, the other preserves
+    -- the actual per-invocation artifacts.
+    dbt_artifacts_ref TEXT,
     -- REQ-405. The change this ONE PUBLICATION was made under, as supplied by
     -- whoever triggered it -- a restatement, a backfill, an out-of-cycle
     -- rerun. Also written onto the Nessie merge commit.
@@ -383,6 +396,250 @@ CREATE TABLE IF NOT EXISTS registry.submission_item (
     FOREIGN KEY (report, as_at_date, version_no)
         REFERENCES registry.report_version (report, as_at_date, version_no)
 );
+
+-- Phase 7. Durable, queryable evidence that a validation CONTROL executed and
+-- what it observed -- not a second ingestion ledger and not a verdict on
+-- `registry.delivery` (see the module header: that table stays observation,
+-- no status column). One row per (logical execution of one control).
+--
+-- THREE LAYERS share this one table rather than three: `layer` says which of
+-- Delivery/Raw/dbt produced the row, and the columns that do not apply to a
+-- given layer stay NULL rather than becoming three schemas that drift.
+--
+-- NO FOREIGN KEY to `registry.run` or `registry.delivery`, deliberately, for
+-- the same reason `run_input` has none (see the module header): validation
+-- history must outlive a rebuild of either table, and a delivery/transport
+-- integrity failure by definition has no successful `registry.delivery` row
+-- to reference. `run_id` links dbt-layer rows to the build run that produced
+-- them; `execution_ref` is a free-form pointer (an ingest run id, an Airflow
+-- run id) for the Delivery/Raw layers, which do not share `registry.run`'s id
+-- space at all -- conflating the two would make one column mean two things.
+--
+-- APPEND-ONLY. `validation_id` is DETERMINISTIC for one logical execution
+-- (one attempt of one control against one subject), so a retry of that same
+-- attempt is `ON CONFLICT DO NOTHING` rather than a duplicate row, while a
+-- later, genuinely new execution gets its own id and its own row. See
+-- `registry/validation.py`.
+CREATE TABLE IF NOT EXISTS registry.validation_result (
+    validation_id  TEXT        PRIMARY KEY,
+    -- dbt layer only: the `registry.run` this test execution belongs to.
+    run_id         TEXT,
+    -- Delivery/Raw layers: whatever identifies the executing process there
+    -- (an ingest run id, an Airflow run id). Not `registry.run.run_id`.
+    execution_ref  TEXT,
+    feed           TEXT,
+    delivery_id    TEXT,
+    transport_id   TEXT,
+    -- 'delivery' | 'raw' | 'dbt'.
+    layer          TEXT        NOT NULL,
+    -- A stable identifier for the control itself: an exception class name
+    -- ('transport_evidence'), a named RPL check ('expected_min_rows'), or a
+    -- dbt node's `unique_id` (preserved verbatim so a later OpenMetadata
+    -- ingestion of the same dbt artifacts can join on it).
+    control_id     TEXT        NOT NULL,
+    control_name   TEXT,
+    model_name     TEXT,
+    column_name    TEXT,
+    -- 'blocking' | 'warn' | 'info'. What executing this control and finding a
+    -- problem is allowed to do to the pipeline -- not what happened this time
+    -- (that is `outcome`).
+    severity       TEXT        NOT NULL,
+    -- 'PASS' | 'WARN' | 'FAIL' | 'ERROR'. FAIL is the control finding a real
+    -- problem; ERROR is the control failing to execute at all. Never conflate
+    -- the two -- see docs/VALIDATION.md.
+    outcome        TEXT        NOT NULL,
+    expected_value TEXT,
+    observed_value TEXT,
+    failure_count  BIGINT,
+    executed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Where the authoritative evidence behind this row lives: a Transport
+    -- marker key, a DeliveryManifest key, or an `s3://.../dbt-artifacts/...`
+    -- prefix. This row is a queryable PROJECTION over that evidence, not a
+    -- replacement for it.
+    evidence_ref   TEXT,
+    message        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS validation_result_run
+    ON registry.validation_result (run_id);
+CREATE INDEX IF NOT EXISTS validation_result_delivery
+    ON registry.validation_result (feed, delivery_id);
+CREATE INDEX IF NOT EXISTS validation_result_transport
+    ON registry.validation_result (transport_id);
+CREATE INDEX IF NOT EXISTS validation_result_layer_outcome
+    ON registry.validation_result (layer, outcome, executed_at DESC);
+
+-- Phase 8. Durable, queryable evidence that a dual-run MIGRATION COMPARISON
+-- executed and what it found -- reusing `validation_result`'s outcome
+-- vocabulary (PASS/WARN/FAIL/ERROR) rather than inventing a second one, but
+-- kept as its OWN table rather than folded into `validation_result`: a
+-- migration comparison identifies a LEGACY reference that has no Delivery,
+-- Transport or dbt-node identity, and forcing it through those columns would
+-- make validation_result's rows misleading (see docs/MIGRATION.md).
+--
+-- NOT A WORKFLOW-STATE TABLE. There is no row for "waiting on legacy" or
+-- "waiting on new" -- absence of a comparable pair is derived at query time
+-- from `registry.delivery`/`registry.run_input` and the legacy adapter, never
+-- stored. A row here means a comparison actually EXECUTED.
+--
+-- APPEND-ONLY AND IDEMPOTENT, same shape as `validation_result`:
+-- `comparison_id` is deterministic over (feed, checkpoint, legacy_ref,
+-- new_ref, comparison_contract_hash), so a retried Airflow task or a repeated
+-- reconciliation pass writes the SAME row rather than a duplicate, while a
+-- corrected/restated Delivery -- a genuinely different new_ref -- gets its
+-- own row. History accumulates; nothing here is ever updated in place.
+--
+-- NO FOREIGN KEY to `registry.delivery`, `registry.run` or
+-- `registry.migration_comparison` itself, for the same rebuildability
+-- reasoning `run_input`/`validation_result` already carry: this table must
+-- outlive a rebuild of the tables it references, and a legacy-side reference
+-- has no row anywhere in this registry to reference at all.
+CREATE TABLE IF NOT EXISTS registry.migration_comparison (
+    comparison_id            TEXT        PRIMARY KEY,
+    feed                     TEXT        NOT NULL,
+    business_date            DATE        NOT NULL,
+    -- 'raw' | 'prepared' | 'reporting'.
+    checkpoint               TEXT        NOT NULL,
+    -- The CORRELATION key this comparison paired the two sides on -- see
+    -- `reporting_platform/migration/correlate.py`. Not a foreign key to
+    -- anything: it is evidence identity, not a relationship.
+    correlation_key          TEXT        NOT NULL,
+    -- New-platform side: the strongest reference available. `new_run_id`
+    -- links to `registry.run` for a prepared/reporting checkpoint (no FK,
+    -- same reasoning as `run_input`); Raw has no run of its own, so it stays
+    -- NULL there and `new_ref` alone (a DeliveryID) is the reference.
+    new_ref                  TEXT        NOT NULL,
+    new_run_id               TEXT,
+    -- Legacy side: the strongest reference the adapter could return. Free
+    -- text because the true legacy estate defines its own identity scheme
+    -- (a query snapshot id, a load id, a filename+hash) that this platform
+    -- does not own -- see docs/MIGRATION.md#legacy-provenance.
+    legacy_ref               TEXT        NOT NULL,
+    -- A hash of the comparison CONTRACT actually used -- checkpoint, key,
+    -- columns, aggregates, strategy versions -- snapshotted so a later
+    -- config edit can never retroactively reinterpret what a historical
+    -- PASS meant. See docs/MIGRATION.md#comparison-contract-versioning.
+    comparison_contract_hash TEXT        NOT NULL,
+    -- 'PASS' | 'WARN' | 'FAIL' | 'ERROR' -- identical vocabulary to
+    -- `validation_result.outcome`. There is no fifth "WAITING" outcome:
+    -- a row is only ever written once both sides were actually compared.
+    outcome                  TEXT        NOT NULL,
+    -- 'blocking' | 'warn' -- whether a WARN/FAIL here counts against
+    -- acceptance. Independent of `outcome`, same relationship
+    -- `validation_result.severity` has to its own `outcome`.
+    severity                 TEXT        NOT NULL,
+    -- Summary evidence only -- never the differing rows themselves. See
+    -- docs/MIGRATION.md#difference-artifacts for why detail lives in object
+    -- storage, not here.
+    summary                  JSONB       NOT NULL,
+    -- Object-store prefix holding the full difference artifact
+    -- (legacy-only/new-only/changed + summary.json), written only when there
+    -- is something to investigate. NULL for an ordinary PASS.
+    diff_ref                 TEXT,
+    executed_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    message                  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS migration_comparison_feed_date
+    ON registry.migration_comparison (feed, business_date);
+CREATE INDEX IF NOT EXISTS migration_comparison_outcome
+    ON registry.migration_comparison (feed, outcome, executed_at DESC);
+
+-- Operational control plane (COB Feed Status). Two tables, deliberately not
+-- one, because they answer different questions and neither is `delivery`
+-- with a status column bolted on:
+--
+--   * `transport_receipt` is an EXECUTION record, like `run` above -- how far
+--     THIS occurrence of a Transport has been carried through
+--     transport_ingest, discovered by the fast path (`transport_watch`) or
+--     the correctness path (`transport_reconcile`) and advanced by the DAG's
+--     own tasks. It legitimately has a mutable `status`, for the same reason
+--     `run` does: nothing else durably records "how far did this attempt
+--     get" -- object storage records what each stage PRODUCED, not that a
+--     particular attempt is in flight. It exists only for Transport-origin
+--     (v2) deliveries; a legacy `landing/`-direct feed has no Transport and
+--     therefore no row here.
+--   * `delivery_committed` is an OBSERVATION, like `delivery_part` above --
+--     one immutable fact ("this Delivery reached Raw and is on `main`")
+--     recorded once, by the one function that actually performs that commit
+--     (`ingest_feed._ingest_manifest`), so it is written identically for the
+--     legacy and the Transport path. `registry.delivery` itself gets a row
+--     at NORMALIZE time, before Raw is ever touched -- see its own header --
+--     so delivery existing is evidence of neither commit nor failure, and a
+--     dedicated append-only fact is what answers COMPLETE without a Spark
+--     query on every status page render.
+--
+-- Neither table replaces Raw as the ledger: `_delivery_id` in Raw remains
+-- authoritative for whether a Delivery committed, exactly as
+-- `registry/deliveries.py`'s header says. `delivery_committed` is a cache of
+-- that fact for cheap operational queries, and unreadable/absent rows here
+-- are a reason to reconcile, never a reason to trust Raw less.
+CREATE TABLE IF NOT EXISTS registry.transport_receipt (
+    transport_id       TEXT        PRIMARY KEY,
+    source             TEXT        NOT NULL,
+    legacy_feed_id     TEXT        NOT NULL,
+    producer_run_id    TEXT,
+    -- NULL for a v1 marker, which carries neither field (see
+    -- docs/TRANSPORT-CONTRACT.md, "v1 compatibility").
+    cob_date           DATE,
+    source_system      TEXT,
+    marker_key         TEXT        NOT NULL,
+    source_observed_at TIMESTAMPTZ,
+    -- Fixed at the Transport's first publication and never rewritten by a
+    -- retry (see TRANSPORT-CONTRACT.md) -- so neither is this column, once set.
+    uploaded_at        TIMESTAMPTZ NOT NULL,
+    -- When THIS PLATFORM first saw the marker, which is a fact about the
+    -- registry's own clock, not the Transport's -- see the `first_seen_at`
+    -- reasoning on `delivery` above.
+    discovered_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Filled in once create_delivery resolves a Feed; NULL until then, and
+    -- forever NULL for a Transport that failed before that point.
+    feed               TEXT,
+    delivery_id        TEXT,
+    -- 'discovered' | 'validated' | 'delivered' | 'normalized' | 'failed'.
+    -- No 'ingested': whether Raw committed is `delivery_committed`'s
+    -- question, answered universally for both paths, not duplicated here.
+    status             TEXT        NOT NULL,
+    -- Denormalized rank of `status` in the pipeline's forward order, so an
+    -- UPDATE can refuse to move status BACKWARDS on a racing/stale task
+    -- retry without a read-then-write. Not part of this table's public
+    -- meaning -- callers read `status`, not this.
+    stage_rank         INT         NOT NULL DEFAULT 0,
+    failure_reason     TEXT,
+    airflow_dag_id     TEXT,
+    airflow_run_id     TEXT,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS transport_receipt_cob_source
+    ON registry.transport_receipt (cob_date, source_system);
+CREATE INDEX IF NOT EXISTS transport_receipt_feed_cob
+    ON registry.transport_receipt (feed, cob_date);
+CREATE INDEX IF NOT EXISTS transport_receipt_status
+    ON registry.transport_receipt (status);
+CREATE INDEX IF NOT EXISTS transport_receipt_delivery
+    ON registry.transport_receipt (feed, delivery_id);
+
+CREATE TABLE IF NOT EXISTS registry.delivery_committed (
+    feed          TEXT        NOT NULL,
+    delivery_id   TEXT        NOT NULL,
+    cob_date      DATE        NOT NULL,
+    source_system TEXT        NOT NULL,
+    file_version  INT,
+    -- NULL when the commit was discovered via the idempotent
+    -- already-committed short-circuit rather than counted fresh: re-counting
+    -- Raw only to fill in a number nothing here needs would cost a Spark
+    -- action for no operational benefit.
+    rows          BIGINT,
+    run_id        TEXT        NOT NULL,
+    committed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed, delivery_id)
+);
+
+CREATE INDEX IF NOT EXISTS delivery_committed_feed_cob
+    ON registry.delivery_committed (feed, cob_date);
+CREATE INDEX IF NOT EXISTS delivery_committed_cob
+    ON registry.delivery_committed (cob_date);
 """
 
 
@@ -402,6 +659,7 @@ MIGRATIONS = """
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_project_ref         TEXT;
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_change_ref   TEXT;
 ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS deployment_pipeline_ref TEXT;
+ALTER TABLE registry.run ADD COLUMN IF NOT EXISTS dbt_artifacts_ref       TEXT;
 """
 
 

@@ -1,0 +1,84 @@
+{{- /*
+RBAC for running Spark on Kubernetes (docs/OPENSHIFT-MAPPING.md "Spark
+execution model": spark-submit / a driver pod per `_spark_task` call, not the
+Spark Operator).
+
+THREE THINGS NEED THIS ROLE, NOT ONE.
+
+1. `spark.serviceAccount` -- the Spark driver POD `_spark_task.driver_pod`
+   launches (docs/DECISIONS.md#execution-mode-is-configuration) runs as this
+   SA, and as a Spark driver it creates its own executor pods, a headless
+   driver Service and a config ConfigMap through the `k8s://` master.
+2. The Airflow WORKER ServiceAccount -- under KubernetesExecutor every task
+   (including the one that calls `_spark_task.run`) runs in its own pod using
+   this SA (verified with `helm template`: the pod_template_file's
+   `serviceAccountName` is `{{ .Release.Name }}-airflow-worker`), so THAT pod
+   is what creates and watches the Spark driver pod above, and reads its log.
+   It is also the pod a dbt build's driver runs in (Cosmos stays LOCAL in
+   every mode -- docs/DECISIONS.md#execution-mode-is-configuration), so it
+   needs the SAME executor/service/configmap permissions the driver SA does.
+3. The Airflow SCHEDULER ServiceAccount -- belt and braces for anything that
+   ever calls `_spark_task` from the scheduler's own process rather than a
+   worker pod.
+
+One Role, one RoleBinding naming all three subjects, rather than a second
+one-slot anything -- see docs/DECISIONS.md#one-shared-write-pool for why this
+codebase is wary of "a second X doesn't exclude anything" in general.
+*/ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.spark.serviceAccount }}
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-spark
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # DELETECOLLECTION ON ALL OF THESE, not only pods. Spark's cleanup at
+  # SparkContext.stop() deletes its services, executor ConfigMaps and PVCs by
+  # label selector. Without the verb that cleanup is Forbidden -- logged, not
+  # raised -- and the ConfigMap survives. Spark 3.5 names the executor
+  # ConfigMap once per JVM, so the NEXT context in the same process (bulk
+  # ingest restarts one per feed) fails to start with 409 `configmaps
+  # "spark-exec-...-conf-map" already exists`. Found by the local-k8s smoke.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["list", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-spark
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-spark
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.spark.serviceAccount }}
+    namespace: {{ .Release.Namespace }}
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-airflow-worker
+    namespace: {{ .Release.Namespace }}
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-airflow-scheduler
+    namespace: {{ .Release.Namespace }}
