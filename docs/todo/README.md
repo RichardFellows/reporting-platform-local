@@ -46,9 +46,9 @@ first.
 every other feed publishing until the new one first delivers. It needs a
 decision before code, and the item lays out the three options.
 
-**25–31** were found reviewing the README on 2026-09-24. 25 and 27 are bugs,
-reproduced before they were written down (26 was too, and is fixed). 28–31 are diagrams, independent of
-each other and of everything else.
+**25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
+bugs, reproduced before they were written down (26 was too, and is fixed).
+28–31 are diagrams, independent of each other and of everything else.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
@@ -59,20 +59,24 @@ independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 ## Done
 
 **26, `python -m tests.run` on a host failed 12 tests unless
-`REPORTING_CONFIG_DIR` was set** — `tests/support.py` now
-`setdefault`s it to the checkout's `reporting_platform/config` at import,
-before `_ORIGINAL_ENV` is captured (so `reset()` restores to it) and before
-any test module imports `reporting_platform`. `settings.py`'s container
+`REPORTING_CONFIG_DIR` was set** — `tests/__init__.py` now defaults it
+(unset or empty) to the checkout's `reporting_platform/config`. The package
+`__init__` runs before any `tests.*` module, so a direct import or `pytest`
+gets the default too, not only `tests/run.py`. `settings.py`'s container
 default and `layout.feed_paths`' refusal are untouched: only the suite
-defaults it. `.github/workflows/config.yml` no longer sets
+defaults it. Because that default is the working tree, `tests/run.py` digests
+the config directory before and after the run and fails if it changed, so a
+test that forgets `config_dir()` cannot rewrite the checkout silently.
+`.github/workflows/config.yml` no longer sets
 `REPORTING_CONFIG_DIR`/`DBT_PROJECT_DIR` for the whole job, only on the
-`config check` step, so the test step runs the fresh-clone case; a new
-`test_ci_pins` case fails if either variable reaches that step again (it
-fails against `main`'s workflow). Reproduced on `main` with nothing set:
-`988 passed, 12 failed, 1 skipped`, all twelve `no feed registry at
-/opt/platform/...`. On the branch: `1001 passed, 0 failed, 1 skipped` both
-unset and with the variable set. The PR template and `tests/README.md` no
-longer tell anyone to set it.
+`config check` step, so the test step runs the fresh-clone case. A new
+`test_ci_pins` case fails if either variable reaches the suite again through
+an `env:` map, the test step's `run:` text, or a `$GITHUB_ENV` write in an
+earlier step. It fails against `main`'s workflow. Reproduced on `main` with
+nothing set: `988 passed, 12 failed, 1 skipped`, all twelve `no feed
+registry at /opt/platform/...`. On the branch: `1001 passed, 0 failed, 1
+skipped` both unset and with the variable set. The PR template and
+`tests/README.md` no longer tell anyone to set it.
 *What the item got wrong*: only its counts, which the suite has outgrown
 (929 then, 988 now). It did not mention that CI also set `DBT_PROJECT_DIR`
 job-wide; the suite turned out not to need that either, so both moved.

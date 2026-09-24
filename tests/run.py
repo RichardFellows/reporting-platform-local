@@ -16,7 +16,9 @@ that.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
+import os
 import pathlib
 import sys
 import traceback
@@ -36,12 +38,30 @@ def modules(only: list[str]) -> list[str]:
     return chosen
 
 
+def tree_digest(root: pathlib.Path) -> dict[str, str]:
+    """relative path -> sha256 of every file under `root`. Empty if absent."""
+    if not root.is_dir():
+        return {}
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     sys.path.insert(0, str(HERE.parent))
     passed, failed, skipped = 0, [], []
 
     from tests import support
+
+    # THE SUITE'S DEFAULT CONFIG DIRECTORY IS THE WORKING TREE
+    # (`tests/__init__.py`), so a test that forgets `config_dir()` or
+    # `registry_on()` and saves through the console would now rewrite the
+    # developer's checkout, where it used to fail loudly on a missing
+    # /opt/platform. Every legitimate write goes to a temp copy, so ANY change
+    # to the tree the variable named when the run began is a failure.
+    # Resolved NOW, because tests repoint the variable as they go.
+    watched = pathlib.Path(os.environ["REPORTING_CONFIG_DIR"])
+    before = tree_digest(watched)
 
     for name in modules(argv):
         # BEFORE THE IMPORT, not after it: a module that calls `config_dir()`
@@ -79,6 +99,18 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 passed += 1
                 print(f"ok    {name}.{attr}")
+
+    after = tree_digest(watched)
+    if after != before:
+        changed = sorted(k for k in before.keys() | after.keys()
+                         if before.get(k) != after.get(k))
+        failed.append((
+            "config tree unchanged",
+            f"the run changed {watched}, the config directory the suite "
+            f"started with. A test wrote to it instead of to a "
+            f"support.config_dir() copy: restore the files and find the "
+            f"test. Changed: {', '.join(changed)}\n"))
+        print("FAIL  config tree unchanged")
 
     tail = f", {len(skipped)} skipped" if skipped else ""
     print(f"\n{passed} passed, {len(failed)} failed{tail}")

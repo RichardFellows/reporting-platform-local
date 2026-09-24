@@ -81,7 +81,7 @@ jobs:
         # neither set, because that is what `python -m tests.run` on a fresh
         # clone sees: with them set job-wide, twelve tests that read the real
         # registry failed on every laptop and passed here, and nothing said
-        # so (todo 26). `tests/support.py` now defaults the config directory
+        # so (todo 26). `tests/__init__.py` now defaults the config directory
         # for the suite, and `tests/test_ci_pins.py` fails if either variable
         # reaches the test step again.
         env:

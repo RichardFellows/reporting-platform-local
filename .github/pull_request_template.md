@@ -14,8 +14,8 @@ standing between the regression and `main`.
 
 <!-- The exact command you ran, and its last line of output. For anything
      touching `dbt/models/` or `common/`, that is at minimum:
-       python3 -m tests.run
-     (no REPORTING_CONFIG_DIR needed: tests/support.py defaults it to
+       python -m tests.run
+     (no REPORTING_CONFIG_DIR needed: tests/__init__.py defaults it to
      this checkout's config.)
      Paste the "N passed, N failed" line itself, not a description of it. -->
 

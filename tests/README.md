@@ -5,11 +5,15 @@ python -m tests.run                    # everything
 python -m tests.run test_conventions   # one module
 ```
 
-No `REPORTING_*` variables are needed: `tests/support.py` defaults
-`REPORTING_CONFIG_DIR` to this checkout's `reporting_platform/config` when it
-is unset (only for the suite -- `common/settings.py` still defaults to the
-container path and refuses an absent registry), and CI's cheap tier runs it
-unset so that stays true.
+Neither `REPORTING_CONFIG_DIR` nor `DBT_PROJECT_DIR` needs setting.
+`tests/__init__.py` defaults `REPORTING_CONFIG_DIR` (unset or empty) to this
+checkout's `reporting_platform/config`, before any test imports the platform.
+Only the suite does this: `common/settings.py` still defaults to the
+container path and refuses an absent registry. CI's cheap tier runs the suite
+with both variables unset, and `tests/test_ci_pins.py` fails if either is set
+for it again. Because the default is the working tree, `tests/run.py` fails
+the run if that config directory's contents change during it: a test must
+write to a `support.config_dir()` copy, never to the checkout.
 
 Runs on the host (needs `pyyaml`, `ruamel.yaml`, `duckdb` and `jinja2`) or inside the
 stack with no rebuild -- where the three modules that read the repo rather
