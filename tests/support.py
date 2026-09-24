@@ -104,6 +104,25 @@ def repo_file(relative: str | pathlib.Path) -> pathlib.Path:
     raise Skipped(f"{relative} is not here: /opt/platform holds the package, "
                   f"not the repo")
 
+# THE SUITE DEFAULTS THE CONFIG DIRECTORY TO THIS REPO'S; THE PLATFORM DOES
+# NOT. Some tests read the REAL registry through `context.feed()`/`feeds()`
+# without a `config_dir()` copy (test_dedupe_rank, test_migration_config,
+# test_doc_claims), and `common/settings.py` defaults `CONFIG_DIR` to the
+# container's `/opt/platform/reporting_platform/config`. On a fresh clone with
+# nothing set, those twelve failed with "no feed registry at /opt/platform/..."
+# -- red on tests with nothing wrong with them. In the container `CONFIG` IS
+# that path, so the default changes nothing there.
+#
+# Here, and not in `settings.py`: a service without its config mounted must
+# keep REFUSING (`layout.feed_paths`) rather than go looking for some other
+# registry. `setdefault`, so an explicit value -- a CI job, a developer
+# pointing at another tree -- still wins. Before `_ORIGINAL_ENV`, so `reset()`
+# restores to it; and this module is imported by `tests/run.py` before any
+# test module, which is what gets it in ahead of `CONFIG_DIR`'s import-time
+# read. `.github/workflows/config.yml` runs the suite with the variable unset
+# so this cannot quietly stop being needed (`test_ci_pins`).
+os.environ.setdefault("REPORTING_CONFIG_DIR", str(CONFIG))
+
 # What these variables were before any test touched them, captured once at
 # import. `None` means "was not set", which is a different thing to restore to
 # than any value.

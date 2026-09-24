@@ -37,13 +37,6 @@ on:
 jobs:
   config:
     runs-on: ubuntu-latest
-    env:
-      # Both are read at import (common/settings.py, common/context.py), so
-      # they are set for the job rather than per step. The defaults are the
-      # container's paths, which do not exist on a runner -- without these
-      # every check reports that the platform manages nothing.
-      REPORTING_CONFIG_DIR: ${{ github.workspace }}/reporting_platform/config
-      DBT_PROJECT_DIR: ${{ github.workspace }}/dbt
     steps:
       - uses: actions/checkout@v4
 
@@ -80,6 +73,20 @@ jobs:
       # step rather than relying on the suite, so a broken feed file reports
       # as "config" and not as whichever test happened to touch it first.
       - name: The registry loads
+        # Both are read at import (common/settings.py, common/context.py). The
+        # defaults are the container's paths, which do not exist on a runner
+        # -- without these the check reports that there is no registry.
+        #
+        # SET ON THIS STEP ONLY, NOT THE JOB. The test step below runs with
+        # neither set, because that is what `python -m tests.run` on a fresh
+        # clone sees: with them set job-wide, twelve tests that read the real
+        # registry failed on every laptop and passed here, and nothing said
+        # so (todo 26). `tests/support.py` now defaults the config directory
+        # for the suite, and `tests/test_ci_pins.py` fails if either variable
+        # reaches the test step again.
+        env:
+          REPORTING_CONFIG_DIR: ${{ github.workspace }}/reporting_platform/config
+          DBT_PROJECT_DIR: ${{ github.workspace }}/dbt
         run: python -m reporting_platform.config check
 
       - name: Config-level tests

@@ -5,6 +5,12 @@ python -m tests.run                    # everything
 python -m tests.run test_conventions   # one module
 ```
 
+No `REPORTING_*` variables are needed: `tests/support.py` defaults
+`REPORTING_CONFIG_DIR` to this checkout's `reporting_platform/config` when it
+is unset (only for the suite -- `common/settings.py` still defaults to the
+container path and refuses an absent registry), and CI's cheap tier runs it
+unset so that stays true.
+
 Runs on the host (needs `pyyaml`, `ruamel.yaml`, `duckdb` and `jinja2`) or inside the
 stack with no rebuild -- where the three modules that read the repo rather
 than the package skip, and say so ("And where the rest of the repo is not",

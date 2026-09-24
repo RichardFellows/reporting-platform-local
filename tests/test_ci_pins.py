@@ -229,3 +229,33 @@ def test_the_dbt_smoke_test_runs_in_ci():
     assert later, (
         "no step after the cosmos install runs `dbt --version`, so the "
         "--no-deps trap is unguarded again")
+
+
+# THE CHEAP TIER RUNS THE SUITE AS A FRESH CLONE DOES -- with no config
+# variables set. `config.yml` used to set REPORTING_CONFIG_DIR for the whole
+# job, so the twelve tests that read the real registry passed in CI and failed
+# on every laptop, and nothing said so (todo 26). `tests/support.py` defaults
+# the variable for the suite now; this is what stops a job- or step-level
+# `env:` quietly taking that case back out of CI. Parsed as YAML, like
+# everything else here: an `env:` is a key, not a sentence.
+CONFIG_WORKFLOW = pathlib.Path(".github/workflows/config.yml")
+_UNSET_FOR_TESTS = ("REPORTING_CONFIG_DIR", "DBT_PROJECT_DIR")
+
+
+def test_the_config_tier_runs_the_suite_with_the_config_variables_unset():
+    workflow = yaml.safe_load(
+        repo_file(CONFIG_WORKFLOW).read_text(encoding="utf-8"))
+    (job,) = workflow["jobs"].values()
+    suite = [s for s in job["steps"]
+             if re.search(r"\btests\.run\b", str(s.get("run", "")))]
+    assert suite, (f"{CONFIG_WORKFLOW} no longer runs `python -m tests.run` "
+                   f"in any step")
+    for where, env in [("workflow", workflow.get("env") or {}),
+                       ("job", job.get("env") or {})] + [
+                           (f"step {s.get('name')!r}", s.get("env") or {})
+                           for s in suite]:
+        leaked = sorted(set(env) & set(_UNSET_FOR_TESTS))
+        assert not leaked, (
+            f"{CONFIG_WORKFLOW} sets {', '.join(leaked)} at {where} level, so "
+            f"CI runs the suite with a config directory a fresh clone does "
+            f"not have. Set it on the `config check` step only.")
