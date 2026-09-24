@@ -5,9 +5,7 @@ it**, what done looks like, and a prompt to paste into a new session.
 
 Everything here was found by working on the platform rather than by reading it.
 Each item file carries the date its "What is wrong" was last verified:
-12–19 on 2026-09-14 against `main` at `fdb0784`, 20–24 against `cea4500`, and
-15 and 16 — the two that were written conditional on 09 merging — re-checked on
-2026-09-15 against `76bec9c`, after 09 merged. 21, and 22's `--full-refresh`
+12–19 on 2026-09-14 against `main` at `fdb0784`, and 20–24 against `cea4500`. 21, and 22's `--full-refresh`
 claim, are reasoned from the code and say so. If an item looks stale, run its verification command first — the
 platform moves, and an item that no longer reproduces should be deleted rather
 than worked.
@@ -18,7 +16,6 @@ than worked.
 | [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
-| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high | 2–4 hours |
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does (README fixed; docstring left) | low–medium | 15 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
@@ -34,12 +31,10 @@ than worked.
 
 ## Where to start
 
-**22 and 15 first**, in either order. **22** breaks both SCD2 builds on the
+**22 first.** It breaks both SCD2 builds on the
 first build after housekeeping first prunes raw — every key is touched every
 day, so not only keys that change — and nothing has pruned raw on this estate
-yet, which is the only reason it is green. **15**: under 09's decision
-the newest `_file_version` decides a whole COB date, and 15 is how a version
-gets mis-numbered.
+yet, which is the only reason it is green.
 
 **07** is no longer blocked: 09 decided that `full_snapshot` selects the
 newest delivery per COB date, so 07's premise holds as written. It is
@@ -48,7 +43,7 @@ its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
 
-**25** ranks with 22 and 15. Until it is fixed, onboarding any feed stops
+**25** ranks with 22. Until it is fixed, onboarding any feed stops
 every other feed publishing until the new one first delivers. It needs a
 decision before code, and the item lays out the three options.
 
@@ -63,6 +58,42 @@ first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**15, `next_file_version` read an unreadable raw table as version 1** — its
+`except Exception: return 1` is gone. Any read failure now raises, naming the
+feed, the table as addressed (ref included) and the COB date, and fails the
+ingest. `COALESCE(MAX(_file_version), 0)` was already answering the genuinely
+empty case, and the one call site runs after `ensure_raw_table` has created
+the table on the branch, so a missing table there is a wrong ref or name too.
+Reproduced on `main` first. Against the live catalog, `fo_trade` 2026-08-19
+correctly got 2, but a nonexistent ref and a nonexistent table both got **1**,
+tying with the delivery already there. `tests/test_next_file_version.py`
+failed on `main` ("an unreadable raw table returned a version instead of
+raising").
+*Concurrent ingests*: measured, not assumed. Two branches cut from one base
+both computed `_file_version=2`. The first merged, and Nessie refused the
+second with `409 REFERENCE_CONFLICT` naming `raw.fo_trade`: its default
+NORMAL per-key merge mode stops the tie from ever reaching `main`. The pool
+plays no part (`bulk_ingest` and the CLI never enter it). Written down as
+[`#a-merge-conflict-not-the-pool-keeps-file-version-unique`](../DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique),
+along with what would break it. `tests/test_nessie_merge.py` pins the merge
+body to an allowlist, so `defaultKeyMergeMode`, `keyMergeModes` and
+`returnConflictAsResult` stay out. `_merge_ingest_branch` turns the bare 409
+into a message naming the table, the version and the branch. It blames a
+concurrent write only when Nessie's own message names this table's key
+(`tests/test_merge_conflict.py`). The conflict is transient, so it is a plain
+`RuntimeError`, not a refusal. The next attempt cuts its own branch
+(`ingest_attempt_id`, merged since this branch began), re-reads the version
+and merges. `registry/db.py`'s header no longer credits the pool.
+*Verified live* with the branch's code in the airflow container, on
+throwaway refs (`probe/todo15/*`, deleted afterwards; `main` stayed at
+`523b887`). A wrong ref raised `could not read _file_version from
+lakehouse.raw.`fo_trade@no-such-branch` for cob_date 2026-08-19: Nessie ref
+'no-such-branch' does not exist`. Two branches each appended a row as
+`_file_version=2`. The first merged into the stand-in for `main`, and the
+second was refused with the new message. `python -m tests.run`: 1000 passed.
+*What the item got wrong.* It expected the two concurrent files to tie after
+merging. They never merge together.
 
 **20, the SCD2 range test refused correct one-day versions and passed
 same-day overlaps** — both `dbt_utils.mutually_exclusive_ranges` tests in

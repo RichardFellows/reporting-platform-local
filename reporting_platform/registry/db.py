@@ -3,9 +3,12 @@
 WHY POSTGRES AND NOT ICEBERG. The registry needs one thing Iceberg cannot give
 cheaply: a serialising authority. `sequence_no` is the order this platform saw
 deliveries in, and an order allocated by `MAX(...)+1` over a table several
-writers append to is the same read-then-write `next_file_version` has --
-correct today only because the `lakehouse_write` pool has one slot, which is
-exactly what the concurrency work intends to change.
+writers append to is the same read-then-write `next_file_version` has. On
+`raw` that is safe only because Nessie's merge refuses the second of two
+concurrent writers to a table -- not the `lakehouse_write` pool, which
+`scripts.bulk_ingest` and the CLI never enter
+(docs/DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique).
+A registry row has no merge to refuse it, so two inserts would share a value.
 
 WHY THIS IS NOT THE `stg` LOAD-CONTROL TABLE. That is the trap this platform
 refuses by name -- see `arrival.already_ingested` -- and the difference is not
