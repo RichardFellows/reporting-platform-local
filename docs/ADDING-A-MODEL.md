@@ -13,15 +13,11 @@ That is the same property `feeds.yml` gives the ingest DAGs, and it is the
 answer to "where do I wire this up?" — you don't.
 
 > **The commands below are PowerShell**, because that is what the Windows
-> stack this was built on uses. Only two constructs differ elsewhere: a
-> continuation is `` ` `` in PowerShell and `\` in bash, and capturing the
-> build branch is
->
-> ```bash
-> branch=$(docker compose exec -T airflow python -m scripts._open_build_branch | tr -d '\r')
-> ```
->
-> instead of `$branch = (...).Trim()`. `$branch` then reads the same in both.
+> stack this was built on uses. The one construct that differs elsewhere is a
+> line continuation: `` ` `` in PowerShell, `\` in bash. Building
+> (`make build-branch` below) sidesteps the branch-capturing incantation
+> entirely — `make` reads the same on both, when you have it; see
+> QUICKSTART.md's Prerequisites for the case where you don't.
 > On Windows, use Git Bash for anything with single-quoted JSON in it —
 > PowerShell mangles the quoting.
 
@@ -195,14 +191,15 @@ files, so the new task appears when the scheduler next parses, not instantly.
 ## Building it
 
 On a throwaway branch, which is the point of the platform — never straight at
-`main`:
+`main`. `make build-branch` opens the branch, builds `SELECT` against it, and
+prints the branch name plus a command to diff it against `main` — it never
+merges:
 
-```powershell
-$branch = (docker compose exec -T airflow python -m scripts._open_build_branch).Trim()
-docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select exposure_by_country+ --vars "{nessie_ref: $branch}"
+```bash
+make build-branch SELECT=exposure_by_country+
 ```
 
-`--select <model>+` builds the model and everything downstream of it, which is
+`SELECT <model>+` builds the model and everything downstream of it, which is
 what you want: a change to a shared model like `counterparty_exposure` moves
 every mart that `ref()`s it, and building it alone proves nothing about them.
 
