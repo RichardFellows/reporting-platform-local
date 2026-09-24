@@ -100,14 +100,25 @@ Five things that are not optional:
   three models is the defect that file exists to prevent. Note also that Spark
   3.x rejects bare `VARCHAR` without a length: use `string`.
 - **A prepared model reading `raw` must have `{{ known_as_of() }}` in its
-  `where`, and `{{ source_provenance() }}` in its select.** Both are checked by
-  `tests/test_supersession.py`, which greps the model files rather than
-  trusting that a macro reached them. The first is the as-of filter: with no
-  `knowledge_time` var it compiles to `1 = 1`, and a model that omits it
-  silently returns everything whatever an as-of query asked for. The second
-  carries `delivery_id` through, which is what a published run enumerates its
-  inputs from — and `_prepared.yml` needs `- name: delivery_id` /
-  `tests: [not_null]` to prove the table was built after that macro existed.
+  `where`, and `{{ source_provenance() }}` in its select.** `known_as_of()` is
+  checked by `tests/test_supersession.py`; both it and `source_provenance()`
+  are checked again by `tests/test_model_rules.py` (plan #24), which greps the
+  model files rather than trusting that a macro reached them. The first is the
+  as-of filter: with no `knowledge_time` var it compiles to `1 = 1`, and a
+  model that omits it silently returns everything whatever an as-of query
+  asked for. The second carries `delivery_id` through, which is what a
+  published run enumerates its inputs from — and `_prepared.yml` needs
+  `- name: delivery_id` / `tests: [not_null]` to prove the table was built
+  after that macro existed.
+- **The dedupe rank runs on the CLEANED key, in a CTE built from `cleaned`
+  (or whatever CTE holds the `clean_string(<key>)` projection) — never in the
+  CTE that reads `source('raw', ...)` directly.** Ranked on the raw key,
+  `' T1'` and `'T1'` in one file both survive as distinct partitions.
+  `tests/test_model_rules.py` greps for this shape too, covering the scaffold
+  template's output as well as the hand-written models, and
+  `.github/pull_request_template.md` is the checklist this and the rule above
+  are two lines of — most of it a human review item no test can stand in for.
+  See [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 - **Aggregates must `ref()` the detail model, not re-derive from `prepared`.**
   `exposure_by_country` reads `counterparty_exposure` so the rollup reconciles
   to the detail *by construction*. Two independent derivations eventually
