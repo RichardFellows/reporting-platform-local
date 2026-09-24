@@ -1263,11 +1263,15 @@ the walkthrough's `docker compose` commands directly — `make -n <target>`
 prints what a target would run, if you have make somewhere else to read it
 with.
 
-**This route does not touch Airflow.** It builds on `main` from the command
-line, which is convenient for a throwaway stack and is *not* the
-write-audit-publish pattern the platform is built around — the Makefile says
-so at the `build` target. To exercise the orchestration, and the asset
-cascade that the topology diagram is really claiming, do section 14.
+**This route does not touch Airflow, and it publishes nothing.** `make build`
+builds on a throwaway Nessie branch and **never merges**. It prints the
+branch and a diff-vs-`main` command, so `main` keeps only what ingest put
+there (raw). To look at the result, query the branch (`@<branch>`, as in
+section 13) or merge it by hand as in section 10. `make build-on-main` and
+its siblings still write straight to `main`, for a throwaway stack where that
+is what you want. Neither is the write-audit-publish pattern the platform is
+built around. To exercise the orchestration, and the asset cascade that the
+topology diagram is really claiming, do section 14.
 
 ---
 
