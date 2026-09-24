@@ -27,7 +27,7 @@ than worked.
 | [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
 | [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
-| [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
+| [55](55-an-archive-with-every-member-refused-is-requarantined-every-poll.md) | An `arrival.archive` container whose every member is refused is re-quarantined on every poll | medium | 1–2 hours |
 
 ## Where to start
 
@@ -47,9 +47,12 @@ first.
 every other feed publishing until the new one first delivers. It needs a
 decision before code, and the item lays out the three options.
 
-**25–31** were found reviewing the README on 2026-09-24. 25–27 are bugs,
-reproduced before they were written down. 28–31 are diagrams, independent of
+**25–30** were found reviewing the README on 2026-09-24. 25–27 are bugs,
+reproduced before they were written down. 28–30 are diagrams, independent of
 each other and of everything else.
+
+**55** was found drawing 31's diagram and reproduced with
+`tests/test_inbox.py`'s harness before it was written down.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
@@ -58,6 +61,27 @@ first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**31, diagram the inbox gate's outcomes.** `docs/DELIVERY-SHAPES.md` has a new
+section, "What the gate does with one file". It holds one `flowchart`: a file
+in `inbox/` passes the `STABLE_POLLS` stability wait, then `route()` in its
+four-claimant order, then `conform.plan_arrival` over `ARRIVAL_SHAPES`
+(`file` / `archive`), then one of `Planned` / `Duplicate` / `Refused` /
+`Waiting`. It ends at `_promote`'s destination decision: `.rejected/`,
+`.processed/<feed>/` then trigger, or left in place. Every label was read out
+of `ingest/inbox.py` and `ingest/conform.py`, not the prose. Four bullets under
+it spell out what no other diagram shows. The existing two-way diagram is
+unchanged.
+*Verified* by rendering the block as committed (extracted from the doc) with
+`@mermaid-js/mermaid-cli@11` and `@10`, and looking at both PNGs.
+`python -m tests.run` passes.
+*What the item got wrong.* It gave `Duplicate` as "do nothing" and listed
+"move to `.processed/`" as a separate outcome. In fact a `Duplicate` writes
+and triggers nothing but still moves the inbox copy to `.processed/`, because
+it counts as `written`. Drawing the destination decision turned up a real
+defect: a container whose every member is `Refused` is neither refused itself
+nor `written`, so it stays in `inbox/` and is quarantined again on every poll.
+That is now todo 55, and the diagram labels that edge `(todo 55)`.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the
