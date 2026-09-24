@@ -124,13 +124,23 @@ class Nessie:
             json=body,
         )
 
-    def create_tag(self, name: str, from_ref: str = "main") -> dict[str, Any]:
+    def create_tag(self, name: str, from_ref: str = "main",
+                   hash: str | None = None) -> dict[str, Any]:
+        """POST /v2/trees?name=<tag>&type=TAG, at `from_ref`'s head -- or at
+        `hash`, a commit on `from_ref`, when given.
+
+        Pass `hash` whenever the tag means "the state THIS write left": the
+        head is only that state until the next merge lands, and a tag cut
+        after the writer let go of the write pool can name somebody else's
+        merge. See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+        """
         src = self.get_reference(from_ref)["reference"]
         return self._req(
             "POST",
             "/trees",
             params={"name": name, "type": "TAG"},
-            json={"type": src["type"], "name": src["name"], "hash": src["hash"]},
+            json={"type": src["type"], "name": src["name"],
+                  "hash": hash or src["hash"]},
         )
 
     def delete_reference(self, name: str) -> None:

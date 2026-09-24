@@ -118,6 +118,7 @@ for the staged walk and its scaling argument.
 
 ```text
 validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+    -> report_drift -> record_snapshot
 ```
 
 | Task | Step (`ingest/transport_steps.py`) | Domain call inside it | XCom out | Fails for |
@@ -125,7 +126,15 @@ validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
 | `validate_transport` | `validate` | `transport.read_validated_transport(marker_key)` | marker key (str) | Missing/mismatched object, bad hash, unsupported contract version |
 | `create_delivery` | `deliver` | `delivery.create_delivery(marker_key)` | DeliveryManifest key (str) | Unknown external Feed id, business-identity conflict, a declared control file that did not arrive |
 | `normalize_delivery` | `normalize` | `normalization.normalize_delivery(delivery_manifest_key)` | NormalizationManifest key (str) | Unsafe archive member, invalid zip, contract conflict |
-| `ingest_raw` | `ingest_raw` | `spark_task.run("ingest-v2", normalization_manifest_key, attempt_id)` (-> `ingest_feed.ingest_normalized_delivery`) | `{feed, delivery_id, cob_date, rows, already_ingested, asset_uri}` | Schema drift with `schema_drift: fail`, row floor/ceiling, row-count/checksum mismatch |
+| `ingest_raw` | `ingest_raw` | `spark_task.run("ingest-v2", normalization_manifest_key, attempt_id)` (-> `ingest_feed.ingest_normalized_delivery`) | `{feed, delivery_id, cob_date, rows, already_ingested, asset_uri, run_id, commit}` + drift column names | Schema drift with `schema_drift: fail`, row floor/ceiling, row-count/checksum mismatch |
+| `report_drift` | `steps.drift_warnings` | -- (logs) | the same summary | Never: drift is reported, not fatal |
+| `record_snapshot` | `steps.record_snapshot` | `Nessie.create_tag(snapshot/<feed>/<bd>/<run_id>, hash=commit)` | the summary + `tag` | Never: a tag that cannot be cut is returned as `tag_error`. No tag when `already_ingested` |
+
+The last two are `ingest_<feed>`'s own last two tasks, calling the same
+functions, so a Transport ingest is reported and pinned exactly as an inbox
+one. The tag names the commit `ingest_raw`'s merge made, not `main`'s head
+(`docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit`), which is what
+lets it run outside the write pool.
 
 Each task is one call to its step, and the step -- with the receipt and
 validation evidence it records -- is what `python -m reporting_platform.ingest

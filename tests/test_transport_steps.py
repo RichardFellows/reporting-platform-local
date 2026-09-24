@@ -95,14 +95,22 @@ def _stub_steps(fail_at: str | None = None, exc: Exception | None = None):
         normalize=step("normalize", "n"), ingest_raw=step("ingest_raw", raw))
 
 
-def test_ingest_transport_runs_the_four_steps_in_order():
-    from reporting_platform.ingest import transport_steps
+def test_ingest_transport_runs_the_four_steps_then_after_ingest():
+    from reporting_platform.ingest import steps, transport_steps
 
     calls, stubs = _stub_steps()
-    with _patched(transport_steps, **stubs):
+    after = []
+
+    def fake_after(feed, result):
+        after.append(feed)
+        return {**result, "tag": "snapshot/f/2026-09-14/r"}
+
+    with _patched(transport_steps, **stubs), _patched(steps, after_ingest=fake_after):
         got = transport_steps.ingest_transport("received/x/_COMPLETE.json")
     assert calls == ["validate", "deliver", "normalize", "ingest_raw"]
+    assert after == ["f"], "the drift report and tag did not follow the ingest"
     assert got["delivery_id"] == "dlv_1" and "error" not in got
+    assert got["tag"] == "snapshot/f/2026-09-14/r"
     assert got["marker_key"] == "received/x/_COMPLETE.json"
 
 
@@ -114,7 +122,12 @@ def test_ingest_transport_reports_a_refusal_apart_from_a_failure():
             ("ingest_raw", SparkTaskRefused("md5 mismatch"), True),
             ("validate", RuntimeError("store down"), False)):
         calls, stubs = _stub_steps(fail_at, exc)
-        with _patched(transport_steps, **stubs):
+        from reporting_platform.ingest import steps
+
+        def no_after(*_):
+            raise AssertionError("after_ingest ran after a failed step")
+
+        with _patched(transport_steps, **stubs), _patched(steps, after_ingest=no_after):
             got = transport_steps.ingest_transport("m")
         assert got["stage"] == fail_at, got
         assert got["refused"] is refused, got

@@ -141,9 +141,12 @@ file ingest does.
 `registry.validation_result` rows, so the COB Status page shows a Transport
 the runner took exactly as one Airflow took.
 
-**No snapshot tag.** The file path cuts `snapshot/<feed>/<bd>/<run>` per
-ingest. Neither Transport path does, in Airflow or here. That is a gap in
-`transport_ingest`, not something the runner changed.
+**A snapshot tag per ingest, as on the file path.** After `ingest_raw`,
+`ingest_transport` runs `steps.after_ingest`: the drift report, then
+`snapshot/<feed>/<bd>/<run>` at the commit the ingest's merge made. It's the
+same function the file path and both DAGs use
+(`docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit`). A Transport raw
+already held is not tagged again.
 
 ## Pointing it at deployed infrastructure
 
