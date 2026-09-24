@@ -348,7 +348,12 @@ to run something for the first time, expect it to fail and read what it says.
   the replay with the target's version before its start, so retracting the
   start version reopens that one. A key absent from a delivery still
   never CLOSES the version in force; and a date raw no longer holds is never
-  a retraction. (`#a-snapshot-re-delivery-restates-the-whole-date`)
+  a retraction: a version in the replay whose COB date retention has pruned
+  is SEEDED FROM THE TARGET (`scd2_pruned_seed`), never re-derived, so an
+  incremental run never needs a pruned date. `--full-refresh` of an SCD2
+  model once raw is pruned re-dates history and REFUSES unless `--vars
+  '{scd2_rebuild_from_pruned_raw: true}'`; restore from a Nessie tag
+  instead. (`#a-snapshot-re-delivery-restates-the-whole-date`)
 - **As-of is a var, not a second model**: the same models with `--vars
   '{knowledge_time: ...}'`, filtered by `known_as_of()`. It compiles to
   `1 = 1` when unset and **refuses an incremental run**, because writing as-of

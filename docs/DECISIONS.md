@@ -5083,11 +5083,15 @@ weighed.**
   `on_schema_change` adds it afterwards — so they are NULL literals, in an
   order `scd2_output_columns()` defines once for `ranged` and the markers
   both, because Spark 3.5 has no `UNION BY NAME`.
-- **A marker only where raw still holds a delivery for the version's COB
-  date.** A retraction means "the newest delivery for that date no longer says
-  this". A date retention has pruned says nothing — and without this guard
-  its version was deleted and the key silently re-dated to the next retained
-  delivery, every SCD2 test green (measured, by removing it).
+- **A pruned date is never, by itself, a retraction.** A retraction means
+  "the newest delivery for that date no longer says this". A date retention
+  has pruned says nothing. Item 09 enforced that with a guard on the marker
+  (only where raw still held the version's COB date); without it the
+  version was deleted and the key silently re-dated to the next retained
+  delivery, every SCD2 test green (measured, by removing it). Todo 22
+  replaced that guard with `scd2_pruned_seed`, below: the pruned version is
+  now carried forward from the target, so it is never missing from the
+  replay and never marked for lacking evidence.
 
 **Through item 09**, the replay read raw from each key's replay start onward,
 and once retention pruned that date the replay re-derived the key from its
@@ -5150,6 +5154,18 @@ from a Nessie tag or commit as the alternative, and applies equally to a
 `--full-refresh knowledge_time` (as-of) build, which takes the same
 non-incremental branch and reads the same pruned raw -- an as-of rebuild
 after pruning is exactly as re-dated and gets no exemption.
+
+**Measured live** (2026-09-24, throwaway Nessie branches, `main` untouched):
+`prepared.ref_rating` full-refreshed from 36 raw COB dates (1,402 versions,
+1,328 of them beginning before 2026-07-20), then every raw row before
+2026-07-20 deleted to stand in for retention, then one incremental build.
+With the old replay, `mutually_exclusive_ranges` failed with 206 rows and 88
+keys had two open versions. With `scd2_pruned_seed`, every test passed and
+the table was row-for-row identical to before the prune; a later
+2026-08-20 delivery changing one such key closed its 2026-04-30 version at
+2026-08-19 and opened one version, nothing else moved. `--full-refresh` on
+that branch refused, naming 29 pruned origin dates; with the override it
+rebuilt 199 versions from 1,402, every one beginning on or after 2026-07-20.
 
 **Tests**, all in `tests/test_scd2_incremental.py`: the seed and the
 retraction interaction --

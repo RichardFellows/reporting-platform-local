@@ -532,8 +532,8 @@
         {%- set examples = [] -%}
         {%- for row in pruned.rows[:5] %}{%- do examples.append(row[0] | string) %}{%- endfor -%}
         {{ exceptions.raise_compiler_error(
-             "--full-refresh of " ~ this ~ " would re-date " ~ (pruned.rows | length)
-             ~ " version(s) whose origin COB date raw no longer holds (e.g. "
+             "--full-refresh of " ~ this ~ " would re-date every version beginning on one of "
+             ~ (pruned.rows | length) ~ " COB date(s) raw no longer holds (e.g. "
              ~ (examples | join(', ')) ~ ") to the next date raw still holds -- a silent "
              ~ "restatement of when they began, not a correction. This refuses a "
              ~ "--full-refresh knowledge_time (as-of) build for the same reason: it reads "
