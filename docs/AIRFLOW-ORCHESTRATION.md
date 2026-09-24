@@ -133,9 +133,14 @@ Failure attribution therefore matches the Phase 6 brief's list exactly: an
 invalid Transport fails `validate_transport`, an unknown Feed id or identity
 conflict fails `create_delivery`, an unsafe archive fails
 `normalize_delivery`, and a schema/row/checksum failure fails `ingest_raw`.
-Standard `retries`/`retry_delay` apply the same as every other DAG in this
-platform; a permanently invalid Transport still retries and still fails, the
-same as the legacy path's `ingest` task does today.
+Standard `retries`/`retry_delay` apply to a failure that might not recur.
+**A refusal is not retried**: a `DeliveryError` in `create_delivery` (a
+missing declared control file included) and a blocking Raw check in
+`ingest_raw` -- schema drift under `fail`, the row floor/ceiling, a declared
+row count or md5 that does not match -- fail the task once, with
+`AirflowFailException`, because the same evidence fails the same check every
+time. The legacy `ingest` task does the same. See
+`docs/DECISIONS.md#a-refusal-is-not-retried`.
 
 `transport_ingest` itself is triggered only -- `schedule=None` -- by
 `transport_watch`, `transport_reconcile`, or a manual replay. It never
@@ -176,8 +181,11 @@ operations it calls already are:
   exist and accepts only byte-identical ones.
 - `ingest_normalized_delivery` is guarded by `_delivery_id` on committed Raw
   `main` -- `already_ingested_delivery` -- so a retry after a merge is a
-  fast, safe no-op, and a retry after a failed branch (never merged) simply
-  runs the write again.
+  fast, safe no-op, and a retry after a failed branch (never merged) runs
+  the write again on a NEW branch -- `ingest_attempt_id` names one per
+  attempt. Until it did, the retry collided with the branch its failed
+  predecessor kept for inspection and died on Nessie's `409 Conflict`, so
+  this sentence was false for every failure it describes.
 
 So **duplicate events are harmless by construction**: two `_COMPLETE.json`
 notifications for the same TransportID resolve to the same DeliveryID

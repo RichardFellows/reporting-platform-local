@@ -2482,6 +2482,20 @@ def branch_name(purpose: str, scope: str, cob_date: date, run_id: str) -> str:
     return f"{purpose}/{scope}/{cob_date:%Y-%m-%d}/{run_id}"
 
 
+def ingest_attempt_id(airflow_run_id: str, try_number: int) -> str:
+    """The run id an ingest ATTEMPT names its branch with: `<run>-a<n>`.
+
+    One per attempt, not per Airflow run. A failed ingest keeps its branch
+    for inspection, so a retry reusing the name died on Nessie's 409 and
+    could never succeed. Reusing the branch instead (`exist_ok`, as the dbt
+    builds do) is wrong HERE: an attempt that failed after its append would
+    leave rows the retry appends again. A fresh branch starts from `main`.
+    See docs/DECISIONS.md#a-refusal-is-not-retried
+    """
+    base = airflow_run_id.replace(":", "").replace("+", "")[-21:]
+    return f"{base}-a{int(try_number)}"
+
+
 def published_tag(report: str, cob_date: date, run_id: str) -> str:
     """The pin a PUBLICATION cuts: published/<report>/<bd>/<run_id>.
 

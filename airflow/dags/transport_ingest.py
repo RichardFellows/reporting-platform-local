@@ -72,18 +72,43 @@ def _record_delivery_failure(exc: Exception, *, control_id: str,
     effort, like every other registry write on this path -- see
     `registry/validation.py`.
     """
-    from reporting_platform.ingest import delivery as delivery_contract
     from reporting_platform.ingest import transport as transport_contract
     from reporting_platform.registry import validation
 
-    known = (transport_contract.TransportContractError, delivery_contract.DeliveryError)
-    outcome = "FAIL" if isinstance(exc, known) else "ERROR"
+    outcome = "FAIL" if _is_refusal(exc) or isinstance(
+        exc, transport_contract.TransportContractError) else "ERROR"
     validation.record_quietly(
         layer="delivery", control_id=control_id, control_name=control_id,
         outcome=outcome, severity="blocking", attempt_key=execution_ref,
         execution_ref=execution_ref, transport_id=transport_id, feed=feed,
         delivery_id=delivery_id, evidence_ref=transport_id,
         message=f"{type(exc).__name__}: {exc}")
+
+
+def _is_refusal(exc: Exception) -> bool:
+    """Will a retry fail the same way? A DeliveryError is about how the
+    Transport's own immutable evidence reads against the Feed; a
+    SparkTaskRefused is a blocking Raw check on the same bytes. Neither
+    changes between attempts. See docs/DECISIONS.md#a-refusal-is-not-retried
+    """
+    from reporting_platform.common.spark_task import SparkTaskRefused
+    from reporting_platform.ingest import delivery as delivery_contract
+
+    return isinstance(exc, (delivery_contract.DeliveryError, SparkTaskRefused))
+
+
+def _raise_final(exc: Exception) -> None:
+    """Re-raise `exc`, as AirflowFailException when retrying cannot help.
+
+    `retries: 2` is for a transient hiccup. Retrying a refusal spends two
+    retry delays and, before each attempt had its own branch, replaced the
+    real message with a Nessie 409 as the task's last error.
+    """
+    if _is_refusal(exc):
+        from airflow.exceptions import AirflowFailException
+
+        raise AirflowFailException(f"{type(exc).__name__}: {exc}") from exc
+    raise exc
 
 
 def _spark_subprocess(*args: str) -> dict:
@@ -226,7 +251,7 @@ def _dag():
                 exc, control_id="delivery_identity",
                 transport_id=transport_id or marker_key,
                 execution_ref=context["run_id"])
-            raise
+            _raise_final(exc)
         receipts.record_stage_quietly(
             transport_id, "delivered", feed=created.feed,
             delivery_id=created.delivery_id, airflow_dag_id="transport_ingest",
@@ -300,7 +325,10 @@ def _dag():
         """
         from reporting_platform.registry import transports as receipts
 
-        run_id = context["run_id"].replace(":", "").replace("+", "")[-24:]
+        from reporting_platform.common.context import ingest_attempt_id
+
+        # A branch PER ATTEMPT: see `ingest_attempt_id`.
+        run_id = ingest_attempt_id(context["run_id"], context["ti"].try_number)
         try:
             result = _spark_subprocess("ingest-v2", normalization_manifest_key, run_id)
         except Exception as exc:
@@ -321,7 +349,7 @@ def _dag():
                 exc, control_id="raw_ingestion",
                 transport_id=normalization_manifest_key,
                 execution_ref=context["run_id"])
-            raise
+            _raise_final(exc)
 
         # THE COMMIT ALREADY HAPPENED, above -- this only tells prepared_build
         # about it. Emitting on the "already_ingested" no-op path is correct,

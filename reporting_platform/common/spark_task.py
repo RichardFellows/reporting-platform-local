@@ -50,6 +50,30 @@ import sys
 # What a driver runs, in a child process or a pod: this module, by name.
 MODULE = "reporting_platform.common.spark_task"
 
+# The exit status of an op that REFUSED its input: sysexits' EX_DATAERR. Any
+# other non-zero status is a failure that might not recur; this one will,
+# because the same bytes fail the same check every time.
+REFUSED_EXIT = 65
+
+
+class Refused(Exception):
+    """Raised by an op when the answer will not change on a retry.
+
+    A declared md5 that does not match, a row count below the floor: the
+    input is wrong, and running again reads the same input. The child exits
+    `REFUSED_EXIT` and the parent raises `SparkTaskRefused`, so a DAG can
+    fail once with this message instead of retrying into a different error.
+    See docs/DECISIONS.md#a-refusal-is-not-retried
+    """
+
+
+class SparkTaskRefused(RuntimeError):
+    """The parent's view of a child that exited `REFUSED_EXIT`.
+
+    A RuntimeError like every other launch failure, so a caller that does
+    not care about the difference is unaffected.
+    """
+
 
 def run(*args: str) -> dict:
     """Launch one of the operations below as its own driver; parse its JSON.
@@ -103,7 +127,8 @@ def parse_result(args, code: int, stdout: str, stderr: str) -> dict:
         head = err[cut:cut + 2500] if cut >= 0 else ""
         tail = ((stdout or "")[-1500:] + "\n" + head
                 + "\n...\n" + err[-2000:])
-        raise RuntimeError(
+        error = SparkTaskRefused if code == REFUSED_EXIT else RuntimeError
+        raise error(
             f"spark task {tuple(args)!r} failed (exit {code})\n{tail}")
     for line in reversed((stdout or "").strip().splitlines()):
         line = line.strip()
@@ -248,8 +273,23 @@ def main(argv: list[str] | None = None) -> int:
             f"op {op!r} is implemented by {module}, which is not installed "
             f"in this image -- build the driver image with the component that "
             f"owns it (components.yml)") from exc
-    return getattr(impl, function)(args)
+    try:
+        return getattr(impl, function)(args)
+    except Refused:
+        import traceback
+
+        traceback.print_exc()
+        return REFUSED_EXIT
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # THE IMPORTED MODULE'S main(), not this copy's. Run as `python -m`, this
+    # file is `__main__`, a second module object whose `Refused` is a
+    # different class from `reporting_platform.common.spark_task.Refused`,
+    # the one every op subclasses -- so the except in main() never matched
+    # and every refusal exited 1. Found by the live run; a test calling
+    # main() in-process could not see it. Handing off means each name here
+    # exists once. `tests/test_refusal.py` runs it the way `run()` does.
+    from reporting_platform.common.spark_task import main as _main
+
+    raise SystemExit(_main())

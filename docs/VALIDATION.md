@@ -137,9 +137,12 @@ docker compose exec -T airflow python -m reporting_platform.registry validation 
 ```
 
 `outcome` is `FAIL` for a known validation exception (`TransportContractError`
-and subclasses, `DeliveryError` and subclasses) and `ERROR` for anything
-else -- the control ran and found a real problem versus the control itself
-breaking.
+and subclasses, `DeliveryError` and subclasses, and -- on `raw_ingestion` --
+`SparkTaskRefused`, a blocking Raw check that failed) and `ERROR` for
+anything else -- the control ran and found a real problem versus the control
+itself breaking. Before `SparkTaskRefused` existed a failed md5 was a FAIL
+one layer down and an ERROR on `raw_ingestion`, the same event classified
+two ways.
 
 ## Raw ingestion evidence
 
@@ -155,6 +158,18 @@ branch):
 * `declared_row_count` -- the producer's assertion, checked only when the
   delivery's control file declared one.
 * `declared_md5` -- the producer's checksum, checked only when declared.
+
+A FAIL on any blocking check raises `IngestValidationError`, a `Refused`: the
+Spark child exits 65 and the DAG fails the task once rather than retrying the
+same bytes (`docs/DECISIONS.md#a-refusal-is-not-retried`).
+
+**"Checked only when declared" means declared by the FEED, not by the
+file.** A feed with no `delivery.control` block, or one whose block does not
+name `md5`, is never asked for a checksum -- that is how a feed whose sender
+sends no control file, or one without a checksum, is configured. A feed that
+DOES declare one and receives a Transport with no control object is refused
+at `create_delivery` (`docs/DECISIONS.md#a-declared-control-must-arrive`);
+it is not ingested with the check silently skipped.
 
 ```
 docker compose exec -T airflow python -m reporting_platform.registry validation delivery <delivery-id> [--feed F]
