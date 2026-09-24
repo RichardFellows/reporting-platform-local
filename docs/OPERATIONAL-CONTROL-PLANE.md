@@ -119,7 +119,7 @@ flowchart TD
     start --> q1
     q1 -- no --> NE
     q1 -- yes --> q2
-    q2 -- "yes: even if a Transport for<br/>this date failed and was superseded" --> C
+    q2 -- "yes: hides any failure for this date,<br/>before the commit (superseded)<br/>or after it (a failed correction)" --> C
     q2 -- no --> q3
     q3 -- yes --> P
     q3 -- no --> q4
@@ -134,19 +134,26 @@ flowchart TD
 *Read from the code*: the branches are `monitoring/feed_status.status_of`,
 in its order. The inputs are assembled by `feed_entry` and `build_report`.
 `build_report` drops any receipt whose `feed` is still NULL, and `feed_entry`
-passes only the latest receipt's status, by `updated_at`. Three consequences
+passes only the latest receipt's status, by `updated_at`. Four consequences
 follow, and none of them is obvious from the vocabulary:
 
-- **A receipt has no `feed` until `create_delivery`.** A Transport that is
-  only `discovered` or `validated`, or that failed `validate_transport`, is
-  invisible here. The feed reads `WAITING` or `MISSING`, not `RECEIVED` or
-  `FAILED`. `create_delivery` fills the feed in on failure too, best effort.
+- **A receipt gets its `feed` from one of two writers.** One is
+  `create_delivery` (`transport_steps.deliver`), on success and, best
+  effort, on failure. The other is `transport_reconcile`'s `sync_receipts`
+  (`sync_from_progress`), which sets `feed` and `delivery_id` when it
+  records `normalized`. Until one of them runs, a Transport that is
+  `discovered` or `validated`, or that failed `validate_transport`, is
+  invisible here. The feed reads `WAITING` or `MISSING`, never `RECEIVED` or
+  `FAILED`.
 - **`registry.delivery` is written at normalize**, so from
   `normalize_delivery` onwards the feed reads `PROCESSING` until
   `delivery_committed` has a row. That includes an `ingest_raw` that failed
-  or was refused. Its `failed` receipt would not survive anyway:
-  `transport_reconcile` sets it back to `normalized` within about 20
-  minutes (§6).
+  or was refused. For a COB date inside reconcile's window, its `failed`
+  receipt is also reset
+  ([§6](#a-failed-receipt-is-reset-by-reconcile)).
+- **`committed` is checked first**, so one commit for the date hides every
+  later failure for that date as well, such as a correction that fails
+  after the original delivery committed.
 - **A Delivery ingested before `_delivery_id` existed on its raw table
   reads `PROCESSING` until that table is rebuilt** or the date ages out.
   `reconcile-committed` cannot find the column to backfill from (§11).
@@ -189,12 +196,12 @@ each stage *produced*, not that a particular attempt is in flight.
   (identity/date conflict) can occur *after* the Feed itself was resolved,
   and a `FAILED` row with no feed attached would never surface on that
   feed's COB Status row, which is exactly the case an operator most needs to
-  see `ingest/transport_steps.py::deliver`, which the `create_delivery`
+  see (`ingest/transport_steps.py::deliver`, which the `create_delivery`
   task calls).
 
 This one *is* a state diagram, because `status` is a stored, mutable
-column. Each edge is labelled with what writes it: a `transport_ingest`
-task id, or `transport_reconcile`'s `sync_receipts` task.
+column. Each edge that writes a stage is labelled with its writer: a
+`transport_ingest` task id, or `transport_reconcile`'s `sync_receipts` task.
 
 ```mermaid
 stateDiagram-v2
@@ -206,29 +213,31 @@ stateDiagram-v2
     discovered --> normalized: sync_receipts
     validated --> normalized: sync_receipts
     delivered --> normalized: sync_receipts
-    discovered --> failed: validate_transport<br/>(conf has transport_id)
-    validated --> failed: create_delivery<br/>(feed best effort)
-    delivered --> failed: normalize_delivery
-    normalized --> failed: ingest_raw<br/>(row found by feed, delivery_id)
-    failed --> validated: validate_transport retry
-    failed --> delivered: create_delivery retry
-    failed --> normalized: sync_receipts, within ~20 min<br/>(or normalize_delivery retry)
+    discovered --> failed: a step fails
+    validated --> failed: a step fails
+    delivered --> failed: a step fails
+    normalized --> failed: a step fails
+    failed --> validated: validate_transport
+    failed --> delivered: create_delivery
+    failed --> normalized: normalize_delivery,<br/>or sync_receipts with no attempt
+    note right of failed
+        failed is accepted from ANY stage, from any of
+        validate_transport, create_delivery,
+        normalize_delivery or ingest_raw failing,
+        so a replay can fail a row that is further on.
+        failed keeps stage_rank; a failed row accepts any stage.
+    end note
     note right of normalized
         Last stage. ingest_raw writes nothing on success:
         reaching Raw is registry.delivery_committed,
         written by ingest_feed._ingest_manifest.
-        A row failed by ingest_raw is set back to normalized,
-        failure_reason NULL, by the next sync_receipts run
-        (every 20 min, 7-day window), retried or not.
     end note
     note left of discovered
-        record_stage is UPDATE-only. A validate_transport
-        failure with no row yet writes nothing here,
-        only registry.validation_result.
+        record_stage is UPDATE-only: a failure before
+        any row exists writes nothing here, only
+        registry.validation_result.
         stage_rank: a write ranked below the row is dropped,
         so a stale or racing retry cannot move status back.
-        failed is always written and keeps stage_rank;
-        a failed row accepts any stage.
     end note
 ```
 
@@ -237,28 +246,39 @@ stateDiagram-v2
 clause). The `transport_ingest` task ids in
 `airflow/dags/transport_ingest.py` call the writers in
 `ingest/transport_steps.py` (`validate`, `deliver`, `normalize`,
-`ingest_raw`). Discovery rows come from `airflow/dags/transport_watch.py`
-and from `transport_reconcile`'s `sync_receipts` task. `record_discovered`
-is an insert. Every other write is `record_stage`, an `UPDATE`, so a failure
-before any row exists records nothing on the receipt. That happens when
-`validate_transport` fails for a Transport nothing discovered first, such as
-a manual replay. `validate` calls `record_discovered` only after validation
-succeeds, then moves the row to `validated` at once.
+`ingest_raw`). Each of them records `failed` when its own call raises.
+`record_stage` accepts `failed` whatever the row's stage, so a replay that
+fails early can fail a row that had gone further. Discovery rows come from
+`airflow/dags/transport_watch.py` and from `transport_reconcile`'s
+`sync_receipts` task. `record_discovered` is an insert, and every other
+write is `record_stage`, an `UPDATE`. So a failure before any row exists
+records nothing on the receipt. That happens when `validate_transport`
+fails for a Transport nothing discovered first, such as a manual replay.
+`validate` calls `record_discovered` only after validation succeeds, then
+moves the row to `validated` at once. No stage says the Delivery reached
+Raw. That is `registry.delivery_committed` (§7).
 
-`sync_receipts` calls `sync_from_progress`. That records `normalized` for
-every Transport in the scanned window that has a NormalizationManifest,
-whatever its current stage, **`failed` included**, and whether or not it
-reached Raw (`transport_reconcile.discover_transport_progress` returns
-these as `candidates_by_feed`). `transport_reconcile` runs every 20
-minutes and scans `TRANSPORT_RECONCILE_WINDOW_DAYS` (default 7). So a
-receipt failed by `ingest_raw` reads `normalized` again within about one
-interval, with `failure_reason` cleared, whether or not anything retried
-it. That is the bullet above ("a successful retry must not stay stuck
-reading FAILED forever") applied by a writer that does not know whether
-there was a retry. The failure's durable record is the
-`registry.validation_result` row `ingest_raw` wrote, not the receipt. No
-stage says the Delivery reached Raw. That is
-`registry.delivery_committed` (§7).
+<a id="a-failed-receipt-is-reset-by-reconcile"></a>
+**A `failed` receipt is reset by reconcile, with no attempt, but only
+inside its window.** `sync_receipts` calls `sync_from_progress`, which
+records `normalized`, with `feed` and `delivery_id`, for every Transport in
+its scan that has a NormalizationManifest. It does this whatever the row's
+current stage, **`failed` included**, and whether or not the Transport
+reached Raw (`transport_reconcile.discover_transport_progress` returns these
+as `candidates_by_feed`). `record_stage` accepts that on a `failed` row and
+clears `failure_reason`. `transport_reconcile` runs every 20 minutes. Its
+scan covers the COB dates in `window_cob_dates(TRANSPORT_RECONCILE_WINDOW_DAYS)`
+(default 7, counted back from today), or everything under
+`{"full_sweep": true}`. So a receipt failed by `ingest_raw` for a COB date
+inside that window reads `normalized` again within about one interval, and
+its reason is gone, whether or not anything retried it. A failure for an
+older COB date, such as a backfill or a replay, stays `failed` until a
+retry or a full sweep. Nothing re-triggers `transport_ingest` for it:
+`trigger_pending` reuses `run_id_for(transport_id)`, which already exists.
+The failure's durable record is the `registry.validation_result` row
+`ingest_raw` wrote, not the receipt. This is the bullet above ("a successful
+retry must not stay stuck reading FAILED forever") applied by a writer that
+cannot tell whether there was a retry. Todo 50 tracks it.
 
 ## 7. Delivery persistence: `delivery_committed`
 
@@ -332,13 +352,16 @@ transport_reconcile (evidence walk,          |    .record_discovered()
   `discover_transport_progress` classification the DAG already computed for
   triggering — so the correctness path and the fast path write through the
   same function, not two implementations that could drift.
-- `transport_ingest`'s own tasks (`validate_transport`, `create_delivery`,
-  `normalize_delivery`, `ingest_raw`) call `record_discovered_quietly` +
-  `record_stage_quietly` right next to their existing
-  `_record_delivery_failure` calls — this is **self-healing**: if neither
-  discovery path saw a Transport before this DAG ran (a manual replay,
-  `docs/AIRFLOW-ORCHESTRATION.md#replaying-a-transport`), the first task to
-  run creates the missing receipt row itself.
+- `transport_ingest`'s tasks call `record_stage_quietly` from their steps
+  in `ingest/transport_steps.py` (`ingest_raw` through
+  `record_stage_by_delivery_id_quietly`), next to `record_failure`. Only
+  `validate_transport` calls `record_discovered_quietly`, in
+  `transport_steps.validate`, after validation succeeds. That call is the
+  **self-healing**: if neither discovery path saw a Transport before this
+  DAG ran (a manual replay,
+  `docs/AIRFLOW-ORCHESTRATION.md#replaying-a-transport`), a successful
+  validation creates the missing receipt row. A failed validation cannot,
+  and neither can the later tasks, because `record_stage` only updates.
 - Every one of these writes is `_quietly` — best-effort, logged on failure,
   never raised. The registry is an index; a write failing here must never
   change what the pipeline actually does, the same rule
@@ -361,10 +384,14 @@ No distributed transaction anywhere. Each step is independently retryable:
   either discovery path on its next pass, or by `transport_ingest` itself
   self-healing (§9) — there is no window where evidence exists and can never
   be found.
-- A receipt stuck at `failed` is not stuck: the next successful attempt for
-  the same `transport_id` (a manual replay after a fix, or a retried task)
-  overwrites it unconditionally (§6) — `failed` is a fact about the last
-  attempt, not a terminal state.
+- A receipt at `failed` is not terminal. A replay or retried task that
+  reaches a stage overwrites it. `ingest_raw` is the exception: it writes
+  nothing on success. Separately, `transport_reconcile`'s `sync_receipts`
+  sets it back to `normalized` with no attempt at all, for any Transport
+  past normalization whose COB date is in its window
+  ([§6](#a-failed-receipt-is-reset-by-reconcile)). So `failed` says the
+  last recorded write was a failure. It does not say the Transport is still
+  failing, and a reset does not say it recovered.
 - A `delivery_committed` write failing after a successful Raw commit does
   not corrupt anything: Raw is still the ledger, `registry.delivery` still
   has its row, and the next `scripts._spark_task reconcile-committed <feed>`

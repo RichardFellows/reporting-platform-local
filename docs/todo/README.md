@@ -27,7 +27,7 @@ than worked.
 | [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
 | [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
-| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and reconcile resets its receipt within 20 minutes | medium | ½–1 day |
+| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and inside reconcile's window its receipt is reset | medium | ½–1 day |
 
 ## Where to start
 
@@ -65,31 +65,29 @@ independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 **29, the Transport receipt's stages and COB Feed Status derivation were not
 drawn** — `docs/OPERATIONAL-CONTROL-PLANE.md` now has both diagrams. §5 has a
 decision `flowchart` of `feed_status.status_of`, in the order the code checks
-it. Its two surprising edges are labelled: committed-after-a-failure is
-`COMPLETE`, and no `expected_by` is `WAITING` forever. §6 has a
-`stateDiagram-v2` of `registry.transport_receipt`, with each edge labelled by
-its writer: the `transport_ingest` task ids, `transport_watch`'s
+it. Its two surprising edges are labelled: a commit hides any failure for
+the date, before or after it (`COMPLETE`), and no `expected_by` is `WAITING` forever. §6 has a
+`stateDiagram-v2` of `registry.transport_receipt`, with each stage write
+labelled by its writer, and `failed` reachable from every stage: the `transport_ingest` task ids, `transport_watch`'s
 `trigger_discovered`, and `transport_reconcile`'s `sync_receipts`. It shows
 the `stage_rank` rule and says reaching Raw is `delivery_committed`, not a
 stage. `AIRFLOW-ORCHESTRATION.md` links to §6. Every name was taken from
 `registry/transports.py`, `ingest/transport_steps.py`, the three DAG files
 and `monitoring/feed_status.py`, and the captions cite them. §6's
 `create_delivery_task` citation now points at `transport_steps.deliver`,
-where that code moved.
+where that code moved. §9's claim that every task self-heals the row and
+§10's claim that only a successful attempt clears `failed` are corrected.
 *Verified* by rendering each block out of the doc itself with mermaid-cli 11
 and 10, and looking at the PNGs. `python -m tests.run`: 1000
 passed, 1 skipped (fastapi).
 *What the item got wrong.* It said a successful retry moves a `failed`
-receipt on again. That is roughly right, but the retry is not what usually
-does it. `transport_reconcile`'s `sync_receipts` (every 20 minutes) records
-`normalized` for every Transport past its NormalizationManifest, and
-`record_stage` accepts that on a `failed` row. So a receipt failed by
-`ingest_raw` is reset to `normalized`, with `failure_reason` cleared, within
-about one interval, retried or not. The first version of this PR said the
-opposite, that such a receipt stays `failed`, and code review caught it. The
-item also treated `RECEIVED` as "any receipt". Receipts without a `feed` are
-dropped first, so a `discovered` or `validated` Transport never reads
-`RECEIVED`. Drawing this exposed todo 50.
+receipt on again. That is roughly right, but inside reconcile's window it is
+usually `transport_reconcile`'s `sync_receipts` that does it, with no retry
+([§6](../OPERATIONAL-CONTROL-PLANE.md#a-failed-receipt-is-reset-by-reconcile)).
+A successful `ingest_raw` retry writes nothing at all. The item also
+treated `RECEIVED` as "any receipt". Receipts without a `feed` are dropped
+first, so a `discovered` or `validated` Transport never reads `RECEIVED`.
+Drawing this exposed todo 50.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the

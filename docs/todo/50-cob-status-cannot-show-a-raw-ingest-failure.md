@@ -1,4 +1,4 @@
-# A failed or refused raw ingest never reads FAILED on COB Status, and its receipt is reset within 20 minutes
+# A failed or refused raw ingest never reads FAILED on COB Status, and inside reconcile's window its receipt is reset
 
 **Value** medium · **Effort** ½–1 day · **Branch** `fix/cob-status-raw-failure`
 
@@ -8,21 +8,19 @@ When `ingest_raw` fails, or is refused (a declared md5 or row count
 mismatch, the row floor, schema drift under `fail`), the operator never sees
 `FAILED` for that feed. Two mechanisms each cause this on their own.
 
-**1. The failed receipt is overwritten.** `transport_steps.ingest_raw`
-records `failed` on the receipt. But `transport_reconcile` runs every 20
-minutes (`schedule=timedelta(minutes=20)`), and its `sync_receipts` task
-calls `registry/transports.py::sync_from_progress`. That function calls
-`record_stage(..., "normalized")` for every Transport in
-`candidates_by_feed`. `transport_reconcile.discover_transport_progress`
-puts a Transport there when it has a NormalizationManifest, whether or not
-it reached Raw. `record_stage`'s `WHERE` accepts any stage on a row whose
-status is `failed` (`OR status = 'failed'`) and sets `failure_reason` to
-NULL. So within about one interval the receipt reads `normalized` again,
-with no reason, whether or not anything retried it. After that the only
-durable record of the failure is the `registry.validation_result` row
-(`control_id=raw_ingestion`). The retrigger does not help either:
-`trigger_pending` re-triggers under the same `run_id_for(transport_id)`,
-which deduplicates against the failed run.
+**1. Inside reconcile's window, the failed receipt is overwritten.**
+`transport_reconcile`'s `sync_receipts` sets it back to `normalized` and
+clears `failure_reason` within about one 20-minute interval, whether or not
+anything retried it. This applies to a COB date inside
+`TRANSPORT_RECONCILE_WINDOW_DAYS` (default 7, counted back from today), or
+to any date under a full sweep. The mechanism, and why nothing re-triggers
+the ingest, is in
+[`OPERATIONAL-CONTROL-PLANE.md` §6](../OPERATIONAL-CONTROL-PLANE.md#a-failed-receipt-is-reset-by-reconcile).
+The cause is in `registry/transports.py`: `sync_from_progress` writes
+`normalized` for every candidate past normalization, and `record_stage`
+accepts any stage on a `failed` row (`OR status = 'failed'`). A failure for
+an older COB date, such as a backfill or a replay, keeps its `failed`
+receipt, but (2) still hides it.
 
 **2. Precedence hides it even before the reset.** `feed_status.status_of`
 checks `has_delivery` (any `registry.delivery` row) before the receipt's
@@ -39,31 +37,42 @@ print(status_of(expected=True, committed=False, has_delivery=True,
 #  PROCESSING
 ```
 
-Fixing (2) alone would show `FAILED` for at most about 20 minutes, until
-(1) erases it. The feed then reads `PROCESSING` with nothing behind it.
-`OPERATIONAL-CONTROL-PLANE.md` §6 calls a FAILED row that never surfaces
-"exactly the case an operator most needs to see".
+Inside the window, fixing (2) alone would show `FAILED` for at most one
+interval, until (1) erases it.
 
-A related gap: `build_report` drops receipts whose `feed` is NULL, and a
-receipt only gets a feed at `create_delivery`. So a `validate_transport`
-failure never reads `FAILED`; the feed reads `WAITING` or `MISSING`. When
-nothing discovered the Transport first, as in a manual replay, the failure
-writes no receipt row at all, because `record_stage` is `UPDATE`-only.
+**3. A failure after a commit is hidden too.** `status_of` checks
+`committed` first. Once any Delivery for the date has committed, a later
+one for the same date that fails reads `COMPLETE`. That later Delivery could
+be a correction whose md5 does not match. It has the same shape as (2), one
+step earlier:
+
+```bash
+# status_of(expected=True, committed=True, has_delivery=True,
+#           receipt_status='failed', ...)  ->  COMPLETE
+```
+
+**Related:** `build_report` drops receipts whose `feed` is NULL. A receipt
+gets a feed only from `create_delivery` or `sync_receipts`, so a
+`validate_transport` failure never reads `FAILED`; the feed reads `WAITING`
+or `MISSING`. When nothing discovered the Transport first, as in a manual
+replay, the failure writes no receipt row at all, because `record_stage` is
+`UPDATE`-only.
 
 ## What done looks like
 
 - [ ] Reproduced live first: a Transport whose declared md5 does not match,
-      carried through `transport_ingest`. Record the receipt and the COB
-      Status page right after the failure, and again after the next
-      `transport_reconcile` run.
-- [ ] A decision on what may overwrite a `failed` receipt. For example,
-      `sync_from_progress` could skip rows that are `failed`, or only
-      advance a failed row that a real stage write has reached. Record it in
+      carried through `transport_ingest`, for a COB date inside the window.
+      Record the receipt and the COB Status page right after the failure,
+      and again after the next `transport_reconcile` run. Then do the same
+      for a correction that fails after the date committed (3).
+- [ ] A decision on what may overwrite a `failed` receipt, for example that
+      `sync_from_progress` skips rows that are `failed`. Record it in
       `registry/transports.py`'s header and in §6, and update the §6 state
       diagram.
-- [ ] A decision on `status_of`'s precedence between `has_delivery` and a
-      failed receipt for the same `delivery_id`. Update `status_of`'s
-      docstring, §5 and the §5 flowchart.
+- [ ] A decision on `status_of`'s precedence: `committed` and
+      `has_delivery` against a failed receipt for a *different*, newer
+      `delivery_id`. Update `status_of`'s docstring, §5 and the §5
+      flowchart.
 - [ ] Either give a `validate_transport` failure a place on the page, or
       say in §5 that it is deliberately not shown.
 - [ ] Tests for each case, in the `status_of`/`feed_entry` style, plus one
@@ -75,13 +84,15 @@ Status is derived, never stored (`#the-registry-records-observations-not-verdict
 The receipt is an execution record and may be mutable. COB status may not.
 "Successful retry must not stay stuck reading FAILED forever" (§6) is a real
 requirement too. Whatever stops reconcile erasing a failure must still let a
-genuinely successful retry move the row on.
+genuinely successful retry move the row on. The precedence in (3) exists
+for a reason: a correction must not be reported FAILED because of what it
+corrected. So compare `delivery_id`s; do not simply reorder the checks.
 
 ## Prompt for a new session
 
 ```text
 Read CLAUDE.md, then docs/todo/50-cob-status-cannot-show-a-raw-ingest-failure.md.
 Reproduce it live first (receipt + COB Status before and after one
-transport_reconcile run), then decide both the overwrite rule and the
-status_of precedence.
+transport_reconcile run, for a COB date inside the window), then decide both
+the overwrite rule and the status_of precedence.
 ```
