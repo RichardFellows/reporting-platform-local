@@ -34,11 +34,25 @@ from datetime import date, datetime, timezone
 from reporting_platform.common.parsing import feed_format
 
 from reporting_platform.common import settings
+from reporting_platform.common.spark_task import Refused
 from reporting_platform.common.context import (
     CATALOG, Nessie, branch_name, feed as get_feed, new_run_id, spark_session,
 )
 
 log = logging.getLogger("ingest")
+
+
+class IngestValidationError(Refused, ValueError):
+    """A blocking Raw check failed: the delivery is wrong, not the run.
+
+    Retrying reads the same bytes and fails the same check, so this is a
+    `Refused` -- the DAG fails once with this message. It used to be a plain
+    ValueError, and the retry that followed died on the branch this attempt
+    left behind, so the last error on the task was a Nessie 409 rather than
+    the checksum. A ValueError still, for every caller that caught one.
+    """
+
+
 _DELIVERY_ID = re.compile(r"dlv_[0-9a-f]{32}")
 
 
@@ -473,8 +487,8 @@ def committed_rows_from_raw(spark, fd, table: str | None = None) -> list[dict]:
     `main` already holds for this Feed -- the BACKFILL source for
     `registry.delivery_committed` (registry/db.py's header). A Delivery
     ingested before that table existed committed just as durably; this is
-    how `python -m scripts._spark_task reconcile-committed <feed>` recovers
-    that fact without re-ingesting anything. One bulk query, the same shape
+    how `python -m reporting_platform.common.spark_task reconcile-committed
+    <feed>` recovers that fact without re-ingesting anything. One bulk query, the same shape
     as `raw_delivered_ids`.
     """
     target = table or fd.raw_table
@@ -572,6 +586,38 @@ def _canonical_v2_manifest(manifest: dict, key: str) -> dict:
                and part["object_key"] for part in manifest["parts"]):
         raise ValueError(f"{key}: v2 part object_key is malformed")
     return {**manifest, "cob_date": manifest["business_date"]}
+
+
+def _with_control_object(manifest: dict, *, client, bucket: str) -> dict:
+    """Name the control object(s) a v2 delivery's declarations came from.
+
+    The md5 and row-count refusals quote `control_object`, and a
+    NormalizationManifest v2 has no such field -- the message read "control
+    file None". It is not ADDED there: `normalize_delivery` accepts an
+    existing manifest only byte-identical, so a new field would make every
+    manifest already in `ready/` a conflict on its next re-normalize. The
+    DeliveryManifest already records each object's role, which is where
+    `registry.deliveries.observations_v2` reads it from too.
+
+    Only when something was declared, and never fatal: this is a label on an
+    error message, and a failure to read it must not become the error.
+    """
+    if manifest.get("control_object") or (
+            manifest.get("declared_md5") is None
+            and manifest.get("declared_row_count") is None):
+        return manifest
+    from reporting_platform.ingest import delivery as delivery_contract
+
+    try:
+        delivery = delivery_contract.read_delivery_manifest(
+            manifest["delivery_manifest"], client=client, bucket=bucket)
+    except Exception as exc:  # noqa: BLE001 - a label, see above
+        log.warning("cannot name the control object for %s: %s",
+                    manifest.get("delivery_id"), exc)
+        return manifest
+    controls = [item.object_key for item in delivery.source_files
+                if item.role == "control"]
+    return {**manifest, "control_object": ", ".join(controls) or None}
 
 
 def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
@@ -684,6 +730,8 @@ def ingest_normalized_delivery(normalization_manifest_key: str,
         normalization_manifest_key, client=arrival._client(),  # noqa: SLF001
         bucket=arrival._bucket())  # noqa: SLF001
     manifest = _canonical_v2_manifest(manifest, normalization_manifest_key)
+    manifest = _with_control_object(
+        manifest, client=arrival._client(), bucket=arrival._bucket())  # noqa: SLF001
     fd = get_feed(manifest["feed"])
     contract_fd = _v2_feed_contract(fd, manifest)
     return _ingest_manifest(
@@ -765,6 +813,9 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             "schema_version": manifest["schema_version"],
             "source_system": contract_fd.source_system,
             "already_ingested": True,
+            # Nothing merged, so no commit of this run's to pin -- and
+            # `steps.record_snapshot` cuts no tag for it.
+            "commit": None,
             "columns_added": [],
             "columns_orphaned": [],
             "missing_columns": [],
@@ -846,7 +897,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             f"missing {drift['missing_columns']}, extra {drift['extra_columns']}",
         )
         if contract_fd.schema_drift == "fail" and drifted:
-            raise ValueError(
+            raise IngestValidationError(
                 f"{fd.name} {bdate}: schema drift with schema_drift=fail — "
                 f"missing {drift['missing_columns']}, "
                 f"extra {drift['extra_columns']}. Branch {branch} left for "
@@ -892,7 +943,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
         )
         if below_floor:
             # Abandon the branch: main is untouched, nothing to roll back.
-            raise ValueError(
+            raise IngestValidationError(
                 f"{fd.name} {bdate}: {row_count} rows, below expected minimum "
                 f"{contract_fd.expected_min_rows}. Branch {branch} left for inspection."
             )
@@ -910,7 +961,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
                 observed_value=row_count,
             )
             if above_ceiling:
-                raise ValueError(
+                raise IngestValidationError(
                     f"{fd.name} {bdate}: {row_count} rows, above expected "
                     f"maximum {contract_fd.expected_max_rows}. Branch {branch} "
                     f"left for inspection."
@@ -930,7 +981,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
                 expected_value=declared, observed_value=row_count,
             )
             if mismatched:
-                raise ValueError(
+                raise IngestValidationError(
                     f"{fd.name} {bdate}: {row_count} rows read, control file "
                     f"{manifest.get('control_object')} declared {declared}. "
                     f"Branch {branch} left for inspection; main is untouched."
@@ -964,7 +1015,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
                 expected_value=declared_md5, observed_value=actual_md5,
             )
             if checksum_mismatch:
-                raise ValueError(
+                raise IngestValidationError(
                     f"{fd.name} {bdate}: {', '.join(hashed)} hashes to "
                     f"{actual_md5}, control file "
                     f"{manifest.get('control_object')} declared "
@@ -974,13 +1025,19 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
                     f"inspection; main is untouched."
                 )
 
+        commit = None
         if dry_run:
             log.info("dry run: would append %s rows to %s", row_count, raw_at_branch)
         else:
             df.writeTo(raw_at_branch).append()
-            nessie.merge(branch, into="main")
+            # THE COMMIT THIS MERGE MADE, which is what a snapshot tag must
+            # name. `main`'s head is that commit only until the next merge
+            # lands, and the tag is cut later, outside the write pool.
+            # See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+            commit = nessie.merge(branch, into="main").get("resultantTargetHash")
             nessie.delete_reference(branch)
-            log.info("merged %s into main and deleted branch", branch)
+            log.info("merged %s into main at %s and deleted branch", branch,
+                     (commit or "?")[:12])
 
         result = {
             "feed": fd.name,
@@ -1001,6 +1058,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             "schema_version": manifest.get("schema_version", contract_fd.schema_version),
             "source_system": contract_fd.source_system,
             "already_ingested": False,
+            "commit": commit,
             # What this ingest did to the TABLE, a different event from what
             # it found in the FILE (`missing_columns` / `extra_columns`
             # below). A contract change shows up here on the first delivery

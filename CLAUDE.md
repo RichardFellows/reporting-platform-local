@@ -69,8 +69,8 @@ to run something for the first time, expect it to fail and read what it says.
   `scripts/_open_build_branch.py`, or `make build-branch SELECT=<selector>`
   (`make build`/`prepared`/`reporting` are the same; only `*-on-main` targets
   touch main). Branch → build → test → merge only if clean.
-- **Spark is the only build engine** (`dbt_builds.py` refuses a non-Spark
-  `DBT_TARGET`): only the Spark path can address a Nessie branch. DuckDB is a
+- **Spark is the only build engine** (`transform.dbt.target()` refuses a
+  non-Spark `DBT_TARGET`, and `dbt_builds.py` calls it at import): only the Spark path can address a Nessie branch. DuckDB is a
   read-only query tool (`scripts/duckdb_console.py`).
   (`#duckdb-is-not-an-engine`)
 - **Endpoints come from `common/settings.py` accessors, and fall back to the
@@ -85,7 +85,8 @@ to run something for the first time, expect it to fail and read what it says.
   engine and an HTTP client in with it. `CONFIG_DIR`/`CATALOG`/`ENV` are in
   `common/settings.py`, which is what lets `spark.py` name the catalog without
   importing `context`.
-- **Every Spark job runs on the cluster, never `local[*]`.** `SPARK_MASTER` is
+- **Every Spark job runs on the cluster, never `local[*]`** — outside
+  `PLATFORM_EXECUTION=embedded`, below. `SPARK_MASTER` is
   read in two places that must not diverge — `spark_session()` and
   `spark.master` in `dbt/profiles.yml` — and `spark_session()` refuses a
   `local` master. Each app caps at 2 cores/2g, or standalone mode holds every
@@ -104,7 +105,7 @@ to run something for the first time, expect it to fail and read what it says.
   `tests/test_spark_config.py` enforces both. A bare `spark-sql` in spark-master no longer knows the catalog: use
   `scripts/spark-sql`. (`#spark-defaults-hold-only-invariants`)
 - **`PLATFORM_EXECUTION=local|kubernetes` decides where a Spark driver
-  runs**, and `_spark_task.run` is the only launcher. In `kubernetes` it
+  runs**, and `spark_task.run` is the only launcher. In `kubernetes` it
   starts the driver as a POD (same module, same args, same JSON) with
   executors as pods. **dbt keeps its driver in the task (Cosmos LOCAL) in both
   modes**, because the artifact archive and the publish gate read its
@@ -112,10 +113,42 @@ to run something for the first time, expect it to fail and read what it says.
   `common/` needs the SCHEDULER restarted too: LocalExecutor forks tasks from
   it, and a stale module fails with `has no attribute`.
   (`#execution-mode-is-configuration`)
-- **Spark inside an Airflow task must go through `scripts/_spark_task.py`** (a
-  subprocess), or the JVM keeps the task process alive, heartbeats stop and the
-  scheduler zombie-reaps it. The *driver* lives in that process, so this holds
-  on a cluster too. (`#spark-in-a-subprocess`)
+- **`PLATFORM_EXECUTION=embedded` is the one mode with no cluster** — a
+  `local[N]` master, driver and tasks in one process — and the only one that
+  accepts a local master; it refuses a cluster one. It is what the
+  `standalone`-profile `runner` service uses: land → ingest → prepared →
+  reporting as four commands with only S3, Nessie and Postgres
+  (`docs/STANDALONE-PIPELINE.md`). Never `--entrypoint` around the runner:
+  the image's entrypoint gives the host uid a home, and without one Spark
+  dies on `?/.ivy2`.
+- **WRITE-AUDIT-PUBLISH IS `transform/wap.py`, and the build DAG only calls
+  it** — open branch + run record, publish (evidence → input set → lifecycle
+  gate → merge → tags → versions), fail-and-keep-the-branch. The DAG passes
+  in what only Airflow knows; `python -m reporting_platform.transform` runs
+  the same functions. `tests/test_transform.py` fails if the DAG grows its
+  own merge again. Likewise `ingest/steps.py` for the snapshot tag and drift
+  report, and `ingest/transport_steps.py` for `transport_ingest`'s four
+  tasks -- validate, deliver, normalize, ingest_raw, with their receipt and
+  evidence rows -- which `tests/test_transport_steps.py` holds the DAG to.
+- **Spark inside an Airflow task must go through
+  `reporting_platform/common/spark_task.py`** (a subprocess), or the JVM keeps
+  the task process alive, heartbeats stop and the scheduler zombie-reaps it.
+  The *driver* lives in that process, so this holds on a cluster too. A new
+  op goes in its component's `spark_ops.py` and in `spark_task.OPS`;
+  `python -m scripts._spark_task` is a shim. (`#spark-in-a-subprocess`)
+- **A FAILURE THE SAME INPUT REPRODUCES IS `spark_task.Refused`, AND IS NOT
+  RETRIED.** The child exits 65, `run()` raises `SparkTaskRefused`, the DAG
+  raises `AirflowFailException`. Each ingest ATTEMPT cuts its own branch
+  (`ingest_attempt_id`, `...-a<n>`): a retry on the name its failed
+  predecessor kept dies on Nessie's 409, which then becomes the task's only
+  visible error. `spark_task`'s `__main__` hands off to the imported module,
+  or `except Refused` matches nothing. (`#a-refusal-is-not-retried`)
+- **THE REPO SHIPS AS SEPARATE COMPONENTS, and `components.yml` says which
+  module is in which.** `tests/test_components.py` fails on an import —
+  lazy ones too — into a component the owner does not `depends_on`, and on a
+  module no component claims. Nothing packaged may import `scripts/` or
+  `ui/`. A new module or DAG file needs a line there.
+  (`#components-are-declared-and-enforced`, `docs/PACKAGING.md`)
 - **THREE jar versions live in `.env`**, and diverging them gives
   `NoSuchMethodError` on the first write, never anything saying "version".
   `ICEBERG_VERSION` must be identical in the Spark image and the Airflow
@@ -203,7 +236,10 @@ to run something for the first time, expect it to fail and read what it says.
   total across members and `md5` is the CONTAINER's. The manifest's
   `checksum_objects` says which objects a declared md5 covers, so
   `ingest_feed` never branches on the kind — an invariant `ui/arrivals.checks()`
-  shares. (`#control-file-gate`)
+  shares. (`#control-file-gate`) A Transport carrying no control object for
+  a feed that declares one is REFUSED at `create_delivery`, never ingested
+  with the checks skipped; a feed with no control, or no `md5`, declares
+  nothing and is untouched. (`#a-declared-control-must-arrive`)
 - **A DELIVERY SHAPE IS A REGISTRY ENTRY, not a branch**:
   `conform.ARRIVAL_SHAPES` at the door (planners returning
   `Planned`/`Refused`/`Duplicate`/`Waiting`, the only four `inbox.py` acts on)
@@ -254,6 +290,12 @@ to run something for the first time, expect it to fail and read what it says.
   comparable there, a **row_count** is not (`at_ingest`), and `no run recorded`
   means Airflow trimmed its history, never "not ingested".
   (`#the-arrivals-view-is-a-join-not-a-record`)
+- **An SCD2 prepared model is ONE `scd2_prepared()` call**
+  (`dbt/macros/scd2.sql`): `keys` (a list), `cleaning` (column -> SQL, output
+  order), `hashed` (source facts only; a key or derived column is refused),
+  optional `derived`. Never hand-write the sequence again. Anything that reads
+  model TEXT must know the call: `model_sources()` reads its `source_name`.
+  (`#scd2-is-one-macro`)
 - **EVERY PREPARED MODEL RANKS THE CLEANED KEY, never the raw one** — clean,
   then `dedupe_rank` in `ranked_rows`, then project
   `prepared_output_columns()` to drop the carried `_cob_date`/`_file_version`/
@@ -386,7 +428,11 @@ them.
   pins `snapshot/<feed>/<bd>/<run_id>`; the **reporting build** cuts
   `published/<report>/<bd>/<run_id>`, one per report, when it merges. A
   **report is a dbt EXPOSURE**, derived by `context.reports()` — not a config
-  block. (`#an-ingest-is-not-a-publication`)
+  block. (`#an-ingest-is-not-a-publication`) The snapshot tag names the
+  commit the ingest's MERGE made (`result["commit"]`), never `main`'s head,
+  which by tagging time may hold later merges. Every way into raw (both DAGs,
+  `ingest ingest`, `ingest transport`) ends in `steps.after_ingest`.
+  (`#a-snapshot-tag-names-its-merge-commit`)
 - **A feed's evidence window is its RETENTION CLASS**, named in `feeds.yml`,
   sized in `retention.yml` per environment, refused at LOAD if undeclared.
   Classes govern `landing/` and `quarantine/` **only** — a per-feed raw window
@@ -398,6 +444,15 @@ them.
   explicitly under Airflow's constraints is the cosmos trap exactly. Env is
   read at process start, so enabling it needs the airflow containers
   **recreated**.
+- **MinIO is BUILT HERE too** (`Dockerfile.minio`, both `minio` and `mc` from
+  the pinned releases' source, through `GOPROXY` with no `,direct`, so never
+  from GitHub): no registry serves MinIO's images anonymously any more, and
+  CI failed at `minio Pulling` before any code ran. Each release is pinned as
+  a tag AND a Go module version, in the Dockerfile only. The first
+  `docker compose up` builds it (~1.5 min). It runs as root because the
+  existing `minio-data` volume was written as root; changing that needs the
+  volume's ownership changed too, or MinIO starts EMPTY rather than failing.
+  (`#minio-is-built-from-source`)
 - **Both Marquez images are BUILT HERE on UBI, from Marquez's own source** —
   `Dockerfile.marquez-api`, `Dockerfile.marquez-web`; upstream ships Ubuntu and
   Alpine. `MARQUEZ_VERSION` is the RELEASE TAG the builders fetch, so the first
@@ -526,6 +581,10 @@ them.
 # No stack, ~6s. Everything else is verified by running it. tests/README.md
 python -m tests.run
 
+# one wheel per component in components.yml; --check installs each in a clean
+# 3.11 venv outside the repo and imports every module it ships. docs/PACKAGING.md
+python -m scripts.build_components --check
+
 # every DAG file imports, and produced the DAGs it should have. What CI's
 # parse tier runs; in the container it needs no argument.
 docker compose exec -T airflow python -m scripts.check_dag_imports
@@ -535,6 +594,20 @@ docker compose exec -T airflow python -m scripts.check_dag_imports
 python -m reporting_platform.config list
 python -m reporting_platform.config show fo_trade --origin
 python -m reporting_platform.config check
+
+# THE PIPELINE WITHOUT AIRFLOW OR A SPARK CLUSTER -- only S3, Nessie, Postgres.
+# Same code as the DAGs. docs/STANDALONE-PIPELINE.md; RUNNER_* env points it
+# at deployed stores (add --no-deps).
+docker compose --profile standalone run --rm runner check
+docker compose --profile standalone run --rm runner run /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.*
+docker compose --profile standalone run --rm runner ingest land <file>...
+docker compose --profile standalone run --rm runner ingest ingest <feed>
+docker compose --profile standalone run --rm runner transform build prepared   # open + dbt + publish|fail
+# ...or Transports instead of files: DCM's completed ones under received/, the
+# same four steps as transport_ingest. `transport publish` is the producer's CLI.
+docker compose --profile standalone run --rm runner transport publish --legacy-feed-id ... --data ... --control ...
+docker compose --profile standalone run --rm runner ingest transport --pending --window 7 --list
+docker compose --profile standalone run --rm runner run --transport --window 7     # pending -> raw -> prepared -> reporting
 
 # bulk ingest everything pending (safe to re-run)
 docker compose exec airflow python -m scripts.bulk_ingest

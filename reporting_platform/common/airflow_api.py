@@ -1,4 +1,10 @@
-"""Drive Airflow from the feed console, over its REST API.
+"""Drive Airflow over its REST API -- for the feed console and the inbox.
+
+IN `common/`, NOT `ui/`, because the inbox watcher deploys and the console
+does not: `ingest/inbox.py` triggers the ingest DAG through this module, and
+an ingest image that had to ship the console to reach it would ship a web app
+to every environment the console is barred from (docs/PACKAGING.md). The
+console imports it as `orchestration`, its old name.
 
 WHY THE REST API AND NOT A SUBPROCESS. The console runs in its own container;
 `airflow dags trigger` would mean either shelling into another container or

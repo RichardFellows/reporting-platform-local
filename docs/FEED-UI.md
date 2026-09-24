@@ -559,6 +559,9 @@ reporting_platform/ui/
   jobs.py           background jobs + streamed logs for the long ones
   arrivals.py       the arrivals view -- a join over the registry, the
                     inbox folder and Airflow. Writes nothing
-  orchestration.py  Airflow REST client
   static/index.html the whole front end, no build step
 ```
+
+The Airflow REST client is `reporting_platform/common/airflow_api.py`,
+imported here as `orchestration`: the inbox watcher uses it too, and the inbox
+deploys where the console does not (`docs/PACKAGING.md`).

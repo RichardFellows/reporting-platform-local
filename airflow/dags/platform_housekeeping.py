@@ -65,7 +65,7 @@ def _spark_subprocess(*args: str) -> dict:
     shared one now, so it follows PLATFORM_EXECUTION like every other DAG.
     See docs/DECISIONS.md#execution-mode-is-configuration
     """
-    from scripts._spark_task import run
+    from reporting_platform.common.spark_task import run
 
     return run(*args)
 
@@ -198,7 +198,7 @@ def platform_housekeeping():
         """Register every delivery object storage holds that has no row yet.
 
         NO SPARK, so it runs in the task process rather than through
-        `scripts/_spark_task.py` -- boto3, json and psycopg2 only.
+        `common/spark_task.py` -- boto3, json and psycopg2 only.
 
         BEFORE the evidence check below and after retention, and both halves
         matter. After, because the landing sweep may have removed deliveries

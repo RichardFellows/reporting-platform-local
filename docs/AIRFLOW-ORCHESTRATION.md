@@ -118,24 +118,44 @@ for the staged walk and its scaling argument.
 
 ```text
 validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+    -> report_drift -> record_snapshot
 ```
 
-| Task | Domain call | XCom out | Fails for |
-|---|---|---|---|
-| `validate_transport` | `transport.read_validated_transport(marker_key)` | marker key (str) | Missing/mismatched object, bad hash, unsupported contract version |
-| `create_delivery` | `delivery.create_delivery(marker_key)` | DeliveryManifest key (str) | Unknown external Feed id, business-identity conflict |
-| `normalize_delivery` | `normalization.normalize_delivery(delivery_manifest_key)` | NormalizationManifest key (str) | Unsafe archive member, invalid zip, contract conflict |
-| `ingest_raw` | `scripts._spark_task.run("ingest-v2", normalization_manifest_key, run_id)` (-> `ingest_feed.ingest_normalized_delivery`) | `{feed, delivery_id, cob_date, rows, already_ingested, asset_uri}` | Schema drift with `schema_drift: fail`, row-count/checksum mismatch |
+| Task | Step (`ingest/transport_steps.py`) | Domain call inside it | XCom out | Fails for |
+|---|---|---|---|---|
+| `validate_transport` | `validate` | `transport.read_validated_transport(marker_key)` | marker key (str) | Missing/mismatched object, bad hash, unsupported contract version |
+| `create_delivery` | `deliver` | `delivery.create_delivery(marker_key)` | DeliveryManifest key (str) | Unknown external Feed id, business-identity conflict, a declared control file that did not arrive |
+| `normalize_delivery` | `normalize` | `normalization.normalize_delivery(delivery_manifest_key)` | NormalizationManifest key (str) | Unsafe archive member, invalid zip, contract conflict |
+| `ingest_raw` | `ingest_raw` | `spark_task.run("ingest-v2", normalization_manifest_key, attempt_id)` (-> `ingest_feed.ingest_normalized_delivery`) | `{feed, delivery_id, cob_date, rows, already_ingested, asset_uri, run_id, commit}` + drift column names | Schema drift with `schema_drift: fail`, row floor/ceiling, row-count/checksum mismatch |
+| `report_drift` | `steps.drift_warnings` | -- (logs) | the same summary | Never: drift is reported, not fatal |
+| `record_snapshot` | `steps.record_snapshot` | `Nessie.create_tag(snapshot/<feed>/<bd>/<run_id>, hash=commit)` | the summary + `tag` | Never: a tag that cannot be cut is returned as `tag_error`. No tag when `already_ingested` |
 
-Each task is a few lines calling one existing function; none reimplements
-Transport parsing, Feed resolution, control parsing, or manifest creation.
+The last two are `ingest_<feed>`'s own last two tasks, calling the same
+functions, so a Transport ingest is reported and pinned exactly as an inbox
+one. The tag names the commit `ingest_raw`'s merge made, not `main`'s head
+(`docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit`), which is what
+lets it run outside the write pool.
+
+Each task is one call to its step, and the step -- with the receipt and
+validation evidence it records -- is what `python -m reporting_platform.ingest
+transport` runs with no Airflow (`docs/STANDALONE-PIPELINE.md`). The task
+adds only what Airflow alone knows: the dag and run id, the try number in the
+branch name, `AirflowFailException` for a refusal, and the raw asset event.
+`tests/test_transport_steps.py` fails if a task grows its own copy of a step.
+No step reimplements Transport parsing, Feed resolution, control parsing, or
+manifest creation.
 Failure attribution therefore matches the Phase 6 brief's list exactly: an
 invalid Transport fails `validate_transport`, an unknown Feed id or identity
 conflict fails `create_delivery`, an unsafe archive fails
 `normalize_delivery`, and a schema/row/checksum failure fails `ingest_raw`.
-Standard `retries`/`retry_delay` apply the same as every other DAG in this
-platform; a permanently invalid Transport still retries and still fails, the
-same as the legacy path's `ingest` task does today.
+Standard `retries`/`retry_delay` apply to a failure that might not recur.
+**A refusal is not retried**: a `DeliveryError` in `create_delivery` (a
+missing declared control file included) and a blocking Raw check in
+`ingest_raw` -- schema drift under `fail`, the row floor/ceiling, a declared
+row count or md5 that does not match -- fail the task once, with
+`AirflowFailException`, because the same evidence fails the same check every
+time. The legacy `ingest` task does the same. See
+`docs/DECISIONS.md#a-refusal-is-not-retried`.
 
 `transport_ingest` itself is triggered only -- `schedule=None` -- by
 `transport_watch`, `transport_reconcile`, or a manual replay. It never
@@ -176,8 +196,11 @@ operations it calls already are:
   exist and accepts only byte-identical ones.
 - `ingest_normalized_delivery` is guarded by `_delivery_id` on committed Raw
   `main` -- `already_ingested_delivery` -- so a retry after a merge is a
-  fast, safe no-op, and a retry after a failed branch (never merged) simply
-  runs the write again.
+  fast, safe no-op, and a retry after a failed branch (never merged) runs
+  the write again on a NEW branch -- `ingest_attempt_id` names one per
+  attempt. Until it did, the retry collided with the branch its failed
+  predecessor kept for inspection and died on Nessie's `409 Conflict`, so
+  this sentence was false for every failure it describes.
 
 So **duplicate events are harmless by construction**: two `_COMPLETE.json`
 notifications for the same TransportID resolve to the same DeliveryID

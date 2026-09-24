@@ -2206,7 +2206,12 @@ def model_sources(layer: str, model: str) -> list[tuple[str, str]]:
     model name == feed name it already knows the feed -- but a lineage graph
     has to name the raw table that prepared model actually reads.
     """
-    return _SOURCE_RE.findall(_model_sql(layer, model))
+    sql = _model_sql(layer, model)
+    # An SCD2 model names its raw table as scd2_prepared()'s `source_name`,
+    # and the macro calls source('raw', <it>) -- the same input, spelled
+    # through the one macro that builds such a model (dbt/macros/scd2.sql).
+    return (_SOURCE_RE.findall(sql)
+            + [("raw", t) for t in _SCD2_SOURCE_RE.findall(sql)])
 
 
 def _model_sql(layer: str, model: str) -> str:
@@ -2220,6 +2225,8 @@ _REF_RE = re.compile(r"""\bref\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
 _SOURCE_RE = re.compile(
     r"""\bsource\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*,"""
     r"""\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)""")
+_SCD2_SOURCE_RE = re.compile(
+    r"""\bscd2_prepared\(\s*source_name\s*=\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]""")
 
 
 def retention_policy(layer: str) -> dict[str, Any]:
@@ -2473,6 +2480,20 @@ def new_run_id() -> str:
 def branch_name(purpose: str, scope: str, cob_date: date, run_id: str) -> str:
     """<purpose>/<scope>/<cob_date>/<run_id> — see docs/ARCHITECTURE.md."""
     return f"{purpose}/{scope}/{cob_date:%Y-%m-%d}/{run_id}"
+
+
+def ingest_attempt_id(airflow_run_id: str, try_number: int) -> str:
+    """The run id an ingest ATTEMPT names its branch with: `<run>-a<n>`.
+
+    One per attempt, not per Airflow run. A failed ingest keeps its branch
+    for inspection, so a retry reusing the name died on Nessie's 409 and
+    could never succeed. Reusing the branch instead (`exist_ok`, as the dbt
+    builds do) is wrong HERE: an attempt that failed after its append would
+    leave rows the retry appends again. A fresh branch starts from `main`.
+    See docs/DECISIONS.md#a-refusal-is-not-retried
+    """
+    base = airflow_run_id.replace(":", "").replace("+", "")[-21:]
+    return f"{base}-a{int(try_number)}"
 
 
 def published_tag(report: str, cob_date: date, run_id: str) -> str:

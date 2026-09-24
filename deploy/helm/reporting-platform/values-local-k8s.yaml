@@ -29,6 +29,7 @@ secrets:
     registryDsn: postgresql://platform:platform@postgres:5432/platform
 localStores:
   enabled: true
+  minioImage: reporting-platform-minio:k8s-smoke   # kind-loaded; scripts/k8s_smoke.sh
 airflow:
   images:
     airflow:

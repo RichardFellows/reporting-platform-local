@@ -290,7 +290,8 @@ feed missed; that is the orchestrator's and the watchdog's territory.
 
 `received/<transport-id>/_COMPLETE.json` ->
 `transport_ingest` (one generic Airflow DAG, not one per Feed) ->
-`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`.
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+-> report_drift -> record_snapshot`.
 It shares the SAME Raw layer, the SAME `lakehouse_write` pool, and the SAME
 asset-triggered `prepared_build`/`reporting_build` chain as the legacy diagram
 above -- only how a Delivery reaches Raw differs. A single deferrable sensor

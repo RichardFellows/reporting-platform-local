@@ -120,17 +120,24 @@ def registry_dsn() -> str:
 
 # ------------------------------------------------------------ execution mode
 # WHERE A SPARK DRIVER RUNS, AND WHERE ITS EXECUTORS DO. `local` is compose:
-# `_spark_task.run` starts the driver as a child process and the executors
+# `spark_task.run` starts the driver as a child process and the executors
 # run on the standalone spark-worker. `kubernetes` is a cluster:
-# `_spark_task.run` starts the driver as its own POD (same image, same module,
+# `spark_task.run` starts the driver as its own POD (same image, same module,
 # same arguments) and the executors are pods too, through a `k8s://` master.
 # dbt is the exception, and deliberately: Cosmos stays LOCAL + SUBPROCESS in
 # both modes, because its artifact archive, validation capture and the
 # publish gate read dbt's target/ from the task's own filesystem. In
 # `kubernetes` its child process is the driver and only the executors move.
+#
+# `embedded` is NO CLUSTER: the driver's own process runs every task, through
+# a `local[N]` master. It is how the pipeline's steps run on their own
+# (`reporting_platform.pipeline`, the compose `runner` service) with only S3,
+# Nessie and Postgres to talk to. It is a MODE, not a fallback: `local` and
+# `kubernetes` still refuse a `local` master, because there an in-process
+# session means a job silently bypassed the cluster it was deployed against.
 # See docs/DECISIONS.md#execution-mode-is-configuration
 
-EXECUTION_MODES = ("local", "kubernetes")
+EXECUTION_MODES = ("local", "kubernetes", "embedded")
 
 # Required when PLATFORM_EXECUTION=kubernetes, in every environment -- there
 # is no compose default for a namespace or an image.

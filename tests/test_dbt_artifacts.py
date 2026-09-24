@@ -5,7 +5,7 @@ import pathlib
 import tempfile
 
 from tests.fakes3 import FakeS3
-from tests.support import DAGS
+from tests.support import REPO
 
 
 def test_artifacts_are_immutable_and_associated_with_the_run():
@@ -48,8 +48,9 @@ def test_publication_guard_reports_the_missing_run_results():
 
 def test_artifact_and_input_guards_run_before_the_nessie_merge():
     """Publication cannot move main before retaining artifacts or inputs."""
-    source = (DAGS / "dbt_builds.py").read_text(encoding="utf-8")
+    source = (REPO / "reporting_platform" / "transform" / "wap.py").read_text(
+        encoding="utf-8")
     publish = source[source.index("def publish("):]
     merge = publish.index("n.merge(")
     assert publish.index("artifacts.require_complete") < merge
-    assert publish.index('inputs = _spark_run("run-inputs", branch)') < merge
+    assert publish.index('inputs = spark_run("run-inputs", branch)') < merge

@@ -26,9 +26,9 @@
     python -m reporting_platform.registry validation run RUN_ID
 
 No Spark in this CLI: everything it reaches is boto3, json and psycopg2, so it
-runs in the task process rather than through `scripts/_spark_task.py`. The one
+runs in the task process rather than through `common/spark_task.py`. The one
 Spark-using module in the package, `registry/inputs.py`, is deliberately not
-wired in here -- it is invoked as `scripts._spark_task run-inputs <branch>`,
+wired in here -- it is invoked as `spark_task run-inputs <branch>`,
 like every other Spark caller in this repo.
 """
 from __future__ import annotations

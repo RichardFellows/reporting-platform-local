@@ -42,8 +42,8 @@ directly -- see [docs/TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md).
 That is the whole trigger — no DAG to unpause per feed, no `land`/`bulk_ingest`
 step. `transport_watch`'s deferrable sensor picks the completed Transport up
 within its next 1-minute cycle and runs
-`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`,
-which emits the Raw Asset that fires `prepared_build`, which on success fires
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+-> report_drift -> record_snapshot`; `ingest_raw` emits the Raw Asset that fires `prepared_build`, which on success fires
 `reporting_build`. Watch it happen:
 
 ```bash
@@ -435,6 +435,7 @@ docker compose down -v      # destroys all data and volumes
 |---|---|
 | [`README.md`](../README.md) | The same journey, step by step, with the reasoning. Section 14 covers the scheduler in more depth. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, write-audit-publish, why Spark is the only build engine, how Cosmos renders the builds |
+| [`STANDALONE-PIPELINE.md`](STANDALONE-PIPELINE.md) | The same pipeline as four commands, with no Airflow and no Spark cluster, against local or deployed S3/Nessie/Postgres |
 | [`ADDING-A-FEED.md`](ADDING-A-FEED.md) | Onboard a new feed — six files, no DAG edit |
 | [`ADDING-A-MODEL.md`](ADDING-A-MODEL.md) | Add a dbt model — two files, no DAG edit |
 | [`ADDING-A-COLUMN.md`](ADDING-A-COLUMN.md) | Add a column to a feed that already delivers — three files, and the one command that is easy to forget |

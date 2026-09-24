@@ -6,7 +6,10 @@ emptyDir everywhere is the point, not an oversight.
 
 Versions mirror docker-compose.yml / .env.example exactly, so a `k8s-smoke`
 divergence from the compose stack is never "which MinIO/Nessie build" --
-only the deployment shape (Deployment vs. plain container) differs.
+only the deployment shape (Deployment vs. plain container) differs. MinIO is
+the image compose builds from source (Dockerfile.minio), loaded into the
+cluster by `make k8s-smoke` like the platform's own: no registry serves
+MinIO's images anonymously any more (docs/DECISIONS.md#minio-is-built-from-source).
 
 NESSIE RUNS IN-MEMORY HERE, not JDBC-to-Postgres as compose does. Compose's
 JDBC store needs a fourth database (`nessie`) that this template does not
@@ -58,7 +61,8 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
+          image: {{ required "localStores.minioImage is required for localStores" .Values.localStores.minioImage | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
           args: ["server", "/data", "--console-address", ":9001"]
           env:
             - name: MINIO_ROOT_USER
@@ -111,7 +115,9 @@ spec:
       # is not visible to a Job the way compose's healthcheck is.
       containers:
         - name: mc
-          image: quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z
+          # The same image: it carries `mc` too.
+          image: {{ required "localStores.minioImage is required for localStores" .Values.localStores.minioImage | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:
             - >

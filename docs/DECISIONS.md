@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-101 entries. They are grouped here by subject; the file itself is in the order
+102 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -87,11 +87,13 @@ anchor; this page is for when you do not yet know what you are looking for.
 
 | Anchor | The finding |
 |---|---|
-| [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images come from quay.io |
+| [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images came from quay.io -- until it did too |
+| [minio-is-built-from-source](#minio-is-built-from-source) | No registry serves MinIO anonymously; the same pinned releases are compiled here, on UBI |
+| [scd2-is-one-macro](#scd2-is-one-macro) | The three SCD2 models are one `scd2_prepared()` call each, moved with a 0-row EXCEPT both ways |
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [the-local-k8s-smoke](#the-local-k8s-smoke) | `make k8s-smoke` runs the chart in kind through a merged `prepared_build`; its first run found four cluster-only defects |
-| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move |
+| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move; `embedded` runs everything in-process with no cluster |
 | [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
 | [the-chart-is-the-only-place-settings-are-written](#the-chart-is-the-only-place-settings-are-written) | One ConfigMap, one Secret, envFrom everywhere; why `existingSecret` needs two literal names, not one computed value |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
@@ -150,6 +152,8 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests) | 157 deleted, 157 remade, both logging success |
 | [namespace-before-branch](#namespace-before-branch) | The namespace is created against `main`, before the ingest branch exists |
 | [transport-to-delivery-is-an-immutable-interpretation](#transport-to-delivery-is-an-immutable-interpretation) | Explicit external Feed identity, occurrence-derived DeliveryID, and a create-once interpretation separate from Ready |
+| [a-declared-control-must-arrive](#a-declared-control-must-arrive) | A Transport missing the control its feed declares is refused, not ingested unchecked |
+| [a-refusal-is-not-retried](#a-refusal-is-not-retried) | A failed md5 retried twice into a Nessie 409 that named neither the checksum nor the file |
 
 ### Feeds, columns and the console
 
@@ -196,6 +200,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [an-incomplete-keep-set-refuses](#an-incomplete-keep-set-refuses) | **A short answer is a deletion order.** Nothing deleted is not nothing to delete |
 | [published-tags-are-the-reproducibility-window](#published-tags-are-the-reproducibility-window) | A tag is **data** retention, sized in years, not by the table keep-set |
 | [an-ingest-is-not-a-publication](#an-ingest-is-not-a-publication) | They cut different tags, and conflating them kept ingests for ten years |
+| [a-snapshot-tag-names-its-merge-commit](#a-snapshot-tag-names-its-merge-commit) | A tag cut from `main`'s head named later merges; the Transport path cut none |
 | [retention-classes-name-the-obligation](#retention-classes-name-the-obligation) | The class is a feed property; the window is per-environment policy |
 | [the-evidence-interlock-is-two-halves](#the-evidence-interlock-is-two-halves) | A configuration check and a per-delivery check, neither sufficient alone |
 | [reproducibility-is-exercised-not-asserted](#reproducibility-is-exercised-not-asserted) | The pin is read against the real catalog |
@@ -215,6 +220,12 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [lineage-is-derived-from-the-dbt-project](#lineage-is-derived-from-the-dbt-project) | A job per task and **no datasets at all**, until the extractor was registered under the variable Airflow reads |
 | [a-column-with-no-source-says-so](#a-column-with-no-source-says-so) | 116 of 136 traced, and reporting only those makes a literal, a `count(*)` and a parser failure identical |
 | [marquez-on-ubi](#marquez-on-ubi) | Both images built here, from Marquez's own source |
+
+### Packaging
+
+| Anchor | The finding |
+|---|---|
+| [components-are-declared-and-enforced](#components-are-declared-and-enforced) | Which module ships in which deployable package is `components.yml`, and a lazy import across a boundary fails a test, not a task |
 
 ---
 
@@ -519,12 +530,15 @@ so check both.
 
 The corporate build has egress only to an internal mirror, so every external
 URL a Dockerfile fetches must be a build ARG whose DEFAULT is today's public
-value — the mirror then only sets build args, never edits a Dockerfile. Five:
+value — the mirror then only sets build args, never edits a Dockerfile. Seven:
 `MAVEN_REPO` (the executor jars in `Dockerfile.spark` and the driver jars in
 `Dockerfile.airflow`, [driver-jars-are-baked](#driver-jars-are-baked)), `NESSIE_GC_URL` and
 `AIRFLOW_CONSTRAINTS_URL` (`Dockerfile.airflow`), `MARQUEZ_SOURCE_URL`
 (both Marquez images), `NPM_REGISTRY` (`Dockerfile.marquez-web`, told to
-every npm invocation, since an ARG is not itself an npm setting).
+every npm invocation, since an ARG is not itself an npm setting), and
+`GOPROXY` and `GOSUMDB` (`Dockerfile.minio`: every byte of both MinIO
+builds comes through the Go proxy, with no `,direct` fallback to GitHub,
+[minio-is-built-from-source](#minio-is-built-from-source)).
 `tests/test_offline_build.py` is the gate: a URL literal inside a
 RUN/COPY/ADD, including a continuation line, fails naming file:line.
 
@@ -669,8 +683,19 @@ Its first run found four defects that nothing short of a cluster could:
 
 ## execution-mode-is-configuration
 
-`PLATFORM_EXECUTION` (`local` | `kubernetes`, default `local`, anything else
-refused) says where a Spark driver runs, and where its executors run.
+`PLATFORM_EXECUTION` (`local` | `kubernetes` | `embedded`, default `local`,
+anything else refused) says where a Spark driver runs, and where its
+executors run.
+
+- **`embedded`** is no cluster at all: the driver's own process runs every
+  task through a `local[N]` master. It is what the `runner` compose service
+  and `python -m reporting_platform.pipeline` use, so the steps can be run
+  with only S3, Nessie and Postgres (`docs/STANDALONE-PIPELINE.md`). It is a
+  declared mode rather than a fallback. `session_conf()` refuses a `local`
+  master in the other two modes, for the reason
+  [spark-master-no-local-fallback](#spark-master-no-local-fallback) gives,
+  and refuses a cluster master in this one. `SPARK_MASTER` is still the only
+  master setting, read by both drivers.
 
 - **`local`** is compose. `_spark_task.run` starts the driver as a child
   process and the executors run on the standalone spark-worker.
@@ -750,6 +775,122 @@ Both now come from `quay.io/minio/*` at the same release tags. It is the same
 image: the local Docker Hub copy and the quay.io pull have identical image IDs
 (`sha256:7d80fd23...` for minio, `sha256:a5399b66...` for mc). The nightly
 build tier is what notices the next registry doing this.
+
+**Superseded two days later** by
+[minio-is-built-from-source](#minio-is-built-from-source): quay.io did it
+too.
+
+## minio-is-built-from-source
+
+On 2026-09-24 `quay.io/minio/minio` and `quay.io/minio/mc` started answering
+`401 UNAUTHORIZED` to anonymous pulls. The Docker Hub tags already refused
+(and now 404), and `ghcr.io/minio/*` denies too. The CI build tier failed at
+`minio Pulling` on every PR, before any code ran. Every machine with the
+image cached kept working, exactly as the first time.
+
+**Decision.** `Dockerfile.minio` compiles both binaries from the same pinned
+releases on `ubi9/go-toolset`, into one `ubi9/ubi-minimal` image, with
+`go install github.com/minio/{minio,mc}@<module version>`. `minio` runs it and
+`minio-init` builds the same Dockerfile, which the layer cache makes free (as
+`spark-master` and `spark-worker` share theirs). It is Marquez's precedent
+([marquez-on-ubi](#marquez-on-ubi)): what cannot be pulled is built, on
+UBI.
+
+**The source comes through a Go module proxy, not from GitHub.** The first
+version of this fetched GitHub's release tarballs, and the corporate build
+has no route to GitHub. Every byte now comes from `GOPROXY`, with no
+`,direct` after it. `direct` is how a module the proxy lacks gets cloned from
+its VCS host, which for both of these is GitHub. The corporate build points
+`GOPROXY` at its internal Go proxy and `GOSUMDB` at its checksum mirror (or
+`off` where the proxy is the trust root). Both are build ARGs
+([images-build-from-a-mirror](#images-build-from-a-mirror)).
+
+MinIO's `RELEASE.<stamp>` tags are not semver, so each release is pinned
+twice in the Dockerfile: the tag (for the version string) and the **module
+version** the proxy knows it by. That is a pseudo-version naming the tag's
+commit, `v0.0.0-20240922003343-03e996320ebb`, which is what `go list -m
+github.com/minio/minio@<tag>` resolves. Resolving a tag is the one query that
+makes the proxy read the origin. The pinned version is a plain proxy lookup.
+Neither module's `go.mod` has a `replace`, which `go install mod@version`
+refuses. Compose passes no version args: a tag overridden without its module
+version would stamp one release's name on another's code.
+
+**Rejected:**
+- **Chainguard** (`cgr.dev/chainguard/minio`): pullable, but its free tier is
+  `latest` only. Pinning a digest lasts until they collect it, and `latest`
+  is a 2025 MinIO release, a different server from the one every test here
+  ran against.
+- **`bitnamilegacy/minio`**: pullable, but frozen and declared unmaintained,
+  with its own entrypoint, data path and environment conventions.
+
+**What the build reproduces.** It uses the flags of MinIO's own Makefile `install` target
+(`CGO_ENABLED=0 -tags kqueue -trimpath`) and the ldflags its
+`buildscripts/gen-ldflags.go` writes, so `minio --version` prints
+`RELEASE.2024-09-22T00-33-43Z (commit-id=03e996320ebb)`, not `DEVELOPMENT`.
+`go install` builds the module as published, so its own `go.mod`/`go.sum`
+decide every dependency.
+
+**Root, as upstream ran.** The existing `minio-data` volume was written by
+the upstream image as root. A server that cannot read its own data does not
+fail: it starts empty. Moving to a non-root user needs the volume's ownership
+changed with it.
+
+**The Helm chart's `local-stores`** (the `make k8s-smoke` throwaway cluster)
+pulled the same two images. It now takes `localStores.minioImage`, required
+when enabled, and `scripts/k8s_smoke.sh` builds `Dockerfile.minio` and loads
+it into kind with the platform's own images.
+
+Live-verified on the development stack. The proxy build ran with `--no-cache`
+and every GitHub hostname (`github.com`, `api.`, `codeload.`,
+`raw.githubusercontent.com`, `objects.githubusercontent.com`, `ghcr.io`)
+pointed at 127.0.0.1: it succeeded in 1m7s. A control build with the same
+`--add-host` got `Connection refused` from `github.com`, so the block does
+apply inside `RUN`. `minio --version` and `mc --version` name their releases
+and commits. `mc ready local` (the
+healthcheck) passed, `minio-init`'s bucket script ran, and a put/get worked
+on a throwaway container. Then the running `minio` was recreated on the new
+image over its existing volume: healthy, the same 1,728 objects, and
+`raw.qa_happy_position` read through DuckDB on `main`.
+
+## scd2-is-one-macro
+
+The three SCD2 prepared models (`ref_counterparty`, `ref_rating`,
+`qa_happy_position_scd2`) each repeated the same sequence by hand:
+`newest_file_version`, `raw_rows`, `cleaned`, `ranked_rows`, `scd2_replay`,
+the hash, `scd2_changes`, `ranged` and `scd2_retractions`. It is the subtlest
+logic in the platform, and a fourth model copied from one of them and edited
+was how it would go wrong. Each model is now its config, its documentation and
+one `scd2_prepared()` call (`dbt/macros/scd2.sql`):
+
+- `keys`: a list; `ref_rating`'s is two columns.
+- `cleaning`: column -> SQL, in output order.
+- `hashed`: the source facts whose change opens a version. The macro refuses
+  a key or a derived column there.
+- `derived`: optional, columns computed after cleaning (`ref_rating`'s rank
+  and band).
+
+The business-column order is derived from `cleaning` and `derived`, so it
+cannot drift from the expressions. `yes_no_flag()` replaces the Y/N `CASE`
+two models spelled out.
+
+Moved with its output proved identical. On a CI stack seeded with every feed,
+the old models were built into `main`, then a new day of `ref_counterparty`
+and `ref_rating` was landed. On four branches from that `main`, the old and
+new models were built full-refresh and incremental. EXCEPT in both
+directions, per model, excluding only the per-invocation audit columns,
+returned **0 rows** for every pair, with identical column order. The
+incremental delta changed 4 `ref_rating` rows. A `ref_counterparty`
+re-delivery renaming CP00001 then opened a new version and closed the old one,
+identically under both. `dbt test` gave 31/31 on both new builds.
+
+Things that read model TEXT had to learn the macro's spelling.
+`context.model_sources()`, which feeds lineage, now reads
+`scd2_prepared(source_name=...)` as `source('raw', ...)`. The structural
+tests accept the call because `test_the_scd2_macro_carries_both` pins that the
+macro calls `known_as_of()` and `dedupe_rank()`. The newest-version test now
+checks the RENDERED SQL. One pre-existing gap, not widened here:
+`feeds_behind_report()` maps a prepared model to a feed by NAME, so
+`qa_happy_position_scd2` resolves to no feed. No report depends on it today.
 
 ## the-build-tier
 
@@ -1236,7 +1377,9 @@ belong.
 
 ## dbt-target-guard
 
-`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**.
+`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**. The
+check is `transform.dbt.target()`, which the hand-run `transform` CLI calls
+before it touches anything too.
 
 The failure it prevents is silent. The branch each build opens is passed to dbt
 as the `nessie_ref` var, and only the Spark profiles honour it; an engine that
@@ -1400,7 +1543,9 @@ that is not derived, which is why it is the one file in
 
 ## spark-master-no-local-fallback
 
-`spark_session()` refuses a `local` master rather than falling back to it.
+`spark_session()` refuses a `local` master rather than falling back to it,
+unless `PLATFORM_EXECUTION=embedded` declares that running in-process is the
+intent ([execution-mode-is-configuration](#execution-mode-is-configuration)).
 
 A missing or blank `SPARK_MASTER` meaning "run the whole job inside this
 container" is a configuration error that **looks like success**: the job
@@ -3614,6 +3759,55 @@ reproduced from a snapshot. Nothing claims a snapshot's evidence is still in
 pins, and a sweep that fails to recognise something skips it forever rather
 than judging it — the same rule `clean_working_branches` follows for `hold/`.
 
+
+## a-snapshot-tag-names-its-merge-commit
+
+Two problems with `snapshot/<feed>/<bd>/<run_id>`, found together.
+
+**The Transport path cut no tag, and logged no drift.** `transport_ingest`
+ended at `ingest_raw`. `ingest_<feed>` ends with `report_drift` and
+`record_snapshot`, and the Transport DAG and the runner's `ingest transport`
+had neither. On the development stack, `qa_happy_position` had 7 Transport
+deliveries in raw and no snapshot tags.
+
+**The inbox path's tag named `main`'s head, not the ingest's state.**
+`record_snapshot` called `create_tag(from_ref="main")` when it ran. In
+Airflow that is a separate task after the ingest has released the
+`lakehouse_write` pool, so another feed's merge could land first, and the
+tag then pinned both ingests. The batch command (`ingest ingest`, and
+`steps.ingest`) was worse: it merges a whole chunk of up to ten deliveries,
+then tags each one, so every tag in the chunk named the chunk's last merge.
+
+**Decision.**
+- `_ingest_manifest` returns `commit`: the `resultantTargetHash` from
+  Nessie's merge response, the commit that merge made.
+- `record_snapshot` tags that commit (`create_tag(..., hash=commit)`).
+- A result with no commit is not tagged at the head as a fallback, because
+  the head is the wrong answer this replaced. It returns `tag_error` saying
+  why.
+- A delivery raw already held (`already_ingested`) merged nothing and gets
+  no tag.
+- `steps.after_ingest` (drift report, then tag) is the one function every
+  way into raw calls: `steps.ingest`, `transport_steps.ingest_transport`, and
+  the matching last two tasks of both DAGs, which call its two halves.
+
+The tag can then be cut at any time after the merge, outside the pool,
+without naming anyone else's write.
+
+**No backfill.** Past Transport ingests have no tag, and the tags cut from a
+later head still include the ingest they are named for (a superset). Nothing
+is reproduced from a snapshot tag, and the development stack's data is
+disposable.
+
+Live-verified on the development stack. In every case the tag's hash on
+Nessie equals the commit the ingest reported:
+- The Airflow `transport_ingest` run, now six tasks, all green: tag at
+  `e8e64fe2...`.
+- The runner's `ingest transport`: tag at `313a729b...`.
+- `ingest ingest ref_rating`, the batch command over 36 pending deliveries
+  in four chunks: 36 tags at 36 distinct commits, each its own merge's. The
+  old code would have produced about four distinct commits, one per chunk.
+- An Airflow `ingest_fo_trade` run: tag at `523b887f...`.
 ## a-run-is-the-first-thing-the-registry-cannot-rebuild
 
 REQ-400, REQ-401, REQ-404. `registry.run`, `registry.run_input`,
@@ -5214,6 +5408,78 @@ Live-verified: a Transport whose control filename did not match its feed's
 `registry validation transport <id>` returned the FAIL row naming the exact
 control and reason.
 
+## a-declared-control-must-arrive
+
+**Decision.** A feed whose `delivery.control` declares any of `cob_date`,
+`version`, `row_count` or `md5` refuses, at `create_delivery`, a Transport
+that carries no control object (`IdentityResolutionError`, a `FAIL` on
+`layer=delivery`).
+
+`resolve_business_identity` read control objects only `if
+transport.control_files`, so a Transport without one went through: no md5
+and no row count asserted, `declared_md5` None, the Raw check skipped, and no
+validation row saying it had been. That is the same state as a feed that
+never declared a checksum -- a subject that could not be READ reported as one
+that was EMPTY. A Transport is complete by contract, so a missing control is
+not late; the inbox makes the same call for an archive member's control file
+missing from its container.
+
+**Optional stays per FEED.** Some feeds have no control file and some control
+files carry no md5. Neither declares the field, so neither reaches this
+check. What this does not express is one feed whose control files sometimes
+carry a checksum and sometimes do not; declaring `md5` for it refuses the
+ones without, naming the missing column. No such feed is known, so no
+per-field optional flag was built.
+
+Live-verified: `qa_happy_position` (declares all four) with a Transport of
+the data file alone failed `create_delivery` in one attempt with
+`AirflowFailException: IdentityResolutionError: ... declares delivery.control
+(cob_date, version, row_count, md5) and the Transport carries no control
+object`, and one `delivery_identity` FAIL row.
+
+## a-refusal-is-not-retried
+
+**Decision.** A failure that the same input will reproduce is raised as
+`spark_task.Refused` in the Spark child, which exits `REFUSED_EXIT` (65,
+EX_DATAERR); `spark_task.run` raises `SparkTaskRefused` (still a
+`RuntimeError`) for that status, and the ingest DAGs turn it -- and
+`DeliveryError` in `create_delivery` -- into `AirflowFailException`. A
+transient failure still retries, on a branch of its own:
+`context.ingest_attempt_id` names `ingest/<feed>/<date>/<run>-a<n>`.
+
+Found by running a Transport whose control file declared the wrong md5.
+Attempt 1 failed correctly, with the checksum and a branch "left for
+inspection". Attempts 2 and 3 cut the SAME branch name, got Nessie's `409
+Conflict`, and that became the task's final error: two retry delays spent,
+and the message an operator reads named neither the checksum nor the file.
+The retry could never have succeeded for a transient failure either, so the
+docs' "a retry after a failed branch simply runs the write again" was false
+for every failure it described.
+
+Reusing the branch (`exist_ok`, as `wap.open_build` does) is right for a dbt
+build and wrong here: an attempt that failed after its append would leave
+rows the retry appends again. A fresh branch starts from `main`, and each
+failed attempt's branch is still there to inspect.
+
+**`__main__` hands off to the imported module.** The first live run of the
+fix still exited 1: run as `python -m`, `spark_task.py` is `__main__`, a
+second module object whose `Refused` is not the class every op subclasses,
+so `except Refused` never matched. An in-process test of `main()` passed
+throughout. `tests/test_refusal.py` now runs the module through `runpy` as
+`__main__`, and fails against the old entry point.
+
+Live-verified: the same mismatch now fails `ingest_raw` in ONE attempt,
+`exit 65`, `AirflowFailException: SparkTaskRefused`, the message naming the
+data object, its md5, the control object and the declared md5, and
+`raw_ingestion` recorded as FAIL where it had been ERROR. A correct delivery
+still merged on `...-a1`.
+
+The message's control object is looked up from the DeliveryManifest at
+ingest (`ingest_feed._with_control_object`), not added to NormalizationManifest
+v2: `normalize_delivery` accepts an existing manifest only byte-identical,
+so a new field would turn every manifest already in `ready/` into a conflict
+on its next re-normalize.
+
 ## migration-comparison-is-not-validation-result
 
 **Decision (Phase 8).** Dual-run comparison evidence lives in its own table,
@@ -5298,3 +5564,64 @@ publication can still be traced back through
 (`#the-release-image-carries-the-code`). Both fail `helm template` naming the
 offending value, the same "fail loud at render, not quiet in the first pod
 that reads it" posture `required` gives every endpoint and image.
+
+
+## components-are-declared-and-enforced
+
+The platform is carved into separately built, versioned and deployed
+components -- `transport`, `core`, `ingest`, `dbt`, `ops`, plus `dev`, which is
+never packaged -- and **`components.yml` is the only statement of which
+module belongs to which**. `tests/test_components.py` reads every import in
+the source, lazy ones included, and fails on one that reaches a component its
+owner does not declare in `depends_on`. See `docs/PACKAGING.md` for the
+target shape.
+
+**Why lazy imports count.** Most cross-package imports here are inside
+functions on purpose, to keep pyspark and boto3 off the import path of code
+that only reads config. On one PYTHONPATH that is invisible. In an image built
+with `ingest` and without `ui`, it is a ModuleNotFoundError on the first run
+that reaches the branch -- the inbox's trigger path imported the console's
+Airflow client exactly this way, and nothing would have said so before a
+deployed inbox first tried to trigger a DAG.
+
+**Ownership is by module, not by directory**, longest prefix wins. The
+delivery index (`registry.deliveries`, `.rejections`, `.transports`) is
+rebuilt from object storage by the ingest code that writes it
+(`#the-registry-records-observations-not-verdicts`), so it ships with
+`ingest`, while `registry.db`'s DDL and the run and lifecycle records are
+`core`. Its pure-SQL reads moved to `registry/delivery_reads.py` (core) so a
+published run's trace needs no ingest install; `deliveries.py` re-exports
+them. Likewise `ingest.sniff` and `ingest.sample_diagnostics` are `dev`: they
+infer a feed definition for the console and nothing that runs a delivery
+calls them. The directories can be made to agree later without changing an
+import path, because every `__init__.py` on the way is empty and so can
+become a namespace package.
+
+**The Spark launcher is core and names its operations as strings.** It was
+`scripts/_spark_task.py`, and `scripts/` ships in no component. It is
+`reporting_platform/common/spark_task.py` now, each operation's body is in a
+`spark_ops.py` in the component that owns it, and `spark_task.OPS` maps the
+name. A driver image built without the owning component refuses the op by
+name. Because a string is invisible to the import scan,
+`test_components.py` checks the table separately: every entry resolves, and
+every DAG launches only ops its own component may import. The launch scan
+asserts it found at least ten launches, so renaming the DAGs' wrapper
+functions cannot turn it off. `python -m scripts._spark_task` still works as
+a shim.
+
+**`ingest` depends on `transport`, deliberately.** The Transport manifest's
+parser is `reporting_transport.contract`, shared unmodified with the
+publisher, so there is one implementation of what a marker means. The
+alternative -- a copy on the consumer side -- is two parsers of one contract
+drifting apart. Pin a compatible range, not an exact version.
+
+**Wheels are built from a staging directory, not a pyproject per
+directory**, because ownership is by module. `scripts/build_components.py`
+copies exactly a component's files, generates its `pyproject.toml` from
+`components.yml` and builds it. `--check` installs the result into an empty
+virtualenv outside the checkout, with its sibling wheels installed BY FILE (a
+name could be answered by a public package of the same name) and none of the
+extras, and imports every module. The static test cannot see a module-level
+import of an undeclared third-party package or a file the staging missed;
+this does, and removing `requests` from core's `requires` fails it on
+`common/airflow_api.py`, measured.

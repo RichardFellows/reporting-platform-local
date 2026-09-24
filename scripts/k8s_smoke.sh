@@ -61,14 +61,18 @@ step "cluster"
 kind get clusters 2>/dev/null | grep -qx "$cluster" \
   || kind create cluster --name "$cluster" --wait 180s
 
-step "images (release + spark), loaded into kind"
+step "images (release + spark + minio), loaded into kind"
 nessie_server=$(grep -E '^NESSIE_SERVER_VERSION=' .env.example | cut -d= -f2)
 docker build -q -f Dockerfile.airflow --target release \
   --build-arg "NESSIE_SERVER_VERSION=$nessie_server" \
   -t reporting-platform-airflow:k8s-smoke .
 docker build -q -f Dockerfile.spark -t reporting-platform-spark:k8s-smoke .
+# MinIO too: no registry serves its images anonymously any more.
+# See docs/DECISIONS.md#minio-is-built-from-source
+docker build -q -f Dockerfile.minio -t reporting-platform-minio:k8s-smoke .
 kind load docker-image --name "$cluster" \
-  reporting-platform-airflow:k8s-smoke reporting-platform-spark:k8s-smoke
+  reporting-platform-airflow:k8s-smoke reporting-platform-spark:k8s-smoke \
+  reporting-platform-minio:k8s-smoke
 
 step "helm install (--wait)"
 helm dependency build "$chart" >/dev/null

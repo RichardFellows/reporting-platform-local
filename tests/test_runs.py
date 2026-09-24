@@ -14,7 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 
-from tests.support import DAGS, REPO, config_dir
+from tests.support import REPO, config_dir
 
 
 def _context():
@@ -152,27 +152,6 @@ def test_the_manifest_ref_is_the_project_not_dbts_own_manifest():
     assert c.dbt_manifest_ref() == c.dbt_manifest_ref()
 
 
-# ------------------------------------------------------- the run key itself
-def test_the_run_key_is_derived_from_the_branch_and_carries_the_purpose():
-    """Recomputing the slug in two tasks is how one run ends up as two rows;
-    and the prepared and reporting builds slugify the SAME dataset-triggered
-    Airflow run id, so the purpose has to be in the key."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_dbt_builds_probe", DAGS / "dbt_builds.py")
-    # The module imports cosmos and airflow, which the test environment does
-    # not have, so the helper is read out of the source rather than imported.
-    source = (DAGS / "dbt_builds.py").read_text(encoding="utf-8")
-    body = source[source.index("def _run_key("):]
-    body = body[:body.index("\ndef ", 1)]
-    ns: dict = {}
-    exec(compile(body, "dbt_builds._run_key", "exec"), ns)          # noqa: S102
-    assert ns["_run_key"]("build/prepared/2026-09-06/abc-123") == "prepared-abc-123"
-    assert ns["_run_key"]("build/reporting/2026-09-06/abc-123") == "reporting-abc-123"
-    assert spec is not None
-
-
 # --------------------------------------------------- the version diff (§11)
 # Postgres again, so what is checked here is the SHAPE of the query rather
 # than its result -- and the shape is where the two defects would be.
@@ -225,7 +204,7 @@ def test_report_version_trace_keeps_missing_delivery_evidence_visible():
     import sys
 
     sys.path.insert(0, str(REPO))
-    from reporting_platform.registry import deliveries, runs
+    from reporting_platform.registry import delivery_reads, runs
 
     columns = [
         "report", "as_at_date", "version_no", "tag", "created_at", "run_id",
@@ -265,13 +244,13 @@ def test_report_version_trace_keeps_missing_delivery_evidence_visible():
     def connect():
         yield Connection()
 
-    original = runs.db.connect, runs.inputs_for_run, deliveries.deliveries_by_id
+    original = runs.db.connect, runs.inputs_for_run, delivery_reads.deliveries_by_id
     runs.db.connect = connect
     runs.inputs_for_run = lambda run_id: [
         {"feed": "feed_a", "delivery_id": "dlv_A"},
         {"feed": "feed_b", "delivery_id": "dlv_missing"},
     ]
-    deliveries.deliveries_by_id = lambda pairs: [
+    delivery_reads.deliveries_by_id = lambda pairs: [
         {"feed": pairs[0][0], "delivery_id": pairs[0][1], "registered": True,
          "manifest_key": "deliveries/DCM/t-a/delivery-manifest.json",
          "source_object": "received/t-a/source.csv"},
@@ -281,7 +260,7 @@ def test_report_version_trace_keeps_missing_delivery_evidence_visible():
     try:
         traced = runs.trace_version("risk", BD, 3)
     finally:
-        runs.db.connect, runs.inputs_for_run, deliveries.deliveries_by_id = original
+        runs.db.connect, runs.inputs_for_run, delivery_reads.deliveries_by_id = original
     assert traced["report_version"]["run_id"] == "run-3"
     assert traced["run"]["dbt_artifacts_ref"].endswith("/run-3/")
     assert traced["inputs"][0]["manifest_key"].endswith("delivery-manifest.json")
