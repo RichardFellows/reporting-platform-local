@@ -486,6 +486,60 @@ services:
     ports: ["${NOTEBOOK_HOST_PORT:-8083}:8083"]
     restart: unless-stopped
 
+  # -------------------------------------------------------------- runner
+  # THE PIPELINE WITH NO AIRFLOW AND NO SPARK CLUSTER: land -> raw ->
+  # prepared -> reporting, one command per step, Spark in this container's
+  # own process (PLATFORM_EXECUTION=embedded, a local[N] master). Needs only
+  # S3, Nessie and Postgres. Same code the DAGs run; see
+  # docs/STANDALONE-PIPELINE.md.
+  #
+  #   docker compose --profile standalone run --rm runner check
+  #   docker compose --profile standalone run --rm runner run /opt/platform/seed_clean/fo_trade/fo_trade_20260801.csv
+  #   docker compose --profile standalone run --rm runner transform build prepared
+  #
+  # DO NOT --entrypoint AROUND IT: the image's entrypoint is what makes the
+  # host uid a user with a home, and without one Spark dies on `?/.ivy2`.
+  #
+  # POINTING IT ELSEWHERE is environment only: set RUNNER_S3_ENDPOINT,
+  # RUNNER_NESSIE_URI, RUNNER_REGISTRY_DSN (and the rest below) in the shell
+  # or .env, and add `--no-deps` so the local stores are not started.
+  runner:
+    <<: *airflow-common
+    profiles: ["standalone"]
+    # The image's own entrypoint first (it makes an arbitrary uid a real
+    # user), then the pipeline, so `run --rm runner <subcommand>` reads right.
+    entrypoint: ["/usr/bin/dumb-init", "--", "/entrypoint",
+                 "python", "-m", "reporting_platform.pipeline"]
+    command: ["check"]
+    environment:
+      <<: [*s3-env, *versions]
+      PYTHONPATH: /opt/platform
+      PYTHONUNBUFFERED: "1"
+      # No cluster. Both drivers read SPARK_MASTER -- spark_session() and
+      # dbt/profiles.yml -- and `embedded` is the only mode that accepts a
+      # local one. See docs/DECISIONS.md#execution-mode-is-configuration
+      PLATFORM_EXECUTION: embedded
+      SPARK_MASTER: ${RUNNER_SPARK_MASTER:-local[2]}
+      DBT_PROJECT_DIR: /opt/platform/dbt
+      DBT_PROFILES_DIR: /opt/platform/dbt
+      DBT_LOG_PATH: /opt/platform/run/dbt/logs
+      DBT_TARGET_PATH: /opt/platform/run/dbt/target
+      DBT_TARGET: ${DBT_TARGET:-spark_local}
+      # The stores. Defaults are this compose file's; each is overridable
+      # without editing it, which is the whole of "point it at deployed
+      # infrastructure". Outside `local`, settings.py refuses an unset one.
+      REPORTING_ENV: ${RUNNER_REPORTING_ENV:-local}
+      S3_ENDPOINT: ${RUNNER_S3_ENDPOINT:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${RUNNER_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-minioadmin}}
+      AWS_SECRET_ACCESS_KEY: ${RUNNER_S3_SECRET_KEY:-${S3_SECRET_KEY:-minioadmin123}}
+      REPORTING_WAREHOUSE: ${RUNNER_WAREHOUSE:-s3a://lakehouse/warehouse}
+      REPORTING_LANDING: ${RUNNER_LANDING:-s3a://lakehouse/landing}
+      NESSIE_URI: ${RUNNER_NESSIE_URI:-http://nessie:19120/api/v2}
+      NESSIE_AUTH_TYPE: ${RUNNER_NESSIE_AUTH_TYPE:-NONE}
+      DBT_ENV_SECRET_NESSIE_AUTH_TOKEN: ${RUNNER_NESSIE_AUTH_TOKEN:-}
+      REGISTRY_DSN: ${RUNNER_REGISTRY_DSN:-postgresql://platform:platform@postgres:5432/platform}
+    restart: "no"
+
   # --------------------------------------------------------------- inbox
   # Drop a file into ./inbox on the host and it lands, ingests, and moves to
   # inbox/.processed/<feed>/. Routed by the feeds' own filename patterns, so

@@ -19,6 +19,7 @@ writes to stderr stays out of the way.
 Usage:
     python -m reporting_platform.common.spark_task pending <feed>
     python -m reporting_platform.common.spark_task ingest <feed> <key> [run_id] [cob_date]
+    python -m reporting_platform.common.spark_task ingest-batch <feed> <key>...
     python -m reporting_platform.common.spark_task ingest-v2 <normalization_manifest_key> [run_id]
     python -m reporting_platform.common.spark_task raw-delivery-ids <feed>
     python -m reporting_platform.common.spark_task reconcile-committed <feed>
@@ -213,6 +214,7 @@ def _run_in_pod(args) -> tuple[int, str, str]:
 OPS = {
     "pending": "reporting_platform.ingest.spark_ops:op_pending",
     "ingest": "reporting_platform.ingest.spark_ops:op_ingest",
+    "ingest-batch": "reporting_platform.ingest.spark_ops:op_ingest_batch",
     "ingest-v2": "reporting_platform.ingest.spark_ops:op_ingest_v2",
     "raw-delivery-ids": "reporting_platform.ingest.spark_ops:op_raw_delivery_ids",
     "reconcile-committed": "reporting_platform.ingest.spark_ops:op_reconcile_committed",

@@ -100,15 +100,24 @@ components:
     extras:
       spark: ["pyspark>=3.5,<3.6"]
     host: [apache-airflow]
+    scripts:
+      # land / pending / ingest, with nothing listening -- the steps the
+      # ingest DAGs run, callable on their own (ingest/steps.py)
+      reporting-ingest: reporting_platform.ingest.__main__:main
 
   dbt:
     distribution: reporting-dbt
-    description: The dbt project (prepared and reporting layers) and the DAGs that build, test and publish it.
-    modules: []
+    description: The dbt project (prepared and reporting layers), the write-audit-publish sequence around a build, and the DAGs that run it.
+    # `transform` is the branch/dbt/publish sequence itself, so the DAG and
+    # `reporting-transform` are one implementation (transform/wap.py).
+    modules:
+      - reporting_platform.transform
     dags:
       - airflow/dags/dbt_builds.py
     depends_on: [core]
     host: [apache-airflow, astronomer-cosmos]
+    scripts:
+      reporting-transform: reporting_platform.transform.__main__:main
 
   ops:
     distribution: reporting-ops
@@ -136,6 +145,8 @@ components:
     modules:
       - reporting_platform.ui
       - reporting_platform.migration
+      # The no-Airflow runner: glue over ingest's and dbt's own entry points.
+      - reporting_platform.pipeline
       # Feed ONBOARDING, not ingestion: they infer a feed definition from a
       # sample file for the console's form, and nothing that runs a delivery
       # calls them. They live in ingest/ because they parse the way ingest
@@ -144,4 +155,4 @@ components:
       - reporting_platform.ingest.sample_diagnostics
     dags:
       - airflow/dags/migration_reconcile.py
-    depends_on: [core, transport, ingest, ops]
+    depends_on: [core, transport, ingest, ops, dbt]

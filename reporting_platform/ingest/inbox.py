@@ -393,6 +393,52 @@ def sweep(seen: dict[str, tuple[int, float, int]], *, dry_run: bool = False) -> 
     return results
 
 
+def land_files(paths: list[Path]) -> list[dict]:
+    """The inbox gate for files NAMED, rather than a directory watched.
+
+    The same `sweep` -- routing, conformance, control-file promotion,
+    quarantine -- over a private copy of exactly these files, so a person or a
+    script can land a delivery without a watcher, a mounted inbox or an
+    Airflow to trigger. Nothing is triggered: the caller ingests.
+
+    The originals are never moved. A file the gate could not act on yet --
+    a data file whose control file was not among `paths` -- is reported as
+    `not landed` rather than left behind somewhere to be forgotten.
+    """
+    import tempfile
+
+    global INBOX, TRIGGER
+    names = [p.name for p in paths]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"two files named {dupes}: one inbox holds one of each")
+    saved = INBOX, TRIGGER
+    with tempfile.TemporaryDirectory(prefix="inbox-") as d:
+        staging = Path(d)
+        for p in paths:
+            shutil.copy2(p, staging / p.name)
+        INBOX, TRIGGER = staging, False
+        try:
+            # Named files are complete by assertion: no stability wait.
+            seen = {p.name: (p.stat().st_size, p.stat().st_mtime, STABLE_POLLS)
+                    for p in staging.iterdir()}
+            results = sweep(seen)
+            left = {p.name for p in staging.iterdir() if not _skip(p)}
+        finally:
+            INBOX, TRIGGER = saved
+    # A legacy control file is "held" when the pass meets it and consumed when
+    # the pass reaches its data file. One still here was not -- and the copy
+    # it was held in is gone, so it did NOT land and must not say it did.
+    results = [r for r in results
+               if r["status"] != "held (control file)" or r["file"] not in left]
+    reported = {r["file"] for r in results}
+    results += [{"file": n, "status": "not landed",
+                 "reason": "the gate is waiting for something not given with "
+                           "it -- usually its control file"}
+                for n in sorted(left - reported)]
+    return results
+
+
 def _promote(feed: Feed, path: Path,
              seen: dict[str, tuple[int, float, int]]) -> list[dict]:
     """Run one inbox file through the conformance gate and write what it says.

@@ -40,22 +40,35 @@ def session_conf(app_name: str, ref: str = "main") -> tuple[str, dict[str, str]]
     # error that LOOKS like success. The default below matches
     # docker-compose.yml so a bare `python -m ...` still works.
     # See docs/DECISIONS.md#spark-master-no-local-fallback
+    #
+    # EXCEPT WHEN THAT IS THE DECLARED MODE. `embedded` runs every task in
+    # this process on purpose, and there it is a cluster master that would be
+    # the mistake -- so the two refusals mirror each other and neither mode
+    # can be reached by a typo in the other's master.
     master = os.environ.get("SPARK_MASTER") or "spark://spark-master:7077"
-    if master.startswith("local"):
+    mode = settings.execution()
+    if mode == "embedded":
+        if not master.startswith("local"):
+            raise RuntimeError(
+                f"PLATFORM_EXECUTION is 'embedded' but SPARK_MASTER is "
+                f"{master!r}. Embedded runs every task in this process: set "
+                f"SPARK_MASTER=local[2] (or local[N]), which dbt/profiles.yml "
+                f"reads too.")
+    elif master.startswith("local"):
         raise RuntimeError(
             f"SPARK_MASTER is {master!r}. This platform runs every Spark job on "
             f"the spark-master/spark-worker cluster; an in-process local session "
             f"silently bypasses it. Point SPARK_MASTER at the cluster "
-            f"(spark://spark-master:7077)."
-        )
-    kubernetes = settings.execution() == "kubernetes"
+            f"(spark://spark-master:7077), or set PLATFORM_EXECUTION=embedded "
+            f"if running without one is the intent.")
+    kubernetes = mode == "kubernetes"
     if kubernetes != master.startswith("k8s://"):
         # The two must agree, or a cluster runs its executors somewhere its
         # execution mode does not describe -- or a laptop tries to reach an
         # API server. See docs/DECISIONS.md#execution-mode-is-configuration
         raise RuntimeError(
-            f"PLATFORM_EXECUTION is {settings.execution()!r} but SPARK_MASTER "
-            f"is {master!r}. `kubernetes` needs a k8s:// master and `local` "
+            f"PLATFORM_EXECUTION is {mode!r} but SPARK_MASTER "
+            f"is {master!r}. `kubernetes` needs a k8s:// master and `{mode}` "
             f"must not have one.")
 
     # `pyspark` here is the pip-installed runtime baked into

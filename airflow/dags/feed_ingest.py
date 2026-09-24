@@ -178,75 +178,24 @@ def build_feed_dag(feed):
 
         @task(task_id="record_snapshot")
         def record_snapshot(result: dict) -> dict:
-            """Pin the state this ingest left, so it stays addressable.
+            """Pin the state this ingest left: `snapshot/<feed>/<bd>/<run_id>`.
+            An ingest is not a publication. See `ingest.steps.record_snapshot`,
+            which the hand-run ingest calls too."""
+            from reporting_platform.ingest.steps import record_snapshot as pin
 
-            THIS TASK USED TO BE CALLED `record_publication` AND CUT
-            `published/<bd>/<run_id>`, AND AN INGEST IS NOT A PUBLICATION.
-            The consequences were not cosmetic: every check that read
-            `published/` -- reproducibility, evidence, the per-report
-            retention window -- was reading ingests, N feeds landing one
-            COB date cut N tags that carried no feed name to tell them
-            apart, and `references.published_tags.per_report` could never match
-            anything because no ingest knows which report it serves.
-
-            It is still worth pinning. Raw is where retention deletes COB
-            dates, so the state each ingest left is exactly what someone may
-            need to read back. It is simply a different object with a
-            different lifetime: `snapshot/<feed>/<bd>/<run_id>`, kept by
-            `references.snapshot_tags` in retention.yml. A REPORT publication
-            is cut by the reporting build, which knows what it published.
-            """
-            from datetime import date as _date
-
-            from reporting_platform.common.context import Nessie, snapshot_tag
-
-            tag = snapshot_tag(feed.name,
-                               _date.fromisoformat(result["cob_date"]),
-                               result["run_id"])
-            try:
-                Nessie().create_tag(tag, from_ref="main")
-            except Exception as exc:      # tag already exists on a rerun
-                return {**result, "tag": tag, "tag_error": str(exc)}
-            return {**result, "tag": tag}
+            return pin(feed.name, result)
 
         @task(task_id="report_drift")
         def report_drift(result: dict) -> dict:
-            """Schema drift is reported, never fatal.
-
-            A new upstream column must not stop the pipeline; it must show up
-            as a warning and in _extra_columns, so the dbt model can be
-            extended deliberately rather than under incident pressure.
-
-            TWO DIFFERENT EVENTS ARE REPORTED HERE and they are logged apart
-            on purpose. DRIFT is a statement about one delivery: the file did
-            not match the contract, and it can happen on any run. A CONTRACT
-            CHANGE is a statement about the deployment: `feeds.yml` changed
-            and this was the first ingest to carry it into the raw table, so
-            it appears once and then never again for that column. Reading the
-            second as the first sends somebody to the upstream about a change
-            that was made here.
-            """
+            """Schema drift is reported, never fatal: a new upstream column
+            must not stop the pipeline. Drift and a contract change are
+            worded apart -- see `ingest.steps.drift_warnings`."""
             import logging
 
-            log = logging.getLogger("airflow.task")
-            if result.get("missing_columns") or result.get("extra_columns"):
-                log.warning(
-                    "SCHEMA DRIFT %s %s: missing=%s extra=%s",
-                    feed.name, result["cob_date"],
-                    result["missing_columns"], result["extra_columns"])
-            if result.get("columns_added"):
-                log.warning(
-                    "CONTRACT CHANGE %s %s: added %s to the raw table. "
-                    "History reads NULL for it -- added, never backfilled.",
-                    feed.name, result["cob_date"],
-                    result["columns_added"])
-            if result.get("columns_orphaned"):
-                log.warning(
-                    "CONTRACT CHANGE %s %s: %s is in the raw table and the "
-                    "feed no longer declares it. Written as NULL, never "
-                    "dropped; settle it deliberately.",
-                    feed.name, result["cob_date"],
-                    result["columns_orphaned"])
+            from reporting_platform.ingest.steps import drift_warnings
+
+            for message in drift_warnings(feed.name, result):
+                logging.getLogger("airflow.task").warning("%s", message)
             return result
 
         arrival = resolve_arrival()
