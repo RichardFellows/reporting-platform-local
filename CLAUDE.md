@@ -66,7 +66,9 @@ to run something for the first time, expect it to fail and read what it says.
 ## Engine and versions
 
 - **Build on a throwaway branch, never `main`** —
-  `scripts/_open_build_branch.py`. Branch → build → test → merge only if clean.
+  `scripts/_open_build_branch.py`, or `make build-branch SELECT=<selector>`
+  (`make build`/`prepared`/`reporting` are the same; only `*-on-main` targets
+  touch main). Branch → build → test → merge only if clean.
 - **Spark is the only build engine** (`transform.dbt.target()` refuses a
   non-Spark `DBT_TARGET`, and `dbt_builds.py` calls it at import): only the Spark path can address a Nessie branch. DuckDB is a
   read-only query tool (`scripts/duckdb_console.py`).

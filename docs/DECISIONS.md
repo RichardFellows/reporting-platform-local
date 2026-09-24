@@ -823,7 +823,7 @@ version would stamp one release's name on another's code.
 - **`bitnamilegacy/minio`**: pullable, but frozen and declared unmaintained,
   with its own entrypoint, data path and environment conventions.
 
-**What the build reproduces.** It uses MinIO's own `make install` flags
+**What the build reproduces.** It uses the flags of MinIO's own Makefile `install` target
 (`CGO_ENABLED=0 -tags kqueue -trimpath`) and the ldflags its
 `buildscripts/gen-ldflags.go` writes, so `minio --version` prints
 `RELEASE.2024-09-22T00-33-43Z (commit-id=03e996320ebb)`, not `DEVELOPMENT`.

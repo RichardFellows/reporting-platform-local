@@ -1243,9 +1243,13 @@ make retention-dry
 | `make land` | Upload seed CSVs into the S3 landing prefix |
 | `make pools` | Re-create the write pool (airflow-init already did this) |
 | `make deps` | Re-install dbt packages (airflow-init already did this) |
-| `make build` | Full dbt build (run + test) -- on main, see note above |
-| `make prepared` | Build the prepared layer only -- on main, see note above |
-| `make reporting` | Build the reporting layer only -- on main, see note above |
+| `make build-branch SELECT=<sel>` | Build `SELECT` on a throwaway Nessie branch (default: prepared+reporting). **Never merges** -- prints the branch and a diff-vs-main command |
+| `make build` | Full dbt build (run + test), safely -- alias for `build-branch` |
+| `make prepared` | Build the prepared layer only, safely -- alias for `build-branch` |
+| `make reporting` | Build the reporting layer only, safely -- alias for `build-branch` |
+| `make build-on-main` | Full dbt build (run + test) -- **on `main`**, see note above |
+| `make prepared-on-main` | Build the prepared layer only -- **on `main`**, see note above |
+| `make reporting-on-main` | Build the reporting layer only -- **on `main`**, see note above |
 | `make lineage` | Generate and serve the dbt lineage docs |
 | `make retention-dry` | Show what retention WOULD expire, changing nothing |
 | `make retention` | Enforce retention for real |
