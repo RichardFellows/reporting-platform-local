@@ -196,13 +196,19 @@ services:
 
   # ---------------------------------------------------------------- storage
   minio:
-    # quay.io, NOT Docker Hub: the `minio/minio` and `minio/mc` repositories
-    # there now refuse anonymous pulls ("pull access denied ... repository
-    # does not exist"), so a fresh clone could not start this stack at all --
-    # found by the CI build tier, the first thing that pulled without a
-    # cache. Same release tag, and the same image: quay.io's copy has the
-    # identical image ID. See docs/DECISIONS.md#minio-images-come-from-quay
-    image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
+    # BUILT HERE, from the pinned releases' source: no registry serves
+    # MinIO's own images anonymously any more -- Docker Hub first, then
+    # quay.io (401 from 2026-09-24), and ghcr.io. The CI build tier, the
+    # first thing that pulls without a cache, is what found both. Same
+    # releases as the images this replaced. `minio-init` builds the same
+    # Dockerfile, which the layer cache makes free, as spark-master and
+    # spark-worker share theirs. See docs/DECISIONS.md#minio-is-built-from-source
+    build:
+      context: .
+      dockerfile: Dockerfile.minio
+      args: &minio-releases
+        MINIO_RELEASE: ${MINIO_RELEASE:-RELEASE.2024-09-22T00-33-43Z}
+        MC_RELEASE: ${MC_RELEASE:-RELEASE.2024-09-16T17-43-14Z}
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
@@ -220,8 +226,11 @@ services:
       retries: 20
 
   minio-init:
-    # quay.io, as minio above.
-    image: quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z
+    # The same image as minio above: it carries `mc` too.
+    build:
+      context: .
+      dockerfile: Dockerfile.minio
+      args: *minio-releases
     depends_on:
       minio: {condition: service_healthy}
     entrypoint: >

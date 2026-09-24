@@ -103,6 +103,9 @@ feedConsole:
 # a shared cluster: they have no persistence worth the name.
 localStores:
   enabled: false
+  # Dockerfile.minio, built and loaded into the cluster -- nothing serves
+  # MinIO's own images anonymously. REQUIRED when enabled.
+  minioImage: ""
 
 # ------------------------------------------------------------------ Airflow
 # Values for the official chart (a dependency, aliased `airflow`). Only what
