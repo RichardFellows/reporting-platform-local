@@ -19,11 +19,18 @@ than worked.
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
 | [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high | 2–4 hours |
-| [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
+| [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does (README fixed; docstring left) | low–medium | 15 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
+| [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
+| [26](26-tests-run-on-a-host-fails-without-reporting-config-dir.md) | `python -m tests.run` on a host fails 12 tests unless `REPORTING_CONFIG_DIR` is set | medium | 1 hour |
+| [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
+| [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
+| [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
+| [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
+| [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
 
 ## Where to start
 
@@ -40,6 +47,14 @@ multi-day design work and only worth starting if a delta feed is real; read
 its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
+
+**25** ranks with 22 and 15. Until it is fixed, onboarding any feed stops
+every other feed publishing until the new one first delivers. It needs a
+decision before code, and the item lays out the three options.
+
+**25–31** were found reviewing the README on 2026-09-24. 25–27 are bugs,
+reproduced before they were written down. 28–31 are diagrams, independent of
+each other and of everything else.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`

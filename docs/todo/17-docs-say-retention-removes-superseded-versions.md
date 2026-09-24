@@ -28,9 +28,11 @@ that is policy.
 
 ## What done looks like
 
-- [ ] `README.md` and the `ingest_feed.py` module docstring say what happens:
+- [x] `README.md` says what happens (walkthrough step 6, 2026-09-24):
       every version stays in raw for the table keep-set and in landing for
-      `keep_years`; `prepared` reads only the newest.
+      its retention class; `prepared` reads only the newest.
+- [ ] The `ingest_feed.py` module docstring says the same. It still reads
+      "retention removes the superseded ones later".
 - [ ] `grep -rn -i 'superseded' docs/ README.md CLAUDE.md reporting_platform/`
       finds nothing else describing a version sweep as current.
 - [ ] If a version sweep is WANTED, that is a new item with a decision in it,
@@ -40,6 +42,6 @@ that is policy.
 
 ```text
 Read docs/todo/17-docs-say-retention-removes-superseded-versions.md. Confirm
-nothing prunes old _file_versions, then correct README.md and
-ingest/ingest_feed.py's docstring to what actually happens.
+nothing prunes old _file_versions, then correct ingest/ingest_feed.py's
+docstring to what actually happens (README.md is already done).
 ```
