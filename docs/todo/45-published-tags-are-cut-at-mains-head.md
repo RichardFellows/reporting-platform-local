@@ -42,7 +42,9 @@ run record's `merged_hash` then names a commit the run did not make.
       recorded on the run as an error, as `steps.record_snapshot` does.
 - [ ] A test with a fake Nessie whose `main` moves between the merge and
       the tag, showing the tag names the merge commit.
-- [ ] `docs/ARCHITECTURE.md#the-ref-graph`'s caveat about this removed.
+- [ ] The caveat in `docs/ARCHITECTURE.md#the-ref-graph` (step 5, "Nothing
+      guarantees it outside Airflow", with its link to this file) removed,
+      since this file is deleted when the item closes.
 
 ## Prompt for a new session
 

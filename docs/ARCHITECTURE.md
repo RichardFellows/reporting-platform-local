@@ -323,33 +323,34 @@ publication is a merge that happens only if the work on the branch passed.
 ### The ref graph
 
 What `curl -s http://localhost:19120/api/v2/trees` lists is this graph's
-refs: `main`, working branches, and tags. One COB date, 2026-08-13, processed
-the next morning:
+refs: `main`, working branches, and tags. It shows one COB date, 2026-08-13,
+processed the next morning in Airflow. Each file was dropped in the inbox,
+which triggers its ingest DAG with a `console__<timestamp>` run id:
 
 ```mermaid
 %%{init: {"gitGraph": {"mainBranchName": "main"}, "themeVariables": {"tagLabelFontSize": "9px", "commitLabelFontSize": "10px"}}}%%
 gitGraph
     commit id: "main"
-    branch "ingest/fo_trade/2026-08-13/-14T060211.4083120000-a1"
+    branch "ingest/fo_trade/2026-08-13/20260814T060211408312-a1"
     commit id: "append raw.fo_trade"
     checkout main
-    merge "ingest/fo_trade/2026-08-13/-14T060211.4083120000-a1" id: "merge fo_trade" tag: "snapshot/fo_trade/2026-08-13/-14T060211.4083120000-a1"
+    merge "ingest/fo_trade/2026-08-13/20260814T060211408312-a1" id: "merge fo_trade" tag: "snapshot/fo_trade/2026-08-13/20260814T060211408312-a1"
     branch "build/prepared/2026-08-14/dataset-triggered-2026-08-14T06-04-30-11"
-    commit id: "prepared.fo_trade"
-    commit id: "prepared.ref_counterparty"
-    commit id: "prepared.ref_rating, then dbt_test FAILS" type: REVERSE
+    commit id: "build 1: prepared.fo_trade"
+    commit id: "build 1: prepared.ref_counterparty"
+    commit id: "build 1: prepared.ref_rating, then dbt_test FAILS" type: REVERSE
     checkout main
-    branch "ingest/ref_counterparty/2026-08-13/-14T063052.7719040000-a1"
-    commit id: "append; merge refused 409" type: REVERSE
+    branch "ingest/ref_counterparty/2026-08-13/20260814T063052771904-a1"
+    commit id: "a1: append, then the driver dies" type: REVERSE
     checkout main
-    branch "ingest/ref_counterparty/2026-08-13/-14T063052.7719040000-a2"
-    commit id: "append raw.ref_counterparty"
+    branch "ingest/ref_counterparty/2026-08-13/20260814T063052771904-a2"
+    commit id: "a2: append raw.ref_counterparty"
     checkout main
-    merge "ingest/ref_counterparty/2026-08-13/-14T063052.7719040000-a2" id: "merge ref_counterparty" tag: "snapshot/ref_counterparty/2026-08-13/-14T063052.7719040000-a2"
+    merge "ingest/ref_counterparty/2026-08-13/20260814T063052771904-a2" id: "merge ref_counterparty" tag: "snapshot/ref_counterparty/2026-08-13/20260814T063052771904-a2"
     branch "build/prepared/2026-08-14/dataset-triggered-2026-08-14T06-33-02-54"
-    commit id: "prepared.fo_trade "
-    commit id: "prepared.ref_counterparty "
-    commit id: "prepared.ref_rating, dbt_test passes"
+    commit id: "build 2: prepared.fo_trade"
+    commit id: "build 2: prepared.ref_counterparty"
+    commit id: "build 2: prepared.ref_rating, dbt_test passes"
     checkout main
     merge "build/prepared/2026-08-14/dataset-triggered-2026-08-14T06-33-02-54" id: "publish(prepared): 2026-08-13"
     branch "build/reporting/2026-08-14/dataset-triggered-2026-08-14T06-41-18-90"
@@ -369,17 +370,19 @@ Read left to right:
    own merge made** (`resultantTargetHash`), never on whatever `main`'s head
    is by the time the tag is cut
    ([DECISIONS.md#a-snapshot-tag-names-its-merge-commit](DECISIONS.md#a-snapshot-tag-names-its-merge-commit)).
-2. **A failed build** (`prepared`, triggered by that ingest) writes one
-   commit per model onto `build/prepared/<utc date>/<run slug>`, then
-   `dbt_test` fails. There is no merge: `main` does not move, and the branch
-   is **kept** for diagnosis.
-3. **A retried ingest** (`ref_counterparty`). Attempt 1 appended and then
-   failed transiently (here, Nessie refused the merge with a 409). Its `-a1`
-   branch is **kept**. Airflow's retry is attempt 2, which cuts its own
-   `-a2` branch from `main`. Reusing `-a1` would die on the 409 of the name
-   that is already there, and would inherit rows attempt 1 appended. `-a2`
-   merges, is deleted, and is the one tagged. A *refusal*, a failure the same
-   input reproduces, is not retried at all
+2. **A failed build.** That ingest triggers a `prepared` build, which writes
+   its models' commits onto `build/prepared/<utc date>/<run slug>`. Each
+   model is at least one commit, and more when a table is created or its
+   schema altered. Then `dbt_test` fails. There is no merge: `main` does not
+   move, and the branch is **kept** for diagnosis.
+3. **A retried ingest** (`ref_counterparty`). Attempt 1 appended, and then
+   its driver died before the merge (an evicted pod, a lost JVM). That is a
+   transient failure, not a refusal, so Airflow retries the task. The `-a1`
+   branch is **kept**. Attempt 2 cuts its own `-a2` branch from `main`,
+   because reusing `-a1` would die on Nessie's 409 for a name that already
+   exists, and would carry the rows attempt 1 appended. `-a2` merges, is
+   deleted, and is the one tagged. A *refusal*, a failure the same input
+   reproduces, is not retried at all
    ([DECISIONS.md#a-refusal-is-not-retried](DECISIONS.md#a-refusal-is-not-retried)).
 4. **A passing prepared build** (triggered by the second ingest) merges as
    `publish(prepared): <cob_date> run <run key>`. It cuts **no** tag, because
@@ -390,9 +393,12 @@ Read left to right:
    They are cut from `main`'s head just after the merge. That head is the
    merge commit only while nothing else merges in between. In Airflow the
    `lakehouse_write` pool guarantees that at its default of one slot.
-   Nothing guarantees it outside Airflow (todo 45).
-   `gitGraph` in the Mermaid version GitHub renders cannot draw two tags on
-   one commit, so the label abbreviates them. The two refs are
+   Nothing guarantees it outside Airflow
+   ([todo 45](todo/45-published-tags-are-cut-at-mains-head.md)).
+
+   The label abbreviates the two tags as one. Two `tag:`s on one `gitGraph`
+   commit render in Mermaid 11 but are a parse error in Mermaid 10, and
+   which version GitHub renders with has not been checked. The two refs are
    `published/counterparty_exposure_report/2026-08-13/reporting-dataset-triggered-2026-08-14T06-41-18-90`
    and
    `published/country_exposure_dashboard/2026-08-13/reporting-dataset-triggered-2026-08-14T06-41-18-90`.
@@ -409,18 +415,22 @@ and `published/` tags for `references.published_tags`, which is sized in
 years because a published tag is how long that run can still be read
 ([DECISIONS.md#published-tags-are-the-reproducibility-window](DECISIONS.md#published-tags-are-the-reproducibility-window)).
 
-The names, and the code that makes each one:
+The names, and the code that makes each one. **The run id depends on the
+path.** Airflow names refs after its own run; everything else mints a fresh
+id, and nothing outside Airflow retries, so those refs have no `-a<n>`:
 
 | Ref | Pattern | Made by |
 |---|---|---|
-| ingest branch | `ingest/<feed>/<cob_date>/<run>-a<n>` | `context.branch_name("ingest", …)` in `ingest_feed.py`. The run id is `context.ingest_attempt_id(airflow_run_id, try_number)`: the **last 21 characters** of the Airflow run id with `:` and `+` removed, then `-a<try>`. That is why a `manual__…` run reads `-14T060211.4083120000-a1`. |
-| build branch | `build/<purpose>/<utc date>/<slug>` | `transform/wap.branch_name`. `<purpose>` is `prepared` or `reporting`, the date is the day the build **opened** (UTC), not the COB date, and the slug is the Airflow run id with non-alphanumerics collapsed to `-`, truncated to 40. A retry of the same Airflow run **reuses** the branch (`exist_ok`), unlike an ingest. |
+| ingest branch, Airflow (`ingest_<feed>`, `transport_ingest`) | `ingest/<feed>/<cob_date>/<run>-a<n>` | `context.branch_name("ingest", …)` in `ingest_feed.py`, with the run id from `context.ingest_attempt_id(airflow_run_id, try_number)`: the **last 21 characters** of the Airflow run id with `:` and `+` removed, then `-a<try>`. The inbox and the console trigger with `console__%Y%m%dT%H%M%S%f` (`common/airflow_api.trigger`), so `<run>` is that timestamp in full: `20260814T060211408312-a1`. A run started from Airflow's own UI or CLI (`manual__<iso time>`) is cut mid-token instead: `-14T060211.4083120000-a1` ([todo 46](todo/46-ingest-attempt-id-slices-mid-token.md)). |
+| ingest branch, anything else (`scripts.bulk_ingest`, `python -m reporting_platform.ingest ingest`, the standalone `runner`, `ingest transport`) | `ingest/<feed>/<cob_date>/<new_run_id>` | These pass no run id, so `ingest_feed` (or `transport_steps.ingest_transport`) uses `context.new_run_id()`: `%Y%m%dT%H%M%S-<6 hex>`, e.g. `20260814T070455-9c1d7e`. There is no retry: a re-run by hand gets a new id, and so a new branch. |
+| build branch | `build/<purpose>/<utc date>/<slug>` | `transform/wap.branch_name(purpose, label)`. `<purpose>` is `prepared` or `reporting`. The date is the day the build **opened** (UTC), not the COB date. The slug is the label with non-alphanumerics collapsed to `-`, truncated to 40 characters. In Airflow, the label is the DAG run id (`dataset_triggered__…`). `python -m reporting_platform.transform` uses `--label`, or `cli-<new_run_id>`, and the standalone pipeline uses `--label`, or `pipeline-<new_run_id>`. A retry on the same day with the same label **reuses** the branch (`exist_ok`), unlike an ingest. |
 | run key | `<purpose>-<slug>` | `wap.run_key(branch)`: the registry's run id, and the last segment of a published tag. |
-| snapshot tag | `snapshot/<feed>/<cob_date>/<run>-a<n>` | `context.snapshot_tag`, from `ingest/steps.record_snapshot` |
-| published tag | `published/<report>/<as_at>/<run key>` | `context.published_tag`, from `wap.publish`, where `<as_at>` is the input set's newest COB date |
+| snapshot tag | `snapshot/<feed>/<cob_date>/<ingest run id>` | `context.snapshot_tag` with the ingest's own run id (either shape above), from `ingest/steps.record_snapshot`. |
+| published tag | `published/<report>/<as_at>/<run key>` | `context.published_tag`, from `wap.publish`, where `<as_at>` is the input set's newest COB date. |
 
 Other prefixes exist and are none of the above: `migrate/<feed>/<date>/<run>`
-(`ingest.migrate_raw`), and `hold/…`, which a person makes by renaming.
+(`ingest.migrate_raw`, also through `context.branch_name`), and `hold/…`,
+which a person makes by renaming.
 
 This gives us three things the legacy RDBMS never did cheaply:
 

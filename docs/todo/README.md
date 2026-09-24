@@ -28,7 +28,7 @@ than worked.
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
 | [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
 | [45](45-published-tags-are-cut-at-mains-head.md) | A reporting publication tags `main`'s head, not the commit its merge made | medium | 1–2 hours |
-| [46](46-ingest-attempt-id-slices-mid-token.md) | `ingest_attempt_id` cuts the Airflow run id mid-token (`-14T060211.4083120000-a1`) | low | 1 hour |
+| [46](46-ingest-attempt-id-slices-mid-token.md) | `ingest_attempt_id` cuts a `manual__` or hand-set run id mid-token (inbox and console runs are fine) | low, cosmetic | 1 hour |
 
 ## Where to start
 
@@ -65,34 +65,43 @@ independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 **28, write-audit-publish as a Nessie commit graph.** `docs/ARCHITECTURE.md`
 now has a `### The ref graph` subsection under "Nessie: write-audit-publish".
-It holds a Mermaid `gitGraph` of one COB date: two ingests (`fo_trade`, and
-`ref_counterparty` with a kept `-a1` and a merged `-a2`), each tagged
-`snapshot/…` on its merge commit; a `build/prepared/…` that fails
-`dbt_test` and is kept with `main` unmoved; a passing prepared build (no
-tag); and a `build/reporting/…` merged and tagged `published/…` once per
-exposure. The caption covers deletion (merged branches are deleted, and failed
-ones are kept), the 48 h / 120 h sweep, `hold/`, and the snapshot and
-published tag windows. Below it is a table of every ref pattern and the
-function that makes it. The README's write-audit-publish section links to it.
-The ASCII sketch it replaced was removed, along with two claims in it. It
-gave one naming scheme for every branch, but build branches are
-`build/<purpose>/<utc date>/<slug>`, not `<cob_date>/<run_id>`. It also
-said tags were `published/<cob_date>/<run_id>`, which is the retired shape
-that ingests used to cut.
+It holds a Mermaid `gitGraph` of one COB date processed in Airflow:
+- two inbox-triggered ingests, each tagged `snapshot/…` on its merge commit
+  (`fo_trade`, and `ref_counterparty`, whose `-a1` is kept after its driver
+  dies and whose `-a2` merges);
+- a `build/prepared/…` that fails `dbt_test` and is kept with `main`
+  unmoved;
+- a passing prepared build, which cuts no tag;
+- a `build/reporting/…` merged and tagged `published/…` once per exposure.
+
+The caption covers deletion (merged branches are deleted, and failed ones
+are kept), the 48 h / 120 h sweep, `hold/`, and the snapshot and published
+tag windows. Below it is a table of every ref pattern and the function that
+makes it. The table covers both run-id paths: Airflow's `<run>-a<n>`, and
+the fresh `new_run_id()` with no `-a<n>` that `bulk_ingest`, the `ingest`
+CLI, the runner and `transform --label` use. The README's write-audit-publish
+section links to it, and `context.branch_name`'s docstring now points at it
+and says which branches it names. The ASCII sketch it replaced was removed,
+along with two claims in it. It gave one naming scheme for every branch,
+but build branches are `build/<purpose>/<utc date>/<slug>`. It also said
+tags were `published/<cob_date>/<run_id>`, which is the retired shape that
+ingests used to cut.
 *Verified.* Every example name was produced by calling the code
-(`context.branch_name`, `ingest_attempt_id`, `snapshot_tag`,
-`published_tag`, `wap.branch_name`, `wap.run_key`) on realistic Airflow run
-ids. The exposure names are from `dbt/models/reporting/_reporting.yml`. The
-shapes match the live catalog's refs (read-only `api/v2/trees`). The block,
+(`context.branch_name`, `ingest_attempt_id`, `new_run_id`, `snapshot_tag`,
+`published_tag`, `wap.branch_name`, `wap.run_key`) on the run ids each path
+really uses. Inbox and console runs use `console__…`
+(`airflow_api.trigger`), and build runs use `dataset_triggered__…`. The
+exposure names are from `dbt/models/reporting/_reporting.yml`. The shapes
+match the live catalog's refs (read-only `api/v2/trees`). The block,
 extracted from the committed file, renders with mermaid-cli 11 and 10.
 `python -m tests.run`: 1000 passed.
 *What the item got wrong.* It asked for two `published/` tags on one
-commit. `gitGraph` has supported that since Mermaid 11, but Mermaid 10
-refuses the second `tag:` with a parse error. Because GitHub's renderer
-version is not known, the merge carries one abbreviated
-`published/{a,b}/…` label, and the caption names both refs in full. The
-GitHub render is still to be checked on the PR. Drawing it found todo 45 and
-todo 46.
+commit. Mermaid 11 renders that, and Mermaid 10 refuses the second `tag:`
+with a parse error. GitHub's renderer version was not checked, so the merge
+carries one abbreviated `published/{a,b}/…` label, and the caption names
+both refs in full. The item also presented `<run>-a<n>` as the only ingest
+naming scheme, but it applies to Airflow only. Drawing the graph found
+todo 45 and todo 46.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the

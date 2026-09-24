@@ -2478,7 +2478,11 @@ def new_run_id() -> str:
 
 
 def branch_name(purpose: str, scope: str, cob_date: date, run_id: str) -> str:
-    """<purpose>/<scope>/<cob_date>/<run_id> — see docs/ARCHITECTURE.md."""
+    """<purpose>/<scope>/<cob_date>/<run_id>, for ingest and migrate branches.
+
+    Build branches are named by `transform.wap.branch_name` instead. Both are
+    in docs/ARCHITECTURE.md#the-ref-graph.
+    """
     return f"{purpose}/{scope}/{cob_date:%Y-%m-%d}/{run_id}"
 
 
