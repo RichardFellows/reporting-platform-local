@@ -211,6 +211,20 @@ def resolve_business_identity(
     configured_fields = tuple(
         field for field in ("cob_date", "version", "row_count", "md5")
         if field in ctl)
+    # A DECLARED CONTROL THAT DID NOT ARRIVE IS A REFUSAL, not an absence of
+    # claims. Without this a Transport missing its `.ctl` went through with
+    # no md5 or row count checked and no record that none was -- the same
+    # outcome as a feed that never declared one. A Transport is complete by
+    # contract, so there is nothing to wait for. A feed with no control, or
+    # a control without `md5`, declares no such field and never gets here.
+    # See docs/DECISIONS.md#a-declared-control-must-arrive
+    if configured_fields and not transport.control_files:
+        raise IdentityResolutionError(
+            f"transport {transport.transport_id}: feed {feed.name!r} declares "
+            f"delivery.control ({', '.join(configured_fields)}) and the "
+            f"Transport carries no control object, so none of those can be "
+            f"read or checked. Either DCM dropped the control file, or this "
+            f"feed's delivery.control should not declare them.")
     if transport.control_files and configured_fields:
         _check_control_names(feed, transport)
         for item in transport.control_files:

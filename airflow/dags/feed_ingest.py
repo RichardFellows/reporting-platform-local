@@ -168,13 +168,24 @@ def build_feed_dag(feed):
             spark-submit — same module, same arguments, different execution
             wrapper.
             """
-            return _spark_subprocess(
-                "ingest",
-                feed.name,
-                arrival["object_key"],
-                context["run_id"].replace(":", "").replace("+", "")[-24:],
-                arrival.get("cob_date") or "",
-            )
+            from airflow.exceptions import AirflowFailException
+
+            from reporting_platform.common.context import ingest_attempt_id
+            from reporting_platform.common.spark_task import SparkTaskRefused
+
+            # A branch PER ATTEMPT, and a refusal is not retried: see
+            # `ingest_attempt_id` and docs/DECISIONS.md#a-refusal-is-not-retried
+            try:
+                return _spark_subprocess(
+                    "ingest",
+                    feed.name,
+                    arrival["object_key"],
+                    ingest_attempt_id(context["run_id"],
+                                      context["ti"].try_number),
+                    arrival.get("cob_date") or "",
+                )
+            except SparkTaskRefused as exc:
+                raise AirflowFailException(str(exc)) from exc
 
         @task(task_id="record_snapshot")
         def record_snapshot(result: dict) -> dict:

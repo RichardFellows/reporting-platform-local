@@ -173,6 +173,42 @@ def test_control_identity_allows_an_awkward_data_filename_and_captures_assertion
     }
 
 
+def test_a_declared_control_that_did_not_arrive_is_refused():
+    """A missing `.ctl` is not "the sender claimed nothing": without this the
+    md5 and row count went unchecked and nothing recorded that they had."""
+    s3 = FakeS3()
+    marker = _put_transport(s3)        # data only, no control object
+    fd = _feed(identity=["control", "filename"], control=CONTROL)
+    try:
+        _create(s3, marker, fd)
+    except delivery.IdentityResolutionError as exc:
+        assert "carries no control object" in str(exc), exc
+        assert "md5" in str(exc), exc
+    else:
+        raise AssertionError("a declared control that never arrived was accepted")
+
+
+def test_a_control_without_md5_needs_none_when_the_feed_declares_none():
+    """Some senders' control files carry no checksum. A feed that does not
+    declare `md5` is never asked for one, and no md5 is asserted."""
+    body = b"BUSINESS_DATE=20260917\nFILE_VERSION=2\nROWS=1\n"
+    s3 = FakeS3()
+    marker = _put_transport(
+        s3, controls=[("positions_20260917_v2.ctl", body)])
+    no_md5 = {k: v for k, v in CONTROL.items() if k != "md5"}
+    got = _create(s3, marker, _feed(identity=["control", "filename"],
+                                    control=no_md5))
+    assert got.producer_assertions.get("md5") is None, got.producer_assertions
+    assert got.producer_assertions["row_count"] == 1
+
+
+def test_a_feed_with_no_control_block_needs_no_control_object():
+    s3 = FakeS3()
+    got = _create(s3, _put_transport(s3), _feed())
+    assert got.producer_assertions.get("md5") is None
+    assert got.producer_assertions.get("row_count") is None
+
+
 def test_original_filename_identity_requires_no_rename():
     s3, fd = FakeS3(), _feed()
     marker = _put_transport(s3)

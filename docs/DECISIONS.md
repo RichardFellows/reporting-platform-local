@@ -151,6 +151,8 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests) | 157 deleted, 157 remade, both logging success |
 | [namespace-before-branch](#namespace-before-branch) | The namespace is created against `main`, before the ingest branch exists |
 | [transport-to-delivery-is-an-immutable-interpretation](#transport-to-delivery-is-an-immutable-interpretation) | Explicit external Feed identity, occurrence-derived DeliveryID, and a create-once interpretation separate from Ready |
+| [a-declared-control-must-arrive](#a-declared-control-must-arrive) | A Transport missing the control its feed declares is refused, not ingested unchecked |
+| [a-refusal-is-not-retried](#a-refusal-is-not-retried) | A failed md5 retried twice into a Nessie 409 that named neither the checksum nor the file |
 
 ### Feeds, columns and the console
 
@@ -5275,6 +5277,78 @@ Live-verified: a Transport whose control filename did not match its feed's
 `IdentityResolutionError`; no `registry.delivery` row was created for it, and
 `registry validation transport <id>` returned the FAIL row naming the exact
 control and reason.
+
+## a-declared-control-must-arrive
+
+**Decision.** A feed whose `delivery.control` declares any of `cob_date`,
+`version`, `row_count` or `md5` refuses, at `create_delivery`, a Transport
+that carries no control object (`IdentityResolutionError`, a `FAIL` on
+`layer=delivery`).
+
+`resolve_business_identity` read control objects only `if
+transport.control_files`, so a Transport without one went through: no md5
+and no row count asserted, `declared_md5` None, the Raw check skipped, and no
+validation row saying it had been. That is the same state as a feed that
+never declared a checksum -- a subject that could not be READ reported as one
+that was EMPTY. A Transport is complete by contract, so a missing control is
+not late; the inbox makes the same call for an archive member's control file
+missing from its container.
+
+**Optional stays per FEED.** Some feeds have no control file and some control
+files carry no md5. Neither declares the field, so neither reaches this
+check. What this does not express is one feed whose control files sometimes
+carry a checksum and sometimes do not; declaring `md5` for it refuses the
+ones without, naming the missing column. No such feed is known, so no
+per-field optional flag was built.
+
+Live-verified: `qa_happy_position` (declares all four) with a Transport of
+the data file alone failed `create_delivery` in one attempt with
+`AirflowFailException: IdentityResolutionError: ... declares delivery.control
+(cob_date, version, row_count, md5) and the Transport carries no control
+object`, and one `delivery_identity` FAIL row.
+
+## a-refusal-is-not-retried
+
+**Decision.** A failure that the same input will reproduce is raised as
+`spark_task.Refused` in the Spark child, which exits `REFUSED_EXIT` (65,
+EX_DATAERR); `spark_task.run` raises `SparkTaskRefused` (still a
+`RuntimeError`) for that status, and the ingest DAGs turn it -- and
+`DeliveryError` in `create_delivery` -- into `AirflowFailException`. A
+transient failure still retries, on a branch of its own:
+`context.ingest_attempt_id` names `ingest/<feed>/<date>/<run>-a<n>`.
+
+Found by running a Transport whose control file declared the wrong md5.
+Attempt 1 failed correctly, with the checksum and a branch "left for
+inspection". Attempts 2 and 3 cut the SAME branch name, got Nessie's `409
+Conflict`, and that became the task's final error: two retry delays spent,
+and the message an operator reads named neither the checksum nor the file.
+The retry could never have succeeded for a transient failure either, so the
+docs' "a retry after a failed branch simply runs the write again" was false
+for every failure it described.
+
+Reusing the branch (`exist_ok`, as `wap.open_build` does) is right for a dbt
+build and wrong here: an attempt that failed after its append would leave
+rows the retry appends again. A fresh branch starts from `main`, and each
+failed attempt's branch is still there to inspect.
+
+**`__main__` hands off to the imported module.** The first live run of the
+fix still exited 1: run as `python -m`, `spark_task.py` is `__main__`, a
+second module object whose `Refused` is not the class every op subclasses,
+so `except Refused` never matched. An in-process test of `main()` passed
+throughout. `tests/test_refusal.py` now runs the module through `runpy` as
+`__main__`, and fails against the old entry point.
+
+Live-verified: the same mismatch now fails `ingest_raw` in ONE attempt,
+`exit 65`, `AirflowFailException: SparkTaskRefused`, the message naming the
+data object, its md5, the control object and the declared md5, and
+`raw_ingestion` recorded as FAIL where it had been ERROR. A correct delivery
+still merged on `...-a1`.
+
+The message's control object is looked up from the DeliveryManifest at
+ingest (`ingest_feed._with_control_object`), not added to NormalizationManifest
+v2: `normalize_delivery` accepts an existing manifest only byte-identical,
+so a new field would turn every manifest already in `ready/` into a conflict
+on its next re-normalize.
 
 ## migration-comparison-is-not-validation-result
 

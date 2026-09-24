@@ -85,8 +85,14 @@ Delivery creation refuses:
 
 - different dates or versions across data objects;
 - different declarations across controls;
-- disagreement between control and filename; and
-- a missing business date after every configured source is inspected.
+- disagreement between control and filename;
+- a missing business date after every configured source is inspected; and
+- a feed whose `delivery.control` declares any of `cob_date`, `version`,
+  `row_count` or `md5`, and a Transport carrying no control object. Those
+  declarations are the claims Raw ingestion checks, and a Transport is
+  complete by contract, so there is nothing to wait for. A feed with no
+  control, or whose control carries no checksum, declares no such field and
+  is unaffected. See `docs/DECISIONS.md#a-declared-control-must-arrive`.
 
 Version is recorded when configured evidence supplies it. The current
 `Feed.parse_filename()` contract treats an omitted optional filename version

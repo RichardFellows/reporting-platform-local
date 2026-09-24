@@ -132,6 +132,13 @@ to run something for the first time, expect it to fail and read what it says.
   The *driver* lives in that process, so this holds on a cluster too. A new
   op goes in its component's `spark_ops.py` and in `spark_task.OPS`;
   `python -m scripts._spark_task` is a shim. (`#spark-in-a-subprocess`)
+- **A FAILURE THE SAME INPUT REPRODUCES IS `spark_task.Refused`, AND IS NOT
+  RETRIED.** The child exits 65, `run()` raises `SparkTaskRefused`, the DAG
+  raises `AirflowFailException`. Each ingest ATTEMPT cuts its own branch
+  (`ingest_attempt_id`, `...-a<n>`): a retry on the name its failed
+  predecessor kept dies on Nessie's 409, which then becomes the task's only
+  visible error. `spark_task`'s `__main__` hands off to the imported module,
+  or `except Refused` matches nothing. (`#a-refusal-is-not-retried`)
 - **THE REPO SHIPS AS SEPARATE COMPONENTS, and `components.yml` says which
   module is in which.** `tests/test_components.py` fails on an import —
   lazy ones too — into a component the owner does not `depends_on`, and on a
@@ -225,7 +232,10 @@ to run something for the first time, expect it to fail and read what it says.
   total across members and `md5` is the CONTAINER's. The manifest's
   `checksum_objects` says which objects a declared md5 covers, so
   `ingest_feed` never branches on the kind — an invariant `ui/arrivals.checks()`
-  shares. (`#control-file-gate`)
+  shares. (`#control-file-gate`) A Transport carrying no control object for
+  a feed that declares one is REFUSED at `create_delivery`, never ingested
+  with the checks skipped; a feed with no control, or no `md5`, declares
+  nothing and is untouched. (`#a-declared-control-must-arrive`)
 - **A DELIVERY SHAPE IS A REGISTRY ENTRY, not a branch**:
   `conform.ARRIVAL_SHAPES` at the door (planners returning
   `Planned`/`Refused`/`Duplicate`/`Waiting`, the only four `inbox.py` acts on)
