@@ -120,15 +120,21 @@ for the staged walk and its scaling argument.
 validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
 ```
 
-| Task | Domain call | XCom out | Fails for |
-|---|---|---|---|
-| `validate_transport` | `transport.read_validated_transport(marker_key)` | marker key (str) | Missing/mismatched object, bad hash, unsupported contract version |
-| `create_delivery` | `delivery.create_delivery(marker_key)` | DeliveryManifest key (str) | Unknown external Feed id, business-identity conflict |
-| `normalize_delivery` | `normalization.normalize_delivery(delivery_manifest_key)` | NormalizationManifest key (str) | Unsafe archive member, invalid zip, contract conflict |
-| `ingest_raw` | `scripts._spark_task.run("ingest-v2", normalization_manifest_key, run_id)` (-> `ingest_feed.ingest_normalized_delivery`) | `{feed, delivery_id, cob_date, rows, already_ingested, asset_uri}` | Schema drift with `schema_drift: fail`, row-count/checksum mismatch |
+| Task | Step (`ingest/transport_steps.py`) | Domain call inside it | XCom out | Fails for |
+|---|---|---|---|---|
+| `validate_transport` | `validate` | `transport.read_validated_transport(marker_key)` | marker key (str) | Missing/mismatched object, bad hash, unsupported contract version |
+| `create_delivery` | `deliver` | `delivery.create_delivery(marker_key)` | DeliveryManifest key (str) | Unknown external Feed id, business-identity conflict, a declared control file that did not arrive |
+| `normalize_delivery` | `normalize` | `normalization.normalize_delivery(delivery_manifest_key)` | NormalizationManifest key (str) | Unsafe archive member, invalid zip, contract conflict |
+| `ingest_raw` | `ingest_raw` | `spark_task.run("ingest-v2", normalization_manifest_key, attempt_id)` (-> `ingest_feed.ingest_normalized_delivery`) | `{feed, delivery_id, cob_date, rows, already_ingested, asset_uri}` | Schema drift with `schema_drift: fail`, row floor/ceiling, row-count/checksum mismatch |
 
-Each task is a few lines calling one existing function; none reimplements
-Transport parsing, Feed resolution, control parsing, or manifest creation.
+Each task is one call to its step, and the step -- with the receipt and
+validation evidence it records -- is what `python -m reporting_platform.ingest
+transport` runs with no Airflow (`docs/STANDALONE-PIPELINE.md`). The task
+adds only what Airflow alone knows: the dag and run id, the try number in the
+branch name, `AirflowFailException` for a refusal, and the raw asset event.
+`tests/test_transport_steps.py` fails if a task grows its own copy of a step.
+No step reimplements Transport parsing, Feed resolution, control parsing, or
+manifest creation.
 Failure attribution therefore matches the Phase 6 brief's list exactly: an
 invalid Transport fails `validate_transport`, an unknown Feed id or identity
 conflict fails `create_delivery`, an unsafe archive fails

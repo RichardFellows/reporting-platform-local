@@ -125,7 +125,9 @@ to run something for the first time, expect it to fail and read what it says.
   in what only Airflow knows; `python -m reporting_platform.transform` runs
   the same functions. `tests/test_transform.py` fails if the DAG grows its
   own merge again. Likewise `ingest/steps.py` for the snapshot tag and drift
-  report.
+  report, and `ingest/transport_steps.py` for `transport_ingest`'s four
+  tasks -- validate, deliver, normalize, ingest_raw, with their receipt and
+  evidence rows -- which `tests/test_transport_steps.py` holds the DAG to.
 - **Spark inside an Airflow task must go through
   `reporting_platform/common/spark_task.py`** (a subprocess), or the JVM keeps
   the task process alive, heartbeats stop and the scheduler zombie-reaps it.
@@ -595,6 +597,11 @@ docker compose --profile standalone run --rm runner run /opt/platform/tests/fixt
 docker compose --profile standalone run --rm runner ingest land <file>...
 docker compose --profile standalone run --rm runner ingest ingest <feed>
 docker compose --profile standalone run --rm runner transform build prepared   # open + dbt + publish|fail
+# ...or Transports instead of files: DCM's completed ones under received/, the
+# same four steps as transport_ingest. `transport publish` is the producer's CLI.
+docker compose --profile standalone run --rm runner transport publish --legacy-feed-id ... --data ... --control ...
+docker compose --profile standalone run --rm runner ingest transport --pending --window 7 --list
+docker compose --profile standalone run --rm runner run --transport --window 7     # pending -> raw -> prepared -> reporting
 
 # bulk ingest everything pending (safe to re-run)
 docker compose exec airflow python -m scripts.bulk_ingest

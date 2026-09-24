@@ -9,11 +9,20 @@ not add any step. This page is about running the steps without it.
 |---|---|---|---|---|
 | land | `python -m reporting_platform.ingest land FILE...` | `ingest` | Runs the inbox gate over the files named: route, conform, promote control files, quarantine what cannot be named. Triggers nothing. | the `inbox` watcher |
 | ingest | `python -m reporting_platform.ingest ingest FEED...` | `ingest` | Takes every pending delivery of each feed into raw, each on its own Nessie branch and merged on success. Cuts a `snapshot/` tag per ingest. | `ingest_<feed>` |
+| *or* transport | `python -m reporting_platform.ingest transport MARKER...` / `--pending` | `ingest` | Takes completed Transports from `received/` into raw: validate, deliver, normalize, ingest. Replaces land + ingest for a feed DCM delivers. | `transport_ingest` (+ `transport_reconcile` for `--pending`) |
 | prepared | `python -m reporting_platform.transform build prepared` | `dbt` | Opens a build branch, runs `dbt build` on it, then publishes, or fails and keeps the branch. | `prepared_build` |
 | reporting | `python -m reporting_platform.transform build reporting` | `dbt` | The same for the marts, plus one `published/<report>/…` tag and version per report. | `reporting_build` |
 
 `python -m reporting_platform.pipeline run FILE...` runs all four in order and
 stops at the first that fails. It is glue: it contains no step of its own.
+
+**Files, or Transports.** `land` + `ingest` is the inbox way in. The other
+is a Transport that DCM has already completed under `received/`
+([`TRANSPORT-CONTRACT.md`](TRANSPORT-CONTRACT.md)). `python -m
+reporting_platform.ingest transport` carries it to raw with the four steps
+the `transport_ingest` DAG runs, and `pipeline run --transport` builds on top.
+Both ways stay: a feed with no DCM mapping can only arrive through the inbox.
+See [Transports instead of files](#transports-instead-of-files).
 
 ## Where the code is shared
 
@@ -22,6 +31,8 @@ stops at the first that fails. It is glue: it contains no step of its own.
 | Open branch + run record, publish, fail | `transform/wap.py` | `dbt_builds.py` tasks, `transform` CLI |
 | Archive a dbt invocation's evidence | `transform/dbt.py:archive_invocation` | the Cosmos callback, `transform dbt` |
 | Snapshot tag, drift report | `ingest/steps.py` | `feed_ingest.py` tasks, `ingest` CLI |
+| A Transport to raw: validate, deliver, normalize, ingest, with receipts and evidence | `ingest/transport_steps.py` | `transport_ingest.py` tasks, `ingest transport` |
+| What Transports are pending | `transport_steps.pending` (the `transport_reconcile` walk) | `ingest transport --pending`, `pipeline run --transport` |
 | The inbox gate | `ingest/inbox.py:sweep` | the watcher, `ingest land` (`land_files`) |
 | Any Spark work | `common/spark_task.run` + an op | every DAG, every CLI |
 
@@ -86,6 +97,54 @@ node is `success`, `pass` or `warn`. A `skipped` node was downstream of a
 failure and was never built. Every command prints a single JSON result on
 stdout; dbt's own output goes to stderr.
 
+## Transports instead of files
+
+A Transport needs nothing landed: the producer has already completed it
+under `received/`. The runner takes it from there.
+
+```bash
+# make one to take in (what DCM runs; the runner's own S3 settings apply)
+docker compose --profile standalone run --rm runner transport publish \
+    --legacy-feed-id qa-happy-position --producer-run-id run-1 \
+    --cob-date 2026-09-14 --source-system QA \
+    --source-observed-at 2026-09-24T16:40:00Z \
+    --data /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.csv \
+    --control /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.ctl
+
+# what is pending, ingest it, or the whole pipeline over it
+docker compose --profile standalone run --rm runner ingest transport --pending --window 7 --list
+docker compose --profile standalone run --rm runner ingest transport --pending --window 7
+docker compose --profile standalone run --rm runner ingest transport received/cob_date=.../_COMPLETE.json
+docker compose --profile standalone run --rm runner run --transport --window 7
+```
+
+**Pending means what `transport_reconcile` means**: every completed
+Transport whose Delivery is not in raw, over the last `--window` COB dates
+(default 7, the DAG's), `--cob-date D` (repeatable), or `--all` (all of
+`received/`, v1 markers included). A marker the walk could not read is
+reported as `unreadable` and exits 1. It is never counted as nothing pending.
+
+**A refused Transport is still pending, every time.** A wrong checksum, a
+missing control file or an identity conflict never reaches raw, so the next
+`--pending` tries it again and refuses it again. Airflow triggers each
+Transport once per run id. Here you see the refusal on every run until the
+Transport is corrected or falls out of the window.
+
+**Refused is not failed.** `pipeline run --transport` treats a refused
+Transport as `run` treats a quarantined file. It never reached raw, so the
+builds go ahead on the ones that did, and the exit is 1. Any other failure
+(a store that was down, a Spark error) stops before the builds, as a failed
+file ingest does.
+
+**Each run writes the same evidence as the DAG.** The step records its
+`registry.transport_receipt` row (with no `airflow_*` values) and its
+`registry.validation_result` rows, so the COB Status page shows a Transport
+the runner took exactly as one Airflow took.
+
+**No snapshot tag.** The file path cuts `snapshot/<feed>/<bd>/<run>` per
+ingest. Neither Transport path does, in Airflow or here. That is a gap in
+`transport_ingest`, not something the runner changed.
+
 ## Pointing it at deployed infrastructure
 
 Only the environment changes. The runner reads each store from a
@@ -132,6 +191,21 @@ no-host-ports override) holding only MinIO, Nessie and Postgres:
 - The refactored `prepared_build` DAG on the same stack, now with Airflow and
   the Spark cluster added: every task green through `wap.publish`, and the
   run record carries its `dag_id`, `airflow_run_id` and `change_ref`.
+- **Transports**, on the development stack with `transport_watch` and
+  `transport_reconcile` paused. `runner transport publish` completed one
+  Transport, and `ingest transport --pending --cob-date 2026-09-14 --list`
+  listed it with the five refused test Transports already in that partition.
+  `runner run --transport --cob-date 2026-09-14` ingested it (3 rows), refused
+  the five again (four at `ingest_raw` on md5, one at `deliver` for a missing
+  control file), and started the prepared build on top. The build failed on
+  `TABLE_OR_VIEW_NOT_FOUND` for four raw tables that stack has never had,
+  exactly as its Airflow `prepared_build` had since 21 Sep. The build then
+  kept its branch, left `main` unmoved and exited 1: 1m45s. Naming the ingested
+  Transport again returned `already_ingested`, exit 0. The refactored
+  `transport_ingest` DAG, same session: a good Transport merged and a wrong
+  md5 failed once as `SparkTaskRefused`, receipts and FAIL row as before. **A
+  clean build on top of a Transport has not been run here**, because the
+  build tier could not pull MinIO's image on 2026-09-24.
 
 ## What it does not do
 

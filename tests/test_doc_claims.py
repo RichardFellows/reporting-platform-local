@@ -253,6 +253,7 @@ NOT_A_FEED_NAME = {
     "ingest_normalized_delivery",  # ingest_feed.py's entry point function, not a DAG
     "ingest_added",                # a column-provenance classification value, not a DAG
     "ingest_columns",              # the function lineage/columns.py:ingest_columns, not a DAG
+    "ingest_transport",            # transport_steps.ingest_transport, a function, not a DAG
     "ingest_attempt_id",           # context.ingest_attempt_id, an ingest attempt's branch run id, not a DAG
 }
 

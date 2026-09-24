@@ -31,7 +31,7 @@ narrowing rather than a new durable-state subsystem.
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pendulum
 
@@ -48,13 +48,6 @@ RETRY_DELAY = timedelta(
 DEFAULT_ARGS = {"owner": "data-platform", "retries": 1, "retry_delay": RETRY_DELAY}
 
 WINDOW_DAYS = int(os.environ.get("TRANSPORT_RECONCILE_WINDOW_DAYS", "7"))
-
-
-def _window_cob_dates(days: int, *, today: date | None = None) -> list[str]:
-    """The last ``days`` calendar dates, inclusive of today, ISO-formatted."""
-    anchor = today or date.today()
-    return [(anchor - timedelta(days=offset)).isoformat()
-           for offset in range(days)]
 
 
 @dag(
@@ -94,7 +87,9 @@ def _dag():
         conf = (context["dag_run"].conf or {}) if context.get("dag_run") else {}
         full_sweep = bool(conf.get("full_sweep",
                                    context["params"].get("full_sweep", False)))
-        cob_dates = None if full_sweep else _window_cob_dates(WINDOW_DAYS)
+        from reporting_platform.ingest.transport_steps import window_cob_dates
+
+        cob_dates = None if full_sweep else window_cob_dates(WINDOW_DAYS)
         report = discover_transport_progress(cob_dates=cob_dates)
         if report["failed"]:
             logging.getLogger("airflow.task").warning(

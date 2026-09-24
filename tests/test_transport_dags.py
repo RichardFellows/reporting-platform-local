@@ -23,14 +23,21 @@ def test_raw_asset_is_emitted_only_after_ingest_v2_returns():
 
     `ingest-v2` returns only after `_ingest_manifest` has already merged onto
     `main` or raised -- so the outlet_events.add call being textually AFTER
-    the _spark_subprocess("ingest-v2", ...) call is what proves the asset is
-    never emitted before the commit is visible on main.
+    the task's call to `transport_steps.ingest_raw`, which is the `ingest-v2`
+    launch, is what proves the asset is never emitted before the commit is
+    visible on main.
     """
+    import inspect
+
+    from reporting_platform.ingest import transport_steps
+
     source = _source("transport_ingest.py")
     task = source[source.index('def ingest_raw_task('):]
-    spark_call = task.index('_spark_subprocess("ingest-v2"')
+    step_call = task.index('_run_step(transport_steps.ingest_raw,')
     emit = task.index('outlet_events"][RAW_ASSET_ALIAS].add(')
-    assert spark_call < emit
+    assert step_call < emit
+    step = inspect.getsource(transport_steps.ingest_raw)
+    assert 'return run("ingest-v2", normalization_manifest_key, attempt_id)' in step
 
 
 def test_ingest_raw_is_the_only_task_on_the_write_pool():
@@ -142,7 +149,7 @@ def test_reconciliation_defaults_to_a_bounded_cob_window_not_a_full_scan():
     source = _source("transport_reconcile.py")
     assert "cob_dates=cob_dates" in source
     assert "full_sweep" in source
-    assert "_window_cob_dates" in source
+    assert "window_cob_dates(WINDOW_DAYS)" in source
 
 
 def test_full_sweep_conf_param_selects_the_unbounded_scan():
