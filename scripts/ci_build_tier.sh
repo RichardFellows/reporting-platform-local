@@ -46,7 +46,7 @@ trap cleanup EXIT
 export AIRFLOW_UID=${AIRFLOW_UID:-$(id -u)}
 
 step "build images"
-"${C[@]}" build airflow airflow-init spark-master spark-worker
+"${C[@]}" build airflow airflow-init spark-master spark-worker minio minio-init
 
 step "stores and Spark"
 "${C[@]}" up -d --wait minio postgres nessie spark-master spark-worker
