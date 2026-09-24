@@ -153,6 +153,27 @@ def test_the_mode_and_the_master_must_agree():
             _raises(lambda: session_conf("t"), "PLATFORM_EXECUTION")
 
 
+def test_embedded_mode_runs_in_process_and_only_there():
+    """`embedded` is the one mode a `local[N]` master is right in, and the
+    one mode a cluster master is wrong in. Each refusal names the way out."""
+    from reporting_platform.common.spark import session_conf
+
+    master, conf = _conf(PLATFORM_EXECUTION="embedded", SPARK_MASTER="local[2]")
+    assert master == "local[2]"
+    assert not [k for k in conf if k.startswith("spark.kubernetes.")]
+    assert conf["spark.sql.catalog.lakehouse.ref"] == "b1"
+    with _env(**CLEAR), _jars():
+        with _env(PLATFORM_EXECUTION="embedded"):
+            # unset falls back to the compose cluster, which embedded refuses
+            _raises(lambda: session_conf("t"), "embedded", "local[")
+            with _env(SPARK_MASTER=K8S["SPARK_MASTER"]):
+                _raises(lambda: session_conf("t"), "embedded")
+        # and the other modes still refuse an in-process session
+        with _env(SPARK_MASTER="local[*]"):
+            _raises(lambda: session_conf("t"), "local[*]",
+                    "PLATFORM_EXECUTION=embedded")
+
+
 def test_kubernetes_mode_refuses_without_the_pod_ip():
     from reporting_platform.common.spark import session_conf
 

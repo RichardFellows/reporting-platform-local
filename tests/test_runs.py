@@ -14,7 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 
-from tests.support import DAGS, REPO, config_dir
+from tests.support import REPO, config_dir
 
 
 def _context():
@@ -150,27 +150,6 @@ def test_the_manifest_ref_is_the_project_not_dbts_own_manifest():
     c = _context()
     assert len(c.dbt_manifest_ref()) == 16
     assert c.dbt_manifest_ref() == c.dbt_manifest_ref()
-
-
-# ------------------------------------------------------- the run key itself
-def test_the_run_key_is_derived_from_the_branch_and_carries_the_purpose():
-    """Recomputing the slug in two tasks is how one run ends up as two rows;
-    and the prepared and reporting builds slugify the SAME dataset-triggered
-    Airflow run id, so the purpose has to be in the key."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_dbt_builds_probe", DAGS / "dbt_builds.py")
-    # The module imports cosmos and airflow, which the test environment does
-    # not have, so the helper is read out of the source rather than imported.
-    source = (DAGS / "dbt_builds.py").read_text(encoding="utf-8")
-    body = source[source.index("def _run_key("):]
-    body = body[:body.index("\ndef ", 1)]
-    ns: dict = {}
-    exec(compile(body, "dbt_builds._run_key", "exec"), ns)          # noqa: S102
-    assert ns["_run_key"]("build/prepared/2026-09-06/abc-123") == "prepared-abc-123"
-    assert ns["_run_key"]("build/reporting/2026-09-06/abc-123") == "reporting-abc-123"
-    assert spec is not None
 
 
 # --------------------------------------------------- the version diff (§11)

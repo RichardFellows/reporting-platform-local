@@ -67,8 +67,8 @@ to run something for the first time, expect it to fail and read what it says.
 
 - **Build on a throwaway branch, never `main`** —
   `scripts/_open_build_branch.py`. Branch → build → test → merge only if clean.
-- **Spark is the only build engine** (`dbt_builds.py` refuses a non-Spark
-  `DBT_TARGET`): only the Spark path can address a Nessie branch. DuckDB is a
+- **Spark is the only build engine** (`transform.dbt.target()` refuses a
+  non-Spark `DBT_TARGET`, and `dbt_builds.py` calls it at import): only the Spark path can address a Nessie branch. DuckDB is a
   read-only query tool (`scripts/duckdb_console.py`).
   (`#duckdb-is-not-an-engine`)
 - **Endpoints come from `common/settings.py` accessors, and fall back to the
@@ -83,7 +83,8 @@ to run something for the first time, expect it to fail and read what it says.
   engine and an HTTP client in with it. `CONFIG_DIR`/`CATALOG`/`ENV` are in
   `common/settings.py`, which is what lets `spark.py` name the catalog without
   importing `context`.
-- **Every Spark job runs on the cluster, never `local[*]`.** `SPARK_MASTER` is
+- **Every Spark job runs on the cluster, never `local[*]`** — outside
+  `PLATFORM_EXECUTION=embedded`, below. `SPARK_MASTER` is
   read in two places that must not diverge — `spark_session()` and
   `spark.master` in `dbt/profiles.yml` — and `spark_session()` refuses a
   `local` master. Each app caps at 2 cores/2g, or standalone mode holds every
@@ -110,6 +111,21 @@ to run something for the first time, expect it to fail and read what it says.
   `common/` needs the SCHEDULER restarted too: LocalExecutor forks tasks from
   it, and a stale module fails with `has no attribute`.
   (`#execution-mode-is-configuration`)
+- **`PLATFORM_EXECUTION=embedded` is the one mode with no cluster** — a
+  `local[N]` master, driver and tasks in one process — and the only one that
+  accepts a local master; it refuses a cluster one. It is what the
+  `standalone`-profile `runner` service uses: land → ingest → prepared →
+  reporting as four commands with only S3, Nessie and Postgres
+  (`docs/STANDALONE-PIPELINE.md`). Never `--entrypoint` around the runner:
+  the image's entrypoint gives the host uid a home, and without one Spark
+  dies on `?/.ivy2`.
+- **WRITE-AUDIT-PUBLISH IS `transform/wap.py`, and the build DAG only calls
+  it** — open branch + run record, publish (evidence → input set → lifecycle
+  gate → merge → tags → versions), fail-and-keep-the-branch. The DAG passes
+  in what only Airflow knows; `python -m reporting_platform.transform` runs
+  the same functions. `tests/test_transform.py` fails if the DAG grows its
+  own merge again. Likewise `ingest/steps.py` for the snapshot tag and drift
+  report.
 - **Spark inside an Airflow task must go through
   `reporting_platform/common/spark_task.py`** (a subprocess), or the JVM keeps
   the task process alive, heartbeats stop and the scheduler zombie-reaps it.
@@ -545,6 +561,15 @@ docker compose exec -T airflow python -m scripts.check_dag_imports
 python -m reporting_platform.config list
 python -m reporting_platform.config show fo_trade --origin
 python -m reporting_platform.config check
+
+# THE PIPELINE WITHOUT AIRFLOW OR A SPARK CLUSTER -- only S3, Nessie, Postgres.
+# Same code as the DAGs. docs/STANDALONE-PIPELINE.md; RUNNER_* env points it
+# at deployed stores (add --no-deps).
+docker compose --profile standalone run --rm runner check
+docker compose --profile standalone run --rm runner run /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.*
+docker compose --profile standalone run --rm runner ingest land <file>...
+docker compose --profile standalone run --rm runner ingest ingest <feed>
+docker compose --profile standalone run --rm runner transform build prepared   # open + dbt + publish|fail
 
 # bulk ingest everything pending (safe to re-run)
 docker compose exec airflow python -m scripts.bulk_ingest

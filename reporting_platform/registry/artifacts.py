@@ -121,3 +121,35 @@ def require_complete(run_id: str, attempts: Iterable[tuple[str, int]], *,
             + ", ".join(missing))
     return {"run_id": run_id, "reference": reference(run_id, bucket=bucket),
             "artifacts_checked": checked}
+
+
+def attempts(run_id: str, task_id: str, *, client=None,
+             bucket: str | None = None) -> list[int]:
+    """The try numbers already archived for one task of a run, ascending.
+
+    A hand-run build has no scheduler counting its tries, and `archive`
+    refuses to overwrite an attempt with different bytes -- so a rerun on the
+    same branch has to find the next number here rather than assume 1.
+    """
+    client = client or _client()
+    bucket = bucket or _bucket()
+    base = f"{prefix(run_id)}{_segment(task_id)}/attempt-"
+    found: set[int] = set()
+    for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=base):
+        for obj in page.get("Contents", []):
+            head = obj["Key"][len(base):].split("/", 1)[0]
+            if head.isdigit():
+                found.add(int(head))
+    return sorted(found)
+
+
+def read_run_results(run_id: str, task_id: str, try_number: int, *,
+                     client=None, bucket: str | None = None) -> dict[str, Any]:
+    """The archived `run_results.json` of one attempt, parsed."""
+    import json
+
+    client = client or _client()
+    bucket = bucket or _bucket()
+    key = attempt_prefix(run_id, task_id, try_number) + "run_results.json"
+    return json.loads(client.get_object(Bucket=bucket, Key=key)["Body"].read())

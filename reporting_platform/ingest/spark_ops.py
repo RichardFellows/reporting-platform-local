@@ -39,6 +39,35 @@ def op_ingest(args: list[str]) -> int:
     return 0
 
 
+def op_ingest_batch(args: list[str]) -> int:
+    """`ingest-batch <feed> <key>...`: several deliveries, ONE Spark session.
+
+    A session per delivery was measured at ~16s of executor acquisition and
+    catalog start-up each, before a few seconds of real work (see
+    scripts/_ingest_chunk.py, which this is the packaged form of). Each key
+    still gets its own branch and merges on its own, so one bad delivery
+    fails alone: its error is reported and the rest carry on.
+    """
+    from reporting_platform.common.context import spark_session
+    from reporting_platform.ingest.ingest_feed import ingest
+
+    feed_name, keys = args[0], args[1:]
+    # Bound to main; each delivery names its own branch (ingest_feed._at_branch).
+    spark = spark_session(f"ingest-batch-{feed_name}", ref="main")
+    results = []
+    try:
+        for key in keys:
+            try:
+                results.append(ingest(feed_name, key, spark=spark))
+            except Exception as exc:                            # noqa: BLE001
+                results.append({"object_key": key,
+                                "error": f"{type(exc).__name__}: {exc}"[:2000]})
+    finally:
+        spark.stop()
+    print(json.dumps({"feed": feed_name, "results": results}, default=str))
+    return 0
+
+
 def op_ingest_v2(args: list[str]) -> int:
     """`ingest-v2`."""
     from reporting_platform.ingest.ingest_feed import ingest_normalized_delivery

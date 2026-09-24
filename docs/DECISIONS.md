@@ -91,7 +91,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [the-local-k8s-smoke](#the-local-k8s-smoke) | `make k8s-smoke` runs the chart in kind through a merged `prepared_build`; its first run found four cluster-only defects |
-| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move |
+| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move; `embedded` runs everything in-process with no cluster |
 | [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
 | [the-chart-is-the-only-place-settings-are-written](#the-chart-is-the-only-place-settings-are-written) | One ConfigMap, one Secret, envFrom everywhere; why `existingSecret` needs two literal names, not one computed value |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
@@ -675,8 +675,19 @@ Its first run found four defects that nothing short of a cluster could:
 
 ## execution-mode-is-configuration
 
-`PLATFORM_EXECUTION` (`local` | `kubernetes`, default `local`, anything else
-refused) says where a Spark driver runs, and where its executors run.
+`PLATFORM_EXECUTION` (`local` | `kubernetes` | `embedded`, default `local`,
+anything else refused) says where a Spark driver runs, and where its
+executors run.
+
+- **`embedded`** is no cluster at all: the driver's own process runs every
+  task through a `local[N]` master. It is what the `runner` compose service
+  and `python -m reporting_platform.pipeline` use, so the steps can be run
+  with only S3, Nessie and Postgres (`docs/STANDALONE-PIPELINE.md`). It is a
+  declared mode rather than a fallback. `session_conf()` refuses a `local`
+  master in the other two modes, for the reason
+  [spark-master-no-local-fallback](#spark-master-no-local-fallback) gives,
+  and refuses a cluster master in this one. `SPARK_MASTER` is still the only
+  master setting, read by both drivers.
 
 - **`local`** is compose. `_spark_task.run` starts the driver as a child
   process and the executors run on the standalone spark-worker.
@@ -1242,7 +1253,9 @@ belong.
 
 ## dbt-target-guard
 
-`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**.
+`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**. The
+check is `transform.dbt.target()`, which the hand-run `transform` CLI calls
+before it touches anything too.
 
 The failure it prevents is silent. The branch each build opens is passed to dbt
 as the `nessie_ref` var, and only the Spark profiles honour it; an engine that
@@ -1406,7 +1419,9 @@ that is not derived, which is why it is the one file in
 
 ## spark-master-no-local-fallback
 
-`spark_session()` refuses a `local` master rather than falling back to it.
+`spark_session()` refuses a `local` master rather than falling back to it,
+unless `PLATFORM_EXECUTION=embedded` declares that running in-process is the
+intent ([execution-mode-is-configuration](#execution-mode-is-configuration)).
 
 A missing or blank `SPARK_MASTER` meaning "run the whole job inside this
 container" is a configuration error that **looks like success**: the job

@@ -35,7 +35,7 @@ jobs:
       # tests/test_components.py fails when this list and components.yml's
       # packaged components disagree.
       matrix:
-        component: [transport, core, ingest, ops]
+        component: [transport, core, ingest, dbt, ops]
     steps:
       - uses: actions/checkout@v4
 
