@@ -1,61 +1,64 @@
-# MinIO server and client on UBI, built FROM SOURCE.
-# See docs/DECISIONS.md#minio-is-built-from-source
+# MinIO server and client on UBI, built FROM SOURCE -- fetched through a Go
+# module proxy, not from GitHub. See docs/DECISIONS.md#minio-is-built-from-source
 #
 # No registry still serves MinIO's own images anonymously: Docker Hub's
 # `minio/*` began refusing pulls first (docs/DECISIONS.md#minio-images-come-
 # from-quay), then quay.io's copies started answering 401 on 2026-09-24, and
-# ghcr.io denies them too. The source is still published per release tag, so
-# the same pinned releases are compiled here instead, the way Marquez is
-# (docs/DECISIONS.md#marquez-on-ubi). One image carries both binaries: the
-# `minio` service runs the server and its healthcheck calls `mc`, and
-# `minio-init` runs `mc` to make the bucket.
+# ghcr.io denies them too. The same pinned releases are compiled here instead,
+# the way Marquez is (docs/DECISIONS.md#marquez-on-ubi). One image carries
+# both binaries: the `minio` service runs the server and its healthcheck calls
+# `mc`, and `minio-init` runs `mc` to make the bucket.
+#
+# THE RELEASES ARE PINNED AS GO MODULE VERSIONS. MinIO's `RELEASE.<stamp>`
+# tags are not semver, so the proxy knows each as a pseudo-version, which
+# names the tag's commit: `go list -m github.com/minio/minio@<tag>` resolves
+# it (that query is the one step that asks the proxy to read the origin).
+# Pinned here, the build only ever asks GOPROXY for a version it already holds.
 ARG MINIO_RELEASE=RELEASE.2024-09-22T00-33-43Z
+ARG MINIO_MODULE_VERSION=v0.0.0-20240922003343-03e996320ebb
 ARG MC_RELEASE=RELEASE.2024-09-16T17-43-14Z
+ARG MC_MODULE_VERSION=v0.0.0-20240916174314-11ebe952ea30
 
 # --------------------------------------------------------------------- build
 # Both releases' go.mod say `go 1.22`.
 FROM registry.access.redhat.com/ubi9/go-toolset:1.22.9 AS build
 ARG MINIO_RELEASE
+ARG MINIO_MODULE_VERSION
 ARG MC_RELEASE
+ARG MC_MODULE_VERSION
 USER root
-WORKDIR /src
 
-# EVERY FETCH IS A BUILD ARG so the corporate mirror can redirect it: the two
-# release tarballs, and GOPROXY for the modules both resolve. The tarball
-# rather than a clone, as Dockerfile.marquez-api does -- so there is no git,
-# and the commit id MinIO's own Makefile reads from `git` is not available.
+# EVERY FETCH GOES THROUGH GOPROXY, and there is no `,direct` after it: with
+# `direct`, a module the proxy lacks is cloned from its VCS host -- GitHub,
+# for both of these -- and that is exactly the fetch this build must not
+# make. The corporate build sets GOPROXY to its internal Go proxy (Artifactory,
+# Nexus, Athens) and GOSUMDB to its checksum mirror, or `off` where the proxy
+# is the trust root. Both ARGs, so it never edits this file.
 # See docs/DECISIONS.md#images-build-from-a-mirror
-ARG MINIO_SOURCE_URL=https://github.com/minio/minio/archive/refs/tags/${MINIO_RELEASE}.tar.gz
-ARG MC_SOURCE_URL=https://github.com/minio/mc/archive/refs/tags/${MC_RELEASE}.tar.gz
-ARG GOPROXY=https://proxy.golang.org,direct
-ENV GOPROXY=${GOPROXY} CGO_ENABLED=0 GOFLAGS=-mod=mod
+ARG GOPROXY=https://proxy.golang.org
+ARG GOSUMDB=sum.golang.org
+ENV GOPROXY=${GOPROXY} GOSUMDB=${GOSUMDB} CGO_ENABLED=0 GOBIN=/out \
+    GOTOOLCHAIN=local
 
-RUN mkdir minio mc \
-    && curl -fsSL "${MINIO_SOURCE_URL}" | tar xz --strip-components=1 -C minio \
-    && curl -fsSL "${MC_SOURCE_URL}" | tar xz --strip-components=1 -C mc
-
-# WHAT EACH PROJECT'S `make install` DOES, minus git: `-tags kqueue
-# -trimpath`, and the ldflags its buildscripts/gen-ldflags.go writes. Version
-# is the tag's timestamp with `:` restored, as releaseTag() parses it back, so
-# `minio --version` names the release rather than DEVELOPMENT. CommitID is
-# the tag itself -- the tarball has no commit to read.
+# WHAT EACH PROJECT'S `make install` DOES: `-tags kqueue -trimpath`, and the
+# ldflags its buildscripts/gen-ldflags.go writes. `go install module@version`
+# builds from the module as published, so its own go.mod and go.sum decide
+# every dependency (neither declares a `replace`, which `go install` would
+# refuse). Version is the tag's timestamp with `:` restored, as releaseTag()
+# parses it back, so `minio --version` names the release rather than
+# DEVELOPMENT; CommitID is the commit the pseudo-version names.
 RUN set -eu; \
     stamp() { t=${1#RELEASE.}; d=${t%%T*}; h=$(echo "${t#*T}" | tr - :); \
               echo "${d}T${h}"; }; \
-    v=$(stamp "${MINIO_RELEASE}"); \
-    cd /src/minio && go build -tags kqueue -trimpath -o /out/minio -ldflags "-s -w \
-      -X github.com/minio/minio/cmd.Version=${v} \
-      -X github.com/minio/minio/cmd.CopyrightYear=${v%%-*} \
-      -X github.com/minio/minio/cmd.ReleaseTag=${MINIO_RELEASE} \
-      -X github.com/minio/minio/cmd.CommitID=${MINIO_RELEASE} \
-      -X github.com/minio/minio/cmd.ShortCommitID=${MINIO_RELEASE}" .; \
-    v=$(stamp "${MC_RELEASE}"); \
-    cd /src/mc && go build -tags kqueue -trimpath -o /out/mc -ldflags "-s -w \
-      -X github.com/minio/mc/cmd.Version=${v} \
-      -X github.com/minio/mc/cmd.CopyrightYear=${v%%-*} \
-      -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE} \
-      -X github.com/minio/mc/cmd.CommitID=${MC_RELEASE} \
-      -X github.com/minio/mc/cmd.ShortCommitID=${MC_RELEASE}" .
+    ldflags() { v=$(stamp "$2"); c=${3##*-}; \
+      echo "-s -w -X $1.Version=${v} -X $1.CopyrightYear=${v%%-*} \
+            -X $1.ReleaseTag=$2 -X $1.CommitID=${c} -X $1.ShortCommitID=${c}"; }; \
+    go install -tags kqueue -trimpath \
+      -ldflags "$(ldflags github.com/minio/minio/cmd "${MINIO_RELEASE}" "${MINIO_MODULE_VERSION}")" \
+      "github.com/minio/minio@${MINIO_MODULE_VERSION}"; \
+    go install -tags kqueue -trimpath \
+      -ldflags "$(ldflags github.com/minio/mc/cmd "${MC_RELEASE}" "${MC_MODULE_VERSION}")" \
+      "github.com/minio/mc@${MC_MODULE_VERSION}"
 
 # ------------------------------------------------------------------- runtime
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.4

@@ -196,19 +196,20 @@ services:
 
   # ---------------------------------------------------------------- storage
   minio:
-    # BUILT HERE, from the pinned releases' source: no registry serves
+    # BUILT HERE, from the pinned releases' source, fetched through a Go
+    # module proxy (GOPROXY), never from GitHub: no registry serves
     # MinIO's own images anonymously any more -- Docker Hub first, then
     # quay.io (401 from 2026-09-24), and ghcr.io. The CI build tier, the
     # first thing that pulls without a cache, is what found both. Same
     # releases as the images this replaced. `minio-init` builds the same
     # Dockerfile, which the layer cache makes free, as spark-master and
     # spark-worker share theirs. See docs/DECISIONS.md#minio-is-built-from-source
+    # The releases are pinned in Dockerfile.minio ONLY: each is a release tag
+    # AND the Go module version naming its commit, and overriding one without
+    # the other would stamp one release's name on another's code.
     build:
       context: .
       dockerfile: Dockerfile.minio
-      args: &minio-releases
-        MINIO_RELEASE: ${MINIO_RELEASE:-RELEASE.2024-09-22T00-33-43Z}
-        MC_RELEASE: ${MC_RELEASE:-RELEASE.2024-09-16T17-43-14Z}
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
@@ -230,7 +231,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.minio
-      args: *minio-releases
     depends_on:
       minio: {condition: service_healthy}
     entrypoint: >
