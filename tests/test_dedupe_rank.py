@@ -171,12 +171,14 @@ def _render(template_text: str, *, incremental: bool = False,
                        adapter=adapter, invocation_id=invocation_id,
                        nessie_ref=nessie_ref)
     env = _environment()
-    model_globals = dict(context, **_macro_modules(env, context))
-    model_globals.update(
+    # source()/ref() reach MACROS too, as in dbt, where a macro called from a
+    # model runs in that model's context -- scd2_prepared() calls source().
+    context.update(
         source=lambda schema, table: f"{schema}_{table}",
         ref=lambda name: f"prepared_{name}",
-        config=config,
     )
+    model_globals = dict(context, **_macro_modules(env, context))
+    model_globals.update(config=config)
     sql = env.from_string(template_text, globals=model_globals).render()
     return sql.replace("`", '"')
 
@@ -549,9 +551,17 @@ def test_every_scd2_model_decides_newest_from_the_unjoined_aggregate():
     retraction guard reads that CTE and a key-scoped filter reintroduced
     before the rank must not quietly make the default window wrong again.
     Their replay is tested end to end in `test_scd2_incremental.py`."""
-    scd2 = [p for p in sorted(PREPARED.glob("*.sql")) if "scd2_replay(" in _model(p)]
+    # Read off the RENDERED model, so it holds however the model is written --
+    # by hand or through scd2_prepared() (dbt/macros/scd2.sql). An SCD2 model
+    # is one whose config asks for the retraction merge.
+    scd2 = [p for p in sorted(PREPARED.glob("*.sql"))
+            if "scd2_retractions=true" in _model(p)]
     assert scd2, "no SCD2 models found; the assertions below would prove nothing"
     for path in scd2:
-        text = _model(path)
-        assert "newest_file_version(" in text, path.name
-        assert "newest_version='_newest_file_version'" in text, path.name
+        ctes = _ctes(_render(_model(path)))
+        assert "newest_file_version" in ctes, (path.name, list(ctes))
+        # the rank's "newest" is the unjoined aggregate, not a window over
+        # the rows the query happened to admit
+        assert re.search(r"_file_version\s*=\s*_newest_file_version",
+                         ctes["ranked_rows"]), path.name
+        assert "MAX(_file_version) OVER" not in ctes["ranked_rows"], path.name

@@ -158,10 +158,18 @@ def _assert_merge_cardinality(con, merge_sql: str):
             f"{bad} target row(s) of {target} matched by more than one source row")
 
 
+def _pointed_at_src(name: str) -> str:
+    """The model's text with its raw source renamed to the fixture's `src`,
+    in both spellings a model may use: a hand-written model's
+    `source('raw', ...)` and an scd2_prepared() call's `source_name=`."""
+    return ((PREPARED / f"{name}.sql").read_text(encoding="utf-8")
+            .replace(f"source('raw', '{name}')", "source('raw', 'src')")
+            .replace(f"source_name='{name}'", "source_name='src'"))
+
+
 def _build(con, name: str, target: str, incremental: bool,
            invocation_id: str = "test-invocation", nessie_ref: str | None = None):
-    text = (PREPARED / f"{name}.sql").read_text(encoding="utf-8").replace(
-        f"source('raw', '{name}')", "source('raw', 'src')")
+    text = _pointed_at_src(name)
     config = _Config({})
     exists = con.execute(
         f"select count(*) from information_schema.tables where table_name = '{target}'"
@@ -491,8 +499,7 @@ def _replay_case(con, name, keys, attr, constants):
         from (values ('{D2}', 'A', false), ('2026-09-10', 'A', true),
                      ('2026-06-01', 'B', true)) t(effective_from, k, is_current)
     """)
-    return (PREPARED / f"{name}.sql").read_text(encoding="utf-8").replace(
-        f"source('raw', '{name}')", "source('raw', 'src')")
+    return _pointed_at_src(name)
 
 
 REPLAYED = "select cob_date::varchar, counterparty_id, source_file_version from replayed order by 1, 2"
