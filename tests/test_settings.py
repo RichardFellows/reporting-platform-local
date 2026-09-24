@@ -108,8 +108,10 @@ def _py_files():
 def _scan_repo() -> list[str]:
     found: list[str] = []
     for path in _py_files():
-        found.extend(hits(path.read_text(encoding="utf-8"),
-                          str(path.relative_to(REPO))))
+        # In the container the DAGs are mounted OUTSIDE the repo root
+        # (/opt/airflow/dags), so a repo-relative label cannot exist for them.
+        label = path.relative_to(REPO) if path.is_relative_to(REPO) else path
+        found.extend(hits(path.read_text(encoding="utf-8"), str(label)))
     return found
 
 

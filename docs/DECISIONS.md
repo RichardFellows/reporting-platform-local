@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-101 entries. They are grouped here by subject; the file itself is in the order
+102 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -92,7 +92,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
 | [the-local-k8s-smoke](#the-local-k8s-smoke) | `make k8s-smoke` runs the chart in kind through a merged `prepared_build`; its first run found four cluster-only defects |
-| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move |
+| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move; `embedded` runs everything in-process with no cluster |
 | [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
 | [the-chart-is-the-only-place-settings-are-written](#the-chart-is-the-only-place-settings-are-written) | One ConfigMap, one Secret, envFrom everywhere; why `existingSecret` needs two literal names, not one computed value |
 | [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
@@ -216,6 +216,12 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [lineage-is-derived-from-the-dbt-project](#lineage-is-derived-from-the-dbt-project) | A job per task and **no datasets at all**, until the extractor was registered under the variable Airflow reads |
 | [a-column-with-no-source-says-so](#a-column-with-no-source-says-so) | 116 of 136 traced, and reporting only those makes a literal, a `count(*)` and a parser failure identical |
 | [marquez-on-ubi](#marquez-on-ubi) | Both images built here, from Marquez's own source |
+
+### Packaging
+
+| Anchor | The finding |
+|---|---|
+| [components-are-declared-and-enforced](#components-are-declared-and-enforced) | Which module ships in which deployable package is `components.yml`, and a lazy import across a boundary fails a test, not a task |
 
 ---
 
@@ -670,8 +676,19 @@ Its first run found four defects that nothing short of a cluster could:
 
 ## execution-mode-is-configuration
 
-`PLATFORM_EXECUTION` (`local` | `kubernetes`, default `local`, anything else
-refused) says where a Spark driver runs, and where its executors run.
+`PLATFORM_EXECUTION` (`local` | `kubernetes` | `embedded`, default `local`,
+anything else refused) says where a Spark driver runs, and where its
+executors run.
+
+- **`embedded`** is no cluster at all: the driver's own process runs every
+  task through a `local[N]` master. It is what the `runner` compose service
+  and `python -m reporting_platform.pipeline` use, so the steps can be run
+  with only S3, Nessie and Postgres (`docs/STANDALONE-PIPELINE.md`). It is a
+  declared mode rather than a fallback. `session_conf()` refuses a `local`
+  master in the other two modes, for the reason
+  [spark-master-no-local-fallback](#spark-master-no-local-fallback) gives,
+  and refuses a cluster master in this one. `SPARK_MASTER` is still the only
+  master setting, read by both drivers.
 
 - **`local`** is compose. `_spark_task.run` starts the driver as a child
   process and the executors run on the standalone spark-worker.
@@ -1277,7 +1294,9 @@ belong.
 
 ## dbt-target-guard
 
-`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**.
+`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**. The
+check is `transform.dbt.target()`, which the hand-run `transform` CLI calls
+before it touches anything too.
 
 The failure it prevents is silent. The branch each build opens is passed to dbt
 as the `nessie_ref` var, and only the Spark profiles honour it; an engine that
@@ -1441,7 +1460,9 @@ that is not derived, which is why it is the one file in
 
 ## spark-master-no-local-fallback
 
-`spark_session()` refuses a `local` master rather than falling back to it.
+`spark_session()` refuses a `local` master rather than falling back to it,
+unless `PLATFORM_EXECUTION=embedded` declares that running in-process is the
+intent ([execution-mode-is-configuration](#execution-mode-is-configuration)).
 
 A missing or blank `SPARK_MASTER` meaning "run the whole job inside this
 container" is a configuration error that **looks like success**: the job
@@ -5339,3 +5360,64 @@ publication can still be traced back through
 (`#the-release-image-carries-the-code`). Both fail `helm template` naming the
 offending value, the same "fail loud at render, not quiet in the first pod
 that reads it" posture `required` gives every endpoint and image.
+
+
+## components-are-declared-and-enforced
+
+The platform is carved into separately built, versioned and deployed
+components -- `transport`, `core`, `ingest`, `dbt`, `ops`, plus `dev`, which is
+never packaged -- and **`components.yml` is the only statement of which
+module belongs to which**. `tests/test_components.py` reads every import in
+the source, lazy ones included, and fails on one that reaches a component its
+owner does not declare in `depends_on`. See `docs/PACKAGING.md` for the
+target shape.
+
+**Why lazy imports count.** Most cross-package imports here are inside
+functions on purpose, to keep pyspark and boto3 off the import path of code
+that only reads config. On one PYTHONPATH that is invisible. In an image built
+with `ingest` and without `ui`, it is a ModuleNotFoundError on the first run
+that reaches the branch -- the inbox's trigger path imported the console's
+Airflow client exactly this way, and nothing would have said so before a
+deployed inbox first tried to trigger a DAG.
+
+**Ownership is by module, not by directory**, longest prefix wins. The
+delivery index (`registry.deliveries`, `.rejections`, `.transports`) is
+rebuilt from object storage by the ingest code that writes it
+(`#the-registry-records-observations-not-verdicts`), so it ships with
+`ingest`, while `registry.db`'s DDL and the run and lifecycle records are
+`core`. Its pure-SQL reads moved to `registry/delivery_reads.py` (core) so a
+published run's trace needs no ingest install; `deliveries.py` re-exports
+them. Likewise `ingest.sniff` and `ingest.sample_diagnostics` are `dev`: they
+infer a feed definition for the console and nothing that runs a delivery
+calls them. The directories can be made to agree later without changing an
+import path, because every `__init__.py` on the way is empty and so can
+become a namespace package.
+
+**The Spark launcher is core and names its operations as strings.** It was
+`scripts/_spark_task.py`, and `scripts/` ships in no component. It is
+`reporting_platform/common/spark_task.py` now, each operation's body is in a
+`spark_ops.py` in the component that owns it, and `spark_task.OPS` maps the
+name. A driver image built without the owning component refuses the op by
+name. Because a string is invisible to the import scan,
+`test_components.py` checks the table separately: every entry resolves, and
+every DAG launches only ops its own component may import. The launch scan
+asserts it found at least ten launches, so renaming the DAGs' wrapper
+functions cannot turn it off. `python -m scripts._spark_task` still works as
+a shim.
+
+**`ingest` depends on `transport`, deliberately.** The Transport manifest's
+parser is `reporting_transport.contract`, shared unmodified with the
+publisher, so there is one implementation of what a marker means. The
+alternative -- a copy on the consumer side -- is two parsers of one contract
+drifting apart. Pin a compatible range, not an exact version.
+
+**Wheels are built from a staging directory, not a pyproject per
+directory**, because ownership is by module. `scripts/build_components.py`
+copies exactly a component's files, generates its `pyproject.toml` from
+`components.yml` and builds it. `--check` installs the result into an empty
+virtualenv outside the checkout, with its sibling wheels installed BY FILE (a
+name could be answered by a public package of the same name) and none of the
+extras, and imports every module. The static test cannot see a module-level
+import of an undeclared third-party package or a file the staging missed;
+this does, and removing `requests` from core's `requires` fails it on
+`common/airflow_api.py`, measured.

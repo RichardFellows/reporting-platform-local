@@ -82,42 +82,90 @@ prior_month_end as (
           and m.cob_date < c.cob_date
     group by c.cob_date
 
+),
+
+-- EVERY (date, counterparty) PAIR THE REPORT COVERS: today's counterparties,
+-- plus the previous date's that are ABSENT today. The model used to be driven
+-- from today's rows alone, so a counterparty that disappeared produced no row
+-- at all and `REMOVED` could never be assigned -- the most interesting row
+-- in a change report, silently omitted, tests green (todo 16).
+--
+-- REMOVED means ABSENT ENTIRELY: exposure on the previous date and no row in
+-- today's `counterparty_exposure`. That table is aggregated from trades, so a
+-- counterparty with no live trades has no row and IS removed; one whose
+-- reference data was carried forward (`reference_carried_forward`) still has
+-- trades, still has a row, and is not. Decided with the report's owner.
+--
+-- A removed counterparty's row belongs to TODAY's partition -- this model is
+-- insert_overwrite per cob_date, and the missing keys are taken only for the
+-- dates `current_exposure` returns, so each date is still returned whole.
+keys as (
+
+    select cob_date, counterparty_id
+    from current_exposure
+
+    union all
+
+    select ds.cob_date, prev.counterparty_id
+    from (select distinct cob_date from current_exposure) w
+    join date_sequence ds
+      on ds.cob_date = w.cob_date
+    join {{ ref('counterparty_exposure') }} prev
+      on prev.cob_date = ds.prior_cob_date
+    where not exists (
+        select 1 from current_exposure cur
+        where cur.cob_date = ds.cob_date
+          and cur.counterparty_id = prev.counterparty_id
+    )
+
 )
 
 select
-    cur.cob_date,
-    cur.counterparty_id,
-    cur.legal_name,
-    cur.country_code,
-    cur.sector,
+    k.cob_date,
+    k.counterparty_id,
+    coalesce(cur.legal_name, prev.legal_name)                as legal_name,
+    coalesce(cur.country_code, prev.country_code)            as country_code,
+    coalesce(cur.sector, prev.sector)                        as sector,
 
+    -- A removed counterparty has no current row: its current values are
+    -- NULL (there is nothing to show), and its CHANGE is the whole of what it
+    -- had -- current treated as zero. A present counterparty keeps the
+    -- original arithmetic, so a null current total still yields a null change.
     cur.total_mtm                                            as current_mtm,
     prev.total_mtm                                           as prior_mtm,
-    cur.total_mtm - coalesce(prev.total_mtm, 0)              as mtm_change,
+    {{ removed_as_zero('cur', 'total_mtm') }} - coalesce(prev.total_mtm, 0)
+                                                             as mtm_change,
     case
         when prev.total_mtm is null or prev.total_mtm = 0 then null
-        else (cur.total_mtm - prev.total_mtm) / abs(prev.total_mtm)
+        else ({{ removed_as_zero('cur', 'total_mtm') }} - prev.total_mtm) / abs(prev.total_mtm)
     end                                                      as mtm_change_pct,
 
     cur.total_notional                                       as current_notional,
     prev.total_notional                                      as prior_notional,
-    cur.total_notional - coalesce(prev.total_notional, 0)    as notional_change,
+    {{ removed_as_zero('cur', 'total_notional') }} - coalesce(prev.total_notional, 0)
+                                                             as notional_change,
 
     cur.trade_count                                          as current_trade_count,
     prev.trade_count                                         as prior_trade_count,
-    cur.trade_count - coalesce(prev.trade_count, 0)          as trade_count_change,
+    {{ removed_as_zero('cur', 'trade_count') }} - coalesce(prev.trade_count, 0)
+                                                             as trade_count_change,
 
     me.total_mtm                                             as prior_month_end_mtm,
-    cur.total_mtm - coalesce(me.total_mtm, 0)                as mtm_change_since_month_end,
+    {{ removed_as_zero('cur', 'total_mtm') }} - coalesce(me.total_mtm, 0)
+                                                             as mtm_change_since_month_end,
 
     -- Classification the report actually presents. Thresholds are business
     -- rules and belong here, in the mart, not in the BI tool — otherwise they
     -- change when the BI tool changes.
+    --
+    -- CHANGED is `is distinct from`, not `abs(diff) > 0`: the two agree for
+    -- two known values, and differ where it matters -- an MTM that became
+    -- unknown (every trade's mtm_value null) is a change, not UNCHANGED.
     case
         when prev.counterparty_id is null then 'NEW'
-        when cur.total_mtm is null then 'REMOVED'
+        when cur.counterparty_id is null then 'REMOVED'
         when abs(cur.total_mtm - coalesce(prev.total_mtm, 0)) > 1000000 then 'MATERIAL_CHANGE'
-        when abs(cur.total_mtm - coalesce(prev.total_mtm, 0)) > 0 then 'CHANGED'
+        when cur.total_mtm is distinct from prev.total_mtm then 'CHANGED'
         else 'UNCHANGED'
     end                                                      as change_category,
 
@@ -125,18 +173,22 @@ select
     cast('{{ invocation_id }}' as string)                    as dbt_invocation_id,
     {{ dbt.current_timestamp() }}                            as dbt_updated_at
 
-from current_exposure cur
+from keys k
 
 join date_sequence ds
-  on ds.cob_date = cur.cob_date
+  on ds.cob_date = k.cob_date
+
+left join current_exposure cur
+       on cur.cob_date = k.cob_date
+      and cur.counterparty_id = k.counterparty_id
 
 left join {{ ref('counterparty_exposure') }} prev
        on prev.cob_date   = ds.prior_cob_date
-      and prev.counterparty_id = cur.counterparty_id
+      and prev.counterparty_id = k.counterparty_id
 
 left join prior_month_end pme
-       on pme.cob_date = cur.cob_date
+       on pme.cob_date = k.cob_date
 
 left join {{ ref('counterparty_exposure') }} me
        on me.cob_date   = pme.prior_month_end_date
-      and me.counterparty_id = cur.counterparty_id
+      and me.counterparty_id = k.counterparty_id

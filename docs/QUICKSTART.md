@@ -435,6 +435,7 @@ docker compose down -v      # destroys all data and volumes
 |---|---|
 | [`README.md`](../README.md) | The same journey, step by step, with the reasoning. Section 14 covers the scheduler in more depth. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, write-audit-publish, why Spark is the only build engine, how Cosmos renders the builds |
+| [`STANDALONE-PIPELINE.md`](STANDALONE-PIPELINE.md) | The same pipeline as four commands, with no Airflow and no Spark cluster, against local or deployed S3/Nessie/Postgres |
 | [`ADDING-A-FEED.md`](ADDING-A-FEED.md) | Onboard a new feed — six files, no DAG edit |
 | [`ADDING-A-MODEL.md`](ADDING-A-MODEL.md) | Add a dbt model — two files, no DAG edit |
 | [`ADDING-A-COLUMN.md`](ADDING-A-COLUMN.md) | Add a column to a feed that already delivers — three files, and the one command that is easy to forget |

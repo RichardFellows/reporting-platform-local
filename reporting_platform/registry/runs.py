@@ -379,11 +379,11 @@ def trace_version(report: str, as_at_date: date, version_no: int) -> dict[str, A
                 f"no published version {report} {as_at_date} v{version_no}")
         record = dict(zip([d[0] for d in cur.description], row))
 
-    from reporting_platform.registry import deliveries
+    from reporting_platform.registry import delivery_reads
 
     pairs = [(item["feed"], item["delivery_id"])
              for item in inputs_for_run(record["run_id"])]
-    evidence = deliveries.deliveries_by_id(pairs)
+    evidence = delivery_reads.deliveries_by_id(pairs)
     return {
         "report_version": {k: record[k] for k in
                            ("report", "as_at_date", "version_no", "tag",

@@ -68,10 +68,10 @@ def _dag():
     @task(task_id="compare_one", pool="lakehouse_write")
     def compare_one(pair: list[str]) -> dict:
         """One (feed, business_date) comparison. Spark-backed -- see
-        `scripts/_spark_task.py migration-compare`, subprocess-only for the
+        `spark_task migration-compare`, subprocess-only for the
         same reason every other Spark call here is
         (`docs/DECISIONS.md#spark-in-a-subprocess`)."""
-        from scripts._spark_task import run
+        from reporting_platform.common.spark_task import run
 
         feed_name, business_date = pair
         return run("migration-compare", feed_name, business_date)

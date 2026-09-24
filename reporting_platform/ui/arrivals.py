@@ -53,7 +53,7 @@ from typing import Any
 
 from reporting_platform.registry import deliveries, rejections
 
-from . import orchestration
+from reporting_platform.common import airflow_api as orchestration
 
 log = logging.getLogger("ui.arrivals")
 

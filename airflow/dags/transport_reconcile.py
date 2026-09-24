@@ -125,7 +125,7 @@ def _dag():
         job in this platform (completeness, reproducibility, maintenance
         metrics -- see docs/ARCHITECTURE.md, "Where Spark actually runs").
         """
-        from scripts._spark_task import run
+        from reporting_platform.common.spark_task import run
 
         from reporting_platform.ingest.transport_reconcile import raw_pending
 

@@ -1,7 +1,7 @@
 """Shared idempotent-trigger helper for the Phase 6 Transport DAGs.
 
 Leading underscore: not a DAG file, the same convention
-`scripts/_spark_task.py` uses and `scripts/check_dag_imports.py` enforces
+`common/spark_task.py` uses and `scripts/check_dag_imports.py` enforces
 (its `_dag_files` docstring: "`_`-prefixed ... are helpers by convention, not
 DAG files").
 
