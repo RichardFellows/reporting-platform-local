@@ -516,7 +516,15 @@ generator. Everything else runs inside containers.
 
 ```bash
 cp .env.example .env
+python3 scripts/doctor.py     # or: make doctor
 ```
+
+`doctor` checks the things that fail environmentally rather than in the
+platform's own code — `.env` exists, `AIRFLOW_UID` is right for your OS,
+Docker has enough memory, the ports the stack publishes are free (or already
+held by this same stack) — and each failure names its own fix. Worth running
+before `docker compose up` the first time, and again any time it refuses to
+come up for a reason that isn't obviously the platform's.
 
 **`make` is optional and is not present on a stock Windows box.** The
 `Makefile` and the "Automated route" below are a convenience wrapper; every
@@ -1039,6 +1047,7 @@ make retention-dry
 | Target | Does |
 |---|---|
 | `make env` | Create .env from the template |
+| `make doctor` | Check this host is set up right BEFORE `make up` -- .env, uid, memory, ports |
 | `make up` | Start the whole local stack |
 | `make test` | Config-level tests (no stack needed, ~1s). See tests/README.md |
 | `make down` | Stop the stack, keep volumes |
