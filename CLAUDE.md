@@ -438,6 +438,15 @@ them.
   explicitly under Airflow's constraints is the cosmos trap exactly. Env is
   read at process start, so enabling it needs the airflow containers
   **recreated**.
+- **MinIO is BUILT HERE too** (`Dockerfile.minio`, both `minio` and `mc` from
+  the pinned releases' source, through `GOPROXY` with no `,direct`, so never
+  from GitHub): no registry serves MinIO's images anonymously any more, and
+  CI failed at `minio Pulling` before any code ran. Each release is pinned as
+  a tag AND a Go module version, in the Dockerfile only. The first
+  `docker compose up` builds it (~1.5 min). It runs as root because the
+  existing `minio-data` volume was written as root; changing that needs the
+  volume's ownership changed too, or MinIO starts EMPTY rather than failing.
+  (`#minio-is-built-from-source`)
 - **Both Marquez images are BUILT HERE on UBI, from Marquez's own source** —
   `Dockerfile.marquez-api`, `Dockerfile.marquez-web`; upstream ships Ubuntu and
   Alpine. `MARQUEZ_VERSION` is the RELEASE TAG the builders fetch, so the first

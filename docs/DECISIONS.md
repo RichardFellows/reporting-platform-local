@@ -87,7 +87,8 @@ anchor; this page is for when you do not yet know what you are looking for.
 
 | Anchor | The finding |
 |---|---|
-| [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images come from quay.io |
+| [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images came from quay.io -- until it did too |
+| [minio-is-built-from-source](#minio-is-built-from-source) | No registry serves MinIO anonymously; the same pinned releases are compiled here, on UBI |
 | [scd2-is-one-macro](#scd2-is-one-macro) | The three SCD2 models are one `scd2_prepared()` call each, moved with a 0-row EXCEPT both ways |
 | [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
@@ -528,12 +529,15 @@ so check both.
 
 The corporate build has egress only to an internal mirror, so every external
 URL a Dockerfile fetches must be a build ARG whose DEFAULT is today's public
-value — the mirror then only sets build args, never edits a Dockerfile. Five:
+value — the mirror then only sets build args, never edits a Dockerfile. Seven:
 `MAVEN_REPO` (the executor jars in `Dockerfile.spark` and the driver jars in
 `Dockerfile.airflow`, [driver-jars-are-baked](#driver-jars-are-baked)), `NESSIE_GC_URL` and
 `AIRFLOW_CONSTRAINTS_URL` (`Dockerfile.airflow`), `MARQUEZ_SOURCE_URL`
 (both Marquez images), `NPM_REGISTRY` (`Dockerfile.marquez-web`, told to
-every npm invocation, since an ARG is not itself an npm setting).
+every npm invocation, since an ARG is not itself an npm setting), and
+`GOPROXY` and `GOSUMDB` (`Dockerfile.minio`: every byte of both MinIO
+builds comes through the Go proxy, with no `,direct` fallback to GitHub,
+[minio-is-built-from-source](#minio-is-built-from-source)).
 `tests/test_offline_build.py` is the gate: a URL literal inside a
 RUN/COPY/ADD, including a continuation line, fails naming file:line.
 
@@ -770,6 +774,82 @@ Both now come from `quay.io/minio/*` at the same release tags. It is the same
 image: the local Docker Hub copy and the quay.io pull have identical image IDs
 (`sha256:7d80fd23...` for minio, `sha256:a5399b66...` for mc). The nightly
 build tier is what notices the next registry doing this.
+
+**Superseded two days later** by
+[minio-is-built-from-source](#minio-is-built-from-source): quay.io did it
+too.
+
+## minio-is-built-from-source
+
+On 2026-09-24 `quay.io/minio/minio` and `quay.io/minio/mc` started answering
+`401 UNAUTHORIZED` to anonymous pulls. The Docker Hub tags already refused
+(and now 404), and `ghcr.io/minio/*` denies too. The CI build tier failed at
+`minio Pulling` on every PR, before any code ran. Every machine with the
+image cached kept working, exactly as the first time.
+
+**Decision.** `Dockerfile.minio` compiles both binaries from the same pinned
+releases on `ubi9/go-toolset`, into one `ubi9/ubi-minimal` image, with
+`go install github.com/minio/{minio,mc}@<module version>`. `minio` runs it and
+`minio-init` builds the same Dockerfile, which the layer cache makes free (as
+`spark-master` and `spark-worker` share theirs). It is Marquez's precedent
+([marquez-on-ubi](#marquez-on-ubi)): what cannot be pulled is built, on
+UBI.
+
+**The source comes through a Go module proxy, not from GitHub.** The first
+version of this fetched GitHub's release tarballs, and the corporate build
+has no route to GitHub. Every byte now comes from `GOPROXY`, with no
+`,direct` after it. `direct` is how a module the proxy lacks gets cloned from
+its VCS host, which for both of these is GitHub. The corporate build points
+`GOPROXY` at its internal Go proxy and `GOSUMDB` at its checksum mirror (or
+`off` where the proxy is the trust root). Both are build ARGs
+([images-build-from-a-mirror](#images-build-from-a-mirror)).
+
+MinIO's `RELEASE.<stamp>` tags are not semver, so each release is pinned
+twice in the Dockerfile: the tag (for the version string) and the **module
+version** the proxy knows it by. That is a pseudo-version naming the tag's
+commit, `v0.0.0-20240922003343-03e996320ebb`, which is what `go list -m
+github.com/minio/minio@<tag>` resolves. Resolving a tag is the one query that
+makes the proxy read the origin. The pinned version is a plain proxy lookup.
+Neither module's `go.mod` has a `replace`, which `go install mod@version`
+refuses. Compose passes no version args: a tag overridden without its module
+version would stamp one release's name on another's code.
+
+**Rejected:**
+- **Chainguard** (`cgr.dev/chainguard/minio`): pullable, but its free tier is
+  `latest` only. Pinning a digest lasts until they collect it, and `latest`
+  is a 2025 MinIO release, a different server from the one every test here
+  ran against.
+- **`bitnamilegacy/minio`**: pullable, but frozen and declared unmaintained,
+  with its own entrypoint, data path and environment conventions.
+
+**What the build reproduces.** It uses MinIO's own `make install` flags
+(`CGO_ENABLED=0 -tags kqueue -trimpath`) and the ldflags its
+`buildscripts/gen-ldflags.go` writes, so `minio --version` prints
+`RELEASE.2024-09-22T00-33-43Z (commit-id=03e996320ebb)`, not `DEVELOPMENT`.
+`go install` builds the module as published, so its own `go.mod`/`go.sum`
+decide every dependency.
+
+**Root, as upstream ran.** The existing `minio-data` volume was written by
+the upstream image as root. A server that cannot read its own data does not
+fail: it starts empty. Moving to a non-root user needs the volume's ownership
+changed with it.
+
+**The Helm chart's `local-stores`** (the `make k8s-smoke` throwaway cluster)
+pulled the same two images. It now takes `localStores.minioImage`, required
+when enabled, and `scripts/k8s_smoke.sh` builds `Dockerfile.minio` and loads
+it into kind with the platform's own images.
+
+Live-verified on the development stack. The proxy build ran with `--no-cache`
+and every GitHub hostname (`github.com`, `api.`, `codeload.`,
+`raw.githubusercontent.com`, `objects.githubusercontent.com`, `ghcr.io`)
+pointed at 127.0.0.1: it succeeded in 1m7s. A control build with the same
+`--add-host` got `Connection refused` from `github.com`, so the block does
+apply inside `RUN`. `minio --version` and `mc --version` name their releases
+and commits. `mc ready local` (the
+healthcheck) passed, `minio-init`'s bucket script ran, and a put/get worked
+on a throwaway container. Then the running `minio` was recreated on the new
+image over its existing volume: healthy, the same 1,728 objects, and
+`raw.qa_happy_position` read through DuckDB on `main`.
 
 ## scd2-is-one-macro
 
