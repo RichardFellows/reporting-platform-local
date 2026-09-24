@@ -24,8 +24,12 @@ one is treated as unset, because `Path("")` is the current directory.
 `tests/test_ci_pins.py` fails if it stops doing so.
 
 Because it points at the working tree, `tests/run.py` fails the run if the
-config tree's contents changed during it: a test that forgets `config_dir()`
-and saves through the console would otherwise rewrite the checkout silently.
+directory's registry files (`.yml`/`.yaml`) changed during it: a test that
+forgets `config_dir()` and saves through the console would otherwise rewrite
+the checkout silently.
+
+`CONFIG_DEFAULT` is the one definition of the path; `tests/support.py`
+imports it as `CONFIG`.
 """
 from __future__ import annotations
 

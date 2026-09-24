@@ -65,8 +65,11 @@ independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 gets the default too, not only `tests/run.py`. `settings.py`'s container
 default and `layout.feed_paths`' refusal are untouched: only the suite
 defaults it. Because that default is the working tree, `tests/run.py` digests
-the config directory before and after the run and fails if it changed, so a
-test that forgets `config_dir()` cannot rewrite the checkout silently.
+the directory's registry files (`.yml`/`.yaml`, through
+`context._tree_digest`) before and after the run and fails if they changed,
+so a test that forgets `config_dir()` cannot rewrite the checkout silently.
+Its first version digested every file and failed a fresh clone on the
+`.pyc` files `test_settings` writes by importing `config.__main__`.
 `.github/workflows/config.yml` no longer sets
 `REPORTING_CONFIG_DIR`/`DBT_PROJECT_DIR` for the whole job, only on the
 `config check` step, so the test step runs the fresh-clone case. A new
@@ -74,8 +77,9 @@ test that forgets `config_dir()` cannot rewrite the checkout silently.
 an `env:` map, the test step's `run:` text, or a `$GITHUB_ENV` write in an
 earlier step. It fails against `main`'s workflow. Reproduced on `main` with
 nothing set: `988 passed, 12 failed, 1 skipped`, all twelve `no feed
-registry at /opt/platform/...`. On the branch: `1001 passed, 0 failed, 1
-skipped` both unset and with the variable set. The PR template and
+registry at /opt/platform/...`. On the branch, in a fresh-clone state
+(every `__pycache__` under `reporting_platform/config` deleted first):
+`1001 passed, 0 failed, 1 skipped` unset, set, and set empty. The PR template and
 `tests/README.md` no longer tell anyone to set it.
 *What the item got wrong*: only its counts, which the suite has outgrown
 (929 then, 988 now). It did not mention that CI also set `DBT_PROJECT_DIR`

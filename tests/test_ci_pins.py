@@ -269,8 +269,13 @@ def test_the_config_tier_runs_the_suite_with_the_config_variables_unset():
             if i in at:
                 if var in (step.get("env") or {}):
                     problems.append(f"{var} in `{name}`'s `env:`")
-                if re.search(rf"\b{var}\b", text):
-                    problems.append(f"{var} named in `{name}`'s `run:`")
+                # SETTING it, not naming it: `env -u VAR` or `unset VAR`
+                # strengthens the invariant and must stay allowed. An
+                # assignment (`VAR=...`, inline, `export`ed or `env VAR=`)
+                # or a bare `export VAR` is what sets it.
+                if (re.search(rf"(?<![\w-]){var}=", text)
+                        or re.search(rf"\bexport\s+{var}\b", text)):
+                    problems.append(f"{var} set in `{name}`'s `run:`")
             elif "GITHUB_ENV" in text and re.search(rf"\b{var}\b", text):
                 problems.append(f"{var} written to $GITHUB_ENV by `{name}`, "
                                 f"which runs before the suite")

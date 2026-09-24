@@ -16,7 +16,6 @@ that.
 """
 from __future__ import annotations
 
-import hashlib
 import importlib
 import os
 import pathlib
@@ -38,12 +37,12 @@ def modules(only: list[str]) -> list[str]:
     return chosen
 
 
-def tree_digest(root: pathlib.Path) -> dict[str, str]:
-    """relative path -> sha256 of every file under `root`. Empty if absent."""
-    if not root.is_dir():
-        return {}
-    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted(root.rglob("*")) if p.is_file()}
+# WHAT THE REGISTRY IS MADE OF, and so what the guard below digests. Not
+# every file: `reporting_platform/config` is also a Python package, and
+# importing its `__main__` (test_settings does) writes `.pyc` files into it.
+# On a fresh clone with no `__pycache__` yet, digesting everything failed the
+# run on the suite's own imports.
+REGISTRY_SUFFIXES = (".yml", ".yaml")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,11 +56,15 @@ def main(argv: list[str] | None = None) -> int:
     # (`tests/__init__.py`), so a test that forgets `config_dir()` or
     # `registry_on()` and saves through the console would now rewrite the
     # developer's checkout, where it used to fail loudly on a missing
-    # /opt/platform. Every legitimate write goes to a temp copy, so ANY change
-    # to the tree the variable named when the run began is a failure.
-    # Resolved NOW, because tests repoint the variable as they go.
+    # /opt/platform. Every legitimate write goes to a temp copy, so any
+    # change to the registry files the variable named when the run began is
+    # a failure. Resolved NOW, because tests repoint the variable as they go.
+    # `_tree_digest` is the platform's own content digest (it already skips
+    # `__pycache__`); the function is captured here because `support.reset()`
+    # purges `reporting_platform` from `sys.modules` between modules.
+    from reporting_platform.common.context import _tree_digest
     watched = pathlib.Path(os.environ["REPORTING_CONFIG_DIR"])
-    before = tree_digest(watched)
+    before = _tree_digest([watched], REGISTRY_SUFFIXES)
 
     for name in modules(argv):
         # BEFORE THE IMPORT, not after it: a module that calls `config_dir()`
@@ -100,16 +103,15 @@ def main(argv: list[str] | None = None) -> int:
                 passed += 1
                 print(f"ok    {name}.{attr}")
 
-    after = tree_digest(watched)
-    if after != before:
-        changed = sorted(k for k in before.keys() | after.keys()
-                         if before.get(k) != after.get(k))
+    if _tree_digest([watched], REGISTRY_SUFFIXES) != before:
         failed.append((
             "config tree unchanged",
-            f"the run changed {watched}, the config directory the suite "
-            f"started with. A test wrote to it instead of to a "
-            f"support.config_dir() copy: restore the files and find the "
-            f"test. Changed: {', '.join(changed)}\n"))
+            f"the registry files ({', '.join(REGISTRY_SUFFIXES)}) under "
+            f"{watched} changed during the run. A test, or another process "
+            f"such as the feed console (which bind-mounts this directory), "
+            f"changed them. Tests must write to a support.config_dir() copy. "
+            f"Compare the directory against the last commit to see what "
+            f"changed.\n"))
         print("FAIL  config tree unchanged")
 
     tail = f", {len(skipped)} skipped" if skipped else ""

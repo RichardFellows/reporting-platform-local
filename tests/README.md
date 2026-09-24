@@ -12,8 +12,10 @@ Only the suite does this: `common/settings.py` still defaults to the
 container path and refuses an absent registry. CI's cheap tier runs the suite
 with both variables unset, and `tests/test_ci_pins.py` fails if either is set
 for it again. Because the default is the working tree, `tests/run.py` fails
-the run if that config directory's contents change during it: a test must
-write to a `support.config_dir()` copy, never to the checkout.
+the run if that directory's registry files (`.yml`/`.yaml`, digested with
+`context._tree_digest`, which skips `__pycache__`) change during it: a test
+must write to a `support.config_dir()` copy, never to the checkout. A feed
+console running against the same directory can trip it too.
 
 Runs on the host (needs `pyyaml`, `ruamel.yaml`, `duckdb` and `jinja2`) or inside the
 stack with no rebuild -- where the three modules that read the repo rather

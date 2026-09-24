@@ -29,8 +29,9 @@ import shutil
 import sys
 import tempfile
 
+from tests import CONFIG_DEFAULT as CONFIG  # one definition, so no drift
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
-CONFIG = REPO / "reporting_platform" / "config"
 
 # THE DAG FILES ARE NOT UNDER `REPO` IN THE CONTAINER. Several tests read a
 # DAG's source to pin something it must keep doing -- the publish gate's
