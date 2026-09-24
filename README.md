@@ -133,9 +133,11 @@ flowchart LR
 
 Casting happens in `prepared`, not at load, so a bad value fails a test instead
 of aborting a 3am load. Every `raw` row carries `_cob_date`, `_ingest_ts`,
-`_source_file`, `_file_version`, `_row_number` and `_batch_id` — added by both
-paths — **plus `_delivery_id`, `_received_at` and `_schema_version` for a
-Transport-path row**, joinable to `registry.delivery`.  `_delivery_id` is the
+`_source_file`, `_file_version`, `_row_number` and `_batch_id`, added by both
+paths. **A Transport-path row also carries `_delivery_id`, `_received_at`,
+`_schema_version` and `_source_system`**, and joins to `registry.delivery` on
+`_delivery_id`. Those four are added to a table and never backfilled, so
+older rows read NULL.  `_delivery_id` is the
 Delivery's identity; `_source_file` is only the physical object Spark read,
 and a historical row that predates the Transport path falls back to it. See
 [ARCHITECTURE.md#raw-provenance](docs/ARCHITECTURE.md#identity-model) for the
@@ -155,20 +157,35 @@ sequenceDiagram
     participant S as Spark / dbt
     participant M as main
 
-    AF->>N: create branch build/prepared/{date}/{run_id}
+    participant R as Registry
+
+    AF->>N: create branch build/{purpose}/{utc date}/{run slug}
+    AF->>R: open run record
     AF->>S: run models, writing on that branch
     S->>N: commits land on the branch only
     AF->>S: test
     alt tests pass
+        AF->>R: record input set (read off the branch)
+        AF->>R: as-at lifecycle gate — refuses a locked/submitted date
         AF->>M: merge branch into main
-        AF->>N: tag published/{date}/{run_id}
         AF->>N: delete working branch
+        opt reporting build only
+            AF->>N: tag published/{report}/{as_at}/{run_id}, one per report
+            AF->>R: allocate that report's version
+        end
         Note over M: consumers see all tables<br/>appear atomically
     else tests fail
         AF--xM: NO merge
         Note over N: branch left for inspection —<br/>main still holds last good state
     end
 ```
+
+All of this is `reporting_platform/transform/wap.py`. The build DAGs only call
+it, and `python -m reporting_platform.transform` runs the same functions
+without Airflow. An **ingest** follows the same branch → merge pattern. It
+cuts a different tag, `snapshot/{feed}/{cob_date}/{run_id}`, on the commit its
+own merge made. An ingest is not a publication. Only a reporting build cuts
+`published/…`, and a **report** is a dbt *exposure*, not a model.
 
 Three things this buys that the legacy RDBMS never did cheaply: **atomic multi-table
 publication** (a nine-table refresh is one merge, so consumers never see a
@@ -211,6 +228,64 @@ Transport orchestration → one DAG run per Transport/Delivery**, not hundreds
 of Feed definitions → hundreds of ingestion DAG definitions. Full design in
 [docs/AIRFLOW-ORCHESTRATION.md](docs/AIRFLOW-ORCHESTRATION.md).
 
+#### One Transport, end to end
+
+The diagram above shows the wiring. This one shows a single run over time:
+what each step writes, and where it writes it. Every arrow into object
+storage, Nessie or the registry is something you can go and look at after
+the run.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as DCM / producer
+    participant S3 as MinIO
+    participant W as transport_watch
+    participant TI as transport_ingest
+    participant R as Registry (Postgres)
+    participant N as Nessie
+    participant B as prepared_build →<br/>reporting_build
+
+    P->>S3: source objects → received/cob_date=…/source_system=…/{TransportID}/
+    P->>S3: _COMPLETE.json, written last
+    W->>S3: deferrable S3KeySensor sees the marker
+    W->>TI: trigger run transport__{TransportID}
+    Note over W,TI: transport_reconcile (every 20 min) triggers<br/>the same run for anything the sensor missed
+
+    TI->>S3: validate_transport — read the marker and contract
+    TI->>R: transport_receipt: discovered → validated
+    TI->>S3: create_delivery — deliveries/ DeliveryManifest (immutable)
+    TI->>R: receipt: delivered
+    TI->>S3: normalize_delivery — ready/ NormalizationManifest (rebuildable)
+    TI->>R: registry.delivery row · receipt: normalized
+
+    rect rgba(128,128,128,0.12)
+    Note over TI,N: ingest_raw — lakehouse_write pool, Spark in a subprocess
+    TI->>N: branch ingest/{feed}/{cob_date}/{run}-a{attempt}
+    TI->>N: write raw.{feed}, all STRING + provenance
+    TI->>TI: delivery.control checks (row_count, md5)
+    TI->>N: merge into main
+    TI->>R: delivery_committed
+    end
+    TI->>N: record_snapshot — tag snapshot/{feed}/{cob_date}/{run_id}
+    TI-->>B: Asset raw.{feed} updated
+
+    B->>N: branch build/prepared/… → dbt models → test → merge
+    B-->>B: Asset prepared.* updated
+    B->>N: branch build/reporting/… → dbt models → test
+    B->>R: input set, as-at lifecycle gate
+    B->>N: merge · tag published/{report}/{as_at}/{run_id}
+    B->>R: report version
+```
+
+A failure at any step stops the run at that step and leaves `main` as it
+was. Validation, delivery and normalization failures are recorded as
+`validation_result` evidence and `receipt: failed`. A failure the same input
+would reproduce is a **refusal**, and a refusal is not retried. The
+per-stage failure modes are in [docs/PIPELINE.md](docs/PIPELINE.md), and
+"where is this feed right now" is answered by the COB Status view in
+[docs/OPERATIONAL-CONTROL-PLANE.md](docs/OPERATIONAL-CONTROL-PLANE.md).
+
 **Legacy compatibility path:** `feed_ingest.py` still generates one
 `ingest_<feed>` DAG per entry in `feeds.yml`, feeding the same asset-triggered
 `prepared_build`/`reporting_build` chain. This is the orchestration model for
@@ -242,15 +317,78 @@ DAG edit — the same property `feeds.yml` already had for ingest DAGs. Verified
 live: a model added to the project appeared as a task within one parse
 interval.
 
-Three settings in `dbt_builds.py` are load-bearing rather than stylistic
-(`InvocationMode.SUBPROCESS`, the `lakehouse_write` pool on every rendered
-task, and `LoadMode.DBT_LS`); the module docstring explains what each one
-prevents and what went wrong without it.
+Four settings in `dbt_builds.py` are load-bearing rather than stylistic:
+`InvocationMode.SUBPROCESS`, the `lakehouse_write` pool on every rendered
+task, `LoadMode.DBT_LS` and `TestBehavior.AFTER_ALL`. The module docstring
+explains what each one prevents and what went wrong without it.
 
 A late feed does not block the feeds that did arrive — the reporting layer
 carries forward the last good version of that dimension and a freshness test
 flags it. That is a deliberate behavioural change from the legacy scheduler's gated model
 and needs report-owner sign-off.
+
+## Where it runs
+
+The same packages run in three configurations. Only environment variables
+change between them. `PLATFORM_EXECUTION` decides where a Spark driver runs,
+and every endpoint comes from `common/settings.py`, which falls back to the
+compose hosts only when `REPORTING_ENV=local`.
+
+```mermaid
+flowchart TB
+    subgraph code["One codebase — components.yml"]
+        direction LR
+        C1["transport<br/><i>reporting_transport</i>"]
+        C2["core · ingest · dbt · ops"]
+        C3["dev<br/><i>feed console, migration harness —<br/>never packaged</i>"]
+    end
+
+    subgraph compose["docker compose — this laptop"]
+        direction TB
+        AFC["airflow · webserver · triggerer<br/><i>dev image, code MOUNTED</i>"]
+        SPC["spark-master + spark-worker<br/><i>PLATFORM_EXECUTION=local</i>"]
+        STC["minio · nessie · postgres"]
+        AUX["inbox · feed-ui :8082 · notebook :8083 · watchdog<br/><i>lineage profile: marquez-api/web</i>"]
+    end
+
+    subgraph standalone["compose --profile standalone"]
+        RUN["runner<br/><i>PLATFORM_EXECUTION=embedded —<br/>local[N] Spark, no Airflow, no cluster</i>"]
+    end
+
+    subgraph k8s["OpenShift / Kubernetes — deploy/helm"]
+        direction TB
+        AFK["Airflow chart<br/><i>release image, code BAKED</i>"]
+        SPK["Spark driver + executor pods<br/><i>PLATFORM_EXECUTION=kubernetes</i>"]
+        STK["on-prem S3 · Nessie · Postgres"]
+    end
+
+    code -->|"make release-image<br/>PLATFORM_CODE_REF + DBT_PROJECT_DIGEST"| AFK
+    code -->|"bind mount"| AFC
+    code -->|"bind mount"| RUN
+    AFC --> SPC --> STC
+    RUN --> STC
+    AFK --> SPK --> STK
+```
+
+| Configuration | Orchestrator | Spark driver runs | Use it for |
+|---|---|---|---|
+| `docker compose up` | Airflow 2.10.5, LocalExecutor | a subprocess of the Airflow task, against the standalone cluster | the full platform on a laptop. [docs/QUICKSTART.md](docs/QUICKSTART.md) |
+| `--profile standalone run runner` | none: four CLI steps | in the runner process (`local[N]`) | land → ingest → prepared → reporting with only S3, Nessie and Postgres, including against deployed stores. [docs/STANDALONE-PIPELINE.md](docs/STANDALONE-PIPELINE.md) |
+| Helm chart, `values-<env>.yaml` | the Airflow estate | a pod, with executor pods (dbt keeps its driver in the task) | dev / UAT / prod. [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md), [docs/PACKAGING.md](docs/PACKAGING.md) |
+
+A change travels ticket → feature branch → CI → dev → UAT → prod. dbt changes
+and DAG changes carry different risk, and prod is gated on a CAB digest. The
+sequence diagrams for that are in [docs/DEV-PROCESS.md](docs/DEV-PROCESS.md).
+CI has three tiers:
+
+| Tier | Workflow | What it proves | Cost |
+|---|---|---|---|
+| config | `.github/workflows/config.yml` | `config check` + `python -m tests.run` on a bare runner | ~10 s |
+| parse | `.github/workflows/parse.yml` | the image's pins install; `dbt parse`; every DAG file imports and produces its DAGs | ~2–3 min |
+| build | `.github/workflows/build.yml` (`scripts/ci_build_tier.sh`) | images build; a throwaway stack ingests a clean seed, builds on a branch, **merges to that stack's `main`**, then `lineage --columns --require-derivable` | full stack |
+
+`.github/workflows/components.yml` builds one wheel per component and
+imports each in a clean venv (`python -m scripts.build_components --check`).
 
 ## Component versions
 
@@ -266,8 +404,8 @@ the notes in this table before moving one.
 | **Nessie Spark extensions** | **0.99.0** (`NESSIE_SPARK_EXT_VERSION`) | `.env` | **Tracks Iceberg, not the server** — 0.103.3 ↔ Iceberg 1.8.1, 0.108.1 ↔ 1.11.0. Newer-than-your-Iceberg is the failing direction, which is why this trails the server. |
 | **Apache Iceberg** | **1.6.1** (`ICEBERG_VERSION`) | `.env` | `iceberg-spark-runtime-3.5_2.12` and `iceberg-aws-bundle`. Must be **identical** in the Spark image and the Airflow image, which bakes the jars for *both* drivers (`spark_session()` and `dbt/profiles.yml`, via `PLATFORM_DRIVER_JARS`) — because every submitting process runs a pip `pyspark` with no jars of its own. |
 | **Marquez** | **0.51.1** (`MARQUEZ_VERSION`) | `.env` | The OpenLineage consumer, off by default behind the `lineage` compose profile. **Both images are built here on UBI** from Marquez's own source (`Dockerfile.marquez-api`, `Dockerfile.marquez-web`) — upstream ships Ubuntu and Alpine. This is the *release tag the builders fetch*, so changing it triggers a gradle + npm build with egress, not a pull. |
-| **Postgres** | **16** | `docker-compose.yml` | Backs three databases: the Airflow metadata DB, the Nessie version store, and the `platform` database holding the delivery/run **registry**. Nessie is JDBC-backed rather than in-memory on purpose, so the local stack exercises the same version-store path as the cluster. |
-| **MinIO** | `RELEASE.2024-09-22T00-33-43Z` | `docker-compose.yml` | Stand-in for the on-prem S3-compatible store. `mc` is pinned separately for the bucket-init job. |
+| **Postgres** | **16** | `docker-compose.yml` | Backs separate databases: the Airflow metadata DB, the Nessie version store (plus `nessie_gc`'s working state), the `platform` database holding the delivery/run **registry**, an idle `serving` database, and Marquez's when the `lineage` profile is up. Nessie is JDBC-backed rather than in-memory on purpose, so the local stack exercises the same version-store path as the cluster. |
+| **MinIO** | `RELEASE.2024-09-22T00-33-43Z` (`mc` `RELEASE.2024-09-16T17-43-14Z`) | `Dockerfile.minio` | Stand-in for the on-prem S3-compatible store. **Built here from source**, both `minio` and `mc`, through `GOPROXY`: no registry serves MinIO's images anonymously any more, and CI failed at `minio Pulling`. Each release is pinned as a tag *and* a Go module version. The first `docker compose up` builds it (~1.5 min). |
 | **dbt-core** | **1.8.7** | `Dockerfile.airflow` | Held back deliberately. It is what every DAG runs on and what has been validated; a bump needs a planned re-verification of both layers, not an opportunistic one. |
 | **dbt-spark** | **1.8.0** (`[PyHive]`) | `Dockerfile.airflow` | The only dbt adapter installed — see below. |
 | **astronomer-cosmos** | **1.15.1** | `Dockerfile.airflow` | Renders the dbt project into Airflow tasks. Installed `--no-deps`, and that is **not** an optimisation: installing it under Airflow's constraint file downgrades `typing_extensions` 4.16 -> 4.12, and dbt's `mashumaro` needs `evaluate_forward_ref` from 4.13+, so **every dbt invocation dies at import** — in dbt, not in cosmos, and not until something runs dbt. The image build now runs `dbt --version` as a smoke check so that can never ship silently again. |
@@ -282,7 +420,7 @@ DuckDB itself stays as a **read-only query tool** for analysts and developers
 (`scripts/duckdb_console.py`). The reasoning is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#engine-strategy-spark-runs-the-pipeline-duckdb-serves-people).
 
-Two version rules worth stating separately, because breaking either is quiet
+Version rules worth stating separately, because breaking any of them is quiet
 rather than loud:
 
 - **There are THREE jar versions in `.env`, not one, and the split is the
@@ -349,6 +487,7 @@ surprises you, not front to back.
 | Document | Read it for |
 |---|---|
 | [docs/TRANSPORT-CONTRACT.md](docs/TRANSPORT-CONTRACT.md) | Contract v2: what a producer hands off under `received/cob_date=…/source_system=…/<TransportID>/`, the `reporting_transport` reference publisher/CLI, and the local wrapper that calls it |
+| [docs/TRANSPORT-SOURCES.md](docs/TRANSPORT-SOURCES.md) | where the publisher reads from: local paths by default, or Kerberos SMB shares |
 | [docs/DELIVERY-CONTRACT.md](docs/DELIVERY-CONTRACT.md) | how a Transport becomes an immutable DeliveryManifest |
 | [docs/NORMALIZATION-CONTRACT.md](docs/NORMALIZATION-CONTRACT.md) | how a Delivery becomes a rebuildable NormalizationManifest v2 |
 | [docs/RAW-INGESTION-CONTRACT.md](docs/RAW-INGESTION-CONTRACT.md) | Spark ingestion into Iceberg `raw`, and the exact provenance columns |
@@ -361,6 +500,7 @@ surprises you, not front to back.
 | [docs/VALIDATION.md](docs/VALIDATION.md) | the three validation layers (delivery/raw controls, Spark ingestion, dbt tests) and `validation_result` evidence |
 | [docs/REGISTRY.md](docs/REGISTRY.md) | what was delivered, what was published, out of which inputs, under which code — and the as-at lifecycle that gates publication |
 | [docs/LINEAGE.md](docs/LINEAGE.md) | OpenLineage export and Marquez — opt-in, and why it is not an authority on what a run published |
+| [docs/STANDALONE-PIPELINE.md](docs/STANDALONE-PIPELINE.md) | the whole pipeline with no Airflow and no Spark cluster: the `runner` service, `PLATFORM_EXECUTION=embedded`, and pointing it at deployed stores |
 
 **Making a change**
 
@@ -377,9 +517,11 @@ surprises you, not front to back.
 | Document | Read it for |
 |---|---|
 | [docs/MONITORING.md](docs/MONITORING.md) | the six checks, what each one can and cannot see, and what a red one means |
+| [docs/OPERATIONAL-CONTROL-PLANE.md](docs/OPERATIONAL-CONTROL-PLANE.md) | COB Feed Status: for one COB date, which feeds were expected, arrived, are processing, completed, failed or are missing. It answers what a per-feed DAG list used to |
 | [docs/RETENTION.md](docs/RETENTION.md) | the two-stage delete model, why tags are data retention, policy config, and which namespaces have no policy yet |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | the five Iceberg procedures, ordering, metric-driven triggering |
 | [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | what changes on promotion, and the three things that genuinely differ |
+| [docs/PACKAGING.md](docs/PACKAGING.md) | the components in `components.yml`, one wheel each, the release image and the Helm chart in `deploy/helm/` |
 
 **Migration / compatibility**
 
@@ -389,6 +531,7 @@ surprises you, not front to back.
 | [docs/DELIVERY-SHAPES.md](docs/DELIVERY-SHAPES.md) | zips, control files and legacy filenames — the current Transport shapes and the legacy inbox conformance gate |
 | [docs/DELIVERY-WALKTHROUGHS.md](docs/DELIVERY-WALKTHROUGHS.md) | four worked examples of the legacy inbox/landing conformance path |
 | [docs/INGESTION-BASELINE.md](docs/INGESTION-BASELINE.md) | Phase 0 baseline captured before the Transport path existed — migration/compatibility evidence, not current architecture |
+| [docs/FEED-ONBOARDING-REMEDIATION.md](docs/FEED-ONBOARDING-REMEDIATION.md) | a point-in-time review (2026-09-17) of the feed console's sample-driven onboarding, and its remediation plan. Not living architecture |
 
 **Reference**
 
@@ -396,7 +539,7 @@ surprises you, not front to back.
 |---|---|
 | **[docs/DECISIONS.md](docs/DECISIONS.md)** | **why the code is shaped the way it is — an anchored decision log, almost all of it learned by running the stack and reading what it actually said**, with superseded entries marked as such rather than deleted |
 | [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | what every `REQ-nnn` cited in the code and tests actually requires, where it is implemented and what proves it |
-| [docs/OPENSHIFT-MAPPING.md](docs/OPENSHIFT-MAPPING.md) | (also listed under Operations) |
+| [docs/todo/](docs/todo/README.md) | known defects and gaps, one file each, with how each was verified |
 
 **Also**
 
@@ -409,57 +552,82 @@ surprises you, not front to back.
 ## Layout
 
 ```
-docker-compose.yml        MinIO, Nessie, Postgres, Spark, Airflow, the feed
-                          console, the watchdog; Marquez behind a profile
-.env                      the three jar versions -- see Component versions
+docker-compose.yml        MinIO, Nessie, Postgres, Spark, Airflow, the inbox
+                          watcher, feed console, notebook and watchdog;
+                          `runner` behind the standalone profile, Marquez
+                          behind the lineage profile
+Dockerfile.*              airflow (dev + release targets), spark, minio (built
+                          from source), marquez-api/-web (built on UBI)
+.env                      jar versions, host ports, Marquez version -- see
+                          Component versions
+conf/spark-defaults.conf  only what is the same in every environment
+components.yml            which module belongs to which shipped component;
+                          enforced by tests/test_components.py
+deploy/helm/              the chart, with values-{dev,uat,prod,local-k8s}.yaml
 reporting_platform/       the platform library (NOT named `platform` -- that
                           shadows a Python stdlib module)
   config/
-    feeds.yml             feed registry -- adding a feed edits only this
+    feeds/                the feed registry: _defaults.yml -> conventions/ ->
+                          one <feed>.yml per feed. `python -m
+                          reporting_platform.config check` validates it
     retention.yml         retention policy + classes, per environment
     maintenance.yml       maintenance thresholds
-  common/                 config loading and resolution, Spark session, Nessie
-                          REST client, COB-date keep-set calculation
-  ingest/                 transport.py/delivery.py/normalization.py (current
-                          Transport/Delivery/Normalization v2 path),
+  common/                 settings.py (endpoints), context.py (config loading
+                          and resolution), spark.py, nessie.py, spark_task.py
+                          (the ONLY Spark launcher), COB-date calendar rules
+  ingest/                 transport.py/delivery.py/normalization.py +
+                          transport_steps.py (Transport path),
                           conform.py/inbox.py/normalize.py (legacy inbox
                           conformance gate, Ready v1), ingest_feed.py (Spark
-                          raw write, shared by both), migrate_raw.py
+                          raw write, shared by both), steps.py (snapshot tag,
+                          drift report), control.py, migrate_raw.py
+  transform/              wap.py -- write-audit-publish: open branch, publish
+                          (evidence -> inputs -> lifecycle gate -> merge ->
+                          tags -> versions), fail and keep the branch
+  pipeline/               the standalone runner's CLI: glue over the ingest
+                          and transform entry points, not a third copy
   registry/               Postgres `platform`: what was delivered, what was
                           published, out of which inputs, and the as-at
                           lifecycle -- docs/REGISTRY.md. validation.py records
-                          Phase 7 validation_result evidence.
+                          validation_result evidence; transports.py the
+                          Transport receipt
   migration/              Phase 8 dual-run migration: correlation, comparison
                           strategies, evidence, acceptance -- docs/MIGRATION.md
-  monitoring/             the six checks that run outside what they watch --
-                          gaps, lateness, evidence, reproducibility, watchdog
+  monitoring/             checks that run outside what they watch --
+                          completeness, lateness, evidence, reproducibility,
+                          watchdog -- plus feed_status.py (COB Feed Status)
   lineage/                OpenLineage export + column classification. Off by
                           default -- docs/LINEAGE.md
   retention/              branch/tag/row/snapshot/orphan expiry, in order,
                           plus the landing, ready and quarantine sweeps
   maintenance/            metric-driven compaction, manifests, deletes
-  ui/                     the feed console on :8082 -- legacy-path onboarding
-                          form, scaffold, sample data, job runner, Arrivals
+  ui/                     the feed console on :8082 -- onboarding form,
+                          scaffold, sample data, job runner, Arrivals,
+                          COB Status
 airflow/dags/
   transport_watch.py      fast path -- one deferrable sensor on received/,
                           not one per feed
   transport_ingest.py     ONE generic DAG: validate_transport ->
                           create_delivery -> normalize_delivery -> ingest_raw
+                          -> report_drift -> record_snapshot
   transport_reconcile.py  evidence-driven recovery for anything transport_watch
                           missed, every 20 minutes
+  _transport_trigger.py   the one way both of the above trigger a run
   migration_reconcile.py  Phase 8: compares new-path output against the legacy
                           estate for feeds in migration.mode: dual_run
-  feed_ingest.py          LEGACY: one DAG per feed, generated from feeds.yml
+  feed_ingest.py          LEGACY: one ingest_<feed> DAG per feed
   dbt_builds.py           asset-triggered prepared and reporting builds;
                           the dbt tasks inside them are rendered by Cosmos
   platform_housekeeping.py  nightly maintenance, then retention, then the
                           reproducibility check
 dbt/
-  models/                 raw sources, prepared, reporting, exposures
+  models/                 raw sources, prepared, reporting, exposures (the
+                          reports)
   macros/                 engine.sql (engine-specific SQL, known_as_of,
-                          dedupe_rank, provenance), naming.sql (schema
-                          routing -- removing it moves every table reference)
-docs/                     see Documentation, above
+                          dedupe_rank, provenance), scd2.sql, merge.sql,
+                          naming.sql (schema routing -- removing it moves
+                          every table reference)
+docs/                     see Documentation, above; docs/todo/ is the backlog
 reporting_transport/      the reference S3 Transport producer -- contract.py
                           (versioned wire contract, pure Python, no boto3),
                           storage.py (StorageConfig, standard boto3 credential
@@ -470,17 +638,22 @@ reporting_transport/      the reference S3 Transport producer -- contract.py
                           environment installs and invokes just this package.
                           docs/TRANSPORT-CONTRACT.md
 scripts/
-  generate_feeds.py       sample feed generator
-  land_feeds.py           landing helper
-  bulk_ingest.py          ingest everything pending, in subprocess batches
-  _ingest_chunk.py        one batch within a single JVM
-  _spark_task.py          the subprocess EVERY Spark job in an Airflow task
-                          goes through, or the JVM zombie-reaps the task
-  _open_build_branch.py   open a throwaway Nessie build branch for a manual
-                          write-audit-publish test
-  duckdb_console.py       read-only query tool against published `main`
+  generate_feeds.py       sample feed generator (`--clean` for a seed that
+                          passes its tests)
   simulate_dcm_transport.py  thin local wrapper over
                           reporting_transport.publisher, for MinIO
+  land_feeds.py           legacy landing helper
+  bulk_ingest.py          ingest everything pending, in subprocess batches
+  _spark_task.py          shim over common/spark_task.py
+  _open_build_branch.py   open a throwaway Nessie build branch for a manual
+                          write-audit-publish test
+  spark-sql               spark-sql with the catalog configured (a bare
+                          spark-sql in spark-master no longer knows it)
+  duckdb_console.py       read-only query tool against published `main`
+  check_dag_imports.py    Airflow's own DagBag over every DAG file (CI parse tier)
+  build_components.py     one wheel per component; --check imports each
+  ci_build_tier.sh        exactly what CI's build tier runs
+  release_image.sh, k8s_smoke.sh   release image; local-k8s smoke test
 tests/                    config-level tests; no stack, no pytest
 spike/                    closed spikes, kept for their findings
 ```
@@ -579,12 +752,11 @@ docker compose logs -f airflow | grep -m1 "Airflow is ready"
 
 Airflow: http://localhost:8081 (`admin` / `admin`). Spark: http://localhost:8080.
 
-Create the pool that serialises lakehouse writes. This is not optional —
-`remove_orphan_files` running concurrently with a write corrupts the table:
-
-```bash
-docker compose exec airflow airflow pools set lakehouse_write 1 "serialise all Iceberg writers, incl. maintenance"
-```
+`airflow-init` has already created `lakehouse_write`, the pool that
+serialises lakehouse writes. It is not optional:
+`remove_orphan_files` running concurrently with a write corrupts the table.
+Confirm it exists with
+`docker compose exec -T airflow airflow pools list -o plain`.
 
 **One pool, not two.** Ingest, dbt builds and nightly maintenance all contend
 for this single slot. An earlier version created a second `iceberg_maintenance`
@@ -655,10 +827,14 @@ docker compose exec spark-master /opt/platform/scripts/spark-sql -e \
    GROUP BY 1,2 ORDER BY 2"
 ```
 
-Both versions are present. Nothing was overwritten. The `prepared` layer picks
-the latest version (see `dedupe_rank` in `dbt/macros/engine.sql`), and retention
-removes superseded versions later, after a grace period. This is the behaviour
-the legacy `stg` truncate-and-load could not give you.
+Both versions are present. Nothing was overwritten. The `prepared` layer reads
+only the newest delivery for each COB date (see `dedupe_rank` in
+`dbt/macros/engine.sql`). For a `full_snapshot` feed that delivery restates
+the whole date, so a key the `_v2` file omits is absent from `prepared`.
+**Nothing sweeps the older version.** It stays in `raw` for as long as its
+COB date is in the table keep-set, and in `landing/` for the feed's retention
+class. That is deliberate: "what did they send us first?" is usually the
+question being asked. The legacy `stg` truncate-and-load could not answer it.
 
 ## 7. Load the rest
 
@@ -669,7 +845,7 @@ docker compose exec airflow python -m scripts.land_feeds --source /opt/platform/
 Then either trigger the ingest DAGs from the Airflow UI, or loop:
 
 ```bash
-for f in counterparty rating trade; do
+for f in ref_counterparty ref_rating fo_trade; do
   docker compose exec -T airflow python - <<PY
 from reporting_platform.common.context import feed
 from reporting_platform.ingest.arrival import find_pending
@@ -704,14 +880,16 @@ docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profi
 In PowerShell the capture is `$branch = (docker compose exec -T airflow python
 -m scripts._open_build_branch).Trim()`.
 
-**The tests will fail, and that is the point of the exercise.** The generator
-injected a trade referencing `CP99999`, which is absent from the counterparty
-feed, and an unparseable notional. You should see:
+**The tests will fail, and that is the point of the exercise.** The default
+seed injects a trade referencing `CP99999`, which is absent from the
+counterparty feed, and an unparseable notional. (`generate_feeds.py --clean`
+makes a seed without them, for when you need a build that publishes.) You
+should see:
 
-- `relationships` failing on `trade.counterparty_id`
-- `not_null` failing on `trade.notional`
+- `relationships` failing on `fo_trade.counterparty_id`
+- `not_null` failing on `fo_trade.notional`
 
-In the legacy chain the first would have been an the legacy ETL tool lookup failure that
+In the legacy chain the first would have been a legacy ETL lookup failure that
 aborted the load, and the second a conversion error. Here the data landed, the
 test failed, and the build stayed on its branch — `main` still holds the last
 good state. Nobody saw a wrong number. Leaving that branch unmerged *is* the
@@ -746,10 +924,11 @@ the specific thing the legacy reporting estate cannot do today, and the
 reason the metadata-catalog gap in the PoC is worth closing with dbt's manifest
 rather than a separate register.
 
-```bash
-docker compose exec airflow dbt docs generate --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
-docker compose exec airflow dbt docs serve --project-dir /opt/platform/dbt --port 8082
-```
+`dbt docs generate` writes the catalog and lineage graph to
+`/opt/platform/run/dbt/target` (`make lineage` runs it). No host port is
+published for `dbt docs serve`: 8082 is the feed console and 8083 the
+notebook. For a browsable cross-system lineage graph use Marquez instead
+([docs/LINEAGE.md](docs/LINEAGE.md)).
 
 ## 10. Publish, then look at the day-over-day report
 
@@ -868,12 +1047,19 @@ docker compose exec -T watchdog python -m reporting_platform.monitoring.watchdog
 curl -s http://localhost:19120/api/v2/trees | python3 -m json.tool | grep published
 ```
 
-Every publication tagged `main`. Query as at a tag:
+A reporting build that merges tags `main` once per report, as
+`published/<report>/<as_at>/<run_id>`. A report is a dbt exposure, such as
+`counterparty_exposure_report`. Each ingest also leaves a
+`snapshot/<feed>/<cob_date>/<run_id>` tag. Query as at a tag:
 
 ```bash
 docker compose exec spark-master /opt/platform/scripts/spark-sql -e \
-  "SELECT count(*) FROM lakehouse.reporting.\`counterparty_exposure@published/2026-08-13/<run_id>\`"
+  "SELECT count(*) FROM lakehouse.reporting.\`counterparty_exposure@published/counterparty_exposure_report/2026-08-13/<run_id>\`"
 ```
+
+Only a build that ran through `reporting_build` (section 14) or
+`python -m reporting_platform.transform` cuts these tags. The hand merge in
+section 10 does not. `registry versions` lists what was published.
 
 This is the answer to "what exactly did we publish on the 5th" — a question
 that currently requires restoring a the legacy RDBMS backup.
@@ -916,7 +1102,7 @@ a file arrives — so unpausing them starts nothing on a timer.
 `platform_housekeeping` is nightly at 22:00.
 
 You do **not** need to create the write pool by hand any more. `airflow-init`
-runs `airflow pools set lakehouse_write 1` on every `docker compose up`, along
+runs `airflow pools set lakehouse_write ${LAKEHOUSE_WRITE_SLOTS:-1}` on every `docker compose up`, along
 with `dbt deps`. Both were manual steps whose omission broke the platform
 *silently*: no pool meant every task sat `queued` forever with nothing
 anywhere saying why, and no `dbt_packages` now means `prepared_build` and
@@ -1040,6 +1226,7 @@ make retention-dry
 |---|---|
 | `make env` | Create .env from the template |
 | `make up` | Start the whole local stack |
+| `make release-image` | Build the release image (code baked in) and write release.env. `IMAGE=<ref>` |
 | `make test` | Config-level tests (no stack needed, ~1s). See tests/README.md |
 | `make down` | Stop the stack, keep volumes |
 | `make nuke` | **Stop and destroy all data** — `down -v`, every volume gone |
@@ -1084,24 +1271,20 @@ what it does and does not prove:
   boundary this replaces DFS/SFTP delivery with. **The legacy path's `landing`
   arrival is still a prefix poll / inbox conformance gate**, which stands in
   for the DFS/SFTP problem that path never solved.
-- **Was not tested end-to-end by the original author, and wasn't working when
-  first run for real.** It has since been brought up against a live stack and
-  eleven genuine defects found and fixed — wrong Nessie API request shapes, a
-  JVM heap leak in bulk ingest, missing dbt/Spark catalog wiring, two
-  cross-engine SQL portability bugs, a schema-naming mismatch, and a retention
-  bug that deleted in-flight build branches. Every one was found by running the
-  thing, not by reading it.
-
-  **Validated now:** ingest (144 seed files, 30,680 rows), the prepared layer,
-  the reporting layer, and retention in dry-run.
-  **Not validated:** any DAG run through Airflow's actual scheduler,
-  `maintenance.py`, retention for real, and publishing a build to `main`.
-  **Known open defect:** the two Airflow pools do not mutually exclude, so
-  maintenance can overlap a write.
-
-  The docs above describe the design; run it to see what it does —
-  read it before trusting any claim in this file. `CLAUDE.md` is the
-  orientation for picking the work up fresh.
+- **Only as proven as its last run.** The original version was never run
+  end to end, and it did not work when it first was. Everything since has
+  been brought up against a live stack, and the defects that turned up are
+  recorded in [docs/DECISIONS.md](docs/DECISIONS.md), almost all of them
+  found by running the thing rather than reading it. The standing proof is
+  now CI's **build tier** (see [Where it runs](#where-it-runs)). It ingests a
+  clean seed with `bulk_ingest`, runs `dbt build` on a branch, and merges to
+  that stack's `main` only if the build is clean. **It does not go through
+  the Airflow scheduler or `transform/wap.py`'s publish.** The asset cascade,
+  the lifecycle gate and the `published/` tags are proven by running them on
+  a stack (section 14), not by CI. Nothing in CI deploys in Kubernetes mode
+  either. That is the manual local-k8s smoke test (`scripts/k8s_smoke.sh`). Known open defects are in
+  [docs/todo/](docs/todo/README.md). `CLAUDE.md` is the orientation for
+  picking the work up fresh.
 - **No serving-layer export.** The Postgres `serving` database is created but
   nothing writes to it. (The `platform` database is no longer idle — the
   delivery registry writes there; see `docs/DECISIONS.md#the-registry-records-observations-not-verdicts`.) The PoC's DuckDB→pyodbc→the legacy RDBMS export would slot in
