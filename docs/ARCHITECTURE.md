@@ -317,19 +317,110 @@ summarises it.
 
 ## Nessie: write-audit-publish
 
-Every ingest and every dbt build runs on a **branch**, not on `main`.
+Every ingest and every dbt build runs on a **branch**, not on `main`, and
+publication is a merge that happens only if the work on the branch passed.
 
-```
-main ────────────●────────────────────●──────────►
-                 ▲                    ▲
-                 │ merge (if tests    │ merge
-                 │        pass)       │
-  ingest/trade/2026-08-11/r7 ──●      │
-                                      │
-  build/prepared/2026-08-11/r7 ───●───●
+### The ref graph
+
+What `curl -s http://localhost:19120/api/v2/trees` lists is this graph's
+refs: `main`, working branches, and tags. One COB date, 2026-08-13, processed
+the next morning:
+
+```mermaid
+%%{init: {"gitGraph": {"mainBranchName": "main"}, "themeVariables": {"tagLabelFontSize": "9px", "commitLabelFontSize": "10px"}}}%%
+gitGraph
+    commit id: "main"
+    branch "ingest/fo_trade/2026-08-13/-14T060211.4083120000-a1"
+    commit id: "append raw.fo_trade"
+    checkout main
+    merge "ingest/fo_trade/2026-08-13/-14T060211.4083120000-a1" id: "merge fo_trade" tag: "snapshot/fo_trade/2026-08-13/-14T060211.4083120000-a1"
+    branch "build/prepared/2026-08-14/dataset-triggered-2026-08-14T06-04-30-11"
+    commit id: "prepared.fo_trade"
+    commit id: "prepared.ref_counterparty"
+    commit id: "prepared.ref_rating, then dbt_test FAILS" type: REVERSE
+    checkout main
+    branch "ingest/ref_counterparty/2026-08-13/-14T063052.7719040000-a1"
+    commit id: "append; merge refused 409" type: REVERSE
+    checkout main
+    branch "ingest/ref_counterparty/2026-08-13/-14T063052.7719040000-a2"
+    commit id: "append raw.ref_counterparty"
+    checkout main
+    merge "ingest/ref_counterparty/2026-08-13/-14T063052.7719040000-a2" id: "merge ref_counterparty" tag: "snapshot/ref_counterparty/2026-08-13/-14T063052.7719040000-a2"
+    branch "build/prepared/2026-08-14/dataset-triggered-2026-08-14T06-33-02-54"
+    commit id: "prepared.fo_trade "
+    commit id: "prepared.ref_counterparty "
+    commit id: "prepared.ref_rating, dbt_test passes"
+    checkout main
+    merge "build/prepared/2026-08-14/dataset-triggered-2026-08-14T06-33-02-54" id: "publish(prepared): 2026-08-13"
+    branch "build/reporting/2026-08-14/dataset-triggered-2026-08-14T06-41-18-90"
+    commit id: "reporting.counterparty_exposure"
+    commit id: "reporting.exposure_by_country"
+    commit id: "reporting.exposure_change"
+    commit id: "reporting.qa_happy_position_summary, dbt_test passes"
+    checkout main
+    merge "build/reporting/2026-08-14/dataset-triggered-2026-08-14T06-41-18-90" id: "publish(reporting): 2026-08-13" tag: "published/{counterparty_exposure_report,country_exposure_dashboard}/2026-08-13/reporting-dataset-triggered-2026-08-14T06-41-18-90"
 ```
 
-Branch naming: `<purpose>/<scope>/<cob_date>/<run_id>`.
+Read left to right:
+
+1. **An ingest** (`fo_trade`) cuts `ingest/<feed>/<cob_date>/<run>-a<n>` from
+   `main`, appends to `raw.<feed>` on it, merges, and **deletes the branch**.
+   It then tags `snapshot/<feed>/<cob_date>/<run>-a<n>` on **the commit its
+   own merge made** (`resultantTargetHash`), never on whatever `main`'s head
+   is by the time the tag is cut
+   ([DECISIONS.md#a-snapshot-tag-names-its-merge-commit](DECISIONS.md#a-snapshot-tag-names-its-merge-commit)).
+2. **A failed build** (`prepared`, triggered by that ingest) writes one
+   commit per model onto `build/prepared/<utc date>/<run slug>`, then
+   `dbt_test` fails. There is no merge: `main` does not move, and the branch
+   is **kept** for diagnosis.
+3. **A retried ingest** (`ref_counterparty`). Attempt 1 appended and then
+   failed transiently (here, Nessie refused the merge with a 409). Its `-a1`
+   branch is **kept**. Airflow's retry is attempt 2, which cuts its own
+   `-a2` branch from `main`. Reusing `-a1` would die on the 409 of the name
+   that is already there, and would inherit rows attempt 1 appended. `-a2`
+   merges, is deleted, and is the one tagged. A *refusal*, a failure the same
+   input reproduces, is not retried at all
+   ([DECISIONS.md#a-refusal-is-not-retried](DECISIONS.md#a-refusal-is-not-retried)).
+4. **A passing prepared build** (triggered by the second ingest) merges as
+   `publish(prepared): <cob_date> run <run key>`. It cuts **no** tag, because
+   a prepared build is not a publication.
+5. **A reporting build** (triggered by `prepared`) merges, and only then
+   tags `published/<report>/<as_at>/<run key>`, **once per report**. A report
+   is a dbt exposure. With two exposures that is two tags on the one commit.
+   They are cut from `main`'s head just after the merge. That head is the
+   merge commit only while nothing else merges in between. In Airflow the
+   `lakehouse_write` pool guarantees that at its default of one slot.
+   Nothing guarantees it outside Airflow (todo 45).
+   `gitGraph` in the Mermaid version GitHub renders cannot draw two tags on
+   one commit, so the label abbreviates them. The two refs are
+   `published/counterparty_exposure_report/2026-08-13/reporting-dataset-triggered-2026-08-14T06-41-18-90`
+   and
+   `published/country_exposure_dashboard/2026-08-13/reporting-dataset-triggered-2026-08-14T06-41-18-90`.
+
+**Merged branches are deleted, and failed ones are kept.** `gitGraph` cannot
+draw a deletion, so every branch above is drawn to its end. In the catalog
+after this morning, only the two failed ones still exist: `ingest/…-a1` and
+the first `build/prepared/…`. Retention sweeps abandoned working branches by
+the age of their head commit: `ingest/*` after **48 h** and `build/*` after
+**120 h** (`retention.yml` → `references.working_branches.abandoned_after_hours`).
+Renaming a branch into `hold/` exempts it. **Tags are not working refs.**
+`snapshot/` tags are kept for `references.snapshot_tags` (7 years locally),
+and `published/` tags for `references.published_tags`, which is sized in
+years because a published tag is how long that run can still be read
+([DECISIONS.md#published-tags-are-the-reproducibility-window](DECISIONS.md#published-tags-are-the-reproducibility-window)).
+
+The names, and the code that makes each one:
+
+| Ref | Pattern | Made by |
+|---|---|---|
+| ingest branch | `ingest/<feed>/<cob_date>/<run>-a<n>` | `context.branch_name("ingest", …)` in `ingest_feed.py`. The run id is `context.ingest_attempt_id(airflow_run_id, try_number)`: the **last 21 characters** of the Airflow run id with `:` and `+` removed, then `-a<try>`. That is why a `manual__…` run reads `-14T060211.4083120000-a1`. |
+| build branch | `build/<purpose>/<utc date>/<slug>` | `transform/wap.branch_name`. `<purpose>` is `prepared` or `reporting`, the date is the day the build **opened** (UTC), not the COB date, and the slug is the Airflow run id with non-alphanumerics collapsed to `-`, truncated to 40. A retry of the same Airflow run **reuses** the branch (`exist_ok`), unlike an ingest. |
+| run key | `<purpose>-<slug>` | `wap.run_key(branch)`: the registry's run id, and the last segment of a published tag. |
+| snapshot tag | `snapshot/<feed>/<cob_date>/<run>-a<n>` | `context.snapshot_tag`, from `ingest/steps.record_snapshot` |
+| published tag | `published/<report>/<as_at>/<run key>` | `context.published_tag`, from `wap.publish`, where `<as_at>` is the input set's newest COB date |
+
+Other prefixes exist and are none of the above: `migrate/<feed>/<date>/<run>`
+(`ingest.migrate_raw`), and `hold/…`, which a person makes by renaming.
 
 This gives us three things the legacy RDBMS never did cheaply:
 
@@ -340,9 +431,10 @@ This gives us three things the legacy RDBMS never did cheaply:
 3. **Reproducibility.** A report can be re-run "as at" a Nessie commit hash, so
    a regulator question about a figure published on a given date is answerable.
 
-Tags are cut on `main` after each successful publication:
-`published/<cob_date>/<run_id>`. Retention of *tags* is what determines
-how far back you can time-travel, and is a separate policy from row retention.
+Tags are cut on `main` after each successful ingest (`snapshot/…`) and
+reporting publication (`published/…`), as drawn above. Retention of *tags* is
+what determines how far back you can time-travel, and is a separate policy
+from row retention.
 
 ---
 

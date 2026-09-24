@@ -24,10 +24,11 @@ than worked.
 | [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
 | [26](26-tests-run-on-a-host-fails-without-reporting-config-dir.md) | `python -m tests.run` on a host fails 12 tests unless `REPORTING_CONFIG_DIR` is set | medium | 1 hour |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
-| [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
 | [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
 | [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
+| [45](45-published-tags-are-cut-at-mains-head.md) | A reporting publication tags `main`'s head, not the commit its merge made | medium | 1–2 hours |
+| [46](46-ingest-attempt-id-slices-mid-token.md) | `ingest_attempt_id` cuts the Airflow run id mid-token (`-14T060211.4083120000-a1`) | low | 1 hour |
 
 ## Where to start
 
@@ -48,8 +49,11 @@ every other feed publishing until the new one first delivers. It needs a
 decision before code, and the item lays out the three options.
 
 **25–31** were found reviewing the README on 2026-09-24. 25–27 are bugs,
-reproduced before they were written down. 28–31 are diagrams, independent of
+reproduced before they were written down. 29–31 are diagrams, independent of
 each other and of everything else.
+
+**45–46** were found drawing todo 28's ref graph. 45 is reasoned from the
+code and says so. Reproduce it first.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
@@ -58,6 +62,37 @@ first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**28, write-audit-publish as a Nessie commit graph.** `docs/ARCHITECTURE.md`
+now has a `### The ref graph` subsection under "Nessie: write-audit-publish".
+It holds a Mermaid `gitGraph` of one COB date: two ingests (`fo_trade`, and
+`ref_counterparty` with a kept `-a1` and a merged `-a2`), each tagged
+`snapshot/…` on its merge commit; a `build/prepared/…` that fails
+`dbt_test` and is kept with `main` unmoved; a passing prepared build (no
+tag); and a `build/reporting/…` merged and tagged `published/…` once per
+exposure. The caption covers deletion (merged branches are deleted, and failed
+ones are kept), the 48 h / 120 h sweep, `hold/`, and the snapshot and
+published tag windows. Below it is a table of every ref pattern and the
+function that makes it. The README's write-audit-publish section links to it.
+The ASCII sketch it replaced was removed, along with two claims in it. It
+gave one naming scheme for every branch, but build branches are
+`build/<purpose>/<utc date>/<slug>`, not `<cob_date>/<run_id>`. It also
+said tags were `published/<cob_date>/<run_id>`, which is the retired shape
+that ingests used to cut.
+*Verified.* Every example name was produced by calling the code
+(`context.branch_name`, `ingest_attempt_id`, `snapshot_tag`,
+`published_tag`, `wap.branch_name`, `wap.run_key`) on realistic Airflow run
+ids. The exposure names are from `dbt/models/reporting/_reporting.yml`. The
+shapes match the live catalog's refs (read-only `api/v2/trees`). The block,
+extracted from the committed file, renders with mermaid-cli 11 and 10.
+`python -m tests.run`: 1000 passed.
+*What the item got wrong.* It asked for two `published/` tags on one
+commit. `gitGraph` has supported that since Mermaid 11, but Mermaid 10
+refuses the second `tag:` with a parse error. Because GitHub's renderer
+version is not known, the merge carries one abbreviated
+`published/{a,b}/…` label, and the caption names both refs in full. The
+GitHub render is still to be checked on the PR. Drawing it found todo 45 and
+todo 46.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the

@@ -187,6 +187,12 @@ cuts a different tag, `snapshot/{feed}/{cob_date}/{run_id}`, on the commit its
 own merge made. An ingest is not a publication. Only a reporting build cuts
 `published/…`, and a **report** is a dbt *exposure*, not a model.
 
+The same flow drawn as what it leaves in the catalog, with branches, merges
+and tags, is the ref graph in
+[ARCHITECTURE.md#the-ref-graph](docs/ARCHITECTURE.md#the-ref-graph). Start
+there if you are reading `curl -s http://localhost:19120/api/v2/trees`. It
+shows which branches outlive their build, and which tags last for years.
+
 Three things this buys that the legacy RDBMS never did cheaply: **atomic multi-table
 publication** (a nine-table refresh is one merge, so consumers never see a
 half-built mart), **rollback** (reset `main` to the prior commit — the data
