@@ -413,14 +413,113 @@ def reconcile_schema(df, fd) -> tuple:
 
 def next_file_version(spark, fd, cob_date: date,
                       table: str | None = None) -> int:
+    """The version to give a new delivery of `cob_date`: MAX(_file_version)+1.
+
+    No fallback on a read failure, deliberately. The one call site (`ingest`,
+    below) runs this straight after `ensure_raw_table` and `ensure_raw_schema`
+    have already created and reconciled `table` ON THIS BRANCH, so by the
+    time this runs, ANY failure reading it -- `TABLE_OR_VIEW_NOT_FOUND`
+    included -- means a wrong ref or a wrong table name, never "this COB date
+    has never been delivered". Swallowing that here used to return `1`, tying
+    with (or losing to, per `dedupe_rank`'s newest-`_file_version` rule) a
+    version that already exists for the date: a subject that could not be
+    READ reported as a subject that is EMPTY (CLAUDE.md). The genuinely empty
+    case is already handled correctly, inside the query, by
+    `COALESCE(MAX(_file_version), 0)`.
+
+    A future caller that can run BEFORE the table exists is not this one, and
+    has to decide its own answer for "no table yet" -- this function does not
+    try to tell that case apart from an unreadable one.
+    """
+    resolved = table or fd.raw_table
     try:
         row = spark.sql(
-            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {table or fd.raw_table} "
+            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {resolved} "
             f"WHERE _cob_date = DATE '{cob_date:%Y-%m-%d}'"
         ).collect()[0]
-        return int(row["v"]) + 1
-    except Exception:
-        return 1
+    except Exception as e:
+        raise RuntimeError(
+            f"{fd.name}: could not read _file_version from {resolved} for "
+            f"cob_date {cob_date:%Y-%m-%d}: {e}"
+        ) from e
+    return int(row["v"]) + 1
+
+
+def _content_key(table: str) -> str:
+    """Nessie's content-key spelling of a fully-qualified table name:
+    `lakehouse.raw.fo_trade` -> `raw.fo_trade`. The catalog is not part of
+    the key Nessie reports a conflict on, so it has to come off before a
+    conflict message is checked for it."""
+    return table.split(".", 1)[1] if "." in table else table
+
+
+def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
+                         version: int) -> dict:
+    """Merge `branch` into main; turn a per-key merge conflict into a message
+    that says what happened and what to do, instead of a bare 409.
+
+    Nessie's v2 merge applies its NORMAL per-content-key merge behaviour, and
+    `Nessie.merge` sends no override of it (no `defaultKeyMergeMode` /
+    `keyMergeModes` in the request body -- pinned by
+    tests/test_nessie_merge.py). That NORMAL behaviour, not the
+    `lakehouse_write` pool, is what actually keeps two concurrent ingests of
+    one COB date from both landing under the same `_file_version`: if another
+    commit touched `fd.raw_table` on `main` since `branch` was cut, THIS merge
+    is refused -- 409 REFERENCE_CONFLICT, one entry in `details` naming the
+    key -- rather than silently applied over it. Measured live: two branches
+    cut from one base both computed `_file_version=2` for one COB date; the
+    first merge applied, the second 409'd with exactly this shape. See
+    docs/DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique.
+
+    REFERENCE_CONFLICT is not exclusively "another write raced this one" --
+    Nessie also returns it for a moved/recreated reference or "No common
+    ancestor", neither of which is a version race. So the conflicting-write
+    story is told only when Nessie's OWN message names this table's content
+    key (`raw.fo_trade` for `lakehouse.raw.fo_trade`, via `_content_key`);
+    otherwise the message is quoted VERBATIM and no claim is made about the
+    cause.
+
+    A conflict is TRANSIENT, so this raises a plain `RuntimeError`, never
+    `spark_task.Refused`: the same delivery on a fresh branch cut from the
+    new `main` re-reads `MAX(_file_version)` -- now counting the write that
+    won -- and merges cleanly. On the DAG path that is the next automatic
+    attempt, which `context.ingest_attempt_id` gives a branch of its own; a
+    CLI or `scripts.bulk_ingest` run is re-run by hand, and gets a new run
+    id and so a new branch. `branch` is left for inspection either way, as
+    every failed ingest's is.
+    """
+    import requests
+
+    try:
+        return nessie.merge(branch, into="main")
+    except requests.exceptions.HTTPError as e:
+        resp = getattr(e, "response", None)
+        body = {}
+        if resp is not None:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+        if (resp is not None and getattr(resp, "status_code", None) == 409
+                and body.get("errorCode") == "REFERENCE_CONFLICT"):
+            nessie_message = body.get("message", "")
+            if _content_key(fd.raw_table) in nessie_message:
+                cause = (f" That means another write to {fd.raw_table} "
+                         f"merged into main since {branch} was cut.")
+            else:
+                cause = (" The conflict does not name this table's key, so "
+                         "no claim is made about the cause -- treat this as "
+                         "a genuine merge failure, not a version race.")
+            raise RuntimeError(
+                f"{fd.name} {bdate}: merge of {branch} into main refused "
+                f"(409 REFERENCE_CONFLICT) while landing "
+                f"_file_version={version} into {fd.raw_table}. Nessie said: "
+                f"{nessie_message!r}.{cause} Nothing reached main. A retry "
+                f"cuts a fresh branch from main and re-reads the version; "
+                f"outside Airflow, re-run the ingest. Branch {branch} is "
+                f"left for inspection."
+            ) from e
+        raise
 
 
 def already_ingested_delivery(spark, fd, delivery_id: str,
@@ -1034,7 +1133,8 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             # name. `main`'s head is that commit only until the next merge
             # lands, and the tag is cut later, outside the write pool.
             # See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
-            commit = nessie.merge(branch, into="main").get("resultantTargetHash")
+            commit = _merge_ingest_branch(
+                nessie, branch, fd, bdate, version).get("resultantTargetHash")
             nessie.delete_reference(branch)
             log.info("merged %s into main at %s and deleted branch", branch,
                      (commit or "?")[:12])

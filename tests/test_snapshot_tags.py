@@ -100,8 +100,12 @@ def test_the_ingest_returns_the_commit_its_merge_made():
     from reporting_platform.ingest import ingest_feed
 
     source = inspect.getsource(ingest_feed._ingest_manifest)
-    assert ('commit = nessie.merge(branch, into="main").get("resultantTargetHash")'
-            in source)
+    # Through `_merge_ingest_branch`, which returns the merge response whole.
+    assert ("commit = _merge_ingest_branch(\n"
+            "                nessie, branch, fd, bdate, version)"
+            '.get("resultantTargetHash")' in source)
+    merge = inspect.getsource(ingest_feed._merge_ingest_branch)
+    assert 'return nessie.merge(branch, into="main")' in merge
     assert '"commit": commit,' in source
     assert '"commit": None,' in source          # the already-ingested result
 
