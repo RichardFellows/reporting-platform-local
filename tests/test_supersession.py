@@ -88,6 +88,24 @@ def _prepared_models() -> list[pathlib.Path]:
     return sorted(MODELS.glob("*.sql"))
 
 
+SCD2_MACRO = REPO / "dbt" / "macros" / "scd2.sql"
+
+
+def _calls(text: str, construct: str) -> bool:
+    """Whether a model calls `construct`, itself or through scd2_prepared().
+
+    The SCD2 models are one scd2_prepared() call each, and the macro calls
+    known_as_of() and dedupe_rank() for them -- which test_the_scd2_macro_
+    carries_both below pins, so this cannot pass for a macro that stopped."""
+    return construct in text or "scd2_prepared(" in text
+
+
+def test_the_scd2_macro_carries_both():
+    macro = SCD2_MACRO.read_text(encoding="utf-8")
+    assert "known_as_of()" in macro
+    assert "dedupe_rank(" in macro
+
+
 def test_every_prepared_model_filters_on_knowledge_time():
     """The as-of predicate is a WHERE clause, so it has to be AT each call
     site -- there is no macro every model already calls that could carry it
@@ -95,7 +113,7 @@ def test_every_prepared_model_filters_on_knowledge_time():
     path at all). A model that omits it silently returns everything, whatever
     knowledge_time says."""
     missing = [p.name for p in _prepared_models()
-               if "known_as_of()" not in p.read_text(encoding="utf-8")]
+               if not _calls(p.read_text(encoding="utf-8"), "known_as_of()")]
     assert not missing, f"prepared models with no as-of filter: {missing}"
 
 
@@ -104,7 +122,7 @@ def test_every_prepared_model_resolves_supersession_through_the_macro():
     the copy-pasted CAST in the reporting layer is the precedent."""
     for path in _prepared_models():
         text = path.read_text(encoding="utf-8")
-        assert "dedupe_rank(" in text, path.name
+        assert _calls(text, "dedupe_rank("), path.name
         assert "row_number() over" not in text.lower().replace(
             "{{ dedupe_rank", ""), path.name
 

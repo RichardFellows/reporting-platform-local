@@ -9,6 +9,7 @@
     python -m reporting_platform.registry runs [--purpose reporting]
     python -m reporting_platform.registry versions [--report NAME]
     python -m reporting_platform.registry inputs --run-id RUN
+    python -m reporting_platform.registry trace --report NAME --as-at DATE --version N
     python -m reporting_platform.registry submissions
     python -m reporting_platform.registry state [--report NAME] [--as-at DATE]
     python -m reporting_platform.registry lock --report NAME --as-at DATE \
@@ -20,11 +21,14 @@
         [--from N] [--to N]
     python -m reporting_platform.registry submit --destination D --by WHO \
         --version report:2026-08-01:3 [--version ...] [--family NAME]
+    python -m reporting_platform.registry validation delivery DELIVERY_ID [--feed F]
+    python -m reporting_platform.registry validation transport TRANSPORT_ID
+    python -m reporting_platform.registry validation run RUN_ID
 
 No Spark in this CLI: everything it reaches is boto3, json and psycopg2, so it
-runs in the task process rather than through `scripts/_spark_task.py`. The one
+runs in the task process rather than through `common/spark_task.py`. The one
 Spark-using module in the package, `registry/inputs.py`, is deliberately not
-wired in here -- it is invoked as `scripts._spark_task run-inputs <branch>`,
+wired in here -- it is invoked as `spark_task run-inputs <branch>`,
 like every other Spark caller in this repo.
 """
 from __future__ import annotations
@@ -39,7 +43,7 @@ from datetime import date
 from reporting_platform.common.context import feed as get_feed
 from reporting_platform.common.context import feeds
 from reporting_platform.registry import (
-    db, deliveries, lifecycle, rejections, runs,
+    db, deliveries, lifecycle, rejections, runs, validation,
 )
 
 
@@ -87,6 +91,12 @@ def main(argv=None) -> int:
     ip = sub.add_parser("inputs", help="the deliveries one run read")
     ip.add_argument("--run-id", required=True)
 
+    tr = sub.add_parser("trace", help="trace a report version to source evidence")
+    tr.add_argument("--report", required=True)
+    tr.add_argument("--as-at", required=True, dest="as_at",
+                    type=lambda s: date.fromisoformat(s))
+    tr.add_argument("--version", required=True, type=int)
+
     sub.add_parser("submissions", help="recorded submissions")
 
     # ------------------------------------------------------ the lifecycle
@@ -128,6 +138,20 @@ def main(argv=None) -> int:
     df.add_argument("--from", dest="from_version", type=int)
     df.add_argument("--to", dest="to_version", type=int)
 
+    # -------------------------------------------------- validation evidence
+    # Phase 7. `delivery`/`transport` look up by DeliveryID/TransportID,
+    # spanning all three layers a Delivery ever touches; `run` looks up
+    # dbt-layer results by `registry.run.run_id`.
+    va = sub.add_parser("validation", help="durable validation execution evidence")
+    va_sub = va.add_subparsers(dest="validation_command", required=True)
+    va_d = va_sub.add_parser("delivery", help="validation results for one Delivery")
+    va_d.add_argument("delivery_id")
+    va_d.add_argument("--feed")
+    va_t = va_sub.add_parser("transport", help="validation results for one Transport")
+    va_t.add_argument("transport_id")
+    va_r = va_sub.add_parser("run", help="dbt-layer validation results for one run")
+    va_r.add_argument("run_id")
+
     sb = sub.add_parser("submit", help="record that versions were submitted")
     sb.add_argument("--destination", required=True)
     sb.add_argument("--by", required=True, dest="submitted_by")
@@ -151,6 +175,23 @@ def main(argv=None) -> int:
         return 0
     if a.command == "inputs":
         print(json.dumps(runs.inputs_for_run(a.run_id), indent=2, default=str))
+        return 0
+    if a.command == "trace":
+        try:
+            out = runs.trace_version(a.report, a.as_at, a.version)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    if a.command == "validation":
+        if a.validation_command == "delivery":
+            out = validation.for_delivery(a.delivery_id, a.feed)
+        elif a.validation_command == "transport":
+            out = validation.for_transport(a.transport_id)
+        else:
+            out = validation.for_run(a.run_id)
+        print(json.dumps(out, indent=2, default=str))
         return 0
     if a.command == "submissions":
         print(json.dumps(runs.submissions(), indent=2, default=str))

@@ -51,3 +51,11 @@ var/
 
 # Windows/msys crash dumps
 *.stackdump
+release.env
+
+# Fetched Helm dependencies (`helm dependency update`) -- Chart.lock pins the
+# exact version; the tarball itself is fetched from the repo, not committed.
+deploy/helm/reporting-platform/charts/
+
+# scripts/build_components.py output
+dist/

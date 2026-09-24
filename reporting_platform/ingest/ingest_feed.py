@@ -27,15 +27,58 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
+import re
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timezone
+from reporting_platform.common.parsing import feed_format
 
+from reporting_platform.common import settings
+from reporting_platform.common.spark_task import Refused
 from reporting_platform.common.context import (
     CATALOG, Nessie, branch_name, feed as get_feed, new_run_id, spark_session,
 )
 
 log = logging.getLogger("ingest")
+
+
+class IngestValidationError(Refused, ValueError):
+    """A blocking Raw check failed: the delivery is wrong, not the run.
+
+    Retrying reads the same bytes and fails the same check, so this is a
+    `Refused` -- the DAG fails once with this message. It used to be a plain
+    ValueError, and the retry that followed died on the branch this attempt
+    left behind, so the last error on the task was a Nessie 409 rather than
+    the checksum. A ValueError still, for every caller that caught one.
+    """
+
+
+_DELIVERY_ID = re.compile(r"dlv_[0-9a-f]{32}")
+
+
+def _record_raw_check(*, control_id: str, fd, manifest: dict, run_id: str,
+                      attempt_key: str, severity: str, outcome: str,
+                      expected_value, observed_value,
+                      message: str | None = None) -> None:
+    """Durable evidence for one Raw ingestion control (Phase 7).
+
+    Called for BOTH the passing and the failing case, right next to the check
+    itself -- so a PASS is exactly as durable as a FAIL, and the values
+    compared are the ones this delivery actually had, not today's config.
+    Best-effort: a registry outage must not turn a successful, already-decided
+    check into a failed ingest. See `registry/validation.py`.
+    """
+    from reporting_platform.registry import validation
+
+    validation.record_quietly(
+        layer="raw", control_id=control_id, control_name=control_id,
+        outcome=outcome, severity=severity, attempt_key=attempt_key,
+        run_id=None, execution_ref=run_id, feed=fd.name,
+        delivery_id=manifest.get("delivery_id"),
+        evidence_ref=manifest.get("source_object"),
+        expected_value=expected_value, observed_value=observed_value,
+        message=message,
+    )
 
 
 def _at_branch(table: str, branch: str | None) -> str:
@@ -96,7 +139,7 @@ def _delivery_md5(manifest: dict) -> str:
 
 
 def _landing_uri(object_key: str) -> str:
-    bucket = os.environ.get("REPORTING_LANDING", "s3a://lakehouse/landing")
+    bucket = settings.landing()
     root = bucket.rsplit("/", 1)[0] if bucket.endswith("/landing") else bucket
     return f"{root}/{object_key}" if not object_key.startswith("s3a://") else object_key
 
@@ -117,9 +160,9 @@ def ensure_raw_namespace(spark, fd) -> None:
 #
 #   _delivery_id     which delivery, joinable to `registry.delivery` on
 #                    (feed, delivery_id). Not `_source_file`, which is the
-#                    PART -- for an archive those differ, and
-#                    `already_ingested` depends on `_source_file` staying the
-#                    part, so the delivery needed a column of its own.
+#                    PART -- for an archive those differ. Legacy v1 pending
+#                    detection uses that part; v2 ingestion is ledgered by
+#                    this DeliveryID instead.
 #   _received_at     when it arrived, which is not `_ingest_ts`: a delivery
 #                    landed Friday and ingested Monday has two timestamps.
 #   _schema_version  the declared column contract it was read against.
@@ -275,22 +318,53 @@ def ensure_raw_schema(spark, table: str, fd) -> dict[str, list]:
 
 
 def read_landing(spark, fmt: dict, uri: str):
-    """Read the CSV with every column as string, permissively.
+    """Read strings with the recorded contract; old manifests keep their defaults.
 
     `fmt` comes from the delivery's MANIFEST, not from feeds.yml, so an ingest
     is reproducible: what delimiter a delivery was actually read with is
     recorded next to it rather than inferred from whatever the config says
     today. See ingest/normalize.py.
     """
-    return (
+    from reporting_platform.common.parsing import csv_rows, spark_encoding
+    if fmt.get("parser_contract", 1) not in (1, 2):
+        raise ValueError(f"unsupported CSV parser contract {fmt['parser_contract']!r}")
+    if fmt.get("parser_contract", 1) >= 2:
+        # Java's CSV decoder can replace bad bytes even in FAILFAST mode.
+        # Validate the original bytes before giving them to that reader.
+        from urllib.parse import urlsplit
+        from pathlib import Path
+        from reporting_platform.ingest.arrival import _client
+        location = urlsplit(uri)
+        if location.scheme in ("s3", "s3a"):
+            body = _client().get_object(Bucket=location.netloc,
+                                        Key=location.path.lstrip("/"))["Body"]
+            try:
+                data = body.read()
+            finally:
+                body.close()
+        elif location.scheme in ("", "file"):
+            data = Path(location.path if location.scheme else uri).read_bytes()
+        else:
+            raise ValueError(f"strict CSV validation does not support {location.scheme!r}")
+        for _ in csv_rows(data, fmt, source=uri):
+            pass
+    reader = (
         spark.read.option("header", str(fmt["header"]).lower())
         .option("sep", fmt["delimiter"])
         .option("quote", fmt["quote_char"])
-        .option("encoding", fmt["encoding"])
-        .option("mode", "PERMISSIVE")
+        .option("encoding", spark_encoding(fmt["encoding"]))
+        .option("escape", fmt.get("escape_char", "\\"))
+        .option("multiLine", str(fmt.get("multiline", False)).lower())
+        .option("mode", "FAILFAST" if fmt.get("parser_contract", 1) >= 2 else "PERMISSIVE")
         .option("inferSchema", "false")
-        .csv(uri)
+        .option("nullValue", "")
+        .option("emptyValue", "")
     )
+    if not fmt["header"] and fmt.get("columns"):
+        from pyspark.sql.types import StringType, StructField, StructType
+        reader = reader.schema(StructType([StructField(name, StringType(), True)
+                                          for name in fmt["columns"]]))
+    return reader.csv(uri)
 
 
 def reconcile_schema(df, fd) -> tuple:
@@ -339,14 +413,310 @@ def reconcile_schema(df, fd) -> tuple:
 
 def next_file_version(spark, fd, cob_date: date,
                       table: str | None = None) -> int:
+    """The version to give a new delivery of `cob_date`: MAX(_file_version)+1.
+
+    No fallback on a read failure, deliberately. The one call site (`ingest`,
+    below) runs this straight after `ensure_raw_table` and `ensure_raw_schema`
+    have already created and reconciled `table` ON THIS BRANCH, so by the
+    time this runs, ANY failure reading it -- `TABLE_OR_VIEW_NOT_FOUND`
+    included -- means a wrong ref or a wrong table name, never "this COB date
+    has never been delivered". Swallowing that here used to return `1`, tying
+    with (or losing to, per `dedupe_rank`'s newest-`_file_version` rule) a
+    version that already exists for the date: a subject that could not be
+    READ reported as a subject that is EMPTY (CLAUDE.md). The genuinely empty
+    case is already handled correctly, inside the query, by
+    `COALESCE(MAX(_file_version), 0)`.
+
+    A future caller that can run BEFORE the table exists is not this one, and
+    has to decide its own answer for "no table yet" -- this function does not
+    try to tell that case apart from an unreadable one.
+    """
+    resolved = table or fd.raw_table
     try:
         row = spark.sql(
-            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {table or fd.raw_table} "
+            f"SELECT COALESCE(MAX(_file_version), 0) AS v FROM {resolved} "
             f"WHERE _cob_date = DATE '{cob_date:%Y-%m-%d}'"
         ).collect()[0]
-        return int(row["v"]) + 1
-    except Exception:
-        return 1
+    except Exception as e:
+        raise RuntimeError(
+            f"{fd.name}: could not read _file_version from {resolved} for "
+            f"cob_date {cob_date:%Y-%m-%d}: {e}"
+        ) from e
+    return int(row["v"]) + 1
+
+
+def _content_key(table: str) -> str:
+    """Nessie's content-key spelling of a fully-qualified table name:
+    `lakehouse.raw.fo_trade` -> `raw.fo_trade`. The catalog is not part of
+    the key Nessie reports a conflict on, so it has to come off before a
+    conflict message is checked for it."""
+    return table.split(".", 1)[1] if "." in table else table
+
+
+def _merge_ingest_branch(nessie: Nessie, branch: str, fd, bdate: date,
+                         version: int) -> dict:
+    """Merge `branch` into main; turn a per-key merge conflict into a message
+    that says what happened and what to do, instead of a bare 409.
+
+    Nessie's v2 merge applies its NORMAL per-content-key merge behaviour, and
+    `Nessie.merge` sends no override of it (no `defaultKeyMergeMode` /
+    `keyMergeModes` in the request body -- pinned by
+    tests/test_nessie_merge.py). That NORMAL behaviour, not the
+    `lakehouse_write` pool, is what actually keeps two concurrent ingests of
+    one COB date from both landing under the same `_file_version`: if another
+    commit touched `fd.raw_table` on `main` since `branch` was cut, THIS merge
+    is refused -- 409 REFERENCE_CONFLICT, one entry in `details` naming the
+    key -- rather than silently applied over it. Measured live: two branches
+    cut from one base both computed `_file_version=2` for one COB date; the
+    first merge applied, the second 409'd with exactly this shape. See
+    docs/DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique.
+
+    REFERENCE_CONFLICT is not exclusively "another write raced this one" --
+    Nessie also returns it for a moved/recreated reference or "No common
+    ancestor", neither of which is a version race. So the conflicting-write
+    story is told only when Nessie's OWN message names this table's content
+    key (`raw.fo_trade` for `lakehouse.raw.fo_trade`, via `_content_key`);
+    otherwise the message is quoted VERBATIM and no claim is made about the
+    cause.
+
+    A conflict is TRANSIENT, so this raises a plain `RuntimeError`, never
+    `spark_task.Refused`: the same delivery on a fresh branch cut from the
+    new `main` re-reads `MAX(_file_version)` -- now counting the write that
+    won -- and merges cleanly. On the DAG path that is the next automatic
+    attempt, which `context.ingest_attempt_id` gives a branch of its own; a
+    CLI or `scripts.bulk_ingest` run is re-run by hand, and gets a new run
+    id and so a new branch. `branch` is left for inspection either way, as
+    every failed ingest's is.
+    """
+    import requests
+
+    try:
+        return nessie.merge(branch, into="main")
+    except requests.exceptions.HTTPError as e:
+        resp = getattr(e, "response", None)
+        body = {}
+        if resp is not None:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+        if (resp is not None and getattr(resp, "status_code", None) == 409
+                and body.get("errorCode") == "REFERENCE_CONFLICT"):
+            nessie_message = body.get("message", "")
+            if _content_key(fd.raw_table) in nessie_message:
+                cause = (f" That means another write to {fd.raw_table} "
+                         f"merged into main since {branch} was cut.")
+            else:
+                cause = (" The conflict does not name this table's key, so "
+                         "no claim is made about the cause -- treat this as "
+                         "a genuine merge failure, not a version race.")
+            raise RuntimeError(
+                f"{fd.name} {bdate}: merge of {branch} into main refused "
+                f"(409 REFERENCE_CONFLICT) while landing "
+                f"_file_version={version} into {fd.raw_table}. Nessie said: "
+                f"{nessie_message!r}.{cause} Nothing reached main. A retry "
+                f"cuts a fresh branch from main and re-reads the version; "
+                f"outside Airflow, re-run the ingest. Branch {branch} is "
+                f"left for inspection."
+            ) from e
+        raise
+
+
+def already_ingested_delivery(spark, fd, delivery_id: str,
+                                table: str | None = None) -> bool:
+    """Whether Raw on ``main`` contains the accepted Delivery.
+
+    This is the v2 ledger.  It deliberately queries ``_delivery_id`` rather
+    than any physical part in ``_source_file``.  A failed branch write is not
+    visible on ``main`` and therefore remains eligible for retry.
+
+    Legacy Ready v1 continues to use :func:`arrival.already_ingested`, whose
+    part-key semantics are unchanged.
+    """
+    if not isinstance(delivery_id, str) or not _DELIVERY_ID.fullmatch(delivery_id):
+        raise ValueError(f"invalid opaque DeliveryID {delivery_id!r}")
+    target = table or fd.raw_table
+    if not spark.catalog.tableExists(target):
+        return False
+    # A chunked caller deliberately reuses one SparkSession across branch
+    # merges.  Spark can retain the pre-merge Iceberg metadata in that
+    # session; refresh before asking Raw to act as the ledger or an immediate
+    # retry can miss the commit it just made and append the Delivery twice.
+    spark.catalog.refreshTable(target)
+    columns = {name.lower() for name, _ in
+               spark.sql(f"SELECT * FROM {target} LIMIT 0").dtypes}
+    if "_delivery_id" not in columns:
+        return False
+    escaped = delivery_id.replace("'", "''")
+    rows = spark.sql(
+        f"SELECT 1 AS present FROM {target} "
+        f"WHERE _delivery_id = '{escaped}' LIMIT 1"
+    ).collect()
+    return bool(rows)
+
+
+def raw_delivered_ids(spark, fd, table: str | None = None) -> set[str]:
+    """Every ``_delivery_id`` Raw ``main`` already holds for this Feed.
+
+    A bulk sibling of :func:`already_ingested_delivery`, for a caller that
+    needs to know the state of MANY Deliveries -- Phase 6 reconciliation,
+    scanning candidates found by walking ``deliveries/`` in object storage.
+    One query per Feed rather than one per Delivery is what keeps that walk
+    from costing a Spark application per candidate: Raw is the only ledger
+    for v2 ingestion state (`docs/RAW-INGESTION-CONTRACT.md`), so there is no
+    cheaper index to ask instead.
+    """
+    target = table or fd.raw_table
+    if not spark.catalog.tableExists(target):
+        return set()
+    spark.catalog.refreshTable(target)
+    columns = {name.lower() for name, _ in
+               spark.sql(f"SELECT * FROM {target} LIMIT 0").dtypes}
+    if "_delivery_id" not in columns:
+        return set()
+    rows = spark.sql(
+        f"SELECT DISTINCT _delivery_id FROM {target} "
+        f"WHERE _delivery_id IS NOT NULL"
+    ).collect()
+    return {row["_delivery_id"] for row in rows}
+
+
+def committed_rows_from_raw(spark, fd, table: str | None = None) -> list[dict]:
+    """Every (delivery_id, cob_date, source_system, file_version, rows) Raw
+    `main` already holds for this Feed -- the BACKFILL source for
+    `registry.delivery_committed` (registry/db.py's header). A Delivery
+    ingested before that table existed committed just as durably; this is
+    how `python -m reporting_platform.common.spark_task reconcile-committed
+    <feed>` recovers that fact without re-ingesting anything. One bulk query, the same shape
+    as `raw_delivered_ids`.
+    """
+    target = table or fd.raw_table
+    if not spark.catalog.tableExists(target):
+        return []
+    spark.catalog.refreshTable(target)
+    columns = {name.lower() for name, _ in
+              spark.sql(f"SELECT * FROM {target} LIMIT 0").dtypes}
+    if "_delivery_id" not in columns:
+        return []
+    rows = spark.sql(
+        f"SELECT _delivery_id AS delivery_id, _cob_date AS cob_date, "
+        f"       _source_system AS source_system, "
+        f"       MAX(_file_version) AS file_version, COUNT(*) AS rows "
+        f"FROM {target} WHERE _delivery_id IS NOT NULL "
+        f"GROUP BY _delivery_id, _cob_date, _source_system"
+    ).collect()
+    return [{"delivery_id": r["delivery_id"], "cob_date": r["cob_date"],
+             "source_system": r["source_system"],
+             "file_version": r["file_version"], "rows": r["rows"]}
+            for r in rows]
+
+
+def _v2_feed_contract(fd, manifest: dict):
+    """Feed-shaped historical read contract captured in Normalization v2.
+
+    Table naming still comes from the registered Feed.  Values that decide
+    how the Delivery is parsed and validated come from immutable evidence.
+    The ``get`` fallbacks are solely for Phase-2/early-Phase-3 manifests that
+    predate the additive source/control snapshot; new manifests carry them.
+    """
+    contract = manifest.get("normalization_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("NormalizationManifest v2 has no normalization_contract")
+    columns = contract.get("columns")
+    source_columns = contract.get("source_columns")
+    if not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
+        raise ValueError("NormalizationManifest v2 contract has malformed columns")
+    if not isinstance(source_columns, dict):
+        raise ValueError("NormalizationManifest v2 contract has malformed source_columns")
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in source_columns.items()):
+        raise ValueError("NormalizationManifest v2 contract has malformed source_columns")
+    source_system = manifest.get("source_system", contract.get("source_system"))
+    if source_system is None:
+        source_system = fd.source_system
+    if not isinstance(source_system, str) or not source_system:
+        raise ValueError("NormalizationManifest v2 contract has malformed source_system")
+    expected_min_rows = contract.get("expected_min_rows", fd.expected_min_rows)
+    if type(expected_min_rows) is not int or expected_min_rows < 0:
+        raise ValueError(
+            "NormalizationManifest v2 contract has malformed expected_min_rows")
+    expected_max_rows = contract.get("expected_max_rows", fd.expected_max_rows)
+    if expected_max_rows is not None and (
+            type(expected_max_rows) is not int or expected_max_rows < 0):
+        raise ValueError(
+            "NormalizationManifest v2 contract has malformed expected_max_rows")
+    schema_drift = contract.get("schema_drift", fd.schema_drift)
+    if schema_drift not in ("warn", "fail"):
+        raise ValueError("NormalizationManifest v2 contract has malformed schema_drift")
+    if manifest.get("format") != contract.get("format"):
+        raise ValueError(
+            "NormalizationManifest v2 format conflicts with its frozen contract")
+    return replace(
+        fd,
+        columns=list(columns),
+        source_columns=dict(source_columns),
+        source_system=str(source_system),
+        expected_min_rows=expected_min_rows,
+        expected_max_rows=expected_max_rows,
+        schema_drift=schema_drift,
+    )
+
+
+def _canonical_v2_manifest(manifest: dict, key: str) -> dict:
+    """Validate and adapt explicit v2 names to the shared Raw machinery."""
+    if manifest.get("normalization_manifest_version") != 2:
+        raise ValueError(f"{key}: expected NormalizationManifest v2")
+    required = ("delivery_id", "feed", "business_date", "received_at",
+                "schema_version", "format", "parts", "normalization_contract")
+    missing = [name for name in required if name not in manifest]
+    if missing:
+        raise ValueError(f"{key}: missing v2 fields: {', '.join(missing)}")
+    if (not isinstance(manifest["delivery_id"], str)
+            or not _DELIVERY_ID.fullmatch(manifest["delivery_id"])):
+        raise ValueError(f"{key}: v2 delivery_id is not opaque")
+    if not isinstance(manifest["feed"], str) or not manifest["feed"]:
+        raise ValueError(f"{key}: v2 feed is malformed")
+    if not isinstance(manifest["schema_version"], str) or not manifest["schema_version"]:
+        raise ValueError(f"{key}: v2 schema_version is malformed")
+    if not isinstance(manifest["parts"], list):
+        raise ValueError(f"{key}: v2 parts are malformed")
+    if not all(isinstance(part, dict)
+               and isinstance(part.get("object_key"), str)
+               and part["object_key"] for part in manifest["parts"]):
+        raise ValueError(f"{key}: v2 part object_key is malformed")
+    return {**manifest, "cob_date": manifest["business_date"]}
+
+
+def _with_control_object(manifest: dict, *, client, bucket: str) -> dict:
+    """Name the control object(s) a v2 delivery's declarations came from.
+
+    The md5 and row-count refusals quote `control_object`, and a
+    NormalizationManifest v2 has no such field -- the message read "control
+    file None". It is not ADDED there: `normalize_delivery` accepts an
+    existing manifest only byte-identical, so a new field would make every
+    manifest already in `ready/` a conflict on its next re-normalize. The
+    DeliveryManifest already records each object's role, which is where
+    `registry.deliveries.observations_v2` reads it from too.
+
+    Only when something was declared, and never fatal: this is a label on an
+    error message, and a failure to read it must not become the error.
+    """
+    if manifest.get("control_object") or (
+            manifest.get("declared_md5") is None
+            and manifest.get("declared_row_count") is None):
+        return manifest
+    from reporting_platform.ingest import delivery as delivery_contract
+
+    try:
+        delivery = delivery_contract.read_delivery_manifest(
+            manifest["delivery_manifest"], client=client, bucket=bucket)
+    except Exception as exc:  # noqa: BLE001 - a label, see above
+        log.warning("cannot name the control object for %s: %s",
+                    manifest.get("delivery_id"), exc)
+        return manifest
+    controls = [item.object_key for item in delivery.source_files
+                if item.role == "control"]
+    return {**manifest, "control_object": ", ".join(controls) or None}
 
 
 def _bootstrap_main_if_empty(nessie: Nessie, fd, spark=None) -> None:
@@ -422,8 +792,7 @@ def resolve_delivery(fd, key: str, cob_date: date | None = None) -> dict:
                 "delivery_id": key.rsplit("/", 1)[-1], "received_at": None,
                 "source_object": key,
                 "parts": [{"object_key": key, "bytes": None}],
-                "format": {"delimiter": fd.delimiter, "quote_char": fd.quote_char,
-                           "header": fd.header, "encoding": fd.file_encoding},
+                "format": feed_format(fd),
                 "control_object": None, "declared_row_count": None,
                 "normalizer": "manual/v1",
             }
@@ -435,12 +804,48 @@ def resolve_delivery(fd, key: str, cob_date: date | None = None) -> dict:
 def ingest(feed_name: str, object_key: str, run_id: str | None = None,
            cob_date: date | None = None, dry_run: bool = False,
            spark=None) -> dict:
-    """Land one delivery into `raw` on its own Nessie branch, then merge.
+    """Legacy Ready v1/Landing ingestion, retained unchanged in Phase 4."""
+    fd = get_feed(feed_name)
+    manifest = resolve_delivery(fd, object_key, cob_date)
+    return _ingest_manifest(
+        fd, fd, manifest, object_key, run_id=run_id, dry_run=dry_run,
+        spark=spark, ledger="legacy_source_file")
+
+
+def ingest_normalized_delivery(normalization_manifest_key: str,
+                               run_id: str | None = None,
+                               dry_run: bool = False, spark=None) -> dict:
+    """Ingest one NormalizationManifest v2 without a Landing dependency.
+
+    The key is the complete caller contract: feed, DeliveryID, frozen business
+    identity, parser/schema contract, source system and physical parts are read
+    from the manifest.  Raw itself is the ingestion ledger, keyed by the opaque
+    DeliveryID.
+    """
+    from reporting_platform.ingest import arrival
+    from reporting_platform.ingest.normalization import read_normalization_manifest
+
+    manifest = read_normalization_manifest(
+        normalization_manifest_key, client=arrival._client(),  # noqa: SLF001
+        bucket=arrival._bucket())  # noqa: SLF001
+    manifest = _canonical_v2_manifest(manifest, normalization_manifest_key)
+    manifest = _with_control_object(
+        manifest, client=arrival._client(), bucket=arrival._bucket())  # noqa: SLF001
+    fd = get_feed(manifest["feed"])
+    contract_fd = _v2_feed_contract(fd, manifest)
+    return _ingest_manifest(
+        fd, contract_fd, manifest, normalization_manifest_key,
+        run_id=run_id, dry_run=dry_run, spark=spark, ledger="delivery_id")
+
+
+def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
+                     *, run_id: str | None, dry_run: bool, spark,
+                     ledger: str) -> dict:
+    """Shared branch/write/validate/merge implementation for explicit v1/v2.
 
     `object_key` is a MANIFEST key under `ready/`, or a landing object key --
-    see `resolve_delivery`. Everything after that point reads the manifest and
-    never the filename: the COB date, which objects hold the rows, and
-    the delimiter/quoting/encoding all come from it.
+    for v1 see `resolve_delivery`.  The v2 caller supplies an already-read
+    NormalizationManifest and never enters Landing.
 
     `spark` is an OPTIONAL session to reuse. Pass one when ingesting several
     files in a row -- `scripts/_ingest_chunk.py` does -- and the caller owns
@@ -457,10 +862,7 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     from pyspark.sql import functions as F
     from pyspark.sql.window import Window
 
-    fd = get_feed(feed_name)
     run_id = run_id or new_run_id()
-
-    manifest = resolve_delivery(fd, object_key, cob_date)
     bdate = date.fromisoformat(manifest["cob_date"])
     parts = manifest["parts"]
     if not parts:
@@ -490,30 +892,71 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
     # it always does.
     ensure_raw_namespace(spark, fd)
 
+    # The v2 no-op guard is inside the domain operation, not merely in a
+    # discovery queue.  It runs against main before a branch is cut, so an
+    # explicit retry cannot append the same Delivery twice.  A failed branch
+    # is invisible here and remains retryable.
+    if ledger == "delivery_id" and already_ingested_delivery(
+            spark, fd, manifest["delivery_id"]):
+        result = {
+            "feed": fd.name,
+            "cob_date": bdate.isoformat(),
+            "file_version": None,
+            "rows": 0,
+            "run_id": run_id,
+            "branch": None,
+            "source_file": parts[0]["object_key"],
+            "manifest": object_key,
+            "parts": len(parts),
+            "delivery_id": manifest["delivery_id"],
+            "schema_version": manifest["schema_version"],
+            "source_system": contract_fd.source_system,
+            "already_ingested": True,
+            # Nothing merged, so no commit of this run's to pin -- and
+            # `steps.record_snapshot` cuts no tag for it.
+            "commit": None,
+            "columns_added": [],
+            "columns_orphaned": [],
+            "missing_columns": [],
+            "extra_columns": [],
+            "asset_uri": fd.asset_uri,
+        }
+        # This IS a commit -- `already_ingested_delivery` only returns True
+        # for a Delivery Raw already holds -- so the fact belongs here too,
+        # not only on the fresh-write path below. `rows` is left unknown
+        # rather than re-counted: nothing downstream needs it enough to
+        # justify a Spark action on an idempotent no-op.
+        from reporting_platform.registry import deliveries as registry_deliveries
+        registry_deliveries.record_committed_quietly(
+            fd.name, manifest["delivery_id"], bdate, contract_fd.source_system,
+            None, run_id)
+        if owns_session:
+            spark.stop()
+        return result
+
     branch = branch_name("ingest", fd.name, bdate, run_id)
     nessie.create_branch(branch)
     log.info("created branch %s", branch)
 
     raw_at_branch = _at_branch(fd.raw_table, branch)
     try:
-        ensure_raw_table(spark, fd, raw_at_branch)
+        ensure_raw_table(spark, contract_fd, raw_at_branch)
         # ON THE BRANCH, like the CREATE above: a schema change is a commit,
         # and a commit against `main` outside the merge is what
         # write-audit-publish exists to prevent. If the ingest then fails the
         # branch is abandoned and the column was never added to main either.
-        schema = ensure_raw_schema(spark, raw_at_branch, fd)
+        schema = ensure_raw_schema(spark, raw_at_branch, contract_fd)
         version = next_file_version(spark, fd, bdate, raw_at_branch)
 
         # ONE DATAFRAME PER PART, each tagged with its OWN object key, then
-        # unioned. `_source_file` must be the object the rows actually came
-        # from -- `already_ingested` matches on it, so writing the manifest's
-        # key here would make every delivery look un-ingested forever. With
-        # `kind: file` there is exactly one part and it is the landing key.
+        # unioned. `_source_file` is physical provenance in both paths. Legacy
+        # pending detection also uses it as its ledger; v2 does not -- v2 uses
+        # the shared DeliveryID carried by every one of these part frames.
         frames, drift = [], {"missing_columns": [], "extra_columns": []}
         for part in parts:
             part_df = read_landing(spark, manifest["format"],
                                    _landing_uri(part["object_key"]))
-            part_df, part_drift = reconcile_schema(part_df, fd)
+            part_df, part_drift = reconcile_schema(part_df, contract_fd)
             frames.append(
                 part_df.withColumn("_source_file", F.lit(part["object_key"])))
             for k in drift:
@@ -533,14 +976,27 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         # column reads as "no value" rather than "never arrived" from then on.
         # A typo here would silently mean "warn", which is how this setting
         # managed to do nothing for so long. Reject anything unknown.
-        if fd.schema_drift not in ("warn", "fail"):
+        if contract_fd.schema_drift not in ("warn", "fail"):
             raise ValueError(
                 f"{fd.name}: schema_drift must be 'warn' or 'fail', got "
-                f"{fd.schema_drift!r}"
+                f"{contract_fd.schema_drift!r}"
             )
-        if fd.schema_drift == "fail" and (drift["missing_columns"]
-                                          or drift["extra_columns"]):
-            raise ValueError(
+        drifted = bool(drift["missing_columns"] or drift["extra_columns"])
+        attempt_key = f"{run_id}:{manifest['delivery_id']}"
+        _record_raw_check(
+            control_id="schema_drift", fd=fd, manifest=manifest,
+            run_id=run_id, attempt_key=attempt_key,
+            severity="blocking" if contract_fd.schema_drift == "fail" else "warn",
+            outcome=("FAIL" if drifted and contract_fd.schema_drift == "fail"
+                     else "WARN" if drifted else "PASS"),
+            expected_value="no drift",
+            observed_value=(f"missing={drift['missing_columns']} "
+                            f"extra={drift['extra_columns']}") if drifted else "none",
+            message=None if not drifted else
+            f"missing {drift['missing_columns']}, extra {drift['extra_columns']}",
+        )
+        if contract_fd.schema_drift == "fail" and drifted:
+            raise IngestValidationError(
                 f"{fd.name} {bdate}: schema drift with schema_drift=fail — "
                 f"missing {drift['missing_columns']}, "
                 f"extra {drift['extra_columns']}. Branch {branch} left for "
@@ -562,8 +1018,9 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
               .withColumn("_delivery_id", F.lit(manifest["delivery_id"]))
               .withColumn("_received_at",
                           F.lit(manifest.get("received_at")).cast("timestamp"))
-              .withColumn("_schema_version", F.lit(fd.schema_version))
-              .withColumn("_source_system", F.lit(fd.source_system))
+              .withColumn("_schema_version", F.lit(
+                  manifest.get("schema_version", contract_fd.schema_version)))
+              .withColumn("_source_system", F.lit(contract_fd.source_system))
         )
 
         # A column the table still has and `feeds.yml` no longer declares.
@@ -575,24 +1032,59 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
             df = df.withColumn(orphan, F.lit(None).cast(dtype))
 
         row_count = df.count()
-        if row_count < fd.expected_min_rows:
+        below_floor = row_count < contract_fd.expected_min_rows
+        _record_raw_check(
+            control_id="expected_min_rows", fd=fd, manifest=manifest,
+            run_id=run_id, attempt_key=attempt_key, severity="blocking",
+            outcome="FAIL" if below_floor else "PASS",
+            expected_value=f">= {contract_fd.expected_min_rows}",
+            observed_value=row_count,
+        )
+        if below_floor:
             # Abandon the branch: main is untouched, nothing to roll back.
-            raise ValueError(
+            raise IngestValidationError(
                 f"{fd.name} {bdate}: {row_count} rows, below expected minimum "
-                f"{fd.expected_min_rows}. Branch {branch} left for inspection."
+                f"{contract_fd.expected_min_rows}. Branch {branch} left for inspection."
             )
+
+        # The CEILING next to the floor. A platform expectation about the
+        # feed as a whole -- distinct from `declared_row_count` below, which
+        # is what THIS delivery's producer asserted. See docs/VALIDATION.md.
+        if contract_fd.expected_max_rows is not None:
+            above_ceiling = row_count > contract_fd.expected_max_rows
+            _record_raw_check(
+                control_id="expected_max_rows", fd=fd, manifest=manifest,
+                run_id=run_id, attempt_key=attempt_key, severity="blocking",
+                outcome="FAIL" if above_ceiling else "PASS",
+                expected_value=f"<= {contract_fd.expected_max_rows}",
+                observed_value=row_count,
+            )
+            if above_ceiling:
+                raise IngestValidationError(
+                    f"{fd.name} {bdate}: {row_count} rows, above expected "
+                    f"maximum {contract_fd.expected_max_rows}. Branch {branch} "
+                    f"left for inspection."
+                )
 
         # The EXACT count next to the floor above. expected_min_rows catches a
         # truncated file; a control file states what the sender counted, so
         # this is an equality check, not another floor. Only a feed with
         # `delivery.control.row_count` and a matching control file has one.
         declared = manifest.get("declared_row_count")
-        if declared is not None and row_count != declared:
-            raise ValueError(
-                f"{fd.name} {bdate}: {row_count} rows read, control file "
-                f"{manifest.get('control_object')} declared {declared}. "
-                f"Branch {branch} left for inspection; main is untouched."
+        if declared is not None:
+            mismatched = row_count != declared
+            _record_raw_check(
+                control_id="declared_row_count", fd=fd, manifest=manifest,
+                run_id=run_id, attempt_key=attempt_key, severity="blocking",
+                outcome="FAIL" if mismatched else "PASS",
+                expected_value=declared, observed_value=row_count,
             )
+            if mismatched:
+                raise IngestValidationError(
+                    f"{fd.name} {bdate}: {row_count} rows read, control file "
+                    f"{manifest.get('control_object')} declared {declared}. "
+                    f"Branch {branch} left for inspection; main is untouched."
+                )
 
         # The checksum, next to the count. It catches what the count cannot: a
         # delivery truncated or re-encoded in transit that still holds the
@@ -614,8 +1106,15 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         if declared_md5 is not None:
             hashed = _checksum_objects(manifest)
             actual_md5 = _delivery_md5(manifest)
-            if actual_md5 != declared_md5:
-                raise ValueError(
+            checksum_mismatch = actual_md5 != declared_md5
+            _record_raw_check(
+                control_id="declared_md5", fd=fd, manifest=manifest,
+                run_id=run_id, attempt_key=attempt_key, severity="blocking",
+                outcome="FAIL" if checksum_mismatch else "PASS",
+                expected_value=declared_md5, observed_value=actual_md5,
+            )
+            if checksum_mismatch:
+                raise IngestValidationError(
                     f"{fd.name} {bdate}: {', '.join(hashed)} hashes to "
                     f"{actual_md5}, control file "
                     f"{manifest.get('control_object')} declared "
@@ -625,13 +1124,20 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
                     f"inspection; main is untouched."
                 )
 
+        commit = None
         if dry_run:
             log.info("dry run: would append %s rows to %s", row_count, raw_at_branch)
         else:
             df.writeTo(raw_at_branch).append()
-            nessie.merge(branch, into="main")
+            # THE COMMIT THIS MERGE MADE, which is what a snapshot tag must
+            # name. `main`'s head is that commit only until the next merge
+            # lands, and the tag is cut later, outside the write pool.
+            # See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+            commit = _merge_ingest_branch(
+                nessie, branch, fd, bdate, version).get("resultantTargetHash")
             nessie.delete_reference(branch)
-            log.info("merged %s into main and deleted branch", branch)
+            log.info("merged %s into main at %s and deleted branch", branch,
+                     (commit or "?")[:12])
 
         result = {
             "feed": fd.name,
@@ -649,7 +1155,10 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
                          else None),
             "parts": len(parts),
             "delivery_id": manifest["delivery_id"],
-            "schema_version": fd.schema_version,
+            "schema_version": manifest.get("schema_version", contract_fd.schema_version),
+            "source_system": contract_fd.source_system,
+            "already_ingested": False,
+            "commit": commit,
             # What this ingest did to the TABLE, a different event from what
             # it found in the FILE (`missing_columns` / `extra_columns`
             # below). A contract change shows up here on the first delivery
@@ -662,6 +1171,13 @@ def ingest(feed_name: str, object_key: str, run_id: str | None = None,
         }
         if drift["missing_columns"] or drift["extra_columns"]:
             log.warning("schema drift on %s: %s", fd.name, json.dumps(drift))
+        # NOT under `dry_run`: a dry run never merged, so there is nothing to
+        # record as committed -- see registry/db.py's header on this table.
+        if not dry_run:
+            from reporting_platform.registry import deliveries as registry_deliveries
+            registry_deliveries.record_committed_quietly(
+                fd.name, manifest["delivery_id"], bdate, contract_fd.source_system,
+                row_count, run_id, file_version=version)
         return result
     finally:
         # Only if we made it. A caller that passed one in owns its lifetime.

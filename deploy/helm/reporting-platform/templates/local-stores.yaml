@@ -1,0 +1,217 @@
+{{- /*
+MinIO, Nessie and Postgres as plain Deployments, for `make k8s-smoke`
+(values-local-k8s.yaml) ONLY -- values.yaml's own comment on `localStores`:
+"Never on a shared cluster: they have no persistence worth the name."
+emptyDir everywhere is the point, not an oversight.
+
+Versions mirror docker-compose.yml / .env.example exactly, so a `k8s-smoke`
+divergence from the compose stack is never "which MinIO/Nessie build" --
+only the deployment shape (Deployment vs. plain container) differs. MinIO is
+the image compose builds from source (Dockerfile.minio), loaded into the
+cluster by `make k8s-smoke` like the platform's own: no registry serves
+MinIO's images anonymously any more (docs/DECISIONS.md#minio-is-built-from-source).
+
+NESSIE RUNS IN-MEMORY HERE, not JDBC-to-Postgres as compose does. Compose's
+JDBC store needs a fourth database (`nessie`) that this template does not
+create -- the plan asks for exactly two, `airflow` and `platform` -- so
+in-memory is the "whichever compose does" option that does not also require
+inventing a database list the plan does not ask for. It is a throwaway
+cluster: losing catalog history on a pod restart is an acceptable trade here
+that it would not be anywhere else.
+*/ -}}
+{{- if .Values.localStores.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-postgres-init
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+data:
+  # Only `platform` (POSTGRES_DB below) and `airflow` -- see the module
+  # docstring above for why not `nessie` too.
+  10-init.sql: |
+    CREATE DATABASE airflow;
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  # The subchart reads this one under `data.metadataSecretName` -- see
+  # values.yaml's comment on `airflow.data.metadataSecretName`.
+  name: {{ required "airflow.data.metadataSecretName is required" .Values.airflow.data.metadataSecretName }}
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  connection: postgresql://platform:platform@postgres:5432/airflow
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: local-stores
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: minio}
+  template:
+    metadata:
+      labels: {app: minio}
+    spec:
+      containers:
+        - name: minio
+          image: {{ required "localStores.minioImage is required for localStores" .Values.localStores.minioImage | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: {{ required "secrets.values.awsAccessKeyId is required for localStores" .Values.secrets.values.awsAccessKeyId | quote }}
+            - name: MINIO_ROOT_PASSWORD
+              value: {{ required "secrets.values.awsSecretAccessKey is required for localStores" .Values.secrets.values.awsSecretAccessKey | quote }}
+          ports:
+            - {name: api, containerPort: 9000}
+            - {name: console, containerPort: 9001}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: minio}
+  ports:
+    - {name: api, port: 9000, targetPort: api}
+    - {name: console, port: 9001, targetPort: console}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-minio-init
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+  annotations:
+    # After MinIO exists but before anything else needs the bucket -- the
+    # subchart's own migrate-database-job is weight 1 and platform-init is
+    # weight 2, so weight 0 puts this first.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # The bucket ONLY, no prefixes -- docker-compose.yml's minio-init has
+      # the long comment on why `landing/`/`warehouse/` are never created as
+      # folder-marker objects. Retried by Kubernetes (backoffLimit) rather
+      # than by a wait-for loop in the container, since MinIO's own readiness
+      # is not visible to a Job the way compose's healthcheck is.
+      containers:
+        - name: mc
+          # The same image: it carries `mc` too.
+          image: {{ required "localStores.minioImage is required for localStores" .Values.localStores.minioImage | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              mc alias set local http://minio:9000
+              "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" &&
+              mc mb --ignore-existing local/lakehouse
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ required "secrets.values.awsAccessKeyId is required for localStores" .Values.secrets.values.awsAccessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ required "secrets.values.awsSecretAccessKey is required for localStores" .Values.secrets.values.awsSecretAccessKey | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: local-stores
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - {name: POSTGRES_USER, value: platform}
+            - {name: POSTGRES_PASSWORD, value: platform}
+            - {name: POSTGRES_DB, value: platform}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: init
+          configMap:
+            name: {{ .Release.Name }}-postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: postgres}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nessie
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: local-stores
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: nessie}
+  template:
+    metadata:
+      labels: {app: nessie}
+    spec:
+      containers:
+        - name: nessie
+          # Kept equal to docker-compose.yml / .env.example's
+          # NESSIE_SERVER_VERSION -- see docs/DECISIONS.md#jar-versions.
+          image: ghcr.io/projectnessie/nessie:0.108.1
+          env:
+            - {name: "nessie.version.store.type", value: "IN_MEMORY"}
+          ports:
+            - {name: nessie, containerPort: 19120}
+          readinessProbe:
+            httpGet: {path: /api/v2/config, port: nessie}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nessie
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: nessie}
+  ports:
+    - {name: nessie, port: 19120, targetPort: nessie}
+{{- end }}

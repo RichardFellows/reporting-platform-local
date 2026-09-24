@@ -19,6 +19,13 @@ working one can only ever produce false alarms.
 Five of the six run inside `platform_housekeeping`. The sixth cannot, and that
 is the point of it.
 
+**A seventh thing lives beside these six and is not one of them.** COB
+Feed Status (`monitoring/feed_status.py`) answers "where is this feed right
+now" for an operator, for one COB date — it has no `--fail-on-*` flag and
+never runs inside `platform_housekeeping`, because it is a status view, not
+a pass/fail gate. See [`REGISTRY.md`](REGISTRY.md#the-operational-control-plane-cob-feed-status)
+and [`OPERATIONAL-CONTROL-PLANE.md`](OPERATIONAL-CONTROL-PLANE.md).
+
 ---
 
 ## Completeness

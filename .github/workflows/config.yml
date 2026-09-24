@@ -25,7 +25,7 @@
 # is the one thing `--columns` exits 1 on, and here it is UNREACHABLE: the
 # step would be a tick that cannot fail. `--require-derivable` inverts it into
 # a failure that can only ever mean "you have not built yet". Both belong to a
-# post-build tier, and there is not one.
+# post-build tier, which is build.yml.
 # See docs/DECISIONS.md#a-gate-that-cannot-fail
 name: config
 
@@ -74,7 +74,7 @@ jobs:
       - name: Install the config layer's dependencies
         run: |
           pip install --quiet \
-            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5" "jinja2==3.1.5"
+            pyyaml "ruamel.yaml==0.18.6" requests "duckdb==1.5.5" "jinja2==3.1.5" boto3
 
       # The registry has to load before anything else is worth asking. Its own
       # step rather than relying on the suite, so a broken feed file reports

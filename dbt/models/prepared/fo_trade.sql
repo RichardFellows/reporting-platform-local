@@ -29,22 +29,24 @@
   which report owns it.
 #}
 
+{% set output_columns = ['cob_date', 'trade_id', 'counterparty_id', 'book', 'product_type', 'currency', 'notional', 'mtm_value', 'trade_date', 'maturity_date'] %}
+
 with raw_rows as (
 
-    select
-        *,
-        {{ dedupe_rank(['trade_id']) }} as _rn
+    {#
+      EVERY raw row the window and the as-of filter admit, unranked. The
+      rank happens after cleaning, on the CLEANED key -- see `ranked_rows`.
+      Cleaning filters nothing, so dedupe_rank's newest delivery per date is
+      decided over the same rows it always was.
+    #}
+    select *
     from {{ source('raw', 'fo_trade') }}
     where {{ incremental_window('_cob_date', 'cob_date') }}
       and {{ known_as_of() }}
 
 ),
 
-deduped as (
-    select * from raw_rows where _rn = 1
-),
-
-typed as (
+cleaned as (
 
     select
         _cob_date                                         as cob_date,
@@ -65,9 +67,39 @@ typed as (
         _source_file                                      as source_file,
         _file_version                                      as source_file_version,
         {{ source_provenance() }}
-        {{ audit_columns() }}
+        {{ audit_columns() }},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number
 
-    from deduped
+    from raw_rows
+
+),
+
+ranked_rows as (
+
+    {#
+      THE IN-FILE DEDUPE IS ON THE CLEANED KEY. Ranked on the raw key, ' T1'
+      and 'T1' in one file were each "last in file", both survived, and
+      became two rows with one (cob_date, trade_id) -- which the uniqueness
+      test then refused, naming uniqueness rather than the padded key.
+    #}
+    select
+        *,
+        {{ dedupe_rank(['trade_id']) }} as _rn
+    from cleaned
+
+),
+
+deduped as (
+
+    select
+        {%- for c in prepared_output_columns(output_columns) %}
+        {{ ident(c) }}{{ ',' if not loop.last }}
+        {%- endfor %}
+    from ranked_rows
+    where _rn = 1
 
 )
 
@@ -78,4 +110,4 @@ select
         when maturity_date < cob_date then true
         else false
     end as is_matured
-from typed
+from deduped

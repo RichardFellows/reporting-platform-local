@@ -56,37 +56,18 @@ DEFAULT_ARGS = {"owner": "data-platform", "retries": 1,
 
 
 def _spark_subprocess(*args: str) -> dict:
-    """Run a Spark-using operation in a child process and parse its JSON.
+    """Run a Spark-using operation as its own driver and parse its JSON.
 
     Identical reasoning to feed_ingest.py: an in-process SparkSession keeps the
     JVM's non-daemon threads alive after the task callable returns, heartbeats
     stop, and the scheduler reaps the task as a zombie even though the work
-    succeeded. Both tasks below run Spark, so both need it.
+    succeeded. This used to be a private copy of the launcher; it is the
+    shared one now, so it follows PLATFORM_EXECUTION like every other DAG.
+    See docs/DECISIONS.md#execution-mode-is-configuration
     """
-    import json
-    import subprocess
-    import sys
+    from reporting_platform.common.spark_task import run
 
-    proc = subprocess.run(
-        [sys.executable, "-m", "scripts._spark_task", *args],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        # Head of the last traceback as well as the tail: a Py4JJavaError's Java
-        # stack pushes the exception MESSAGE off the front of a tail-only
-        # budget. See docs/DECISIONS.md#log-tail-plus-head
-        err = proc.stderr or ""
-        cut = err.rfind("Traceback (most recent call last)")
-        head = err[cut:cut + 2500] if cut >= 0 else ""
-        tail = ((proc.stdout or "")[-1500:] + "\n" + head
-                + "\n...\n" + err[-2000:])
-        raise RuntimeError(
-            f"spark task {args!r} failed (exit {proc.returncode})\n{tail}")
-    for line in reversed((proc.stdout or "").strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            return json.loads(line)
-    raise RuntimeError(f"spark task {args!r} produced no JSON")
+    return run(*args)
 
 
 @dag(
@@ -217,7 +198,7 @@ def platform_housekeeping():
         """Register every delivery object storage holds that has no row yet.
 
         NO SPARK, so it runs in the task process rather than through
-        `scripts/_spark_task.py` -- boto3, json and psycopg2 only.
+        `common/spark_task.py` -- boto3, json and psycopg2 only.
 
         BEFORE the evidence check below and after retention, and both halves
         matter. After, because the landing sweep may have removed deliveries

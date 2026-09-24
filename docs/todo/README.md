@@ -5,9 +5,7 @@ it**, what done looks like, and a prompt to paste into a new session.
 
 Everything here was found by working on the platform rather than by reading it.
 Each item file carries the date its "What is wrong" was last verified:
-12–19 on 2026-09-14 against `main` at `fdb0784`, 20–24 against `cea4500`, and
-15, 16 and 18 — the three that were written conditional on 09 merging — re-checked on
-2026-09-15 against `76bec9c`, after 09 merged. 21, and 22's `--full-refresh`
+12–19 on 2026-09-14 against `main` at `fdb0784`, and 20–24 against `cea4500`. 21, and 22's `--full-refresh`
 claim, are reasoned from the code and say so. If an item looks stale, run its verification command first — the
 platform moves, and an item that no longer reproduces should be deleted rather
 than worked.
@@ -18,27 +16,25 @@ than worked.
 | [12](12-inbox-one-shot-dry-run-says-empty.md) | One-shot `inbox --dry-run` prints `inbox empty` with a file in the inbox | medium | 1–2 hours |
 | [13](13-undated-file-sniff-prefills-an-unsaveable-form.md) | Sniffing an undated plain file pre-fills a form the loader refuses | low–medium | 1 hour |
 | [14](14-decisions-preamble-cites-a-missing-amended-block.md) | `DECISIONS.md`'s preamble cites an `Amended.` block that never existed | low | 15 min |
-| [15](15-next-file-version-reads-unreadable-as-version-1.md) | `next_file_version` treats an unreadable raw table as version 1 | high | 2–4 hours |
-| [16](16-exposure-change-removed-never-fires.md) | `exposure_change`'s `'REMOVED'` category can never be assigned | medium | ½ day |
-| [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does | low–medium | 30 min |
-| [18](18-adding-a-feed-sample-model-is-missing-macros.md) | The sample prepared model in `ADDING-A-FEED.md` misses `known_as_of()` and `source_provenance()` | low–medium | 30 min |
+| [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does (README fixed; docstring left) | low–medium | 15 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
-| [20](20-mutually-exclusive-ranges-refuses-one-day-versions.md) | `mutually_exclusive_ranges` refuses a correct one-day SCD2 version and passes a same-day overlap | high | 1–2 hours |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
-| [23](23-date-partitioned-models-rank-the-raw-key.md) | `fo_trade` and `ref_collateral` dedupe on the raw key, then clean it | low–medium | 1–2 hours |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
+| [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
+| [26](26-tests-run-on-a-host-fails-without-reporting-config-dir.md) | `python -m tests.run` on a host fails 12 tests unless `REPORTING_CONFIG_DIR` is set | medium | 1 hour |
+| [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
+| [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
+| [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
+| [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
+| [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
 
 ## Where to start
 
-**22 and 15 first**, in either order. **22** breaks both SCD2 builds on the
+**22 first.** It breaks both SCD2 builds on the
 first build after housekeeping first prunes raw — every key is touched every
 day, so not only keys that change — and nothing has pruned raw on this estate
-yet, which is the only reason it is green. **15**: under 09's decision
-the newest `_file_version` decides a whole COB date, and 15 is how a version
-gets mis-numbered. **20** is short and the SCD2 range test is currently wrong both
-ways — it fails correct one-day versions and passes same-day overlaps — so
-take it before relying on that test.
+yet, which is the only reason it is green.
 
 **07** is no longer blocked: 09 decided that `full_snapshot` selects the
 newest delivery per COB date, so 07's premise holds as written. It is
@@ -47,13 +43,93 @@ its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
 
-**12–24** were found working 08–10. 12–20, 23 and 24 were reproduced before
+**25** ranks with 22. Until it is fixed, onboarding any feed stops
+every other feed publishing until the new one first delivers. It needs a
+decision before code, and the item lays out the three options.
+
+**25–31** were found reviewing the README on 2026-09-24. 25–27 are bugs,
+reproduced before they were written down. 28–31 are diagrams, independent of
+each other and of everything else.
+
+**12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
 does after pruning) are reasoned from the code and say so — reproduce them
-first. **20–24** came out of 09's reviews and live runs. **16** and **18** describe models 09 changed, so re-read them
-against the current models before starting. The rest are independent.
+first. **21–24** came out of 09's reviews and live runs. The rest are
+independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**15, `next_file_version` read an unreadable raw table as version 1** — its
+`except Exception: return 1` is gone. Any read failure now raises, naming the
+feed, the table as addressed (ref included) and the COB date, and fails the
+ingest. `COALESCE(MAX(_file_version), 0)` was already answering the genuinely
+empty case, and the one call site runs after `ensure_raw_table` has created
+the table on the branch, so a missing table there is a wrong ref or name too.
+Reproduced on `main` first. Against the live catalog, `fo_trade` 2026-08-19
+correctly got 2, but a nonexistent ref and a nonexistent table both got **1**,
+tying with the delivery already there. `tests/test_next_file_version.py`
+failed on `main` ("an unreadable raw table returned a version instead of
+raising").
+*Concurrent ingests*: measured, not assumed. Two branches cut from one base
+both computed `_file_version=2`. The first merged, and Nessie refused the
+second with `409 REFERENCE_CONFLICT` naming `raw.fo_trade`: its default
+NORMAL per-key merge mode stops the tie from ever reaching `main`. The pool
+plays no part (`bulk_ingest` and the CLI never enter it). Written down as
+[`#a-merge-conflict-not-the-pool-keeps-file-version-unique`](../DECISIONS.md#a-merge-conflict-not-the-pool-keeps-file-version-unique),
+along with what would break it. `tests/test_nessie_merge.py` pins the merge
+body to an allowlist, so `defaultKeyMergeMode`, `keyMergeModes` and
+`returnConflictAsResult` stay out. `_merge_ingest_branch` turns the bare 409
+into a message naming the table, the version and the branch. It blames a
+concurrent write only when Nessie's own message names this table's key
+(`tests/test_merge_conflict.py`). The conflict is transient, so it is a plain
+`RuntimeError`, not a refusal. The next attempt cuts its own branch
+(`ingest_attempt_id`, merged since this branch began), re-reads the version
+and merges. `registry/db.py`'s header no longer credits the pool.
+*Verified live* with the branch's code in the airflow container, on
+throwaway refs (`probe/todo15/*`, deleted afterwards; `main` stayed at
+`523b887`). A wrong ref raised `could not read _file_version from
+lakehouse.raw.`fo_trade@no-such-branch` for cob_date 2026-08-19: Nessie ref
+'no-such-branch' does not exist`. Two branches each appended a row as
+`_file_version=2`. The first merged into the stand-in for `main`, and the
+second was refused with the new message. `python -m tests.run`: 1000 passed.
+*What the item got wrong.* It expected the two concurrent files to tie after
+merging. They never merge together.
+
+**20, the SCD2 range test refused correct one-day versions and passed
+same-day overlaps** — both `dbt_utils.mutually_exclusive_ranges` tests in
+`dbt/models/prepared/_prepared.yml` (`ref_counterparty`, `ref_rating`) now
+bound on the exclusive end, `upper_bound_column: date_add(effective_to, 1)`,
+with `gaps: not_allowed`. `effective_to` is inclusive, and dbt_utils'
+arithmetic assumes an exclusive end. The YAML comment says what the test
+catches (an overlap, including a same-day one, a zero- or negative-length
+range, and a gap) and what it does not (a missing or duplicate open version,
+which `scd2_exactly_one_current_version` owns). Before `gaps: not_allowed`
+was turned on, the change checked that nothing legitimately produces a gap.
+`scd2_effective_to` is contiguous by construction, a retraction reopens the
+version before it, and `apply_scd2_retention` deletes only `NOT is_current AND
+effective_to < cutoff`, so it removes a prefix of a key's history, never a
+middle version. `tests/test_scd2_range_test.py` reads the YAML and re-derives
+the macro's arithmetic in DuckDB over a one-day version, a same-day overlap,
+a gap and an open version. It failed on the old YAML.
+
+*Verified live* on a throwaway Nessie branch. `raw.ref_counterparty` and
+`raw.ref_rating` were created with ingest's own `ensure_raw_table` and
+`ensure_raw_schema` and seeded with SQL. Both models were built, and each got
+a key whose value changed on 09-03 and again on 09-04. With `main`'s YAML the
+range tests failed on correct data (`FAIL 1` and `FAIL 4`, one per one-day
+version). With the branch's YAML, the same tables passed (21 of 21).
+`ref_counterparty` was then given a same-day overlap (a version ending 09-03
+next to one starting 09-03), and `ref_rating` a gap (one version deleted). The
+branch's YAML failed each with 1 row. `main`'s YAML still counted only the
+one-day rows (`FAIL 1` and `FAIL 3`) and missed both defects. On Spark 3.5.3,
+`date_add(DATE '9999-12-31', 1)` is a non-NULL DATE (`+10000-01-01`) that
+compares correctly. Only collecting it into a Python `datetime` fails (`year
+10000 is out of range`), and dbt only counts the failing rows. `main`'s hash
+was the same before and after, and the branch was deleted.
+
+*What the item got wrong.* Not much. Its DuckDB simulation gave the open
+version `9999-12-30`, so it never exercised the real `9999-12-31` sentinel
+that `date_add` has to step past. The branch's test uses the real one.
 
 **09, `dedupe_rank` kept keys a `full_snapshot` re-delivery dropped** — the
 owner's decision was that the macro was wrong and the documented meaning
@@ -183,7 +259,8 @@ first:
   **Found, not fixed:** `fo_trade` and `ref_collateral` rank raw `trade_id`
   and `collateral_id` the same way, so ` T1` and `T1` in one file would both
   survive; their uniqueness tests would fail that build rather than publish
-  it. Left for item [23](23-date-partitioned-models-rank-the-raw-key.md) — their path is live-verified as it stands.
+  it. Fixed since (plan #13): both, and the scaffold, rank in `ranked_rows`
+  after cleaning.
 - **A reopened seed row kept an earlier run's audit columns** (low): it now
   takes this run's `dbt_invocation_id`, `nessie_ref` and `dbt_updated_at`
   through `audit_columns()`, and keeps the target's `source_batch_id`.
@@ -226,7 +303,7 @@ requires `effective_from < effective_to` strictly, and this project's
 `effective_to` is inclusive, so any value in force for exactly one COB date
 (`Q`, 09-03 → 09-03) is refused. The full refresh over the same raw is
 identical, so it fails there too. Filed as item
-[20](20-mutually-exclusive-ranges-refuses-one-day-versions.md), which also found
+20 (done, see its entry above), which also found
 the test passes a same-day overlap.
 
 One thing the run found that the host tests could not: the procedure's first

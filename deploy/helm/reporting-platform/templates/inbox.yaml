@@ -1,0 +1,90 @@
+{{- /*
+The legacy drop-folder watcher (reporting_platform/ingest/inbox.py). Off by
+default -- on a cluster deliveries arrive by the Transport path (S3,
+`transport_watch`), so this is only for a Feed still onboarded onto
+`landing/` the old way. See values.yaml's comment on `inbox.enabled`.
+
+A PVC, not an emptyDir: a Deployment restart must not lose whatever the
+watcher has not yet moved out of the drop folder.
+*/ -}}
+{{- if .Values.inbox.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-inbox
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ required "inbox.storage is required" .Values.inbox.storage | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-inbox
+  labels:
+    {{- include "reporting-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: inbox
+spec:
+  replicas: 1
+  strategy:
+    # Exactly one watcher over the PVC at a time -- two polling the same
+    # folder would both try to move the same file.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}-inbox
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}-inbox
+        {{- include "reporting-platform.labels" . | nindent 8 }}
+        app.kubernetes.io/component: inbox
+    spec:
+      containers:
+        - name: inbox
+          image: {{ include "reporting-platform.image" (dict
+              "repo" .Values.images.platform.repository
+              "digest" .Values.images.platform.digest
+              "tag" .Values.images.platform.tag
+              "name" "images.platform"
+              "environment" .Values.environment
+              "controlled" (include "reporting-platform.controlled" .)) | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "-m", "reporting_platform.ingest.inbox",
+                    "--loop", {{ .Values.inbox.pollSeconds | quote }}]
+          envFrom:
+            - configMapRef:
+                name: {{ include "reporting-platform.envConfigMap" . }}
+            - secretRef:
+                name: {{ include "reporting-platform.envSecret" . }}
+          env:
+            - name: REPORTING_INBOX
+              value: /opt/platform/inbox
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: health
+              containerPort: 8090
+          # See reporting_platform/ingest/inbox.py's --loop health server
+          # (Part B): 200 while the last completed poll is fresh, 503 once
+          # it is stale by more than 3x the poll interval -- a watcher whose
+          # loop is stuck must fail liveness, not pass it.
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /healthz, port: health}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: inbox
+              mountPath: /opt/platform/inbox
+      volumes:
+        - name: inbox
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-inbox
+{{- end }}

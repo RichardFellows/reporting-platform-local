@@ -1,5 +1,86 @@
 # Lineage
 
+The authoritative operational chain for a published result is:
+
+```text
+Report Version
+  -> registry.run
+  -> registry.run_input
+  -> registry.delivery observation
+  -> DeliveryManifest
+  -> Transport completion evidence
+  -> original received source object(s)
+```
+
+Use `python -m reporting_platform.registry trace --report NAME --as-at DATE
+--version N` to read that chain. A missing `registry.delivery` observation is
+reported as an evidence-coverage gap; it does not remove the DeliveryID from
+the authoritative run history. Reconciliation can rebuild the observation
+from the immutable DeliveryManifest later.
+
+## Delivery provenance through transformation
+
+Raw has two deliberately different fields:
+
+| Field | Meaning |
+|---|---|
+| `_delivery_id` | accepted Delivery identity; new v2 rows carry the opaque `dlv_...` value |
+| `_source_file` | physical object or normalized part that Spark read |
+
+`delivery_ref()` maps Raw `_delivery_id` to the prepared layer's canonical
+`delivery_id`. It uses the basename of `_source_file` only when `_delivery_id`
+is null on a historical row written before Delivery provenance existed. New
+v2 identity is never reconstructed from a filename.
+
+`_file_version` remains ordering for Feed + COB-date restatement selection.
+It decides which snapshot survives; `delivery_id` identifies the accepted
+Delivery that supplied the surviving row. They are not interchangeable.
+
+SCD2 rows keep the Delivery that created each historical version. A later
+replay may update that version's build-audit columns when it closes or reopens
+the range, but it does not replace the version's `delivery_id`. If Delivery A
+creates state X and a later Delivery B repeats X unchanged, B is scanned but
+creates no SCD2 version and is therefore absent from the published input set.
+
+## What `run_input` means
+
+**`run_input` contains Deliveries whose rows are present in what the run
+published. It does not necessarily contain every Delivery scanned during
+execution.**
+
+Both prepared and reporting runs collect the distinct `(feed, delivery_id)`
+pairs from prepared tables on their own build branch before merge. Prepared is
+the boundary used for both because its model/table name preserves Feed
+identity, while arbitrary reporting joins and aggregates may combine several
+feeds and several Deliveries. A reporting row keeps a scalar `delivery_id`
+only where one Delivery is naturally representable; generic report lineage is
+the run-level union in `registry.run_input`, not a comma-separated or JSON
+list added to every row.
+
+This yields three separate levels:
+
+- operational Delivery provenance: the authoritative chain above;
+- dbt dataset/column lineage: which datasets and columns may contribute;
+- optional model-specific value provenance: which value won, only where a
+  model already materializes that business fact.
+
+Phase 5 implements the first and preserves the second. It does not introduce a
+universal value-level framework.
+
+## dbt execution artifacts
+
+`registry.run.dbt_manifest_ref` remains the content digest of the dbt project
+that was built, alongside the declared `dbt_project_ref`. Cosmos runs one dbt
+subprocess per rendered task, so there is no honest single invocation manifest.
+Each task therefore copies its own `manifest.json` and `run_results.json` to
+the immutable object prefix in `registry.run.dbt_artifacts_ref` before another
+task can overwrite the shared target directory. `catalog.json` is copied when
+generated. Publication refuses to merge if a successful dbt task lacks either
+required artifact.
+
+These files are retained for later metadata consumers; they are not a custom
+catalogue and Phase 5 does not implement OpenMetadata.
+
 OpenLineage is an **export**. Marquez is a **consumer**. Neither is an
 authority, and neither may ever gain the power to stop the pipeline.
 
@@ -126,6 +207,17 @@ curl -s -G http://localhost:15000/api/v1/lineage \
 curl -s -G http://localhost:15000/api/v1/column-lineage --data-urlencode depth=20 \
   --data-urlencode 'nodeId=datasetField:iceberg://lakehouse:reporting.exposure_by_country:total_mtm'
 ```
+
+## Phase 6: orchestration does not change lineage
+
+`transport_ingest`'s `ingest_raw` task calls the same
+`ingest_normalized_delivery()` Phase 4 already used, so Raw rows it writes
+carry the identical `_delivery_id`/`_source_file`/`_cob_date`/etc. provenance
+columns regardless of whether a Delivery reached Raw through the legacy
+per-feed DAG or the new Transport-driven one. `delivery_ref()`, `run_input`,
+and `registry trace` all continue to work unchanged --
+`docs/AIRFLOW-ORCHESTRATION.md` is about triggering, retries, and
+concurrency, not about what gets written or how it is traced.
 
 ## Related
 

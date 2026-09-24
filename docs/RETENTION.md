@@ -1,5 +1,17 @@
 # Data Retention
 
+## Scope: what this document covers, and a known gap
+
+This document covers `landing/`, `quarantine/`, `ready/` v1 (all legacy
+compatibility path namespaces), and the Iceberg `raw`/`prepared`/`reporting`
+layers (shared by both paths). **`received/` and `deliveries/` — the current
+Transport path's durable source and Delivery evidence namespaces — have no
+retention policy implemented yet.** Nothing below enforces or documents an
+expiry for them; that is a gap for later work, not a claim that a policy
+exists and is silent. `ready/` v2 (the Transport path's NormalizationManifest
+cache) is a rebuildable cache the same way `ready/` v1 is, but likewise has no
+dedicated sweep documented here yet.
+
 ## Two delete modes
 
 Retention has two paths, chosen per table by **detecting** whether it carries

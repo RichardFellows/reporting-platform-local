@@ -26,13 +26,15 @@ questions it will not answer.
 | | Observations | Events |
 |---|---|---|
 | **Tables** | `delivery`, `delivery_part`, `rejection` | `run`, `run_input`, `report_version`, `submission`, `submission_item`, `as_at_transition` |
+| **Also** | `validation_result` sits beside both — see below | |
 | **About** | bytes that still exist in object storage | things that happened once |
 | **Rebuildable?** | **yes** — `reconcile()` is the authority, not a repair tool | **no** |
 | **Mutable status?** | no | `run` has one |
 | **Records verdicts?** | **never** | yes, that is what they are |
 
 The delivery half holds no `ingested`, no `superseded`, no `status`. Whether a
-delivery reached raw stays derived from `_source_file` in the raw table;
+legacy v1 delivery reached raw stays derived from `_source_file`; for a
+NormalizationManifest v2 Delivery it is derived from Raw `_delivery_id`;
 whether it supersedes another stays `dedupe_rank`'s answer. That is the single
 difference from the legacy `stg` load-control tables this platform replaces —
 those held a status that could disagree with the data, and eventually did.
@@ -103,7 +105,8 @@ copy of the same thing.
 |---|---|
 | `runs [--purpose prepared\|reporting] [--limit N]` | Build runs, newest first. |
 | `versions [--report R] [--limit N]` | Published report versions and the tag pinning each. |
-| `inputs --run-id RUN` | The deliveries that run actually read. |
+| `inputs --run-id RUN` | Deliveries whose rows are present in what that run published. |
+| `trace --report R --as-at DATE --version N` | Report version → run → run inputs → Delivery evidence. |
 | `submissions` | Recorded submissions. |
 | `submit --destination D --by WHO --version R:DATE:N [--version …] [--family F] [--note …]` | Record that published versions were **sent somewhere**. |
 | `diff --report R --as-at DATE [--from N] [--to N]` | What changed between two versions — **inputs and code, not data**. |
@@ -112,7 +115,20 @@ copy of the same thing.
 **`inputs` is derived, not declared.** The publish step selects the distinct
 delivery ids out of the prepared models on the branch before the merge, using
 the same `delivery_ref()` the rows themselves carry. Nobody hands the platform
-a list.
+a list. It is deliberately **not every Delivery scanned**: an unchanged SCD2
+restatement creates no historical version, so it is absent from the published
+input set.
+
+`trace` follows the normalized `report_version.run_id` relationship rather
+than copying DeliveryIDs onto report versions. It includes DeliveryManifest
+and original-source references from `registry.delivery`. The join is tolerant:
+an unreconciled observation appears with `registered: false` and is counted as
+missing evidence coverage, while the `run_input` DeliveryID remains visible.
+
+Each run also records `dbt_artifacts_ref`, an immutable object-store prefix
+containing every Cosmos task's `manifest.json` and `run_results.json` (and
+`catalog.json` where generated). `dbt_manifest_ref` remains the dbt project
+content digest; `dbt_project_ref` remains the deployed project identity.
 
 **`diff` defaults to the last two versions**, which is the comparison anybody
 actually wants and the one that is tedious to type. It reports the set
@@ -205,8 +221,100 @@ that caused it. Both constants are in `registry/db.py`.
   nothing. An arrivals table would hold verdicts the platform derives and could
   not be rebuilt. ([`#the-arrivals-view-is-a-join-not-a-record`](DECISIONS.md#the-arrivals-view-is-a-join-not-a-record))
 
+## Phase 3 Delivery and normalization observations
+
+`registry.delivery` can now also index a Phase 2 DeliveryID. In that projection
+`manifest_key` is the immutable DeliveryManifest, `source_object` is the
+producer data object below `received/`, and `origin` names the Transport
+source. The row remains an observation: no normalized, ingested, processed, or
+generic status column was added. Existing legacy rows and `run_input` are
+unchanged.
+
+`registry.normalization_part` is additive and rebuildable. It indexes each v2
+part's deterministic key, size, optional original archive-member name, and
+whether the object was materialized. It is separate from
+`registry.delivery_part`, whose established meaning is a physical part that
+can join to the current Raw `_source_file`. Phase 4 writes v2 physical keys to
+Raw but does not turn either registry part table into an ingestion ledger.
+
+Phase 4 leaves this projection observational. Raw `_delivery_id`, not a
+registry status column, is authoritative for whether a v2 Delivery committed.
+
+Inline registration is best-effort. `deliveries.reconcile_v2()` reconstructs
+the projection by walking DeliveryManifests and their NormalizationManifests;
+repetition upserts the same `(feed, delivery_id)` and replaces only that
+delivery's v2 part observations. Registry failure never removes or invalidates
+object-store evidence.
+
+## Phase 7 validation evidence
+
+`registry.validation_result` is neither an observation nor an event in the
+sense above — it is a durable record of a DECISION already made elsewhere
+(RPL, Spark, or dbt), append-only and keyed so a retried execution cannot
+duplicate itself. It carries no foreign key to `delivery` or `run`, for the
+same rebuildability reason `run_input` carries none, and it must never be
+mistaken for a verdict column on `delivery`: no `outcome`/`status` was added
+there. Query it by Delivery, Transport or run id:
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.registry validation delivery DELIVERY_ID
+docker compose exec -T airflow python -m reporting_platform.registry validation transport TRANSPORT_ID
+docker compose exec -T airflow python -m reporting_platform.registry validation run RUN_ID
+```
+
+Full model, outcome semantics and the dbt artifact pipeline this reads from:
+[`VALIDATION.md`](VALIDATION.md).
+
+## Phase 8 migration comparison evidence
+
+`registry.migration_comparison` sits beside `validation_result`, same
+append-only/idempotent-by-deterministic-id shape, reusing its PASS/WARN/
+FAIL/ERROR vocabulary. It is NOT `validation_result` extended: a migration
+comparison names a legacy reference that has no Delivery/Transport/dbt-node
+identity, and there is no `WAITING` row -- absence of a comparable pair is
+never persisted, only an executed comparison is. See
+[`MIGRATION.md`](MIGRATION.md) for the full model.
+
+```bash
+docker compose exec -T airflow python -m reporting_platform.migration overview
+docker compose exec -T airflow python -m reporting_platform.migration status <feed>
+```
+
+## The operational control plane (COB Feed Status)
+
+Two tables answer "where is this feed right now", for an operator, without
+reading Airflow's DAG list or walking S3 on every page render:
+
+- `registry.transport_receipt` — an EVENT record, like `run`: how far one
+  Transport occurrence has been carried through `transport_ingest`
+  (`discovered` → `validated` → `delivered` → `normalized`, or `failed`).
+  Only exists for Transport-origin (v2) deliveries.
+- `registry.delivery_committed` — an OBSERVATION, like `delivery_part`: one
+  fact, "this Delivery reached Raw on `main`", recorded once by
+  `ingest_feed._ingest_manifest` for BOTH the legacy and the Transport path.
+
+Neither is a status column on `delivery`, and neither replaces Raw's own
+`_delivery_id` as the ledger — see
+[`OPERATIONAL-CONTROL-PLANE.md`](OPERATIONAL-CONTROL-PLANE.md) for the full
+design, including why this needed a durable addition when the rest of the
+registry does not, and the failure/recovery semantics.
+
+```bash
+# for one COB date: every feed, grouped by source system, with its derived
+# status. No Spark, no Airflow calls -- pure Postgres reads.
+docker compose exec -T airflow python -m reporting_platform.monitoring.feed_status --cob-date 2026-09-21
+
+# one-time per feed, after deploying this feature: recover delivery_committed
+# facts for Deliveries ingested before that table existed, from Raw itself.
+docker compose exec -T airflow python -m scripts._spark_task reconcile-committed <feed>
+```
+
+The feed console's **COB Status** page (`http://localhost:8082`) renders the
+same report.
+
 ## Related
 
+- [`VALIDATION.md`](VALIDATION.md) — validation controls and execution evidence
 - [`REQUIREMENTS.md`](REQUIREMENTS.md) — the 100 and 400/500 blocks
 - [`ARCHITECTURE.md`](ARCHITECTURE.md#the-registry-what-is-recorded-and-what-stays-derived) — where the registry sits
 - [`MONITORING.md`](MONITORING.md) — the checks that read it

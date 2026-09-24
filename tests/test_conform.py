@@ -409,7 +409,7 @@ def test_the_api_returns_every_block_the_form_can_edit():
 
     from reporting_platform.ui import registry
 
-    source = pathlib.Path(registry.__file__).with_name("app.py").read_text()
+    source = pathlib.Path(registry.__file__).with_name("app.py").read_text(encoding="utf-8")
     summary = next(n for n in ast.walk(ast.parse(source))
                    if isinstance(n, ast.FunctionDef) and n.name == "_summary")
     returned = next(n for n in ast.walk(summary)

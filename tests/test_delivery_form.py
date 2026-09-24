@@ -431,7 +431,7 @@ def test_the_form_has_a_member_pattern_input_that_it_sends():
     import pathlib
 
     page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
-            / "ui" / "static" / "index.html").read_text()
+            / "ui" / "static" / "index.html").read_text(encoding="utf-8")
 
     # the input exists, and is pre-filled from an existing feed's block, or
     # editing an archive feed through the form would blank it on every save
@@ -457,7 +457,7 @@ def test_the_form_says_the_landing_pattern_names_the_members():
     import pathlib
 
     page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
-            / "ui" / "static" / "index.html").read_text()
+            / "ui" / "static" / "index.html").read_text(encoding="utf-8")
     note = page[page.index("const membersNotTheZipNote"):]
     note = note[:note.index("});")]
     assert "MEMBER" in note, note
@@ -483,7 +483,7 @@ def test_the_form_does_not_manufacture_an_arrival_control_for_dated_members():
     import pathlib
 
     page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
-            / "ui" / "static" / "index.html").read_text()
+            / "ui" / "static" / "index.html").read_text(encoding="utf-8")
     sync = page[page.index("function syncArrivalArchive"):]
     sync = sync[:sync.index("\n  }")]
     assert 'arrCtlPattern.value === AUTO_CTL' in sync, sync
@@ -604,7 +604,7 @@ def test_the_form_offers_a_control_block_for_an_archive():
     import pathlib
 
     page = (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
-            / "ui" / "static" / "index.html").read_text()
+            / "ui" / "static" / "index.html").read_text(encoding="utf-8")
     sync = page[page.index("function syncDeliveryVisibility"):]
     sync = sync[:sync.index("\n  }")]
     for field in ("controlPatternField", "ctlFormatField", "controlRowCountField",
@@ -633,7 +633,7 @@ def _page() -> str:
     import pathlib
 
     return (pathlib.Path(__file__).resolve().parent.parent / "reporting_platform"
-            / "ui" / "static" / "index.html").read_text()
+            / "ui" / "static" / "index.html").read_text(encoding="utf-8")
 
 
 def test_the_form_prefills_both_control_blocks_from_a_member_control_proposal():

@@ -1,0 +1,176 @@
+# Reporting platform chart -- the values schema, with the defaults every
+# environment inherits. Per-environment files (values-dev.yaml,
+# values-uat.yaml, values-prod.yaml, values-local-k8s.yaml) override these.
+#
+# THE RULE: this chart is the ONLY place a deployment's settings are written.
+# Everything reporting_platform/common/settings.py requires outside `local`
+# comes from here, through ONE ConfigMap and ONE Secret that every platform
+# pod -- Airflow's, the Spark driver pods `_spark_task` launches, the inbox
+# watcher and the console -- reads with envFrom, so no two can disagree.
+# docs/OPENSHIFT-MAPPING.md links here instead of restating these.
+# See docs/DECISIONS.md#execution-mode-is-configuration
+
+# REPORTING_ENV. `uat` and `prod` are CONTROLLED environments: the project
+# digest must match (check_project_drift) and the console is not deployed.
+environment: dev
+
+images:
+  # The platform RELEASE image (Dockerfile.airflow --target release), by
+  # DIGEST. The digest is also PLATFORM_CODE_REF, the code identity every run
+  # records -- a tag can be re-pushed under a run already published.
+  # `make release-image` prints it. REQUIRED.
+  #
+  # `tag` is for a throwaway cluster only (kind loads images by tag); the
+  # chart refuses a tag without a digest in uat and prod.
+  platform:
+    repository: ""
+    digest: ""
+    tag: ""
+  # The Spark image (Dockerfile.spark), for executor pods. REQUIRED.
+  spark:
+    repository: ""
+    digest: ""
+    tag: ""
+  pullPolicy: IfNotPresent
+
+# Where the stores are. All REQUIRED -- settings.py refuses a missing one
+# outside `local`, and so does this chart.
+endpoints:
+  s3: ""                  # S3_ENDPOINT; https:// turns on S3A TLS
+  region: us-east-1       # AWS_REGION
+  nessie: ""              # NESSIE_URI (REST API v2)
+  warehouse: ""           # REPORTING_WAREHOUSE, s3a://<bucket>/warehouse
+  landing: ""             # REPORTING_LANDING,  s3a://<bucket>/landing
+  catalog: lakehouse      # REPORTING_CATALOG
+
+nessie:
+  # NESSIE_AUTH_TYPE: NONE or BEARER. The shared Nessie has no auth today.
+  # BEARER needs `nessieToken` in the Secret below.
+  authType: NONE
+
+# The deployment's change provenance. Constant for the life of a deployment,
+# recorded by every run. See docs/OPENSHIFT-MAPPING.md, "What the chart must
+# supply", and docs/DECISIONS.md#a-change-is-a-deployment-event-not-a-run-event
+provenance:
+  dbtProjectRef: ""          # DBT_PROJECT_REF: the commit the pipeline built
+  dbtProjectDigest: ""       # DBT_PROJECT_DIGEST: `make release-image` prints it
+  deploymentChangeRef: ""    # DEPLOYMENT_CHANGE_REF: the approved change ticket
+  deploymentPipelineRef: ""  # DEPLOYMENT_PIPELINE_REF: the deploying job id
+
+# Credentials. Either name a Secret created outside the chart (the norm above
+# dev: Vault, sealed-secrets, the platform team's process) holding the keys
+# below, or let the chart create one from `values` (dev and local-k8s only).
+secrets:
+  existingSecret: ""
+  create: false
+  values:
+    awsAccessKeyId: ""       # -> AWS_ACCESS_KEY_ID
+    awsSecretAccessKey: ""   # -> AWS_SECRET_ACCESS_KEY
+    registryDsn: ""          # -> REGISTRY_DSN (the `platform` registry database)
+    nessieToken: ""          # -> DBT_ENV_SECRET_NESSIE_AUTH_TOKEN (BEARER only)
+
+spark:
+  # The ServiceAccount Spark driver pods run as; it may create executor pods.
+  # The chart creates it and its Role. SPARK_SERVICE_ACCOUNT.
+  serviceAccount: spark
+  # k8s:// API server as seen from inside the cluster. SPARK_MASTER.
+  master: k8s://https://kubernetes.default.svc:443
+  # Per-application cap, as locally: SPARK_APP_CORES x SPARK_APP_EXECUTORS.
+  appCores: "2"
+  appMemory: 2g
+  appExecutors: "1"
+
+# lakehouse_write pool slots. ABOVE 1 THE POOL EXCLUDES NOTHING -- maintenance
+# can run under a write. See docs/DECISIONS.md#one-shared-write-pool
+lakehouseWriteSlots: 1
+
+# The legacy drop-folder watcher (reporting_platform/ingest/inbox.py). On a
+# cluster deliveries arrive by the Transport path (S3, transport_watch), so it
+# is off by default. Enabled, it polls a PVC.
+inbox:
+  enabled: false
+  pollSeconds: 10
+  storage: 1Gi
+
+# The feed console. NEVER above dev: it writes feeds.yml, _sources.yml and
+# scaffolded models into the project, which is the drift check_project_drift
+# exists to catch. The chart refuses it in uat/prod.
+feedConsole:
+  enabled: false
+
+# MinIO, Nessie and Postgres as plain Deployments inside the release, for a
+# throwaway cluster only (values-local-k8s.yaml, `make k8s-smoke`). Never on
+# a shared cluster: they have no persistence worth the name.
+localStores:
+  enabled: false
+  # Dockerfile.minio, built and loaded into the cluster -- nothing serves
+  # MinIO's own images anonymously. REQUIRED when enabled.
+  minioImage: ""
+
+# ------------------------------------------------------------------ Airflow
+# Values for the official chart (a dependency, aliased `airflow`). Only what
+# the platform needs is set here; everything else is the official default.
+airflow:
+  executor: KubernetesExecutor
+  airflowVersion: 2.10.5
+  # images.airflow is set per environment to the platform release image.
+  images:
+    airflow:
+      repository: ""
+      digest: ""
+  # Every Airflow pod -- scheduler, webserver, triggerer and each
+  # KubernetesExecutor worker -- reads the platform ConfigMap and Secret, and
+  # knows its own IP: a dbt build's driver runs IN the worker pod, and Spark's
+  # executors call it back there. The names are fixed by this chart's
+  # templates (reporting-platform.envConfigMap / .envSecret).
+  #
+  # THIS DEFAULT IS ONLY CORRECT WHEN `secrets.existingSecret` IS UNSET. Helm
+  # evaluates this string in the AIRFLOW SUBCHART's own scope, which cannot
+  # see this chart's `secrets` block -- see the comment on
+  # `reporting-platform.envSecret` in templates/_helpers.tpl. Any values file
+  # that sets `secrets.existingSecret` (values-dev/uat/prod.yaml) overrides
+  # this key too, naming the same secret literally.
+  extraEnvFrom: |
+    - configMapRef:
+        name: '{{ .Release.Name }}-platform-env'
+    - secretRef:
+        name: '{{ .Release.Name }}-platform-secrets'
+  extraEnv: |
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+  # External metadata database, as the platform registry is: the bundled
+  # Postgres is off. `data.metadataSecretName` names a Secret with a
+  # `connection` key.
+  postgresql:
+    enabled: false
+  data:
+    metadataSecretName: ""
+  # PLAIN JOBS, NOT HELM HOOKS. As hooks they are post-install, and
+  # `helm install --wait` -- which any pipeline wants -- runs post-install
+  # hooks only once every pod is ready, while every Airflow pod's init
+  # container waits for exactly these migrations: a deadlock that ends in
+  # "There are still unapplied migrations ... MigrationHead(s) in DB: set()"
+  # and Init:CrashLoopBackOff. Found by the local-k8s smoke test.
+  migrateDatabaseJob:
+    useHelmHooks: false
+  createUserJob:
+    useHelmHooks: false
+  # basic_auth as well as session, as compose sets it: without it the feed
+  # console and the inbox watcher -- which call Airflow's REST API with
+  # AIRFLOW_API_USER/PASSWORD -- get 401 UNAUTHORIZED on every call against a
+  # healthy webserver. Found by the local-k8s smoke (the inbox's triggers).
+  # See docs/DECISIONS.md#airflow-api-auth
+  config:
+    api:
+      auth_backends: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  # DAGs are baked into the release image, not git-synced.
+  dags:
+    gitSync:
+      enabled: false
+    persistence:
+      enabled: false
+  # Arbitrary UID in group 0, as OpenShift's restricted SCC assigns; the image
+  # owns everything it writes airflow:0 g+rwX (docs/DECISIONS.md#image-permissions-layer).
+  gid: 0

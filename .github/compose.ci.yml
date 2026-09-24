@@ -1,0 +1,25 @@
+# The CI build tier's override (.github/workflows/build.yml): the same stack,
+# with NO host ports, so a copy of it can run beside a developer's own stack
+# (`docker compose -p rp-ci -f docker-compose.yml -f .github/compose.ci.yml`)
+# and on a runner where nothing needs to reach it from outside. Everything the
+# tier does goes through `docker compose run` inside the network.
+# See docs/DECISIONS.md#the-build-tier
+services:
+  minio:
+    ports: !reset []
+  postgres:
+    ports: !reset []
+  nessie:
+    ports: !reset []
+  spark-master:
+    ports: !reset []
+  airflow-webserver:
+    ports: !reset []
+  feed-ui:
+    ports: !reset []
+  notebook:
+    ports: !reset []
+  marquez-api:
+    ports: !reset []
+  marquez-web:
+    ports: !reset []

@@ -49,6 +49,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
+from reporting_platform.common import settings
 from reporting_platform.common.context import Nessie, maintenance_config
 
 log = logging.getLogger("orphan-storage")
@@ -63,7 +64,7 @@ def _client():
 
     return boto3.client(
         "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT", "http://minio:9000"),
+        endpoint_url=settings.s3_endpoint(),
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
@@ -72,7 +73,9 @@ def _client():
 
 def _warehouse() -> tuple[str, str]:
     """(bucket, root prefix) of the Iceberg warehouse."""
-    wh = os.environ.get("REPORTING_WAREHOUSE", "s3a://lakehouse/warehouse")
+    # Not settings.bucket_of(): this needs the ROOT PREFIX too, not just the
+    # bucket, so it stays a hand-rolled split.
+    wh = settings.warehouse()
     body = wh.split("://", 1)[-1]
     bucket, _, prefix = body.partition("/")
     return bucket, prefix.strip("/")

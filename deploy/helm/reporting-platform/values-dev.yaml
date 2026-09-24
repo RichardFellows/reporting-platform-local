@@ -1,0 +1,24 @@
+# dev: the one shared environment the feed console and the inbox run in.
+# Endpoints, digests and provenance are set by the deploy pipeline
+# (--set / a generated values file); an empty one fails the render.
+environment: dev
+secrets:
+  existingSecret: reporting-platform-dev
+feedConsole:
+  enabled: true
+inbox:
+  enabled: true
+airflow:
+  data:
+    metadataSecretName: reporting-platform-dev-airflow-db
+  # MUST NAME THE SAME SECRET AS `secrets.existingSecret` ABOVE. Airflow's own
+  # pods read this string, tpl'd in the SUBCHART's own scope, which cannot see
+  # this chart's `secrets.existingSecret` -- see
+  # templates/_helpers.tpl's `reporting-platform.envSecret` comment. Two
+  # strings to keep in step, not one, because Helm gives a parent chart no way
+  # to hand a subchart a value computed from the parent's own values.
+  extraEnvFrom: |
+    - configMapRef:
+        name: '{{ .Release.Name }}-platform-env'
+    - secretRef:
+        name: 'reporting-platform-dev'

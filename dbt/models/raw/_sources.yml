@@ -57,3 +57,13 @@ sources:
         columns:
           - name: collateral_id
             tests: [not_null]
+      - name: qa_happy_position
+        description: Dummy QA positions for pipe CSV and control-file end-to-end verification.
+        columns:
+          - name: position_id
+            tests: [not_null]
+      - name: qa_headerless_position
+        description: Dummy QA feed with a headerless pipe-delimited control file.
+        columns:
+          - name: position_id
+            tests: [not_null]

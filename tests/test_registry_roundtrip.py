@@ -96,14 +96,15 @@ def test_a_hand_written_supersession_block_survives_a_console_save():
     """
     d, registry, feeds = _setup()
     path = d / "feeds" / "fo_trade.yml"
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     # Hand-add the block the way somebody would, under `name:`.
     marker = "name: fo_trade\n"
     assert marker in text
     path.write_text(text.replace(
-        marker, marker + "supersession:\n  mode: full_snapshot\n", 1))
+        marker, marker + "supersession:\n  mode: full_snapshot\n", 1),
+        encoding="utf-8")
 
     registry.update(registry.spec_from_feed(feeds()["fo_trade"]))
-    after = path.read_text()
+    after = path.read_text(encoding="utf-8")
     assert "supersession:" in after, "the console dropped a key it does not manage"
     assert feeds()["fo_trade"].supersession_mode == "full_snapshot"

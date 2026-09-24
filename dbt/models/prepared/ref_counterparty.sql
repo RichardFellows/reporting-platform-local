@@ -67,122 +67,24 @@
   See docs/DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date
 #}
 
-{% set business_columns = ['counterparty_id', 'legal_name', 'country_code', 'sector', 'parent_counterparty_id', 'is_active'] %}
-
-with
-
-{{ newest_file_version(source('raw', 'ref_counterparty')) }}
-
-raw_rows as (
-
-    {#
-      EVERY raw row, unranked. Ranking, the replay scope and the retraction
-      markers all happen after cleaning, so that every one of them uses the
-      CLEANED key -- see `ranked_rows` and `scd2_replay`. `nv` decides the
-      newest delivery per COB date from raw unjoined; see `newest_version` on
-      dedupe_rank. The retraction guard reads the same CTE.
-
-      known_as_of() applies on the FULL-REFRESH path, which is the only path
-      an as-of build is allowed to take (the macro refuses an incremental
-      one). It compiles to `1 = 1` when no knowledge_time is set.
-    #}
-    select
-        r.*,
-        nv._newest_file_version
-    from {{ source('raw', 'ref_counterparty') }} r
-    join newest_file_version nv on nv._newest_cob_date = r._cob_date
-    where {{ known_as_of() }}
-
-),
-
-cleaned as (
-
-    select
-        _cob_date                                                   as cob_date,
-        {{ clean_string('counterparty_id') }}                       as counterparty_id,
-        {{ clean_string('legal_name') }}                            as legal_name,
-        upper({{ clean_string('country_code') }})                   as country_code,
-        {{ clean_string('sector') }}                                as sector,
-        {{ clean_string('parent_counterparty_id') }}                as parent_counterparty_id,
-
-        -- Upstream sends Y/N/1/0/true/false depending on the release.
-        -- Normalise once, here, rather than in every consuming report.
-        case
-            when upper({{ clean_string('is_active') }}) in ('Y', 'YES', 'TRUE', '1') then true
-            when upper({{ clean_string('is_active') }}) in ('N', 'NO', 'FALSE', '0') then false
-            else null
-        end                                                         as is_active,
-
-        _source_file                                                as source_file,
-        _file_version                                               as source_file_version,
-        {{ source_provenance() }}
-        {{ audit_columns() }},
-        -- carried for the rank below, which needs the cleaned key
-        _cob_date,
-        _file_version,
-        _row_number,
-        _newest_file_version
-
-    from raw_rows
-
-),
-
-ranked_rows as (
-
-    {#
-      THE IN-FILE DEDUPE IS ON THE CLEANED KEY. Ranked on the raw key, ' B'
-      and 'B' (or 'moodys' and 'MOODYS') in one file were each "last in file"
-      and both survived as one cleaned key: two versions with one
-      effective_from, one ending before it began.
-    #}
-    select
-        *,
-        {{ dedupe_rank(['counterparty_id'],
-                       newest_version='_newest_file_version') }} as _rn
-    from cleaned
-
-),
-
-{{ scd2_replay('ranked_rows', ['counterparty_id'], business_columns, source('raw', 'ref_counterparty')) }}
-
 {#
-  Business attributes only -- see the scd2_hash macro for what including an
-  audit column would do.
+  `source_file` is the delivery on which a value FIRST appeared, not the most
+  recent one to repeat it -- the more useful question, and the restatements
+  are still in raw. is_active is normalised once, here (yes_no_flag), rather
+  than in every consuming report: upstream sends Y/N/1/0/true/false depending
+  on the release.
 #}
-versioned as (
 
-    select
-        *,
-        {{ scd2_hash(['legal_name', 'country_code', 'sector',
-                      'parent_counterparty_id', 'is_active']) }}    as _row_hash
-    from replayed
-
-),
-
-{{ scd2_changes('versioned', ['counterparty_id']) }}
-
-ranged as (
-
-    {#
-      `source_file` is the delivery on which this value FIRST appeared, not
-      the most recent one to repeat it. That is the more useful question,
-      and the restatements are still in raw.
-    #}
-    select
-        {%- for c in scd2_output_columns(business_columns) %}
-        {{ ident(c) }},
-        {%- endfor %}
-        {{ scd2_columns(['counterparty_id']) }}
-
-    from kept
-
-)
-
-{#
-  On an incremental run, plus one marker row per version this replay
-  covers and no longer derives -- a change a re-delivery dropped or
-  reverted. The merge deletes those (macros/merge.sql); without them it
-  would leave the retracted version current.
-#}
-select * from ranged
-{{ scd2_retractions('ranged', ['counterparty_id'], business_columns) }}
+{{ scd2_prepared(
+    source_name='ref_counterparty',
+    keys=['counterparty_id'],
+    cleaning={
+        'counterparty_id':        clean_string('counterparty_id'),
+        'legal_name':             clean_string('legal_name'),
+        'country_code':           'upper(' ~ clean_string('country_code') ~ ')',
+        'sector':                 clean_string('sector'),
+        'parent_counterparty_id': clean_string('parent_counterparty_id'),
+        'is_active':              yes_no_flag(clean_string('is_active')),
+    },
+    hashed=['legal_name', 'country_code', 'sector', 'parent_counterparty_id', 'is_active'],
+) }}

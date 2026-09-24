@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# spark-sql against the lakehouse catalog, for ad hoc queries in spark-master:
+#
+#   docker compose exec spark-master /opt/platform/scripts/spark-sql -e "SHOW NAMESPACES"
+#
+# conf/spark-defaults.conf holds only what is the same in every environment,
+# so a bare /opt/spark/bin/spark-sql has no Nessie URI, warehouse or S3
+# endpoint. They come from the container's environment here, as they do in
+# spark_session() and dbt/profiles.yml; TLS follows S3_ENDPOINT's scheme.
+# See docs/DECISIONS.md#spark-defaults-hold-only-invariants
+set -euo pipefail
+: "${NESSIE_URI:?NESSIE_URI is not set}"
+: "${REPORTING_WAREHOUSE:?REPORTING_WAREHOUSE is not set}"
+: "${S3_ENDPOINT:?S3_ENDPOINT is not set}"
+case "$S3_ENDPOINT" in https://*) ssl=true ;; *) ssl=false ;; esac
+cat=lakehouse
+exec /opt/spark/bin/spark-sql \
+  --conf "spark.sql.catalog.$cat.uri=$NESSIE_URI" \
+  --conf "spark.sql.catalog.$cat.ref=main" \
+  --conf "spark.sql.catalog.$cat.authentication.type=NONE" \
+  --conf "spark.sql.catalog.$cat.warehouse=$REPORTING_WAREHOUSE" \
+  --conf "spark.sql.catalog.$cat.s3.endpoint=$S3_ENDPOINT" \
+  --conf "spark.sql.catalog.$cat.s3.path-style-access=true" \
+  --conf "spark.hadoop.fs.s3a.endpoint=$S3_ENDPOINT" \
+  --conf "spark.hadoop.fs.s3a.path.style.access=true" \
+  --conf "spark.hadoop.fs.s3a.connection.ssl.enabled=$ssl" \
+  "$@"

@@ -40,7 +40,9 @@ def test_manifest_records_date_parts_and_format():
         # Format is captured from feeds.yml AT NORMALIZE TIME, so an ingest
         # can be reproduced later even if the config has moved on.
         assert m["format"] == {"delimiter": ",", "quote_char": '"',
-                               "header": True, "encoding": "utf-8"}, m["format"]
+                               "header": True, "encoding": "utf-8",
+                               "escape_char": '"', "multiline": True,
+                               "parser_contract": 2}, m["format"]
         assert m["normalizer"] == "file/v1"
     finally:
         uninstall(monkey)
@@ -141,6 +143,28 @@ def test_reconcile_is_idempotent():
         uninstall(monkey)
 
 
+def test_ready_cache_can_be_deleted_and_rebuilt_byte_identically():
+    """Landing plus feed config is sufficient to reconstruct plain ready/."""
+    s3, monkey, fd, norm = _setup()
+    try:
+        report = norm.reconcile(fd)
+        assert len(report["created"]) == 1, report
+        manifest_key = report["created"][0]
+        first = s3.objects[manifest_key][0]
+        landing_bytes = s3.objects[LANDED][0]
+
+        s3.delete_object(Bucket="lakehouse", Key=manifest_key)
+        assert manifest_key not in s3.objects
+        assert s3.objects[LANDED][0] == landing_bytes
+
+        rebuilt = norm.reconcile(fd)
+        assert rebuilt["created"] == [manifest_key], rebuilt
+        assert s3.objects[manifest_key][0] == first
+        assert s3.objects[LANDED][0] == landing_bytes
+    finally:
+        uninstall(monkey)
+
+
 def test_one_unroutable_file_does_not_block_the_others():
     """Raising here would let a single bad filename stop the night's load."""
     s3, monkey, fd, norm = _setup()
@@ -199,5 +223,29 @@ def test_unparsable_name_with_an_explicit_date_still_ingests():
         assert m["cob_date"] == "2026-03-04"
         assert m["parts"][0]["object_key"] == key
         assert m["normalizer"] == "manual/v1"
+    finally:
+        uninstall(monkey)
+
+
+# ---------------------------------------------- coexistence with Ready v2
+def test_a_v2_delivery_manifest_sharing_this_prefix_is_not_picked_up():
+    """Phase 3's Delivery path writes ONE LEVEL DEEPER in this same feed's
+    `ready/` prefix -- `ready/<feed>/<delivery-id>/normalization-manifest.
+    json`, deliberately "beside, not in place of" this module
+    (`docs/NORMALIZATION-CONTRACT.md`). A v1 `list_manifests` that matched on
+    prefix + `.json` alone picked that up too and `read_manifest` raised on
+    its (different) `manifest_version` key, breaking `bulk_ingest` for any
+    feed a Transport had ever touched -- found running Phase 6 live against a
+    feed also carrying legacy deliveries.
+    """
+    s3, monkey, fd, norm = _setup()
+    try:
+        norm.normalize(fd, LANDED)
+        s3.put(f"ready/{fd.name}/dlv_deadbeef/normalization-manifest.json",
+              json.dumps({"normalization_manifest_version": 2}))
+        keys = norm.list_manifests(fd)
+        assert keys == [norm.manifest_key(fd, LANDED)], keys
+        # The real symptom: this must not raise on the v2 manifest's shape.
+        assert len(norm.manifests_for(fd)) == 1
     finally:
         uninstall(monkey)

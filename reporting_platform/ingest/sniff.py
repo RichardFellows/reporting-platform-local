@@ -32,6 +32,8 @@ from __future__ import annotations
 import ast
 import re
 
+from reporting_platform.common.parsing import decode_bytes
+
 from reporting_platform.ui.registry import platform_names
 from reporting_platform.ui.scaffold import COLUMN_TYPES
 
@@ -98,93 +100,9 @@ def _row(con, sql: str) -> dict:
 
 
 # --------------------------------------------------------------- encoding
-# Tried in order once a BOM does not settle it. sniff_csv rejects a byte
-# sequence invalid for the encoding it is told to assume, and EVERY encoding
-# here can genuinely fail -- checked against a real duckdb.
-#
-# ORDER IS NOT ARBITRARY, and reversing it makes one entry dead code. duckdb's
-# `latin-1` rejects the C1 control range (0x80-0x9F) that `cp1252` accepts
-# except for five undefined slots. Checked byte-by-byte: every byte latin-1
-# accepts, cp1252 also accepts, plus 27 more -- so with cp1252 first, latin-1
-# could never succeed. latin-1 goes first because plain Western-European text
-# is genuinely ISO-8859-1 and that is the more accurate label; cp1252 is tried
-# LAST as the widest-accepting, which is why `sniff_delivery` reports it as
-# low-confidence.
-#
-# `utf-16` IS NOT HERE, and that absence was earned: `sniff_csv(...,
-# encoding='utf-16')` on plain ASCII/latin-1 bytes does NOT raise -- it
-# reinterprets byte-pairs as UTF-16 code units and "succeeds" with a single
-# garbled column, before anything else gets a turn, reporting HIGH confidence
-# for mojibake. Without a BOM UTF-16 has no reliable signature, so it is only
-# tried when `_bom_encoding` finds one.
+# Retained as public documentation of the proposal order. Python performs
+# strict decoding; DuckDB sees only a temporary UTF-8 inspection copy.
 ENCODING_FALLBACKS = ["utf-8", "latin-1", "cp1252"]
-
-
-def _bom_encoding(head: bytes) -> str | None:
-    """An encoding implied by a byte-order mark, or None.
-
-    The ONLY path that ever proposes "utf-16" -- see ENCODING_FALLBACKS for
-    why guessing it from content alone is actively wrong. UTF-8's BOM is not
-    handled here: sniff_csv strips it itself (checked), so plain "utf-8" --
-    already first in ENCODING_FALLBACKS -- handles that case with no special
-    casing needed above this function.
-    """
-    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return "utf-16"
-    return None
-
-
-def _peek(con, path: str, n: int = 8) -> bytes:
-    """The delivery's first `n` bytes, local or `s3://` alike."""
-    row = _row(con, f"SELECT content FROM read_blob({_lit(path)}) LIMIT 1")
-    return row.get("content", b"")[:n]
-
-
-def _is_encoding_failure(exc: Exception) -> bool:
-    """Whether `exc` is sniff_csv rejecting the ENCODING it was told to
-    assume, rather than some other invalid-input problem worth surfacing as
-    -is.
-
-    Matched on the message, and deliberately loosely: a first draft matched
-    the exact wording duckdb uses for a UTF-8 failure ("...is not utf-8
-    encoded") and missed latin-1's differently-worded one ("File is not
-    latin-1 encoded", no "Invalid unicode" preamble at all) entirely, so
-    that failure propagated raw instead of moving to the next candidate.
-    "encoded" is the one word every observed shape shares.
-    """
-    return "encoded" in str(exc).lower()
-
-
-def _sniff_with_encoding(con, path: str) -> tuple[dict, str]:
-    """(sniff_csv()'s row as a dict, the encoding that actually worked).
-
-    A BOM-implied encoding is tried first; ENCODING_FALLBACKS after that, in
-    order, skipping anything already tried. Every encoding here CAN raise --
-    see ENCODING_FALLBACKS -- so reaching the end of the list without one
-    working is real and raises a clear error; it is the caller's job to
-    treat even a successful `latin-1` read as low-confidence, not this
-    function's job to refuse it.
-    """
-    import duckdb as ddb
-
-    bom = _bom_encoding(_peek(con, path))
-    ordered = [bom] + ENCODING_FALLBACKS if bom else ENCODING_FALLBACKS
-    tried: list[str] = []
-    last_exc: Exception | None = None
-    for encoding in ordered:
-        if encoding in tried:
-            continue
-        tried.append(encoding)
-        try:
-            row = _row(con, f"SELECT * FROM sniff_csv({_lit(path)}, "
-                            f"encoding={_lit(encoding)})")
-            return row, encoding
-        except ddb.InvalidInputException as exc:
-            if not _is_encoding_failure(exc):
-                raise  # a real format problem, not an encoding guess to retry
-            last_exc = exc
-    raise ValueError(
-        f"{path}: could not read as any of {tried} -- last error: {last_exc}")
 
 
 # ------------------------------------------------------------- the proposal
@@ -217,7 +135,7 @@ def candidate_keys(con, path: str, prompt: str, names: list[str]) -> list[str]:
     """
     file_headers = _file_headers(prompt)
     exprs = ", ".join(
-        f'count(DISTINCT "{h}") AS c{i}' for i, h in enumerate(file_headers))
+        f'count(DISTINCT "{h.replace(chr(34), chr(34) * 2)}") AS c{i}' for i, h in enumerate(file_headers))
     query = f"SELECT count(*) AS n, {exprs} {prompt.rstrip(';').strip()}"
     row = con.sql(query).fetchone()
     total, counts = row[0], row[1:]
@@ -225,7 +143,7 @@ def candidate_keys(con, path: str, prompt: str, names: list[str]) -> list[str]:
            if total > 0 and unique == total]
 
 
-def sniff_delivery(con, path: str) -> dict:
+def sniff_delivery(con, path: str, encoding: str | None = None) -> dict:
     """Propose a feeds.yml shape for the file at `path`.
 
     `path` is anything `con` can already read -- a local path for a test, an
@@ -239,7 +157,23 @@ def sniff_delivery(con, path: str) -> dict:
     it first, the same reduction every other write path uses, so a column
     this sniffer agrees with `infer_type` about still produces no diff.
     """
-    row, encoding = _sniff_with_encoding(con, path)
+    from reporting_platform.common.parsing import detect_text
+    from pathlib import Path
+    import tempfile
+    data = _row(con, f"SELECT content FROM read_blob({_lit(path)}) LIMIT 1")["content"]
+    text, encoding = detect_text(data, encoding)
+    from reporting_platform.common.parsing import spark_encoding
+    spark_encoding(encoding)
+    with tempfile.TemporaryDirectory(prefix="feed-inspect-") as directory:
+        inspection = Path(directory) / "sample.csv"
+        inspection.write_text(text, encoding="utf-8", newline="")
+        row = _row(con, f"SELECT * FROM sniff_csv({_lit(str(inspection))}, encoding='utf-8')")
+        if row.get("SkipRows", 0):
+            raise ValueError("CSV preambles are not supported; supply a file starting at its header/data")
+        return _proposal(con, str(inspection), row, encoding)
+
+
+def _proposal(con, path: str, row: dict, encoding: str) -> dict:
     file_headers = [c["name"] for c in row["Columns"]]
     names, sources = platform_names(file_headers)
     types = {name: platform_type(col["type"])
@@ -254,8 +188,8 @@ def sniff_delivery(con, path: str) -> dict:
         "quote_char": _or_default(row["Quote"], '"'),
         "header": bool(row["HasHeader"]),
         "file_encoding": encoding,
-        "encoding_confidence": ("low" if encoding == ENCODING_FALLBACKS[-1]
-                                else "high"),
+        "encoding_confidence": ("low" if encoding in ("latin-1", "cp1252") else "high"),
+        "csv_options": {"escape_char": _or_default(row["Escape"], _or_default(row["Quote"], '"')), "multiline": True},
         "columns": names,
         "source_columns": sources,
         "column_types": types,
@@ -264,7 +198,8 @@ def sniff_delivery(con, path: str) -> dict:
 
 
 # ------------------------------------------------------ from raw bytes
-def sniff_bytes(con, data: bytes, filename: str) -> dict:
+def sniff_bytes(con, data: bytes, filename: str, encoding: str | None = None,
+                control_encoding: str | None = None) -> dict:
     """`sniff_delivery`, given the delivery's bytes directly rather than a
     path `con` can already read -- an upload, or a file already fetched from
     object storage. `.zip` dispatches to `sniff_archive`; everything else is
@@ -274,11 +209,13 @@ def sniff_bytes(con, data: bytes, filename: str) -> dict:
     import tempfile
 
     if filename.lower().endswith(".zip"):
-        return sniff_archive(con, data)
+        return sniff_archive(con, data, encoding=encoding, control_encoding=control_encoding)
     suffix = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(data)
-    return sniff_delivery(con, f.name)
+    from pathlib import Path
+    with tempfile.TemporaryDirectory(prefix="feed-upload-") as directory:
+        path = Path(directory) / ("sample" + suffix)
+        path.write_bytes(data)
+        return sniff_delivery(con, str(path), encoding)
 
 
 # ------------------------------------------------ member control files
@@ -482,10 +419,10 @@ def _member_facts(data: bytes, proposal: dict) -> dict:
     import hashlib
     import io
 
-    text = data.decode(proposal["file_encoding"], errors="replace")
-    rows = sum(1 for r in csv.reader(io.StringIO(text),
-                                     delimiter=proposal["delimiter"],
-                                     quotechar=proposal["quote_char"]) if r)
+    from reporting_platform.common.parsing import csv_rows
+    fmt = {"encoding": proposal["file_encoding"], "delimiter": proposal["delimiter"],
+           "quote_char": proposal["quote_char"], **proposal.get("csv_options", {})}
+    rows = sum(1 for _ in csv_rows(data, fmt))
     return {"md5": hashlib.md5(data).hexdigest(),
             "rows": max(rows - 1, 0) if proposal["header"] else rows}
 
@@ -584,10 +521,10 @@ def _member_control(zf, names: list[str], pairs: dict[str, str],
     }
     if pattern is None:
         return out
-    encoding = proposal["file_encoding"]
+    encoding = proposal.get("control_encoding") or proposal["file_encoding"]
     # One member's bytes at a time: measured, then released.
     facts = {d: _member_facts(zf.read(d), proposal) for d in sorted(paired_data)}
-    controls = [(c, zf.read(c).decode(encoding, errors="replace"), facts[d])
+    controls = [(c, decode_bytes(zf.read(c), encoding), facts[d])
                 for c, d in sorted(pairs.items())]
     readings = _control_readings([text for _c, text, _f in controls])
     by_reading = {("text" if fmt is None else "delimited"):
@@ -673,7 +610,8 @@ def _paired_member_pattern_candidate(data_names: list[str]) -> str | None:
                                       if "." in n and n.rsplit(".", 1)[-1] in leaders])
 
 
-def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> dict:
+def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None,
+                  encoding: str | None = None, control_encoding: str | None = None) -> dict:
     """Propose a feeds.yml `delivery: {kind: archive, ...}` shape.
 
     Extracts matching members to a local temp file and sniffs the FIRST one
@@ -724,7 +662,9 @@ def sniff_archive(con, zip_bytes: bytes, member_pattern: str | None = None) -> d
         member = candidates[0]
         data = zf.read(member)
 
-        proposal = sniff_bytes(con, data, member)
+        proposal = sniff_bytes(con, data, member, encoding)
+        if control_encoding is not None:
+            proposal["control_encoding"] = control_encoding
         proposal["archive_members"] = names
         proposal["sniffed_member"] = member
         proposal["member_pattern_candidate"] = (
@@ -753,7 +693,8 @@ def _container_has_a_date(filename: str) -> bool:
     return derive_pattern(filename) is not None
 
 
-def propose_feed(filename: str, data: bytes) -> dict:
+def propose_feed(filename: str, data: bytes, encoding: str | None = None,
+                 control_encoding: str | None = None) -> dict:
     """The whole onboarding proposal for one delivered file: everything
     `sniff_bytes`/`sniff_archive` return, plus the `filename_pattern`
     `ui.registry.derive_pattern` would suggest from `filename` and, for an
@@ -767,8 +708,8 @@ def propose_feed(filename: str, data: bytes) -> dict:
 
     from reporting_platform.ui.registry import derive_pattern
 
-    con = duckdb.connect()
-    proposal = sniff_bytes(con, data, filename)
+    with duckdb.connect() as con:
+        proposal = sniff_bytes(con, data, filename, encoding, control_encoding)
     dated = derive_pattern(filename)
     proposal["filename_pattern"] = dated
     proposal["filename_has_date"] = dated is not None

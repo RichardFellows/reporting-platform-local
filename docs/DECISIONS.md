@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-99 entries. They are grouped here by subject; the file itself is in the order
+102 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -65,6 +65,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 |---|---|
 | [jar-versions](#jar-versions) | Three version values in `.env` reaching six consumers, and why the split is the finding rather than pedantry |
 | [spark-jars-prebaked](#spark-jars-prebaked) | The Spark image bakes its jars instead of resolving `--packages` at submit |
+| [driver-jars-are-baked](#driver-jars-are-baked) | The Airflow image bakes the drivers' jars; both drivers read `PLATFORM_DRIVER_JARS`, no Ivy at runtime |
 | [nessie-gc-jar](#nessie-gc-jar) | There is no server-side GC endpoint; collecting content needs the CLI jar |
 | [nessie-iceberg-rest](#nessie-iceberg-rest) | Nessie serves an Iceberg REST catalog, and what that does and does not replace |
 | [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) | Nessie logs Elastic Common Schema field names, which is why its logs read oddly |
@@ -72,6 +73,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [airflow-provider-constraints](#airflow-provider-constraints) | Providers install under Airflow's constraint file so pip cannot drag a version quietly |
 | [airflow-api-auth](#airflow-api-auth) | `session` alone authenticates only a browser |
 | [image-permissions-layer](#image-permissions-layer) | The permissions layer is last in the Dockerfile because it changes least |
+| [images-build-from-a-mirror](#images-build-from-a-mirror) | Every external URL a Dockerfile fetches is a build ARG, so a corporate mirror can redirect it |
 | [containers-run-as-the-host-uid](#containers-run-as-the-host-uid) | `user: "${AIRFLOW_UID:-50000}:0"`, and what a bind mount does to ownership |
 | [minio-host-ports](#minio-host-ports) | The published MinIO ports are the host side only |
 | [no-folder-markers](#no-folder-markers) | `minio-init` creates the bucket and nothing else |
@@ -85,8 +87,19 @@ anchor; this page is for when you do not yet know what you are looking for.
 
 | Anchor | The finding |
 |---|---|
+| [minio-images-come-from-quay](#minio-images-come-from-quay) | Docker Hub's `minio/*` refuses anonymous pulls; the identical images came from quay.io -- until it did too |
+| [minio-is-built-from-source](#minio-is-built-from-source) | No registry serves MinIO anonymously; the same pinned releases are compiled here, on UBI |
+| [scd2-is-one-macro](#scd2-is-one-macro) | The three SCD2 models are one `scd2_prepared()` call each, moved with a 0-row EXCEPT both ways |
+| [the-build-tier](#the-build-tier) | `build.yml` builds the project on a throwaway stack and runs the lineage gate after a merge; the only tier that can fail an unknown test |
 | [spark-master-single-source](#spark-master-single-source) | `SPARK_MASTER` is read in two places that must not diverge |
+| [the-local-k8s-smoke](#the-local-k8s-smoke) | `make k8s-smoke` runs the chart in kind through a merged `prepared_build`; its first run found four cluster-only defects |
+| [execution-mode-is-configuration](#execution-mode-is-configuration) | `PLATFORM_EXECUTION` moves `_spark_task`'s driver into its own pod; dbt keeps its driver in the task and only its executors move; `embedded` runs everything in-process with no cluster |
+| [nessie-auth-is-a-setting](#nessie-auth-is-a-setting) | `NESSIE_AUTH_TYPE` NONE/BEARER, read by all four Nessie clients; nessie-gc refuses under BEARER |
+| [the-chart-is-the-only-place-settings-are-written](#the-chart-is-the-only-place-settings-are-written) | One ConfigMap, one Secret, envFrom everywhere; why `existingSecret` needs two literal names, not one computed value |
+| [s3-ssl-follows-the-endpoint-scheme](#s3-ssl-follows-the-endpoint-scheme) | TLS is derived from `S3_ENDPOINT`'s own scheme, not a second env var |
+| [spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants) | `spark-defaults.conf` ships in the cluster image, so it may hold no host, TLS switch or credential source |
 | [spark-master-no-local-fallback](#spark-master-no-local-fallback) | A `local` master is **refused**, not fallen back to — the failure worth guarding is the one that is not red anywhere |
+| [settings-refuse-outside-local](#settings-refuse-outside-local) | Endpoint settings fall back to compose's hosts only when `REPORTING_ENV` is `local`; anywhere else an unset one is refused by name |
 | [spark-worker-sizing](#spark-worker-sizing) | Cap each application, or standalone mode holds every free core until the session stops |
 | [spark-in-a-subprocess](#spark-in-a-subprocess) | The JVM keeps the task process alive; heartbeats stop; the scheduler zombie-reaps it |
 | [one-session-per-chunk](#one-session-per-chunk) | `ingest()` opens and stops its own session, in a `finally` |
@@ -114,6 +127,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [no-unused-config-paths](#no-unused-config-paths) | No `seeds:` block, and why an unused config path is a trap |
 | [identifiers-in-macros](#identifiers-in-macros) | Which macros call `ident()`, and why that is a decision |
 | [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps) | Migrate, admin user, the pool, the registry schema, `dbt deps` — miss the last and two DAGs do not import |
+| [the-release-image-carries-the-code](#the-release-image-carries-the-code) | `Dockerfile.airflow` has a `release` stage with the code and dbt packages baked in; compose builds `dev` and mounts the code |
 | [assets-are-or-not-and](#assets-are-or-not-and) | A bare schedule list is **AND**, which is almost never what you meant |
 | [retry-delay](#retry-delay) | Seconds, not the five minutes it used to be |
 
@@ -137,6 +151,9 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [ready-is-a-derived-index](#ready-is-a-derived-index) | **`ready/` is a derived index of `landing/`**, not a queue somebody fills |
 | [the-ready-window-bounds-the-parts-not-the-manifests](#the-ready-window-bounds-the-parts-not-the-manifests) | 157 deleted, 157 remade, both logging success |
 | [namespace-before-branch](#namespace-before-branch) | The namespace is created against `main`, before the ingest branch exists |
+| [transport-to-delivery-is-an-immutable-interpretation](#transport-to-delivery-is-an-immutable-interpretation) | Explicit external Feed identity, occurrence-derived DeliveryID, and a create-once interpretation separate from Ready |
+| [a-declared-control-must-arrive](#a-declared-control-must-arrive) | A Transport missing the control its feed declares is refused, not ingested unchecked |
+| [a-refusal-is-not-retried](#a-refusal-is-not-retried) | A failed md5 retried twice into a Nessie 409 that named neither the checksum nor the file |
 
 ### Feeds, columns and the console
 
@@ -165,6 +182,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | Anchor | The finding |
 |---|---|
 | [the-registry-records-observations-not-verdicts](#the-registry-records-observations-not-verdicts) | **No `ingested`, no `superseded`, no `status`** — the whole difference from the `stg` load-control tables |
+| [a-merge-conflict-not-the-pool-keeps-file-version-unique](#a-merge-conflict-not-the-pool-keeps-file-version-unique) | Two ingests can compute the same `_file_version`; Nessie's merge, not the `lakehouse_write` pool, refuses the loser |
 | [a-run-is-the-first-thing-the-registry-cannot-rebuild](#a-run-is-the-first-thing-the-registry-cannot-rebuild) | Which is why `run_input` has no foreign key and a run has a mutable status |
 | [version-is-per-report-and-as-at-date](#version-is-per-report-and-as-at-date) | Not per run, not per family |
 | [code-identity-is-a-digest-when-it-cannot-be-a-tag](#code-identity-is-a-digest-when-it-cannot-be-a-tag) | A value **and** a kind, never conflated |
@@ -183,6 +201,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [an-incomplete-keep-set-refuses](#an-incomplete-keep-set-refuses) | **A short answer is a deletion order.** Nothing deleted is not nothing to delete |
 | [published-tags-are-the-reproducibility-window](#published-tags-are-the-reproducibility-window) | A tag is **data** retention, sized in years, not by the table keep-set |
 | [an-ingest-is-not-a-publication](#an-ingest-is-not-a-publication) | They cut different tags, and conflating them kept ingests for ten years |
+| [a-snapshot-tag-names-its-merge-commit](#a-snapshot-tag-names-its-merge-commit) | A tag cut from `main`'s head named later merges; the Transport path cut none |
 | [retention-classes-name-the-obligation](#retention-classes-name-the-obligation) | The class is a feed property; the window is per-environment policy |
 | [the-evidence-interlock-is-two-halves](#the-evidence-interlock-is-two-halves) | A configuration check and a per-delivery check, neither sufficient alone |
 | [reproducibility-is-exercised-not-asserted](#reproducibility-is-exercised-not-asserted) | The pin is read against the real catalog |
@@ -203,6 +222,12 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [a-column-with-no-source-says-so](#a-column-with-no-source-says-so) | 116 of 136 traced, and reporting only those makes a literal, a `count(*)` and a parser failure identical |
 | [marquez-on-ubi](#marquez-on-ubi) | Both images built here, from Marquez's own source |
 
+### Packaging
+
+| Anchor | The finding |
+|---|---|
+| [components-are-declared-and-enforced](#components-are-declared-and-enforced) | Which module ships in which deployable package is `components.yml`, and a lazy import across a boundary fails a test, not a task |
+
 ---
 
 ## jar-versions
@@ -212,16 +237,18 @@ finding, not pedantry.
 
 | Variable | Sets |
 |---|---|
-| `ICEBERG_VERSION` | the Iceberg runtime: baked into the Spark image's `/opt/spark/jars`, and resolved by both drivers |
+| `ICEBERG_VERSION` | the Iceberg runtime: baked into the Spark image's `/opt/spark/jars` for the executors, and into the Airflow image's `/opt/platform/jars` for both drivers |
 | `NESSIE_SPARK_EXT_VERSION` | the Nessie Spark SQL extensions, in the same three places |
 | `NESSIE_SERVER_VERSION` | the Nessie server image tag and the `nessie-gc` jar |
 
-`ICEBERG_VERSION` has to be identical in three places — `Dockerfile.spark`, and
-*both* drivers (`spark_session()` in `common/spark.py`, `spark.jars.packages`
-in `dbt/profiles.yml`) — because every process that submits work here runs a
-pip-installed pyspark with no jars of its own. `spark.jars.packages` ships the
-driver's jars to every executor, so what the executors load is what the driver
-resolved. Diverge and you get two Iceberg versions in one application, which
+`ICEBERG_VERSION` has to be identical in both images — `Dockerfile.spark` for
+the executors, and `Dockerfile.airflow` for the drivers (`spark_session()` in
+`common/spark.py` and `spark_local` in `dbt/profiles.yml`, which both read the
+baked jar list from `PLATFORM_DRIVER_JARS`) — because every process that
+submits work here runs a pip-installed pyspark with no jars of its own.
+`spark.jars` ships the driver's jars to every executor, so what the executors
+load is what the driver has. See
+[driver-jars-are-baked](#driver-jars-are-baked). Diverge and you get two Iceberg versions in one application, which
 surfaces as `NoSuchMethodError` on the first write rather than as anything
 saying "version".
 
@@ -238,7 +265,8 @@ also what decides the server's log format** — see
 [nessie-logs-are-ecs-json](#nessie-logs-are-ecs-json) — which is why the server
 here is pinned ahead of the extensions rather than level with them.
 
-`hadoop-aws` and `aws-java-sdk-bundle` are deliberately not parameterised. They
+`hadoop-aws` and `aws-java-sdk-bundle` are build ARGs of `Dockerfile.airflow`
+only (`HADOOP_AWS_VERSION`, `AWS_SDK_BUNDLE_VERSION`), not `.env` values. They
 track Spark 3.5's Hadoop, not Iceberg.
 
 Defaults everywhere repeat the pinned combination, so a clone with no `.env`
@@ -255,9 +283,37 @@ The Spark image bakes its jars rather than resolving `--packages` at submit
 time. In the cluster they come from the internal registry; baking them means no
 egress at runtime.
 
-The drivers still resolve via Ivy (see [jar-versions](#jar-versions)) because
-they run pip-installed pyspark, which has none of these jars — the first
-Iceberg SQL statement would fail with `ClassNotFoundException` before it ran.
+The drivers used to resolve theirs via Ivy at session start; they are baked
+too now — see [driver-jars-are-baked](#driver-jars-are-baked).
+
+## driver-jars-are-baked
+
+Every driver here is a pip-installed pyspark with none of the Iceberg, Nessie
+or S3A jars, so without them the first Iceberg statement fails with
+`ClassNotFoundException`. Both drivers used to fetch them from Maven Central
+through `spark.jars.packages` on every cold start. That is a runtime
+dependency on egress, which a cluster behind a mirror does not have, and a
+second copy of every version in two files.
+
+`Dockerfile.airflow` now downloads the five jars at build time (through
+`MAVEN_REPO`, so a mirror redirects them) into `/opt/platform/jars`, and
+exports the list as `PLATFORM_DRIVER_JARS`. `spark_session()` and
+`spark_local` both set `spark.jars` from that one variable, so the drivers
+cannot diverge, and the versions live once, in the Dockerfile's ARGs, which
+`tests/test_versions.py` pins against `Dockerfile.spark`. `spark.jars` ships
+the jars to every executor, exactly as `spark.jars.packages` did, which is
+still how `hadoop-aws` (not baked into the Spark image) reaches them.
+
+A process outside the image has no `PLATFORM_DRIVER_JARS`. `spark_session()`
+refuses naming it, and names any listed jar that is missing, rather than
+failing later with `ClassNotFoundException`. dbt refuses with `Env var
+required but not provided`. CI's parse tier sets it to an inert path,
+because it renders the profile but starts no session.
+
+Verified live: a session on a Nessie branch showed `spark.jars.packages`
+unset and no Ivy resolution in the log. An Iceberg write and read, a sorted
+`rewrite_data_files`, and an S3A read of landing across 2 executor partitions
+all worked, and a dbt branch build ran as before.
 
 ## nessie-logs-are-ecs-json
 
@@ -459,6 +515,83 @@ after the one that changed — put it higher and editing a directory list costs 
 full reinstall of Airflow's providers, dbt, pyspark, cosmos and marimo through
 whatever registry mirror is in front of pip. Nothing below it depends on it.
 
+`Dockerfile.spark` has the same layer, last for the same reason, and it
+learned the other half of the rule the hard way. **Own the directories as the
+image's user, in group 0 (`spark:0`, like `airflow:0`), not as root.** Group 0
+with `g+rwX` serves an arbitrary OpenShift UID, but compose runs the image's
+own `spark` user (uid 185), which is not in group 0. With root-owned
+directories every executor launch failed with `java.io.IOException: Failed to
+create directory /opt/spark/work/app-...`, and the driver reported
+`Master removed our application: FAILED`, and then the misleading
+`spark.sql.catalog.lakehouse is not defined`, because the session was
+half-dead. The layer passed a random-UID check and failed the default user,
+so check both.
+
+## images-build-from-a-mirror
+
+The corporate build has egress only to an internal mirror, so every external
+URL a Dockerfile fetches must be a build ARG whose DEFAULT is today's public
+value — the mirror then only sets build args, never edits a Dockerfile. Seven:
+`MAVEN_REPO` (the executor jars in `Dockerfile.spark` and the driver jars in
+`Dockerfile.airflow`, [driver-jars-are-baked](#driver-jars-are-baked)), `NESSIE_GC_URL` and
+`AIRFLOW_CONSTRAINTS_URL` (`Dockerfile.airflow`), `MARQUEZ_SOURCE_URL`
+(both Marquez images), `NPM_REGISTRY` (`Dockerfile.marquez-web`, told to
+every npm invocation, since an ARG is not itself an npm setting), and
+`GOPROXY` and `GOSUMDB` (`Dockerfile.minio`: every byte of both MinIO
+builds comes through the Go proxy, with no `,direct` fallback to GitHub,
+[minio-is-built-from-source](#minio-is-built-from-source)).
+`tests/test_offline_build.py` is the gate: a URL literal inside a
+RUN/COPY/ADD, including a continuation line, fails naming file:line.
+
+Two things this does NOT cover. `pip install` and `apt-get` resolve through
+`pip.conf`, apt sources and SSL cert config injected at build time in the
+corporate environment (see `Dockerfile.airflow`'s comment above the provider
+install) — no ARG needed, because their own resolution already goes through
+whatever index that config points at. And `FROM` base images are the deploying fork's concern, not this
+repo's: swapping `apache/airflow`, `apache/spark` or the UBI bases for
+mirrored copies is a registry/pull-through-cache setting, not a Dockerfile
+edit. Still NOT redirectable by anything here: `api`'s gradle build
+(`Dockerfile.marquez-api`) may reach repositories `build.gradle` declares
+beyond Maven Central — unknown without downloading Marquez's own build files,
+which this change deliberately did not do just to answer that.
+
+Also removed: the `|| pip install pyyaml boto3` fallback on
+`Dockerfile.spark`'s pynessie install. It silently dropped `pynessie` on
+failure and shipped an image that imports cleanly and lacks the package the
+platform needs at runtime — a build that "succeeds" with a different image
+than the one asked for. If `pynessie==0.65.0` stops installing, that must
+fail loudly at the `RUN`, not three layers of indirection later at import.
+
+## the-release-image-carries-the-code
+
+Every service built from `Dockerfile.airflow` used to get its code from bind
+mounts: the DAGs, `reporting_platform`, `reporting_transport`, `scripts` and
+`dbt`. A cluster has no working tree to mount, so the image the platform
+deployed contained no platform at all. `airflow-init` also ran `dbt deps` at
+startup, which needs egress to the package hub.
+
+The Dockerfile now has two targets. `dev` is the old image, and compose pins
+`target: dev` on the airflow anchor, because a multi-stage build otherwise
+defaults to the LAST stage. `release` is `dev` plus a COPY of each mounted
+code directory to the path compose mounts it at, the dbt path variables as
+`ENV`, and `dbt deps` run at build time into the path `dbt_project.yml`
+already defaults to. Tests, seeds and notebooks stay out of it.
+
+Proved with no mounts: `docker run <release image> bash -c 'airflow db migrate
+&& python -m scripts.check_dag_imports'` reports 13 DAGs from 7 files. It
+needs only `NESSIE_URI`, `S3_ENDPOINT` and `REPORTING_WAREHOUSE`, which
+`profiles.yml` reads with no default
+([spark-defaults-hold-only-invariants](#spark-defaults-hold-only-invariants))
+and the chart's ConfigMap supplies.
+
+`scripts/release_image.sh` (`make release-image`) is the pipeline step. It
+builds the image and prints `PLATFORM_CODE_REF` as the image DIGEST, never a
+tag, because a tag can be re-pushed. It also prints `DBT_PROJECT_DIGEST` from
+`registry provenance` run INSIDE the built image, so the digest is the
+platform's own computation over the project actually shipped.
+`tests/test_release_image.py` fails if the anchor mounts a code directory
+that the release stage does not copy, or if compose stops pinning `dev`.
+
 ## airflow-init-load-bearing-steps
 
 `airflow-init` runs once and everything else waits on it *completing*, so no
@@ -506,6 +639,298 @@ The webserver secret key is shared across replicas and restarts so sessions
 survive. Airflow 2 needs nothing like Airflow 3's execution-API URL or JWT
 secret — see [airflow-2-not-3](#airflow-2-not-3).
 
+## the-local-k8s-smoke
+
+`make k8s-smoke` (`scripts/k8s_smoke.sh`) runs the platform in a kind cluster
+from the chart, `values-local-k8s.yaml`, with MinIO, Nessie and Postgres
+in-release. It is the first place the chart, the release image and
+`PLATFORM_EXECUTION=kubernetes` run together. The sequence:
+
+1. Install with `--wait`, then check the init hook (the pool, the registry
+   schema), that every DAG imports from the baked image, and `config check`.
+2. Bulk-ingest the reference feeds: drivers in the scheduler pod, executors
+   as pods.
+3. The inbox gate lands the qa_ fixtures and triggers their ingest DAGs
+   through Airflow's API.
+4. An `ingest_fo_trade` DAG run launches its driver as a pod
+   (`spark-task-ingest-*`, which creates `...-exec-1`).
+5. `prepared_build` builds on a branch, audits and merges. The script
+   asserts Nessie `main`'s head is its `publish(prepared)` commit, and that
+   `registry runs` shows the run `published`.
+
+It waits on specific run ids, never `dags test`.
+
+Its first run found four defects that nothing short of a cluster could:
+
+- **A `--wait` deadlock.** The Airflow chart's migrate and create-user jobs
+  are post-install hooks by default, and `--wait` runs those only when every
+  pod is ready. Every Airflow pod's init container waits for exactly those
+  migrations, so the pods crash-loop on `There are still unapplied
+  migrations ... MigrationHead(s) in DB: set()`. Both are now plain Jobs
+  (`useHelmHooks: false`).
+- **RBAC without `deletecollection`** on services, configmaps and pvcs.
+  Spark's cleanup at `stop()` deletes by label selector; Forbidden, it left
+  the executor ConfigMap behind. Spark 3.5 names that ConfigMap once per JVM,
+  so the next SparkContext in the same process failed to start with a 409:
+  `configmaps "spark-exec-...-conf-map" already exists`.
+- **Executor pods get none of the platform's environment.** The first S3
+  read on an executor failed with `Unable to load region from any of the
+  providers in the chain`. Both drivers now pass `spark.executorEnv.AWS_REGION`,
+  and the credentials by `spark.kubernetes.executor.secretKeyRef.*` to the
+  platform Secret, so they never appear in the Spark conf.
+- **Airflow's API was session-only**, so the inbox's triggers (and the
+  console's calls) got `401 UNAUTHORIZED`. The chart now sets `basic_auth,
+  session`, as compose does ([airflow-api-auth](#airflow-api-auth)).
+
+## execution-mode-is-configuration
+
+`PLATFORM_EXECUTION` (`local` | `kubernetes` | `embedded`, default `local`,
+anything else refused) says where a Spark driver runs, and where its
+executors run.
+
+- **`embedded`** is no cluster at all: the driver's own process runs every
+  task through a `local[N]` master. It is what the `runner` compose service
+  and `python -m reporting_platform.pipeline` use, so the steps can be run
+  with only S3, Nessie and Postgres (`docs/STANDALONE-PIPELINE.md`). It is a
+  declared mode rather than a fallback. `session_conf()` refuses a `local`
+  master in the other two modes, for the reason
+  [spark-master-no-local-fallback](#spark-master-no-local-fallback) gives,
+  and refuses a cluster master in this one. `SPARK_MASTER` is still the only
+  master setting, read by both drivers.
+
+- **`local`** is compose. `_spark_task.run` starts the driver as a child
+  process and the executors run on the standalone spark-worker.
+- **`kubernetes`**: `_spark_task.run` starts the driver as its own **pod** of
+  the platform release image (`SPARK_DRIVER_IMAGE`). The pod runs the same
+  module with the same arguments and prints the same JSON, which `run` reads
+  off the pod log with the same parser. Its executors are pods through a
+  `k8s://` master (`SPARK_EXECUTOR_IMAGE`). The pod gets its whole
+  environment from the platform ConfigMap and Secret (`envFrom`), plus its own
+  IP from the downward API, which executors need to call back in client mode.
+  The pod is deleted in `finally`, so a killed Airflow task does not leave a
+  driver holding executors after the `lakehouse_write` slot is released.
+
+Every DAG already called `_spark_task.run` and nothing else, apart from
+`platform_housekeeping`, whose private copy of it is gone. So no DAG changed
+shape, and pools, retries and the logic around each call are untouched. The
+plan had proposed a `KubernetesPodOperator` per Spark call instead. That
+would have split the conditional Python in `resolve_arrival` and friends
+across operators, for a pod that is only visible in the UI, not more
+isolated.
+
+**dbt is the exception.** Cosmos stays `ExecutionMode.LOCAL` +
+`InvocationMode.SUBPROCESS` in both modes. Its `KUBERNETES` mode would run
+dbt in another pod, where `_archive_dbt_artifacts` cannot read `target/`.
+That callback archives the artifacts and captures validation evidence, and
+`publish` refuses to merge a build it cannot verify, so the switch would
+never publish. Instead `spark_ocp` merges every `spark_local` key through a
+YAML anchor and adds a `k8s://` master and the executor-pod keys. The dbt
+child process stays the driver, in the Airflow task's pod, and only the
+executors move. That driver is only isolated if the Airflow task is its own
+pod, so the chart runs the **KubernetesExecutor**.
+
+`session_conf()` in `common/spark.py` holds a session's whole configuration
+as a pure function, so both modes are tested without a JVM
+(`tests/test_execution_mode.py`). It refuses a `k8s://` master outside
+`kubernetes` mode and the reverse, and it refuses a missing `POD_IP`. `config
+check` lists every `KUBERNETES_REQUIRED` setting that is unset.
+
+Verified in `local` mode on the stack: a real `ingest_fo_trade` run, the
+housekeeping launcher, and `check_dag_imports` (13 DAGs). In `kubernetes`
+mode, `check_dag_imports` also gives 13 DAGs, which renders `spark_ocp` under
+dbt. No pod has run yet; that is the local-k8s smoke test.
+
+**A deploy trap this found.** The LocalExecutor forks tasks from the
+scheduler, so a task inherits the scheduler's already-imported modules. New
+`_spark_task.py` code with a stale `settings` failed with `module
+'reporting_platform.common.settings' has no attribute 'execution'`, until the
+scheduler was restarted. The CLAUDE.md rule about long-running processes
+covers the scheduler too.
+
+## nessie-auth-is-a-setting
+
+`NESSIE_AUTH_TYPE` (`NONE` | `BEARER`, default `NONE` in every environment,
+because the shared Nessie has no auth today) is read by all four Nessie
+clients: `spark_session()`, both dbt targets, and the Python `Nessie` REST
+client (an `Authorization: Bearer` header). BEARER takes its token from
+`DBT_ENV_SECRET_NESSIE_AUTH_TOKEN`, one name for both sides. dbt scrubs the
+`DBT_ENV_SECRET_` prefix from its logs and allows it only in
+`profiles.yml`, and one secret under two names would be two things to keep
+in step. An unknown type, or BEARER without a token, is listed by `config
+check`.
+
+Not wired, deliberately: `nessie-gc`. Retention's GC refuses to run under
+BEARER rather than try client options nobody has seen work, on a path that
+deletes data. The read-only DuckDB console's Iceberg REST catalog is also
+not wired for auth.
+## minio-images-come-from-quay
+
+`minio/minio` and `minio/mc` on Docker Hub now refuse anonymous pulls: `pull
+access denied for minio/minio, repository does not exist or may require
+'docker login'`. Every machine that had pulled them before kept working from
+its cache, so nothing local noticed. The CI build tier, the first thing to
+pull on a clean runner, failed on it immediately. A fresh clone could not
+have started the stack.
+
+Both now come from `quay.io/minio/*` at the same release tags. It is the same
+image: the local Docker Hub copy and the quay.io pull have identical image IDs
+(`sha256:7d80fd23...` for minio, `sha256:a5399b66...` for mc). The nightly
+build tier is what notices the next registry doing this.
+
+**Superseded two days later** by
+[minio-is-built-from-source](#minio-is-built-from-source): quay.io did it
+too.
+
+## minio-is-built-from-source
+
+On 2026-09-24 `quay.io/minio/minio` and `quay.io/minio/mc` started answering
+`401 UNAUTHORIZED` to anonymous pulls. The Docker Hub tags already refused
+(and now 404), and `ghcr.io/minio/*` denies too. The CI build tier failed at
+`minio Pulling` on every PR, before any code ran. Every machine with the
+image cached kept working, exactly as the first time.
+
+**Decision.** `Dockerfile.minio` compiles both binaries from the same pinned
+releases on `ubi9/go-toolset`, into one `ubi9/ubi-minimal` image, with
+`go install github.com/minio/{minio,mc}@<module version>`. `minio` runs it and
+`minio-init` builds the same Dockerfile, which the layer cache makes free (as
+`spark-master` and `spark-worker` share theirs). It is Marquez's precedent
+([marquez-on-ubi](#marquez-on-ubi)): what cannot be pulled is built, on
+UBI.
+
+**The source comes through a Go module proxy, not from GitHub.** The first
+version of this fetched GitHub's release tarballs, and the corporate build
+has no route to GitHub. Every byte now comes from `GOPROXY`, with no
+`,direct` after it. `direct` is how a module the proxy lacks gets cloned from
+its VCS host, which for both of these is GitHub. The corporate build points
+`GOPROXY` at its internal Go proxy and `GOSUMDB` at its checksum mirror (or
+`off` where the proxy is the trust root). Both are build ARGs
+([images-build-from-a-mirror](#images-build-from-a-mirror)).
+
+MinIO's `RELEASE.<stamp>` tags are not semver, so each release is pinned
+twice in the Dockerfile: the tag (for the version string) and the **module
+version** the proxy knows it by. That is a pseudo-version naming the tag's
+commit, `v0.0.0-20240922003343-03e996320ebb`, which is what `go list -m
+github.com/minio/minio@<tag>` resolves. Resolving a tag is the one query that
+makes the proxy read the origin. The pinned version is a plain proxy lookup.
+Neither module's `go.mod` has a `replace`, which `go install mod@version`
+refuses. Compose passes no version args: a tag overridden without its module
+version would stamp one release's name on another's code.
+
+**Rejected:**
+- **Chainguard** (`cgr.dev/chainguard/minio`): pullable, but its free tier is
+  `latest` only. Pinning a digest lasts until they collect it, and `latest`
+  is a 2025 MinIO release, a different server from the one every test here
+  ran against.
+- **`bitnamilegacy/minio`**: pullable, but frozen and declared unmaintained,
+  with its own entrypoint, data path and environment conventions.
+
+**What the build reproduces.** It uses the flags of MinIO's own Makefile `install` target
+(`CGO_ENABLED=0 -tags kqueue -trimpath`) and the ldflags its
+`buildscripts/gen-ldflags.go` writes, so `minio --version` prints
+`RELEASE.2024-09-22T00-33-43Z (commit-id=03e996320ebb)`, not `DEVELOPMENT`.
+`go install` builds the module as published, so its own `go.mod`/`go.sum`
+decide every dependency.
+
+**Root, as upstream ran.** The existing `minio-data` volume was written by
+the upstream image as root. A server that cannot read its own data does not
+fail: it starts empty. Moving to a non-root user needs the volume's ownership
+changed with it.
+
+**The Helm chart's `local-stores`** (the `make k8s-smoke` throwaway cluster)
+pulled the same two images. It now takes `localStores.minioImage`, required
+when enabled, and `scripts/k8s_smoke.sh` builds `Dockerfile.minio` and loads
+it into kind with the platform's own images.
+
+Live-verified on the development stack. The proxy build ran with `--no-cache`
+and every GitHub hostname (`github.com`, `api.`, `codeload.`,
+`raw.githubusercontent.com`, `objects.githubusercontent.com`, `ghcr.io`)
+pointed at 127.0.0.1: it succeeded in 1m7s. A control build with the same
+`--add-host` got `Connection refused` from `github.com`, so the block does
+apply inside `RUN`. `minio --version` and `mc --version` name their releases
+and commits. `mc ready local` (the
+healthcheck) passed, `minio-init`'s bucket script ran, and a put/get worked
+on a throwaway container. Then the running `minio` was recreated on the new
+image over its existing volume: healthy, the same 1,728 objects, and
+`raw.qa_happy_position` read through DuckDB on `main`.
+
+## scd2-is-one-macro
+
+The three SCD2 prepared models (`ref_counterparty`, `ref_rating`,
+`qa_happy_position_scd2`) each repeated the same sequence by hand:
+`newest_file_version`, `raw_rows`, `cleaned`, `ranked_rows`, `scd2_replay`,
+the hash, `scd2_changes`, `ranged` and `scd2_retractions`. It is the subtlest
+logic in the platform, and a fourth model copied from one of them and edited
+was how it would go wrong. Each model is now its config, its documentation and
+one `scd2_prepared()` call (`dbt/macros/scd2.sql`):
+
+- `keys`: a list; `ref_rating`'s is two columns.
+- `cleaning`: column -> SQL, in output order.
+- `hashed`: the source facts whose change opens a version. The macro refuses
+  a key or a derived column there.
+- `derived`: optional, columns computed after cleaning (`ref_rating`'s rank
+  and band).
+
+The business-column order is derived from `cleaning` and `derived`, so it
+cannot drift from the expressions. `yes_no_flag()` replaces the Y/N `CASE`
+two models spelled out.
+
+Moved with its output proved identical. On a CI stack seeded with every feed,
+the old models were built into `main`, then a new day of `ref_counterparty`
+and `ref_rating` was landed. On four branches from that `main`, the old and
+new models were built full-refresh and incremental. EXCEPT in both
+directions, per model, excluding only the per-invocation audit columns,
+returned **0 rows** for every pair, with identical column order. The
+incremental delta changed 4 `ref_rating` rows. A `ref_counterparty`
+re-delivery renaming CP00001 then opened a new version and closed the old one,
+identically under both. `dbt test` gave 31/31 on both new builds.
+
+Things that read model TEXT had to learn the macro's spelling.
+`context.model_sources()`, which feeds lineage, now reads
+`scd2_prepared(source_name=...)` as `source('raw', ...)`. The structural
+tests accept the call because `test_the_scd2_macro_carries_both` pins that the
+macro calls `known_as_of()` and `dedupe_rank()`. The newest-version test now
+checks the RENDERED SQL. One pre-existing gap, not widened here:
+`feeds_behind_report()` maps a prepared model to a feed by NAME, so
+`qa_happy_position_scd2` resolves to no feed. No report depends on it today.
+
+## the-build-tier
+
+`.github/workflows/build.yml` is the only CI tier that BUILDS the dbt project
+against a real catalog. It exists because two classes of defect pass
+everything cheaper. `dbt parse` accepts an unknown generic test and an
+unknown column key, and `lineage --columns` without a catalog reads most
+tables as `not derivable` and exits 0 ([a-gate-that-cannot-fail](#a-gate-that-cannot-fail)).
+It is separate from `config.yml` and `parse.yml`, so those stay at seconds
+and minutes. It runs on PRs that touch the code or images, and nightly.
+
+The steps are `scripts/ci_build_tier.sh`, which the workflow only calls, so a
+developer runs exactly what CI runs. It brings up its own compose project,
+`-p rp-ci`, with `.github/compose.ci.yml` stripping every host port, so it
+runs beside a developer's stack. The sequence:
+
+1. Build the images; start MinIO, Postgres, Nessie and Spark; run
+   `airflow-init`.
+2. Seed with `generate_feeds.py --clean`, 3 months, and land it.
+3. Put the two qa_ fixtures through the inbox gate with `--no-trigger`.
+   Their control files are promoted only by the gate, and the stack has no
+   webserver to trigger.
+4. Run `bulk_ingest`, then `dbt build` on a throwaway branch.
+5. Merge to that stack's `main` only if the build is clean, then run
+   `lineage --columns --require-derivable`. **The merge is required:** the
+   lineage gate reads schemas through DuckDB, which addresses only the
+   default branch, so on a branch-only build every model is `not derivable`.
+
+Measured locally from a cold start with cached images, about 4.5 minutes:
+`dbt build` PASS=84 ERROR=0, `unresolved: none`, `derivable: 17 of 17
+tables`. With an unknown generic test on `fo_trade.trade_id`, `dbt parse`
+exits 0 and this tier fails.
+
+Building it found two bugs in the inbox gate. One-shot mode swept twice, but
+stability needs `STABLE_POLLS + 1` observations, so it reported "inbox
+empty" for every freshly dropped file. And a trigger failure escaped
+`sweep()`, abandoning the rest of the pass. `--no-trigger` exists for callers
+that ingest by themselves.
+
 ## spark-master-single-source
 
 Every Spark job runs on the `spark-master`/`spark-worker` cluster, never
@@ -517,6 +942,94 @@ quietly running the pipeline inside the Airflow container with the cluster idle.
 `feed-ui` sets it explicitly rather than relying on the default, because both
 readers default to the same address — which is exactly the silent divergence
 worth avoiding.
+
+## s3-ssl-follows-the-endpoint-scheme
+
+Hadoop's S3A connector does not infer TLS from `fs.s3a.endpoint`'s own
+scheme — it has a separate switch, `fs.s3a.connection.ssl.enabled`, and it
+used to be hardcoded to `"false"` in both `spark_session()`
+(`common/spark.py`) and `dbt/profiles.yml`'s `spark_local` target. That is
+correct for local MinIO over plain HTTP and silently wrong the moment
+`S3_ENDPOINT` points at a real, TLS-terminated S3-compatible store — see
+[OPENSHIFT-MAPPING.md](OPENSHIFT-MAPPING.md), "Object storage": only the
+endpoint URL and credentials are meant to change between local and the
+cluster target, not code.
+
+A second env var for the switch would just be one more value that has to be
+kept in sync with `S3_ENDPOINT`'s own scheme by hand — exactly the kind of
+divergence [spark-master-single-source](#spark-master-single-source) exists
+to avoid. So it derives from `S3_ENDPOINT` directly: `https://` turns TLS on,
+anything else leaves it off. Iceberg's own `S3FileIO` needs no equivalent
+flag — the AWS SDK it uses already reads the scheme off the endpoint URL
+itself; only the Hadoop S3A path (`spark.hadoop.fs.s3a.*`, used for reading
+landing CSVs) needed the fix.
+
+## spark-defaults-hold-only-invariants
+
+`conf/spark-defaults.conf` used to carry the whole catalog wiring, including
+`http://nessie:19120/api/v2`, `http://minio:9000` and
+`fs.s3a.connection.ssl.enabled false`, and `spark_ocp` in `dbt/profiles.yml`
+relied on it for everything but the Nessie ref. The cluster's Spark image
+ships that file, so the cluster target inherited compose's host names: the
+first build on a cluster would have gone looking for a MinIO that is not
+there, with nothing in the error saying "config".
+
+The file now holds only what is the same in every environment: the
+extensions, the catalog and io implementations, the S3A filesystem class,
+the timezone, AQE and Kryo. Every per-environment value (Nessie URI,
+warehouse, S3 endpoint, TLS, auth) is read from the environment, in
+`spark_session()` and in both dbt targets. `spark_ocp` reads the same
+`env_var()` keys as `spark_local`, without defaults, so a missing variable
+fails at dbt startup instead of pointing at a local host.
+`tests/test_spark_config.py` enforces all of it. (Since
+[execution-mode-is-configuration](#execution-mode-is-configuration),
+`spark_ocp` merges every `spark_local` key and relies on this file for
+nothing: its driver runs in the platform image, which has no copy of it.)
+
+Two things in the old file were wrong, not just local:
+
+- The extensions were listed Iceberg first, the order `spark_session()`
+  documents as breaking `rewrite_data_files` ("Cannot parse order: parser is
+  not an Iceberg ExtendedParser"). `spark_local` had the same order. Both are
+  Nessie first now, and the test pins the three copies equal.
+- It pinned `SimpleAWSCredentialsProvider`, which reads `fs.s3a.access.key`,
+  and nothing sets that key. The credentials provider is a per-environment
+  choice (environment variables locally, web identity on a cluster), so it
+  is left to Hadoop's default chain.
+
+Locally, compose bind-mounts the file onto spark-master and spark-worker, so
+a bare `spark-sql` there no longer knows where the catalog is.
+`scripts/spark-sql` passes the per-environment values from the container's
+environment, and the README's ad hoc queries use it.
+
+## settings-refuse-outside-local
+
+About a dozen modules read `S3_ENDPOINT`, `NESSIE_URI`, `REPORTING_WAREHOUSE`
+or `REPORTING_LANDING` straight from the environment, each with the compose
+host as its default (`http://minio:9000`, `http://nessie:19120/api/v2`). On a
+cluster where one of those was left unset, the process did not fail at
+startup. It connected to a host that does not exist there, and the error
+was about a connection, not about configuration. One site
+(`ui/feeddata.py`) had no default at all: with the variable unset, boto3
+1.36 resolves `endpoint_url=None` to `https://s3.amazonaws.com` (checked in
+the feed-ui container).
+
+The reads now go through accessors in `common/settings.py`: `s3_endpoint()`,
+`nessie_uri()`, `warehouse()`, `landing()`, `registry_dsn()`. Each returns
+the compose default only when `REPORTING_ENV` is `local`; anywhere else an
+unset or empty variable raises `MissingSetting` naming it. This is the rule
+[spark-master-no-local-fallback](#spark-master-no-local-fallback) already
+applies to the master: a fallback that looks like success is worse than a
+refusal. `REGISTRY_DSN` keeps its stricter rule and has no default even
+locally.
+
+`python -m reporting_platform.config check` calls `settings.missing()`, so a
+deployment missing a setting fails at the cheapest seam there is, before any
+task runs. It reports nothing in `local`, because the cheap CI tier runs
+there with no registry. `tests/test_settings.py` fails if a direct
+`os.environ` read of one of these names appears outside `settings.py`.
+`reporting_transport/` is exempt: it imports nothing from the platform on
+purpose, and it already has no defaults.
 
 ## spark-worker-sizing
 
@@ -689,11 +1202,14 @@ than relying on `conf/spark-defaults.conf`, which is not mounted into the
 Airflow container -- and the driver needs the jars regardless of what the
 executors have baked in.
 
-For `spark_ocp`, dbt runs inside the driver pod that `spark-submit` created for
-the build, so there is one SparkSession per build and the Nessie ref is
-unambiguous. That target carries far less config on purpose: a driver pod built
-from the Spark image does have `spark-defaults.conf`, so only the per-run
-override belongs there. Duplicating the rest would be a forked copy that drifts.
+For `spark_ocp`, dbt runs where it runs locally, as the child process of a
+Cosmos task, now in the Airflow task's pod. So there is still one
+SparkSession per build and the Nessie ref is unambiguous. It merges every
+`spark_local` key and adds a `k8s://` master and the executor-pod keys; see
+[execution-mode-is-configuration](#execution-mode-is-configuration). An
+earlier design had it inside a spark-submit driver pod that took its
+invariant keys from the Spark image's `spark-defaults.conf`. It doesn't:
+this driver runs in the platform image, which has no such file.
 
 A connection method other than `session` was tried there and removed: it served
 no purpose the design had chosen and carried a silent-failure risk on the branch
@@ -862,7 +1378,9 @@ belong.
 
 ## dbt-target-guard
 
-`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**.
+`dbt_builds.py` refuses a non-Spark `DBT_TARGET` at **import time**. The
+check is `transform.dbt.target()`, which the hand-run `transform` CLI calls
+before it touches anything too.
 
 The failure it prevents is silent. The branch each build opens is passed to dbt
 as the `nessie_ref` var, and only the Spark profiles honour it; an engine that
@@ -959,6 +1477,15 @@ Without the pool, every task sits `queued` forever with nothing to say why,
 which is why `airflow-init` creates it -- see
 [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps).
 
+**The slot count is `LAKEHOUSE_WRITE_SLOTS` (default 1), and above 1 the pool
+no longer excludes anything.** It is configurable so a deployment can size it
+without editing `airflow-init`. It is NOT a throughput knob. Two slots let
+maintenance's `remove_orphan_files` run beside an ingest, which is the
+corruption this pool exists to prevent. Raise it only once maintenance is
+excluded from writers some other way, and never by adding a second pool: an
+Airflow task belongs to exactly one pool, so a second pool does not exclude
+anything.
+
 ## gc-lag-and-assertions
 
 Identification and removal are two different steps, a deferral window apart: the
@@ -1017,7 +1544,9 @@ that is not derived, which is why it is the one file in
 
 ## spark-master-no-local-fallback
 
-`spark_session()` refuses a `local` master rather than falling back to it.
+`spark_session()` refuses a `local` master rather than falling back to it,
+unless `PLATFORM_EXECUTION=embedded` declares that running in-process is the
+intent ([execution-mode-is-configuration](#execution-mode-is-configuration)).
 
 A missing or blank `SPARK_MASTER` meaning "run the whole job inside this
 container" is a configuration error that **looks like success**: the job
@@ -1424,8 +1953,8 @@ from a catalog, so every column is `sourced` by construction -- 28 of 28,
 measured -- and `unresolved` cannot arise at all: a tick that cannot fail,
 which is what this section is named after. With the flag it fails every time
 and says only "you have not built yet". The gate belongs to a post-build tier,
-there is not one, and `config.yml`'s header now says that instead of claiming
-the check. The tier that DOES exist above it, `parse.yml`, changes nothing
+which is now `build.yml` ([the-build-tier](#the-build-tier)), and
+`config.yml`'s header says that instead of claiming the check. The tier that DOES exist above it, `parse.yml`, changes nothing
 here: `dbt parse` writes no compiled SQL.
 
 The flag alone, without `--columns`, is an argparse error rather than a silent
@@ -1436,8 +1965,9 @@ refused: a setting that cannot apply must not look like one that did.
 
 [jar-versions](#jar-versions) has been documented in CLAUDE.md, `.env.example`
 and here for as long as it has existed, and was checked by nothing.
-`common/spark.py` reads two of the three and interpolates them straight into
-`spark.jars.packages`; the failure is `NoSuchMethodError` on the first write,
+`common/spark.py` read two of the three and interpolated them straight into
+`spark.jars.packages` (the driver jars are baked now,
+[driver-jars-are-baked](#driver-jars-are-baked)); the failure is `NoSuchMethodError` on the first write,
 after the image builds and the stack comes up, naming no version.
 
 `tests/test_versions.py` pins what is actually checkable, which is not the
@@ -1836,8 +2366,8 @@ FEED a control file belongs to is
 `control.format` names HOW a control file is read, separately from WHAT is
 read out of it. The original reading -- a regex per field over the file's
 whole text -- stays the default and the name of a format nobody has to write
-down; the second is `kind: delimited`, for a control file that is a small
-table.
+down. `kind: delimited` reads a small table; `kind: key_value` reads one
+declared key and value per line through the same shared parser.
 
 ```yaml
 delivery:
@@ -1857,14 +2387,33 @@ FEED|BUSINESS_DATE|RECORD_COUNT|CHECKSUM
 POSITIONS|20260801|2|517263d1618098b81bb21c1cb7cfed25
 ```
 
+A structured key/value control declares its separator and names keys rather
+than regexes:
+
+```yaml
+delivery:
+  control:
+    pattern: '{stem}\.ctl'
+    format:
+      kind: key_value
+      separator: '='
+    row_count: ROWS
+    md5: CHECKSUM
+```
+
+against `ROWS=2` and `CHECKSUM=517263d1618098b81bb21c1cb7cfed25` on separate
+lines. Duplicate keys, missing separators and empty keys are refused. Control
+bytes are decoded strictly using `control_encoding`, which defaults to the data
+file's `file_encoding`; a matching BOM is removed before every format parser.
+
 **The field values change meaning with the format, and that is the point.**
 A regex over a delimited line has to count the fields in front of the one it
 wants -- `^(?:[^|]*\|){3}(?P<rows>\d+)` -- so a column inserted upstream
 reads the wrong value rather than failing. Naming the column moves the
 question to the header row, where the sender answers it on every delivery.
 
-**One reader, two callers.** `arrival.control` (identity: COB date, version,
-read at the door) and `delivery.control` (integrity: row count, md5, read on
+**One reader, multiple callers.** `arrival.control` (identity: COB date, version,
+read at the legacy door) and `delivery.control` (integrity: row count, md5, read on
 the landing side) are the same file: the gate PROMOTES the control file into
 `landing/` byte for byte rather than consuming it, see
 [#the-inbox-is-the-conformance-gate](#the-inbox-is-the-conformance-gate).
@@ -1876,6 +2425,11 @@ where it was -- `conform` turns `cob_date` into a date it must name a file
 after, `ingest_feed` compares `row_count` against rows it counted -- because
 that boundary is the identity/integrity split and it does not belong inside a
 parser.
+
+> **Amended for Phase 2.** A DCM Transport does not pass through the inbox, so
+> `delivery.control` may also name COB date and version for direct
+> DeliveryManifest interpretation. Legacy normalization still reads only its
+> integrity pair; both paths reuse `ingest/control.py`.
 
 **The format is declared on each block, and `check_gates_are_coherent`
 refuses two that disagree.** The alternative was one declaration inherited by
@@ -2794,10 +3348,15 @@ in it?" without listing object storage by hand.
 
 **Postgres, because `sequence_no` needs a serialising authority.** The order in
 which the platform saw deliveries cannot be allocated by `MAX(...)+1` over a
-table several writers append to — that is `next_file_version`'s read-then-write,
-correct today only because the `lakehouse_write` pool has one slot, which is
-precisely what the concurrency work intends to change. A database sequence is
-serialised at any pool size. An Iceberg replica for analytical joins is the
+table several writers append to — that is `next_file_version`'s read-then-write.
+That pattern is safe on `raw` only because Nessie's merge refuses the loser of
+two concurrent writers outright rather than applying both — see
+[a-merge-conflict-not-the-pool-keeps-file-version-unique](#a-merge-conflict-not-the-pool-keeps-file-version-unique)
+— and it is NOT safe here: `sequence_no` is a plain column update, with no
+merge to reject the second writer, so two registry inserts racing on the same
+`MAX(...)+1` can both compute the same value and neither fails. A database
+sequence is serialised at any pool size, any number of writers. An Iceberg
+replica for analytical joins is the
 other half of the recommendation and is deliberately not built yet: it needs a
 namespace outside the dbt project, which `managed_tables()` derives from, so
 maintenance and retention would not cover it without explicit registration.
@@ -2836,6 +3395,85 @@ upload, verified against this stack — and only from reading the object when th
 ETag is a multipart hash of hashes. A row already registered is never
 re-hashed: `md5`, `bytes`, `received_at` and `sequence_no` are left alone on
 conflict, and only what config can legitimately change is refreshed.
+
+## a-merge-conflict-not-the-pool-keeps-file-version-unique
+
+`next_file_version` (`ingest_feed.py`) reads `MAX(_file_version)` for a
+(raw table, COB date) on the ingest's own branch, forked from `main`, and
+returns `MAX + 1` — a plain read-then-write with no lock. Two ingests of one
+COB date, cut from the same base and running at once, both read the same MAX
+and compute the SAME version. An earlier analysis assumed the two would tie
+once merged, since item 09 made `dedupe_rank` gate on the newest
+`_file_version` per date rather than ranking per key. **Measured live, that
+assumption is wrong**, because the tie never reaches the target ref.
+
+### What was measured
+
+Two branches were cut from one base, both ran `next_file_version` for
+`fo_trade`/`2026-08-19` and both computed `_file_version=2`. Both merges
+targeted `probe/item15/fakemain`, a throwaway stand-in for `main` (all three
+branches deleted afterwards; `main`'s own hash, `487d319…`, never moved).
+The first applied cleanly. The second failed:
+
+```
+409 Conflict ... /history/merge:
+{"status": 409, "reason": "Conflict",
+ "message": "The following keys have been changed in conflict: 'raw.fo_trade'",
+ "errorCode": "REFERENCE_CONFLICT"}
+```
+
+— Nessie's v2 merge applies **NORMAL** per-content-key merge behaviour by
+default (the applied merge's own response carried
+`'mergeBehavior': 'NORMAL'` for the `raw.fo_trade` key): a key changed on
+both sides since the branches diverged conflicts, refused outright rather
+than silently applied. A re-run cuts a fresh branch, re-reads
+`MAX(_file_version)` — now reflecting the winner — and gets the correct
+next value.
+
+### What actually serialises `_file_version`, and what does not
+
+**It is this merge conflict, not the `lakehouse_write` pool.** The ingest
+task itself declares `pool="lakehouse_write"` (`feed_ingest.py`), giving it
+one slot — but `scripts/bulk_ingest.py` runs ingests as its own subprocesses
+outside Airflow, and so does the bare CLI, neither subject to any pool.
+(`bulk_ingest.py` happens to run its chunks sequentially today; that is how
+it is written, not a guarantee anything enforces.) Whichever path opens two
+branches on one COB date at once, the merge — not the pool, not the caller —
+refuses the second write, and no docstring here may attribute this to it.
+
+**What would break it:** `Nessie.merge` sending `defaultKeyMergeMode` /
+`keyMergeModes` (FORCE applies over a conflict, DROP silently skips it) or
+`returnConflictAsResult: true` (a conflict returns as a normal response
+instead of raising) — full field list from the live server's own schema,
+`Merge`/`Merge1` in `/nessie-openapi/openapi.yaml`. It sends none of them;
+`tests/test_nessie_merge.py` pins the body against an explicit allowlist,
+shown failing with `returnConflictAsResult: true` added. So would any write
+to a raw table outside branch+merge, which never goes through a merge to
+conflict on: `_bootstrap_main_if_empty` (`ingest_feed.py`) is exactly that,
+for the one-time case where `main` has no commits yet. From the code: it is
+guarded by `if history.get("logEntries"): return`, firing once per catalog,
+before any ingest has committed — two ingests racing THAT window is a real,
+unguarded gap, reported here and not fixed, since it can only happen once,
+against a brand new catalog.
+
+**The cost:** one failed attempt, which is transient and recovers on
+retry. The losing version is stale the instant the 409 arrives, so the
+ingest does not retry the merge itself; it raises a plain `RuntimeError`,
+never `spark_task.Refused`. On the DAG path, Airflow's automatic retry
+(`retries: 2`) cuts a branch of its own
+([a-refusal-is-not-retried](#a-refusal-is-not-retried),
+`context.ingest_attempt_id`), re-reads `MAX(_file_version)` from the new
+`main` and merges. A CLI or `scripts.bulk_ingest` run is re-run by hand,
+with a new run id and so a new branch. The loser's branch is left for
+inspection, like every failed ingest's. The conflict is not specific to one
+COB date: Nessie's key granularity is the TABLE, so any two concurrent
+writers to one raw table conflict, whatever dates they touch.
+
+### What proves it
+
+The live measurement above, and `tests/test_nessie_merge.py` /
+`tests/test_merge_conflict.py`, pinning the request shape and
+`_merge_ingest_branch`'s reaction without talking to a real Nessie.
 
 ## quarantine-is-where-a-refused-delivery-goes
 
@@ -3145,7 +3783,8 @@ check could see nothing about the deliveries behind older rows.
     coalesce(_delivery_id, element_at(split(_source_file, '/'), -1))
 
 **The basename, not the key, and that is the whole subtlety.**
-`_delivery_id` holds a bare filename; `_source_file` holds a full object key.
+For the legacy rows for which this decision was introduced, `_delivery_id`
+holds a bare filename; `_source_file` holds a full object key.
 Coalescing them without stripping the prefix would put two namespaces in one
 column — every join and group-by over it silently wrong for exactly the rows
 that predate provenance, and looking perfectly ordinary in both. It is exact
@@ -3158,6 +3797,13 @@ row exists, and the limit is written down rather than left to be found.
 `source_provenance()` projects it as `delivery_id`, so a rebuilt prepared table
 can name the delivery behind every row it holds — which is what makes a run's
 input set enumerable across the whole history rather than from phase 3 onwards.
+
+> **Phase 5 amendment.** Phase 4's v2 Raw path writes an opaque `dlv_...`
+> DeliveryID into `_delivery_id`. The coalesce still expresses the migration
+> rule, but the preferred value is no longer a filename: new rows preserve
+> that opaque ID unchanged into Prepared. Only a null historical
+> `_delivery_id` takes the basename fallback. `_source_file` remains physical
+> part provenance and `_file_version` remains restatement ordering.
 
 **A macro change reaches only the models rebuilt after it**, and this one is
 the prepared layer's version of the migration `migrate_raw.py` performs for
@@ -3200,6 +3846,55 @@ reproduced from a snapshot. Nothing claims a snapshot's evidence is still in
 pins, and a sweep that fails to recognise something skips it forever rather
 than judging it — the same rule `clean_working_branches` follows for `hold/`.
 
+
+## a-snapshot-tag-names-its-merge-commit
+
+Two problems with `snapshot/<feed>/<bd>/<run_id>`, found together.
+
+**The Transport path cut no tag, and logged no drift.** `transport_ingest`
+ended at `ingest_raw`. `ingest_<feed>` ends with `report_drift` and
+`record_snapshot`, and the Transport DAG and the runner's `ingest transport`
+had neither. On the development stack, `qa_happy_position` had 7 Transport
+deliveries in raw and no snapshot tags.
+
+**The inbox path's tag named `main`'s head, not the ingest's state.**
+`record_snapshot` called `create_tag(from_ref="main")` when it ran. In
+Airflow that is a separate task after the ingest has released the
+`lakehouse_write` pool, so another feed's merge could land first, and the
+tag then pinned both ingests. The batch command (`ingest ingest`, and
+`steps.ingest`) was worse: it merges a whole chunk of up to ten deliveries,
+then tags each one, so every tag in the chunk named the chunk's last merge.
+
+**Decision.**
+- `_ingest_manifest` returns `commit`: the `resultantTargetHash` from
+  Nessie's merge response, the commit that merge made.
+- `record_snapshot` tags that commit (`create_tag(..., hash=commit)`).
+- A result with no commit is not tagged at the head as a fallback, because
+  the head is the wrong answer this replaced. It returns `tag_error` saying
+  why.
+- A delivery raw already held (`already_ingested`) merged nothing and gets
+  no tag.
+- `steps.after_ingest` (drift report, then tag) is the one function every
+  way into raw calls: `steps.ingest`, `transport_steps.ingest_transport`, and
+  the matching last two tasks of both DAGs, which call its two halves.
+
+The tag can then be cut at any time after the merge, outside the pool,
+without naming anyone else's write.
+
+**No backfill.** Past Transport ingests have no tag, and the tags cut from a
+later head still include the ingest they are named for (a superset). Nothing
+is reproduced from a snapshot tag, and the development stack's data is
+disposable.
+
+Live-verified on the development stack. In every case the tag's hash on
+Nessie equals the commit the ingest reported:
+- The Airflow `transport_ingest` run, now six tasks, all green: tag at
+  `e8e64fe2...`.
+- The runner's `ingest transport`: tag at `313a729b...`.
+- `ingest ingest ref_rating`, the batch command over 36 pending deliveries
+  in four chunks: 36 tags at 36 distinct commits, each its own merge's. The
+  old code would have produced about four distinct commits, one per chunk.
+- An Airflow `ingest_fo_trade` run: tag at `523b887f...`.
 ## a-run-is-the-first-thing-the-registry-cannot-rebuild
 
 REQ-400, REQ-401, REQ-404. `registry.run`, `registry.run_input`,
@@ -3280,6 +3975,15 @@ one dbt subprocess per model, each overwriting that file with its own
 invocation id, so there is no single manifest for a run and the field would
 record whichever task finished last. The project's source is what determines
 what was built.
+
+> **Phase 5 amendment.** The digest remains `dbt_manifest_ref`; it was not
+> replaced with whichever task happened to finish last. Actual execution
+> artifacts now have a separate `dbt_artifacts_ref`: every Cosmos task copies
+> its own `manifest.json` and `run_results.json` (and `catalog.json` when
+> generated) into an immutable run/task/attempt object prefix before the next
+> subprocess overwrites `target/`. Publication checks all successful task
+> artifacts before merge. This preserves execution evidence without inventing
+> a false single-invocation manifest or a metadata catalogue.
 
 Both follow `Feed.schema_version`: derived, not declared, because a version
 somebody has to remember to bump is wrong the first time somebody forgets.
@@ -4546,3 +5250,531 @@ on Spark against Iceberg on a Nessie branch.
 > file gave one version and a MERGE Spark accepted, and a key that cleans to
 > NULL was versioned, matched on the next run and closed -- each state
 > identical to a full refresh over the same raw.
+
+## DCM uploads completed transport evidence
+
+**Decision.** DCM remains the owner of DFS watching and source-side
+completeness. Its follow-on action writes original source objects beneath
+`received/<transport-id>/`, verifies them, and writes `_COMPLETE.json` last.
+The reporting platform begins at that marker, validates its versioned contract
+and every declared object's size and SHA-256, and does no stability polling.
+
+`received/` is intentionally separate from the existing feed-scoped
+`landing/`. A TransportID identifies one DCM transfer execution and is opaque
+to this platform; it is neither a producer filename nor the current
+filename-derived DeliveryID. Phase 1 therefore does not rename or copy a
+Transport into Landing merely to satisfy `Feed.parse_filename`. The
+Transport-to-Delivery mapping is a later decision.
+
+At application level the evidence is append-only. The development simulator
+uses conditional create-only writes, returns the existing validated contract
+for an identical retry, and refuses conflicting reuse of a TransportID. This
+does not make the bucket WORM: production versioning, Object Lock and
+retention controls remain deployment decisions. The full producer and
+consumer contract is in `docs/TRANSPORT-CONTRACT.md`.
+
+**Amendment (Contract v2).** The publication algorithm above was promoted out
+of `reporting_platform/ingest/dcm_simulator.py` (deleted) into a standalone
+`reporting_transport/` package with no dependency on the rest of this
+repository, so it is the reference producer a real DCM Python subprocess can
+invoke directly (`python -m reporting_transport publish`), not merely a local
+simulation of one. The local `scripts/simulate_dcm_transport.py` is now a
+thin wrapper calling the identical `publish_transport()` function -- there is
+one implementation of publication semantics, not two. TransportID is no
+longer caller-supplied: it is derived deterministically as
+`{source}-{legacy_feed_id}-{producer_run_id}`, which is why `producer_run_id`
+became required. `received/` gained a `cob_date=<date>/source_system=<system>/`
+partitioning ahead of `<transport-id>/`, both producer-supplied. v1 markers
+(no partitioning) remain permanently readable; nothing rewrites them. See
+`docs/TRANSPORT-CONTRACT.md` for the full v2 contract, including a known,
+accepted limitation this change introduces: TransportID does not include
+`cob_date`/`source_system`, so a caller reusing `producer_run_id` under a
+different `cob_date` is not detected as a conflicting retry.
+
+## transport-to-delivery-is-an-immutable-interpretation
+
+**Decision.** A validated Transport becomes a Delivery by explicit external
+Feed mapping and an immutable interpretation manifest, not by conforming its
+filename or copying it into Landing.
+
+`Feed.source_identifiers` maps `(Transport.source, legacy_feed_id)` to exactly
+one Feed and duplicate pairs fail registry loading. `Feed.delivery_identity`
+is deliberately only an ordered list of the two evidence forms the platform
+already understands: configured control fields and the original data
+filename. Every configured source is inspected and disagreement is an error;
+the ordering chooses provenance only when evidence agrees.
+
+The DeliveryID is a domain-separated SHA-256 digest of transport source and
+TransportID, rendered as an opaque `dlv_` value. TransportID already names the
+immutable occurrence, so this gives identical retry identity without an
+allocation database and keeps two distinct DCM executions distinct even when
+they transfer the same producer filename.
+
+The manifest lives at the deterministic
+`deliveries/<source>/<transport-id>/delivery-manifest.json` key and is written
+with a create-only precondition. A valid existing manifest is verified against
+the accepted Transport and returned; today's Feed configuration cannot
+silently regenerate historical business identity or schema interpretation.
+It references `received/` objects directly and carries no processing status.
+
+`registry.delivery` is unchanged in this phase. Its current reconstruction is
+from legacy Ready/Landing evidence and its parts imply Raw-readable objects;
+mixing new non-ingestible Deliveries into that projection before the registry
+schema and consumers understand both manifest kinds would make the index lie.
+The future projection must reconcile from DeliveryManifests first, remain
+additive to legacy rows and `run_input`, and keep registry availability out of
+manifest creation. The complete boundary is in `docs/DELIVERY-CONTRACT.md`.
+
+## delivery-normalization-is-a-separate-rebuildable-contract
+
+**Decision.** Phase 3 normalizes an immutable DeliveryManifest into a separate
+NormalizationManifest v2 at
+`ready/<feed>/<delivery-id>/normalization-manifest.json`. It does not mutate the
+DeliveryManifest and does not create a compatibility object in Landing.
+
+A plain file part points directly to `received/`. An archive stays unchanged
+there while sorted matching members become deterministic numbered Ready parts.
+Create-only, verify-identical writes make partial retry and full cache rebuild
+the same operation; producer filenames and archive member names remain
+metadata rather than storage identity.
+
+New DeliveryManifests snapshot the resolved normalization contract. Old Phase
+2 manifests use current Feed configuration only for the first normalization,
+record that compatibility source explicitly, and thereafter use the v2
+snapshot. They are never rewritten to invent missing history.
+
+The registry uses a distinct `normalization_part` table because legacy
+`delivery_part` means a key that may occur in Raw `_source_file`. Raw and dbt
+identity are Phase 4 decisions, so assigning that meaning to v2 parts now
+would silently pull the migration forward. The complete contract and boundary
+are in `docs/NORMALIZATION-CONTRACT.md`.
+
+## raw-v2-is-ledgered-by-delivery-not-part
+
+**Decision (Phase 4).** `ingest_normalized_delivery()` consumes one
+NormalizationManifest v2 key without entering Landing. `_delivery_id` is the
+opaque identity of the accepted Delivery and the committed Raw table on
+`main` is the v2 ingestion ledger. `_source_file` remains the exact physical
+object Spark read, so archive members differ there while sharing one
+DeliveryID.
+
+The legacy Ready v1 path keeps its `_source_file`-based pending semantics. The
+two entry points are explicit because silently auto-detecting and blending
+their ledgers would make a part name compete with a Delivery occurrence.
+
+The write retains the existing Nessie branch/merge boundary. Validation and
+Iceberg append happen on the branch; only the merge makes a Delivery visible
+to `already_ingested_delivery()`. A failed attempt is therefore retryable
+without a mutable manifest or registry verdict. Reused Spark sessions refresh
+the Raw table before the ledger query; live verification caught that without
+the refresh an immediate retry could observe pre-merge metadata and append the
+same Delivery twice.
+
+`_file_version` remains the platform ordering number used by existing dbt
+restatement logic. It is not Delivery identity. Prepared/Reporting provenance
+is completed in Phase 5 without redesigning that ordering. Airflow-native
+orchestration is added in Phase 6, below. The full contract is in
+`docs/RAW-INGESTION-CONTRACT.md`.
+
+## one-generic-transport-dag-not-one-per-feed
+
+**Decision (Phase 6).** `transport_ingest` is one DAG
+(`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`)
+serving every Feed, rather than a bespoke DAG per Feed the way the legacy
+`feed_ingest.py` generates one `ingest_<feed>` per entry in `feeds.yml`. The
+legacy shape is per-Feed because Landing/Ready v1 identity is per-Feed by
+construction; the new path's unit of acquisition is Transport, and which Feed
+a Transport belongs to is resolved data (`resolve_transport_feed`), not DAG
+topology. A bespoke-per-Feed shape here would mean hundreds of near-identical
+DAG definitions once DCM's Feed count grows, which is the anti-pattern the
+Phase 6 brief names directly.
+
+Feed-specific behaviour -- filename pattern, control format, archive member
+pattern, schema contract -- still comes entirely from Feed configuration and
+the Delivery/Normalization manifests it produces, unchanged from Phases 2-4.
+Nothing about a Feed's parsing or validation moved into `transport_ingest.py`.
+See `docs/AIRFLOW-ORCHESTRATION.md`.
+
+## the-raw-asset-is-emitted-through-an-alias-not-a-static-list
+
+**Decision (Phase 6).** `ingest_raw` declares
+`outlets=[AssetAlias("raw-table-updated")]` and resolves the concrete asset at
+run time (`context["outlet_events"][alias].add(Asset(feed.asset_uri))`)
+rather than a static `outlets=[Asset(f.asset_uri) for f in feeds().values()]`
+the way `dbt_builds.py`'s `RAW_ASSETS` is built.
+
+A static list was considered and rejected: Airflow marks every Dataset in a
+task's `outlets=` updated on success, unconditionally, regardless of which
+one the task's logic actually touched. A single generic DAG processing one
+Feed per run cannot know which concrete asset to declare at PARSE time
+(`transport_ingest.py` is parsed once, before any Transport exists), and a
+static full-feed-list outlet would mark every OTHER Feed's raw asset updated
+on every single Transport this DAG processes -- wrong, and indistinguishable
+from a real update to a consumer watching that asset. `AssetAlias`
+(`DatasetAlias` pre-Airflow-3, added in Airflow 2.10 under AIP-59) exists
+for exactly this: outlets declared at parse time, the concrete Dataset
+resolved and emitted at run time. Because `prepared_build`'s schedule
+matches Datasets by URI rather than by which DAG/task emitted the event,
+`dbt_builds.py` needed no change to receive these events alongside the
+legacy per-feed DAGs' own.
+
+**Live verification.** Confirmed against a real Airflow 2.10.5 scheduler: an
+`ingest_raw` run's outlet event produced a `dataset_triggered__...`
+`prepared_build` run, which on success triggered `reporting_build` the same
+way, ending in real rows in `reporting.qa_happy_position_summary`. See
+`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally`.
+
+## a-deferrable-sensor-plus-reconciliation-not-bespoke-polling
+
+**Decision (Phase 6).** The fast path (`transport_watch`) is one deferrable
+`S3KeySensor` over the whole `received/` prefix; the correctness path
+(`transport_reconcile`) derives progress from object-storage evidence on a
+coarser schedule and never relies on the fast path having run at all.
+
+Rejected: a real object-store event integration (no MinIO
+webhook/notification exists in this repository, and building one would be
+infrastructure neither this repo nor its documented OpenShift target
+currently support -- see `docs/OPENSHIFT-MAPPING.md`'s still-open "Feed
+arrival" row); a Dataset/Asset-based external trigger (Airflow's asset
+mechanism models events Airflow itself emits, not an external upload it never
+wrote); and one polling sensor per Feed (explicitly the anti-pattern the
+Phase 6 brief rules out -- the unit of acquisition is now Transport).
+
+`apache-airflow-providers-amazon` was already an image dependency
+(`Dockerfile.airflow`) with nothing using it, which is a strong signal this
+was staged for exactly this purpose. Its `S3KeySensor(deferrable=True)`
+costs no new infrastructure and holds no worker slot while waiting -- the
+triggerer polls, not a task process.
+
+Reconciliation still exists and is still scheduled independently, because a
+deferrable sensor is an optimisation on Airflow's OWN availability: if the
+triggerer is down, the sensor never fires, and the Phase 6 brief is explicit
+that correctness must not depend on events alone. See
+`docs/AIRFLOW-ORCHESTRATION.md#reconciliation` for the staged evidence walk
+and `#reconciliation-scale` for why it bounds Raw's Spark cost to one query
+per Feed with a candidate rather than one per Delivery.
+
+**Live verification.** Confirmed against a real stack: `airflow connections
+get aws_default` resolves the MinIO endpoint from
+`docker-compose.yml`'s `AIRFLOW_CONN_AWS_DEFAULT`; a simulated Transport was
+picked up by the sensor within its next cycle and triggered
+`transport_ingest`; re-triggering the same TransportID repeatedly (the
+marker persists, so `transport_watch` keeps finding it every minute) deduped
+every time via `DagRunAlreadyExists`, never a failure or a duplicate Raw
+row; and `transport_reconcile`, run with `transport_watch` paused, correctly
+discovered and triggered a Transport the fast path had never seen. See
+`docs/AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally`.
+
+## ready-v1-manifest-listing-must-not-match-ready-v2-manifests
+
+**Decision (Phase 6, found in live verification).** `normalize.py`'s (v1)
+`is_manifest_key`/`list_manifests` matched any key under a feed's
+`ready/<feed>/` prefix ending in `.json`. `normalization.py`'s (v2) Delivery
+path deliberately shares that same prefix, one level deeper --
+`ready/<feed>/<delivery-id>/normalization-manifest.json`
+(`docs/NORMALIZATION-CONTRACT.md`, "beside, not in place of the legacy
+path"). A prefix-plus-suffix match cannot see the extra path segment, so v1's
+listing picked up v2's manifest too, and `read_manifest`'s version check
+raised on the mismatch (`manifest_version` vs. v2's
+`normalization_manifest_version`) -- discovered running `bulk_ingest` against
+a feed (`qa_happy_position`) that had received one Transport-based Delivery:
+`find_pending` raised and the legacy path was permanently broken for that
+feed from then on, contradicting `docs/AIRFLOW-ORCHESTRATION.md`'s claim that
+the two paths "share nothing except their final destination, Raw."
+
+Fixed by tightening `is_manifest_key` to require no further `/` after the
+prefix -- the shape every v1 manifest key has by construction (v1 manifests
+are never nested; only extracted archive members are, and those are never
+named `*.json`) and a v2 manifest key never has. `list_manifests` now calls
+`is_manifest_key` instead of duplicating a looser check inline, so
+`retention/ready.py`'s sweep (which calls `manifests_for`, built on
+`list_manifests`) is covered by the same fix. No v2 code changed; the fix is
+entirely on the v1 side, which is the side that made the unqualified claim.
+`tests/test_normalize.py::test_a_v2_delivery_manifest_sharing_this_prefix_is_not_picked_up`
+reproduces the collision and pins the fix.
+
+## validation-evidence-is-append-only
+
+**Decision (Phase 7).** `registry.validation_result` (`docs/VALIDATION.md`)
+records the outcome of controls that already run in RPL, Spark and dbt --
+it is deliberately not a fourth place those controls are DEFINED, only a
+durable, queryable record of what they OBSERVED.
+
+**Why one table across three layers, not three.** Delivery/Transport
+controls, Raw ingestion controls and dbt tests already have three different
+execution mechanisms, and Phase 7's brief is explicit that they must stay
+that way -- no generic validation engine. But an investigator asking "what do
+we know about this Delivery" or "what did this run check" needs one place to
+look, not three schemas to join by hand. `layer` says which mechanism
+produced a row; the columns that do not apply to a layer stay NULL.
+
+**Why no foreign key to `registry.run` or `registry.delivery`.** Same
+reasoning `run_input` already established (`registry/db.py`'s module
+header): a foreign key would let a rebuild of either table cascade validation
+history away, and a Delivery/Transport integrity FAILURE by definition has no
+successful `registry.delivery` row to reference in the first place -- see
+`#failed-delivery-validation-has-no-fake-manifest` below. `run_id` links
+dbt-layer rows to the `registry.run` that produced them (informational, not
+enforced); `execution_ref` is a separate, free-form pointer for the
+Delivery/Raw layers, which run in an entirely different id space (an ingest
+run id or an Airflow run id, never a `registry.run.run_id`) -- conflating the
+two under one column would make it mean two different things depending on
+which row you were reading.
+
+**Why append-only with a deterministic id, not a mutable "latest status"
+row.** A mutable row answers "did this control pass" and destroys "when did
+it first fail, and did a later run genuinely fix it" on every UPDATE -- the
+same reasoning `registry.as_at_transition` already uses for the same shape of
+problem. `validation_id` is computed from `(layer, control_id, attempt_key)`,
+where the caller's `attempt_key` names ONE LOGICAL EXECUTION (an Airflow run
+id for a Delivery control, `run_id:task_id:try_number` for a dbt task).
+`INSERT ... ON CONFLICT DO NOTHING` makes retrying that same execution a
+no-op rather than a duplicate; a genuinely later execution gets a new
+`attempt_key` and therefore its own row. Verified live: retriggering
+`transport_ingest` for the same TransportID under a fresh Airflow run id
+produced a second, independent `delivery_identity` FAIL row beside the
+first, while re-running `record` with the same `attempt_key` produced none.
+
+## failed-delivery-validation-has-no-fake-manifest
+
+**Decision (Phase 7).** A Transport/Delivery control that fails --
+`TransportContractError`/`TransportEvidenceError` from `ingest/transport.py`,
+`DeliveryError` and its subclasses from `ingest/delivery.py` -- is recorded
+in `registry.validation_result` (`layer=delivery`, `outcome=FAIL`) keyed by
+`transport_id`, never by inventing a `registry.delivery` row or a
+DeliveryManifest for something that was refused. `registry.delivery` stays
+exactly what its module header already says it is: an index over accepted
+Deliveries, rebuildable from object storage. A row for something that was
+NOT accepted would make that rebuild lie.
+
+The immutable Transport evidence under `received/<transport_id>/` already
+answers "what arrived"; the validation_result row answers "what the platform
+decided about it and why", which is the fact nothing else records. FAIL
+(a known validation exception -- the control ran and found a real problem) is
+kept distinct from ERROR (anything else -- the control itself could not
+execute), by classifying the caught exception's type rather than by outcome
+alone. See `docs/VALIDATION.md#outcomes`.
+
+Live-verified: a Transport whose control filename did not match its feed's
+`delivery.control.pattern` failed `create_delivery` with
+`IdentityResolutionError`; no `registry.delivery` row was created for it, and
+`registry validation transport <id>` returned the FAIL row naming the exact
+control and reason.
+
+## a-declared-control-must-arrive
+
+**Decision.** A feed whose `delivery.control` declares any of `cob_date`,
+`version`, `row_count` or `md5` refuses, at `create_delivery`, a Transport
+that carries no control object (`IdentityResolutionError`, a `FAIL` on
+`layer=delivery`).
+
+`resolve_business_identity` read control objects only `if
+transport.control_files`, so a Transport without one went through: no md5
+and no row count asserted, `declared_md5` None, the Raw check skipped, and no
+validation row saying it had been. That is the same state as a feed that
+never declared a checksum -- a subject that could not be READ reported as one
+that was EMPTY. A Transport is complete by contract, so a missing control is
+not late; the inbox makes the same call for an archive member's control file
+missing from its container.
+
+**Optional stays per FEED.** Some feeds have no control file and some control
+files carry no md5. Neither declares the field, so neither reaches this
+check. What this does not express is one feed whose control files sometimes
+carry a checksum and sometimes do not; declaring `md5` for it refuses the
+ones without, naming the missing column. No such feed is known, so no
+per-field optional flag was built.
+
+Live-verified: `qa_happy_position` (declares all four) with a Transport of
+the data file alone failed `create_delivery` in one attempt with
+`AirflowFailException: IdentityResolutionError: ... declares delivery.control
+(cob_date, version, row_count, md5) and the Transport carries no control
+object`, and one `delivery_identity` FAIL row.
+
+## a-refusal-is-not-retried
+
+**Decision.** A failure that the same input will reproduce is raised as
+`spark_task.Refused` in the Spark child, which exits `REFUSED_EXIT` (65,
+EX_DATAERR); `spark_task.run` raises `SparkTaskRefused` (still a
+`RuntimeError`) for that status, and the ingest DAGs turn it -- and
+`DeliveryError` in `create_delivery` -- into `AirflowFailException`. A
+transient failure still retries, on a branch of its own:
+`context.ingest_attempt_id` names `ingest/<feed>/<date>/<run>-a<n>`.
+
+Found by running a Transport whose control file declared the wrong md5.
+Attempt 1 failed correctly, with the checksum and a branch "left for
+inspection". Attempts 2 and 3 cut the SAME branch name, got Nessie's `409
+Conflict`, and that became the task's final error: two retry delays spent,
+and the message an operator reads named neither the checksum nor the file.
+The retry could never have succeeded for a transient failure either, so the
+docs' "a retry after a failed branch simply runs the write again" was false
+for every failure it described.
+
+Reusing the branch (`exist_ok`, as `wap.open_build` does) is right for a dbt
+build and wrong here: an attempt that failed after its append would leave
+rows the retry appends again. A fresh branch starts from `main`, and each
+failed attempt's branch is still there to inspect.
+
+**`__main__` hands off to the imported module.** The first live run of the
+fix still exited 1: run as `python -m`, `spark_task.py` is `__main__`, a
+second module object whose `Refused` is not the class every op subclasses,
+so `except Refused` never matched. An in-process test of `main()` passed
+throughout. `tests/test_refusal.py` now runs the module through `runpy` as
+`__main__`, and fails against the old entry point.
+
+Live-verified: the same mismatch now fails `ingest_raw` in ONE attempt,
+`exit 65`, `AirflowFailException: SparkTaskRefused`, the message naming the
+data object, its md5, the control object and the declared md5, and
+`raw_ingestion` recorded as FAIL where it had been ERROR. A correct delivery
+still merged on `...-a1`.
+
+The message's control object is looked up from the DeliveryManifest at
+ingest (`ingest_feed._with_control_object`), not added to NormalizationManifest
+v2: `normalize_delivery` accepts an existing manifest only byte-identical,
+so a new field would turn every manifest already in `ready/` into a conflict
+on its next re-normalize.
+
+## migration-comparison-is-not-validation-result
+
+**Decision (Phase 8).** Dual-run comparison evidence lives in its own table,
+`registry.migration_comparison`, rather than as a fourth `layer` value on
+`registry.validation_result`. Every existing `validation_result` row is
+identified by a Delivery, a Transport, or a dbt node -- three identity
+schemes this platform owns. A migration comparison's OTHER side is a
+reference into a legacy estate this platform does not own and cannot assign
+identity to (a legacy load id, a query snapshot id, whatever that adapter
+returns), and forcing it through `delivery_id`/`transport_id` columns would
+either be wrong (those columns mean specifically THIS platform's identity)
+or would require inventing a synthetic Delivery for something that was never
+ingested here at all -- the exact trap
+`#failed-delivery-validation-has-no-fake-manifest` above already refuses for
+a different reason.
+
+The outcome vocabulary (PASS/WARN/FAIL/ERROR) and the append-only,
+deterministic-id idempotency shape ARE reused verbatim, because those are
+genuinely the same concept. Only the identity columns differ. See
+`docs/MIGRATION.md`.
+
+## a-migration-comparison-row-is-only-written-when-both-sides-exist
+
+**Decision (Phase 8).** `registry.migration_comparison` has no
+`WAITING_FOR_LEGACY`/`WAITING_FOR_NEW` outcome and no row is ever written for
+one. `run.compare_business_date` returns a Python-level `NOT_COMPARABLE`
+value that nothing persists when either side has nothing yet for a
+business date. The alternative -- a mutable "current stage" row per
+(feed, business_date) -- is the same workflow-state trap the delivery
+registry already refuses (`#the-registry-records-observations-not-verdicts`):
+it would need updating out from under itself as sides arrive, could disagree
+with what object storage / the legacy adapter actually shows, and would give
+`migration_comparison` a second kind of row (workflow state) beside its one
+kind (an executed comparison's result). "Not yet comparable" is instead
+always a live derivation from whether the new side has a registered Delivery
+and the legacy adapter returns non-`None`, computed fresh on every
+`migration_reconcile` pass -- the same "derive, never store the absence of
+evidence" principle `deliveries.reconcile()` already applies to Landing/Raw.
+
+## the-chart-is-the-only-place-settings-are-written
+
+**Decision (2c).** `deploy/helm/reporting-platform` writes exactly ONE
+ConfigMap (`<release>-platform-env`) and ONE Secret
+(`<release>-platform-secrets`, or `secrets.existingSecret`), and every
+platform pod -- Airflow's own (scheduler/webserver/triggerer/worker, via
+`airflow.extraEnvFrom`), the Spark driver pods `_spark_task.driver_pod`
+launches, the inbox watcher and the feed console -- reads both with
+`envFrom`. One pair, not one per consumer, for the same reason
+`REGISTRY_DSN` lives on one compose anchor rather than four service blocks:
+a setting two pods could each have their own copy of is a setting that can
+silently disagree.
+
+**Why `existingSecret` needs two literal names kept in step, not one computed
+value.** `airflow.extraEnvFrom` is a plain string that the AIRFLOW SUBCHART's
+own templates `tpl` at render time, in ITS OWN scope. `.Release.Name`
+resolves there because `Release` is shared by every chart in one release, but
+`.Values` in that scope is the airflow subchart's own values tree -- it never
+contains this chart's `secrets.existingSecret`, and Helm has no template hook
+that lets a parent chart hand a subchart a value computed from the parent's
+own values (short of `global.*`, which still has to be set by hand in the
+same values file for the same reason -- one more name to keep in step, not
+fewer). So `values.yaml`'s default `extraEnvFrom` names the fixed pattern
+(correct whenever `secrets.existingSecret` is unset), and each values file
+that sets a custom `secrets.existingSecret` (`values-dev.yaml`,
+`values-uat.yaml`, `values-prod.yaml`) overrides `extraEnvFrom` in the SAME
+file to name that same secret literally. `templates/_helpers.tpl`'s
+`reporting-platform.envSecret` -- used by every template THIS chart owns
+(inbox, feed-console, job-platform-init, rbac) -- resolves the same name from
+`secrets.existingSecret` directly, since those templates render in this
+chart's own scope and can see it. `tests/test_chart.py` checks that the base
+`values.yaml` file's default agrees with the helper's fallback; a
+per-environment override is checked by `helm template` actually resolving
+both to the same string, in the PR's Done-when transcript.
+
+**Refused in `uat`/`prod`** (`reporting-platform.controlled`,
+`_helpers.tpl`): `feedConsole.enabled` (docs/OPENSHIFT-MAPPING.md, "the feed
+console is not deployed above dev" -- it writes into the dbt project, which
+is exactly the drift `check_project_drift` exists to catch), and a platform
+or Spark image with a `.tag` but no `.digest` -- a tag can be re-pushed under
+a run already published, and `PLATFORM_CODE_REF` must be the identity a
+publication can still be traced back through
+(`#the-release-image-carries-the-code`). Both fail `helm template` naming the
+offending value, the same "fail loud at render, not quiet in the first pod
+that reads it" posture `required` gives every endpoint and image.
+
+
+## components-are-declared-and-enforced
+
+The platform is carved into separately built, versioned and deployed
+components -- `transport`, `core`, `ingest`, `dbt`, `ops`, plus `dev`, which is
+never packaged -- and **`components.yml` is the only statement of which
+module belongs to which**. `tests/test_components.py` reads every import in
+the source, lazy ones included, and fails on one that reaches a component its
+owner does not declare in `depends_on`. See `docs/PACKAGING.md` for the
+target shape.
+
+**Why lazy imports count.** Most cross-package imports here are inside
+functions on purpose, to keep pyspark and boto3 off the import path of code
+that only reads config. On one PYTHONPATH that is invisible. In an image built
+with `ingest` and without `ui`, it is a ModuleNotFoundError on the first run
+that reaches the branch -- the inbox's trigger path imported the console's
+Airflow client exactly this way, and nothing would have said so before a
+deployed inbox first tried to trigger a DAG.
+
+**Ownership is by module, not by directory**, longest prefix wins. The
+delivery index (`registry.deliveries`, `.rejections`, `.transports`) is
+rebuilt from object storage by the ingest code that writes it
+(`#the-registry-records-observations-not-verdicts`), so it ships with
+`ingest`, while `registry.db`'s DDL and the run and lifecycle records are
+`core`. Its pure-SQL reads moved to `registry/delivery_reads.py` (core) so a
+published run's trace needs no ingest install; `deliveries.py` re-exports
+them. Likewise `ingest.sniff` and `ingest.sample_diagnostics` are `dev`: they
+infer a feed definition for the console and nothing that runs a delivery
+calls them. The directories can be made to agree later without changing an
+import path, because every `__init__.py` on the way is empty and so can
+become a namespace package.
+
+**The Spark launcher is core and names its operations as strings.** It was
+`scripts/_spark_task.py`, and `scripts/` ships in no component. It is
+`reporting_platform/common/spark_task.py` now, each operation's body is in a
+`spark_ops.py` in the component that owns it, and `spark_task.OPS` maps the
+name. A driver image built without the owning component refuses the op by
+name. Because a string is invisible to the import scan,
+`test_components.py` checks the table separately: every entry resolves, and
+every DAG launches only ops its own component may import. The launch scan
+asserts it found at least ten launches, so renaming the DAGs' wrapper
+functions cannot turn it off. `python -m scripts._spark_task` still works as
+a shim.
+
+**`ingest` depends on `transport`, deliberately.** The Transport manifest's
+parser is `reporting_transport.contract`, shared unmodified with the
+publisher, so there is one implementation of what a marker means. The
+alternative -- a copy on the consumer side -- is two parsers of one contract
+drifting apart. Pin a compatible range, not an exact version.
+
+**Wheels are built from a staging directory, not a pyproject per
+directory**, because ownership is by module. `scripts/build_components.py`
+copies exactly a component's files, generates its `pyproject.toml` from
+`components.yml` and builds it. `--check` installs the result into an empty
+virtualenv outside the checkout, with its sibling wheels installed BY FILE (a
+name could be answered by a public package of the same name) and none of the
+extras, and imports every module. The static test cannot see a module-level
+import of an undeclared third-party package or a file the staging missed;
+this does, and removing `requests` from core's `requires` fails it on
+`common/airflow_api.py`, measured.

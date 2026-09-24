@@ -1,5 +1,11 @@
 # Airflow 2.x, deliberately, not 3.x. See docs/DECISIONS.md#airflow-2-not-3
-FROM apache/airflow:2.10.5-python3.11
+#
+# TWO TARGETS. `dev` (everything up to the permissions layer) is what compose
+# builds, with the code BIND-MOUNTED so an edit is live. `release` is `dev`
+# plus the code and the dbt packages, for a cluster with no mounts at all.
+# Compose pins `target: dev`; without it, a multi-stage build defaults to the
+# LAST stage. See docs/DECISIONS.md#the-release-image-carries-the-code
+FROM apache/airflow:2.10.5-python3.11 AS dev
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,10 +16,15 @@ ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 # Nessie GC tool. The only way to collect content unreachable from any Nessie
 # reference; version tracks the server. ~128 MB, most of this image's size.
 # See docs/DECISIONS.md#nessie-gc-jar
+#
+# NESSIE_GC_URL IS A BUILD ARG so the corporate mirror can redirect it -- the
+# ARG comes AFTER NESSIE_SERVER_VERSION so the default actually expands the
+# version into it; declared before, it would bake in a literal
+# "${NESSIE_SERVER_VERSION}". See docs/DECISIONS.md#images-build-from-a-mirror
 ARG NESSIE_SERVER_VERSION=0.108.1
+ARG NESSIE_GC_URL=https://github.com/projectnessie/nessie/releases/download/nessie-${NESSIE_SERVER_VERSION}/nessie-gc-${NESSIE_SERVER_VERSION}.jar
 RUN mkdir -p /opt/platform/lib \
-    && curl -fsSL -o /opt/platform/lib/nessie-gc.jar \
-       "https://github.com/projectnessie/nessie/releases/download/nessie-${NESSIE_SERVER_VERSION}/nessie-gc-${NESSIE_SERVER_VERSION}.jar" \
+    && curl -fsSL -o /opt/platform/lib/nessie-gc.jar "${NESSIE_GC_URL}" \
     && chown -R airflow: /opt/platform/lib
 
 USER airflow
@@ -21,8 +32,16 @@ USER airflow
 # airflow version to satisfy them. In the corporate environment these resolve
 # via the internal registry mirror; pip.conf / SSL cert config is injected at
 # build time there. See docs/DECISIONS.md#airflow-provider-constraints
+#
+# AIRFLOW_CONSTRAINTS_URL IS A BUILD ARG so the mirror can redirect the fetch
+# itself, not just what pip resolves through it -- a raw.githubusercontent.com
+# URL is exactly the literal a corporate egress policy blocks.
+# tests/test_ci_pins.py compares this default against
+# .github/workflows/parse.yml's copy; both must name the same Airflow and
+# Python version. See docs/DECISIONS.md#images-build-from-a-mirror
+ARG AIRFLOW_CONSTRAINTS_URL=https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt
 RUN pip install --no-cache-dir \
-      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt" \
+      --constraint "${AIRFLOW_CONSTRAINTS_URL}" \
       "apache-airflow-providers-apache-spark" \
       "apache-airflow-providers-amazon"
 
@@ -81,6 +100,41 @@ RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}" \
     && dbt --version >/dev/null \
     && python -c "import marimo, duckdb; print('marimo', marimo.__version__)"
 
+# THE DRIVER'S JARS, baked in rather than resolved by Ivy at session start.
+# Every submitting process here -- spark_session() and dbt's spark_local
+# target -- is a pip pyspark with NO Iceberg, Nessie or S3A jars of its own.
+# It used to fetch them from Maven Central through spark.jars.packages on
+# every cold start, which is a runtime dependency on egress that a cluster
+# does not have. Both drivers now read PLATFORM_DRIVER_JARS below, set as
+# spark.jars, which also SHIPS them to the executors -- how hadoop-aws, which
+# Dockerfile.spark does not bake, reaches them at all.
+#
+# The versions must equal Dockerfile.spark's, and tests/test_versions.py
+# checks that they do. hadoop-aws tracks the Hadoop that pyspark 3.5.3
+# bundles, and aws-java-sdk-bundle tracks hadoop-aws.
+# See docs/DECISIONS.md#jar-versions, docs/DECISIONS.md#driver-jars-are-baked
+ARG MAVEN_REPO=https://repo1.maven.org/maven2
+ARG ICEBERG_VERSION=1.6.1
+ARG NESSIE_SPARK_EXT_VERSION=0.99.0
+ARG HADOOP_AWS_VERSION=3.3.4
+ARG AWS_SDK_BUNDLE_VERSION=1.12.262
+USER root
+RUN set -eux; \
+    J=/opt/platform/jars; mkdir -p $J; \
+    curl -fsSL -o $J/iceberg-spark-runtime.jar \
+      "${MAVEN_REPO}/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar"; \
+    curl -fsSL -o $J/iceberg-aws-bundle.jar \
+      "${MAVEN_REPO}/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar"; \
+    curl -fsSL -o $J/nessie-spark-extensions.jar \
+      "${MAVEN_REPO}/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/${NESSIE_SPARK_EXT_VERSION}/nessie-spark-extensions-3.5_2.12-${NESSIE_SPARK_EXT_VERSION}.jar"; \
+    curl -fsSL -o $J/hadoop-aws.jar \
+      "${MAVEN_REPO}/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
+    curl -fsSL -o $J/aws-java-sdk-bundle.jar \
+      "${MAVEN_REPO}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"; \
+    chown -R airflow:0 $J; chmod -R g+rX $J
+ENV PLATFORM_DRIVER_JARS=/opt/platform/jars/iceberg-spark-runtime.jar,/opt/platform/jars/iceberg-aws-bundle.jar,/opt/platform/jars/nessie-spark-extensions.jar,/opt/platform/jars/hadoop-aws.jar,/opt/platform/jars/aws-java-sdk-bundle.jar
+USER airflow
+
 # ---------------------------------------------------------------------------
 USER root
 # dbt's working directories, outside the ./dbt bind mount because a bind mount
@@ -95,3 +149,33 @@ RUN mkdir -p /opt/platform/run/dbt/logs /opt/platform/run/dbt/target \
     && chown -R airflow:0 /opt/platform/run \
     && chmod -R g+rwX /opt/platform/run
 USER airflow
+
+# ---------------------------------------------------------------------------
+# RELEASE: the same image with the code in it, at the paths compose mounts it.
+# Nothing a DAG, a task or the console reads may come from a mount here --
+# `docker run <image> python -m scripts.check_dag_imports` with no mounts is
+# the proof. Tests, seeds and docs stay out: this is a runtime image.
+FROM dev AS release
+
+COPY --chown=airflow:0 airflow/dags          /opt/airflow/dags
+COPY --chown=airflow:0 reporting_platform    /opt/platform/reporting_platform
+COPY --chown=airflow:0 reporting_transport   /opt/platform/reporting_transport
+COPY --chown=airflow:0 scripts               /opt/platform/scripts
+COPY --chown=airflow:0 dbt                   /opt/platform/dbt
+
+# Paths that are facts about THIS image, not about an environment, so they
+# live here rather than in a chart ConfigMap. The same values compose sets on
+# its airflow anchor. See docs/DECISIONS.md#dbt-working-directories
+ENV PYTHONPATH=/opt/platform \
+    DBT_PROJECT_DIR=/opt/platform/dbt \
+    DBT_PROFILES_DIR=/opt/platform/dbt \
+    DBT_LOG_PATH=/opt/platform/run/dbt/logs \
+    DBT_TARGET_PATH=/opt/platform/run/dbt/target
+
+# dbt packages AT BUILD TIME, into the path dbt_project.yml's
+# packages-install-path defaults to, so airflow-init needs no network for
+# them on a cluster. Without packages `dbt ls` cannot compile a dbt_utils
+# test and both build DAGs fail to IMPORT.
+# See docs/DECISIONS.md#airflow-init-load-bearing-steps
+RUN dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt \
+    && chmod -R g+rwX /opt/platform/run /opt/platform/dbt

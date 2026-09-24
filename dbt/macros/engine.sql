@@ -752,19 +752,32 @@
 {%- endmacro %}
 
 
-{% macro scd2_output_columns(business_columns) %}
+{% macro prepared_output_columns(business_columns) %}
   {#-
-    The column ORDER of an SCD2 model's output, defined once: the business
-    columns, the delivery the value first appeared in, the provenance and
-    audit columns, then what `scd2_columns` appends. `scd2_replay` projects
-    it, `ranged` projects it, and `scd2_retractions` unions against it
-    POSITIONALLY -- Spark 3.5 has no UNION BY NAME -- so they must not be able
-    to disagree.
+    The column ORDER of a prepared model's cleaned output, defined once: the
+    business columns, the delivery the row came from, the provenance and
+    audit columns -- the order `cleaned` writes them in. A model that ranks
+    AFTER cleaning carries `_cob_date`, `_file_version` and `_row_number`
+    through for the rank, and Spark 3.5 has no `SELECT * EXCEPT`, so it
+    projects this list to drop them. `insert_overwrite` into an existing
+    table must see the columns it always did, in that order.
   -#}
   {%- set cols = business_columns + ['source_file', 'source_file_version'] -%}
   {%- for alias, _expression in provenance_pairs() %}{% do cols.append(alias) %}{% endfor -%}
   {%- do cols.extend(['source_batch_id', 'dbt_invocation_id', 'nessie_ref', 'dbt_updated_at']) -%}
   {{ return(cols) }}
+{% endmacro %}
+
+
+{% macro scd2_output_columns(business_columns) %}
+  {#-
+    The column ORDER of an SCD2 model's output, defined once: the prepared
+    order above, then what `scd2_columns` appends. `scd2_replay` projects
+    it, `ranged` projects it, and `scd2_retractions` unions against it
+    POSITIONALLY -- Spark 3.5 has no UNION BY NAME -- so they must not be able
+    to disagree.
+  -#}
+  {{ return(prepared_output_columns(business_columns)) }}
 {% endmacro %}
 
 

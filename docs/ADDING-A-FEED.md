@@ -1,6 +1,25 @@
 # Adding a feed
 
-Worked example: a `treasury_margin_call` feed from the `treasury` source system,
+**New Transport-path Feeds are handled by the generic ingestion
+orchestration. There is no Feed-specific ingestion DAG to add.** The Feed
+config file, dbt model and tests below (steps 1-4) are still what you write —
+the same `Feed` schema, `source_identifiers`, `filename_pattern` and
+`delivery.control` fields serve both the Transport path and the legacy
+`landing` path — but a Transport-path Feed needs no per-Feed Airflow DAG and
+therefore skips step 5 below. `transport_watch`/`transport_ingest` already run
+generically for every Feed; the Feed becomes live the moment a Delivery for it
+starts arriving under `received/`. See
+`reporting_platform/config/feeds/qa_happy_position.yml` for a worked
+Transport-path Feed, and [DELIVERY-CONTRACT.md](DELIVERY-CONTRACT.md) /
+[TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md) for identity resolution and the
+producer side.
+
+**This walkthrough below still runs the worked example through the legacy
+`landing`/`feed_ingest.py` path**, including step 5 ("unpause the generated
+DAG"), because that is what the local sample-data and CLI tooling exercises
+today. It remains accurate for a legacy/compatibility Feed, and steps 1-4 are
+shared with a Transport-path Feed. Worked example: a `treasury_margin_call`
+feed from the `treasury` source system,
 delivering `marginCalls_20260801.csv`. The lowerCamelCase filename is
 deliberate — it is what makes the per-feed `filename_pattern` earn its keep.
 
@@ -60,7 +79,7 @@ Four things that are easy to get wrong:
 
 - **`name` is a table name, an Airflow DAG id and an S3 prefix at once.**
   `treasury_margin_call` gives `lakehouse.raw.treasury_margin_call`, DAG
-  `ingest_margin_call` and landing prefix `landing/treasury_margin_call/`. Use
+  `ingest_treasury_margin_call` and landing prefix `landing/treasury_margin_call/`. Use
   lowercase with underscores regardless of what the upstream calls its files.
 - **`filename_pattern` must yield a `cob_date` named group**, and it is
   matched with `re.fullmatch`, not `search` — a pattern that does not cover
@@ -102,7 +121,7 @@ Optional, and worth a thought rather than a default:
 | `column_types:` | A column whose prepared-layer treatment is not what its *name* implies. `haircut_pct` reads as a string to the inference but should be `decimal`; `settlement_ccy` is a code, not free text. Only list the disagreements — anything absent falls back to the inference. It is what the feed console writes when you change a type on the form, and what the sample-data generator reads, so the two cannot drift apart. Raw is still all strings; this describes the **prepared** model. |
 | `arrival:` | The upstream does **not** send a correctly named file. `landing/` accepts only conformant names, so a legacy sender goes through the inbox gate instead: `source_pattern` recognises the name as sent, and `control:` (`pattern`, `cob_date`, `version`) says how to find the control file and what it declares about the delivery's **identity**. The gate renames the delivery *and its control file* to match, writes both into `landing/` with a `.meta.json` sibling, and a re-delivery for a date already landed becomes `_v2`. It verifies nothing — row count and checksum belong to `delivery.control` and are checked at ingest, so a feed with `arrival:` needs `delivery.control` too. Omit both for any upstream that already names files correctly, which is every feed here today. See [DECISIONS.md#the-inbox-is-the-conformance-gate](DECISIONS.md#the-inbox-is-the-conformance-gate). |
 | `arrival.archive:` | The upstream sends a **zip**. The gate unpacks it and lands each member as its own delivery; the container never reaches `landing/`, and its name, md5 and byte count are recorded in each member's `.meta.json` — the only record it ever existed ([worked example](DELIVERY-SHAPES.md#the-metadata-sibling)). `member_pattern` says which members belong to this feed and must capture `(?P<cob_date>...)` — each member is a complete delivery for its own date. Members that are *parts* of one date are a different shape and are not built. |
-| `delivery.control:` | The delivery is gated on a control file landing beside it, and that file states the row count (`row_count`) or a checksum (`md5`). Checked at ingest for **every** delivery — one an approved sender wrote straight into landing, and one the inbox renamed and promoted — so there is one implementation of the check and the trusted path is not the less-verified one. A mismatch abandons the build branch and leaves `main` untouched. `format:` says how the file is READ — the default is a regex per field over its text, `kind: delimited` makes each field a column name of a `|`-or-whatever table, and both control blocks must declare the same one because they parse the same promoted bytes. See [DECISIONS.md#control-file-formats](DECISIONS.md#control-file-formats). |
+| `delivery.control:` | The legacy delivery is gated on a control file landing beside it, and that file states the row count (`row_count`) or a checksum (`md5`). Checked at ingest for **every** legacy delivery — one an approved sender wrote straight into landing, and one the inbox renamed and promoted — so there is one implementation of the check and the trusted path is not the less-verified one. A mismatch abandons the build branch and leaves `main` untouched. For a Phase 2 Transport mapping the same block may also name `cob_date` and `version`, read directly from the Transport control object when creating its DeliveryManifest. `format:` says how the file is READ — the default is a regex per field over its text, `kind: delimited` makes each field a column name of a `|`-or-whatever table, and both legacy control blocks must declare the same one because they parse the same promoted bytes. See [DECISIONS.md#control-file-formats](DECISIONS.md#control-file-formats). |
 | `supersession:` | Only if a later delivery does **not** simply restate the whole population for its COB date. The one built mode is `full_snapshot`, which is the default and what every feed here does; `delta_append` and `correction` are refused at load with the reason. Set it explicitly on a feed whose shape you want stated rather than assumed — the failure it prevents is silent, because a delta feed deduped as a snapshot loses every key its newest file omits and the row counts still look plausible. See [DECISIONS.md#supersession-is-declared-not-assumed](DECISIONS.md#supersession-is-declared-not-assumed). |
 | `delivery:` | The delivery is a zip (`kind: archive`, plus `member_pattern`) rather than one plain CSV. See [DELIVERY-SHAPES.md](DELIVERY-SHAPES.md) for the shapes, and [DECISIONS.md#archive-normalizer](DECISIONS.md#archive-normalizer) / [#control-file-gate](DECISIONS.md#control-file-gate) for what each key actually does. The console validates it with the exact function feeds.yml load does, so a typo here fails in the form rather than at the next Airflow parse. |
 
@@ -117,7 +136,9 @@ property of the source system far more often than of one feed.
 |---|---|---|
 | `delimiter` | `","` | The upstream sends pipes, tabs or semicolons. **Never inherited by a control file** — `control.format` needs its own, because pipes read as commas is not an error, it is one column named by the whole header line. |
 | `quote_char` | `'"'` | The upstream quotes with something else, or nothing. |
-| `file_encoding` | `utf-8` | A mainframe extract in `cp1252` or `latin-1`. Getting this wrong does not fail — it lands mojibake. |
+| `file_encoding` | `utf-8` | A data extract uses another supported encoding such as `cp1252`, `latin-1` or UTF-16. Decoding is strict and the configured codec must map to a verified Spark codec; bad bytes fail before publication. |
+| `control_encoding` | same as `file_encoding` | The control file uses a different encoding from the data file. |
+| `csv_options` | `{}` | The CSV overrides `escape_char` or explicitly disables multiline records with `multiline: false`. These options are validated and recorded in the delivery manifest. |
 | `header` | `true` | The file has no header row. `columns:` then carries the whole contract by position. |
 | `schema_drift` | `warn` | `fail` aborts the load on an extra **or** missing column, leaves the ingest branch for inspection, and never touches `main`. The default is usually right: a rejected file is a file nobody looks at. |
 | `landing_prefix` / `ready_prefix` / `raw_namespace` | `landing` / `ready` / `raw` | Effectively never. They exist so the paths have one definition, not so feeds vary. |
@@ -180,32 +201,109 @@ collide.
 
 Copy the nearest existing model rather than starting blank —
 `counterparty` for reference data, `trade` for transactional. The
-skeleton is fixed and the three macro calls are not optional:
+skeleton is fixed and the macro calls in it are not optional. This one is not
+hand-written — it is exactly what the console's scaffold emits for this
+feed's own YAML in section 1 above (`render_model()` in
+`reporting_platform/ui/scaffold.py`), and the console writes it for you.
+`tests/test_doc_claims.py` renders the same call and asserts the two agree,
+so this block cannot drift from the generator again.
 
 ```sql
-{{ config(materialized='incremental', incremental_strategy='insert_overwrite',
-          partition_by=['cob_date'], tags=['prepared','reference']) }}
+{{
+  config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    partition_by=['cob_date'],
+    tags=['prepared', 'reference']
+  )
+}}
+
+{#
+  Margin calls per counterparty and call type, from treasury.
+
+  SCAFFOLDED by the feed console from the registry entry -- conforming and
+  typing only. Anything that restates what the feed already says (a validity
+  flag derived from its own effective/expiry dates, a status normalisation)
+  belongs here and should be added deliberately. Anything that is a report
+  opinion -- utilisation, breach flags, anything needing a join -- belongs in
+  `reporting`, where it can be joined to exposure.
+#}
+
+{% set output_columns = ['cob_date', 'margin_call_id', 'counterparty_id', 'call_type', 'call_amount', 'currency', 'effective_date', 'due_date', 'status'] %}
 
 with raw_rows as (
-    select *, {{ dedupe_rank(['margin_call_id']) }} as _rn
+
+    {#
+      EVERY raw row the window and the as-of filter admit, unranked. The
+      rank happens after cleaning, on the CLEANED key -- see `ranked_rows`.
+    #}
+    select *
     from {{ source('raw', 'treasury_margin_call') }}
     where {{ incremental_window('_cob_date', 'cob_date') }}
+      and {{ known_as_of() }}
+
 ),
-deduped as (select * from raw_rows where _rn = 1),
+
 cleaned as (
+
     select
-        _cob_date                            as cob_date,
-        {{ clean_string('margin_call_id') }}       as margin_call_id,
+        _cob_date                                                     as cob_date,
+        {{ clean_string('margin_call_id') }}                          as margin_call_id,
+        {{ clean_string('counterparty_id') }}                         as counterparty_id,
+        upper({{ clean_string('call_type') }})                        as call_type,
         {{ safe_cast(clean_string('call_amount'), 'DECIMAL(18,2)') }} as call_amount,
-        {{ parse_date(clean_string('due_date')) }}                  as due_date,
-        _source_file                         as source_file,
-        _file_version                        as source_file_version,
-        {{ audit_columns() }}
-    from deduped
+        upper({{ clean_string('currency') }})                         as currency,
+        {{ parse_date(clean_string('effective_date')) }}              as effective_date,
+        {{ parse_date(clean_string('due_date')) }}                    as due_date,
+        upper({{ clean_string('status') }})                           as status,
+        _source_file                                                  as source_file,
+        _file_version                                                 as source_file_version,
+        {{ source_provenance() }}
+        {{ audit_columns() }},
+        -- carried for the rank below, which needs the cleaned key
+        _cob_date,
+        _file_version,
+        _row_number
+
+    from raw_rows
+
+),
+
+ranked_rows as (
+
+    {# THE IN-FILE DEDUPE IS ON THE CLEANED KEY: ' B' and 'B' are one key. #}
+    select
+        *,
+        {{ dedupe_rank(['margin_call_id']) }} as _rn
+    from cleaned
+
+),
+
+deduped as (
+
+    select
+        {%- for c in prepared_output_columns(output_columns) %}
+        {{ ident(c) }}{{ ',' if not loop.last }}
+        {%- endfor %}
+    from ranked_rows
+    where _rn = 1
+
 )
-select * from cleaned
+
+select * from deduped
 ```
 
+- **`raw_rows` is every row the window and the as-of filter admit,
+  unranked.** The rank happens after cleaning, in `ranked_rows`, on the
+  CLEANED key, not here — see the next point.
+- **`known_as_of()` is the as-of filter.** It compiles to `1 = 1` when
+  `knowledge_time` is unset, and refuses an incremental run when it is set —
+  see [DECISIONS.md#as-of-is-a-var-not-a-second-model](DECISIONS.md#as-of-is-a-var-not-a-second-model).
+- **`cleaned` casts and projects `source_provenance()` before anything is
+  ranked or deduplicated.** `dedupe_rank`, in `ranked_rows`, must run on the
+  CLEANED key: a raw `' B'` and `'B'` are the same key once cleaned, and
+  ranking the raw key kept both as distinct "newest" rows. See
+  [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 - **`incremental_window('_cob_date', 'cob_date')` takes two
   arguments here and one in reporting.** The source column is raw's
   `_cob_date`; the target column is the modelled `cob_date`. Passing
@@ -213,9 +311,9 @@ select * from cleaned
   the build fails with `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY`. It only
   fires on the *incremental* path, so a first build against a fresh branch
   will not show it — the first build after publishing to `main` will.
-- **`dedupe_rank(business_key)` is what picks the newest delivery for each
-  COB date** — all of it, so a key that delivery omits is gone. Omit it and a
-  re-delivery doubles the rows.
+- **`dedupe_rank(business_key)`, in `ranked_rows`, is what picks the newest
+  delivery for each COB date** — all of it, so a key that delivery omits is
+  gone. Omit it and a re-delivery doubles the rows.
 - **`incremental_strategy='insert_overwrite'` is what makes "gone" true on an
   incremental run.** A merge never deletes a row it merged before. The
   overwrite replaces each COB date the select returns, whole — so keep the
@@ -348,7 +446,7 @@ $branch = (docker compose exec -T airflow python -m scripts._open_build_branch).
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt --target spark_local --select path:models/prepared --vars "{nessie_ref: $branch}"
 
 # 5. the new DAG is created PAUSED -- it will never fire until you do this
-docker compose exec -T airflow airflow dags unpause ingest_margin_call
+docker compose exec -T airflow airflow dags unpause ingest_treasury_margin_call
 ```
 
 Step 5 is the one that gets forgotten. `airflow dags list` shows a paused DAG
@@ -362,8 +460,10 @@ identically to a running one except for a single boolean column.
 
 Worth knowing, because it is where the effort would otherwise go:
 
-- **No DAG file.** `feed_ingest.py` generates one DAG per entry in
-  `feeds.yml`.
+- **No DAG file, on either path.** On the Transport path, `transport_ingest`
+  is one generic DAG serving every Feed. On the legacy path, `feed_ingest.py`
+  generates one DAG per entry in `feeds.yml` — still no DAG file to write by
+  hand, but still one DAG per Feed under the hood, unlike the Transport path.
 - **No maintenance registration.** `managed_tables()` derives the prepared and
   reporting sets from the dbt project directory, so writing step 3 registers
   the table. This used to be a sixth file, and was the one step with no error

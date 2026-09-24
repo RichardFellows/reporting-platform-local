@@ -235,6 +235,171 @@ def register_quietly(feed: Feed, manifest: dict[str, Any],
                     f"{type(exc).__name__}: {exc}")
 
 
+# -------------------------------------------- Delivery/Normalization v2 path
+def observations_v2(feed: Feed, delivery, manifest: dict[str, Any], md5: str,
+                    bucket: str) -> dict[str, Any]:
+    """Pure projection of immutable Delivery evidence plus its v2 plan.
+
+    `normalization_parts` are kept separate from legacy `parts`: the former
+    describes a v2 rebuildable read plan; the latter remains the legacy Ready
+    v1 Raw join table. Phase 4 writes v2 part keys to `_source_file` without
+    changing either table's evidence contract.
+    """
+    data_files = [item for item in delivery.source_files if item.role == "data"]
+    if len(data_files) != 1:
+        raise ValueError(
+            f"{delivery.delivery_id}: registry v2 projection requires one data object")
+    source = data_files[0]
+    assertions = delivery.producer_assertions
+    normalized_parts = []
+    for number, part in enumerate(manifest["parts"]):
+        source_meta = part.get("source") or {}
+        normalized_parts.append({
+            "part_no": number,
+            "object_key": part["object_key"],
+            "bytes": part.get("bytes"),
+            "source_member": source_meta.get("archive_member"),
+            "materialized": bool(part.get("materialized")),
+        })
+    return {
+        "feed": delivery.feed,
+        "delivery_id": delivery.delivery_id,
+        "source_system": feed.source_system,
+        "cob_date": delivery.business_date,
+        "received_at": delivery.received_at,
+        "source_object": source.object_key,
+        "normalizer": manifest["normalizer"],
+        "bytes": source.bytes,
+        "md5": md5,
+        "schema_version": delivery.schema_version,
+        "origin": f"transport:{delivery.transport_source}",
+        "origin_uri": f"s3://{bucket}/{source.object_key}",
+        "source_filename": source.original_filename,
+        "source_container": (source.original_filename
+                             if manifest["normalizer"] == "archive/v2" else None),
+        "control_object": next(
+            (item.object_key for item in delivery.source_files
+             if item.role == "control"), None),
+        "declared_row_count": assertions.get("row_count"),
+        "declared_md5": assertions.get("md5"),
+        "producer_run_id": assertions.get("producer_run_id"),
+        "parts": [],
+        "normalization_parts": normalized_parts,
+    }
+
+
+def write_v2(conn, row: dict[str, Any], delivery_manifest_key: str) -> None:
+    """Upsert a v2 observation without assigning Raw semantics to its parts."""
+    values = {**{c: row.get(c) for c in _COLUMNS},
+              "manifest_key": delivery_manifest_key}
+    sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in _UPDATABLE)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO registry.delivery ({', '.join(_COLUMNS)}) "
+            f"VALUES ({', '.join('%(' + c + ')s' for c in _COLUMNS)}) "
+            f"ON CONFLICT (feed, delivery_id) DO UPDATE SET {sets}", values)
+        cur.execute("DELETE FROM registry.normalization_part "
+                    "WHERE feed = %s AND delivery_id = %s",
+                    (row["feed"], row["delivery_id"]))
+        for part in row["normalization_parts"]:
+            cur.execute(
+                "INSERT INTO registry.normalization_part "
+                "(feed, delivery_id, part_no, object_key, bytes, "
+                " source_member, materialized) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (row["feed"], row["delivery_id"], part["part_no"],
+                 part["object_key"], part["bytes"], part["source_member"],
+                 part["materialized"]))
+
+
+def register_v2(delivery, manifest: dict[str, Any], delivery_manifest_key: str,
+                *, client, bucket: str, conn=None,
+                registry: dict[str, Feed] | None = None) -> dict[str, Any]:
+    """Index one v2 evidence chain. Object storage remains authoritative."""
+    registry = feeds() if registry is None else registry
+    expected = {
+        "delivery_id": delivery.delivery_id,
+        "feed": delivery.feed,
+        "delivery_manifest": delivery_manifest_key,
+        "business_date": delivery.business_date.isoformat(),
+        "schema_version": delivery.schema_version,
+    }
+    conflicts = [field for field, value in expected.items()
+                 if manifest.get(field) != value]
+    if conflicts:
+        raise ValueError(
+            f"{delivery.delivery_id}: NormalizationManifest conflicts in "
+            f"{', '.join(conflicts)}")
+    feed = registry.get(delivery.feed)
+    if feed is None:
+        raise ValueError(f"unknown Feed {delivery.feed!r}")
+    source = manifest["source_object"]
+    body = client.get_object(Bucket=bucket, Key=source)["Body"].read()
+    import hashlib
+    md5 = hashlib.md5(body).hexdigest()
+    row = observations_v2(feed, delivery, manifest, md5, bucket)
+    if conn is not None:
+        write_v2(conn, row, delivery_manifest_key)
+    else:
+        with db.connect() as own:
+            write_v2(own, row, delivery_manifest_key)
+    return row
+
+
+def register_v2_quietly(delivery, manifest: dict[str, Any],
+                        delivery_manifest_key: str, *, client, bucket: str,
+                        registry: dict[str, Feed] | None = None) -> None:
+    try:
+        register_v2(delivery, manifest, delivery_manifest_key, client=client,
+                    bucket=bucket, registry=registry)
+    except Exception as exc:  # noqa: BLE001 - this index is best-effort
+        log.warning("registry: could not record v2 %s/%s: %s -- reconcile-v2 "
+                    "will pick it up", delivery.feed, delivery.delivery_id,
+                    f"{type(exc).__name__}: {exc}")
+
+
+def reconcile_v2(*, client, bucket: str,
+                 registry: dict[str, Feed] | None = None) -> dict[str, Any]:
+    """Rebuild v2 observations from Delivery and Normalization manifests."""
+    from reporting_platform.ingest import delivery as delivery_contract
+    from reporting_platform.ingest import normalization
+    from reporting_platform.ingest import transport as transport_contract
+
+    registry = feeds() if registry is None else registry
+    paginator = client.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix="deliveries/"):
+        keys.extend(obj["Key"] for obj in page.get("Contents", [])
+                    if obj["Key"].endswith("/delivery-manifest.json"))
+    out: dict[str, Any] = {"registered": [], "missing_normalization": [],
+                           "failed": []}
+    for delivery_key in sorted(keys):
+        try:
+            delivery = delivery_contract.read_delivery_manifest(
+                delivery_key, client=client, bucket=bucket)
+            if delivery.feed not in registry:
+                raise ValueError(f"unknown Feed {delivery.feed!r}")
+            normalization_key = normalization.manifest_key(delivery)
+            try:
+                client.head_object(Bucket=bucket, Key=normalization_key)
+            except Exception as exc:  # missing cache is not a failed observation
+                if transport_contract._is_missing(exc):  # noqa: SLF001
+                    out["missing_normalization"].append(delivery_key)
+                    continue
+                raise
+            manifest = normalization.read_normalization_manifest(
+                normalization_key, client=client, bucket=bucket)
+            # One transaction per observation: a later malformed manifest
+            # cannot roll back rows already reconstructed successfully.
+            with db.connect() as conn:
+                register_v2(delivery, manifest, delivery_key, client=client,
+                            bucket=bucket, conn=conn, registry=registry)
+            out["registered"].append(delivery.delivery_id)
+        except Exception as exc:  # noqa: BLE001
+            out["failed"].append({"delivery_manifest": delivery_key,
+                                  "error": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
 # --------------------------------------------------------------- reconciling
 def reconcile(feed: Feed, *, normalize_first: bool = True) -> dict[str, Any]:
     """Register every delivery in object storage that has no row yet.
@@ -359,122 +524,99 @@ def coverage(feed: Feed) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ reading
-# THE ARRIVALS READS. What `deliveries_on` and `deliveries_by_id` are for a
-# date and for a run's input set, these are for "what has arrived lately" --
-# the question the feed console's arrivals view asks. They live here rather
-# than in the console because a read of the registry is the registry's shape
-# to state, and a SELECT written in `ui/` would be the second place that knows
-# what a delivery row holds.
-_ARRIVAL_COLUMNS = (
-    "feed, delivery_id, sequence_no, source_system, cob_date, received_at, "
-    "first_seen_at, source_object, manifest_key, normalizer, bytes, md5, "
-    "schema_version, origin, origin_uri, source_filename, source_container, "
-    "control_object, declared_row_count, declared_md5, producer_run_id")
+# Moved to `delivery_reads.py` (core) so a reader of the index needs no
+# ingest install; re-exported so every existing caller is unchanged.
+from reporting_platform.registry.delivery_reads import (  # noqa: E402,F401
+    _ARRIVAL_COLUMNS, by_id, deliveries_by_id, deliveries_on, delivered_dates,
+    recent,
+)
 
 
-def recent(limit: int = 50, feed: str | None = None) -> list[dict[str, Any]]:
-    """The most recent deliveries, newest first, with their part count.
+# -------------------------------------------------------- delivery_committed
+# THE ONE FACT `registry.delivery` CANNOT ANSWER: whether a Delivery reached
+# Raw. `register`/`register_v2` write a row at NORMALIZE time, before Raw is
+# ever touched (see this module's own header), so a row existing is not
+# evidence of a commit. This is recorded once, by `ingest_feed._ingest_manifest`
+# -- the one function both the legacy and the Transport path funnel through --
+# right where it already knows it has either appended and merged, or found the
+# Delivery already there. See registry/db.py's header on this table for why it
+# is a dedicated append-only fact rather than a column on `delivery`.
+_COMMITTED_COLUMNS = ("feed", "delivery_id", "cob_date", "source_system",
+                      "file_version", "rows", "run_id")
 
-    ORDERED BY `received_at`, NOT `first_seen_at`. The delivery's own arrival
-    time is what "recent" means to somebody asking what has arrived; the
-    registry's clock is when it got round to writing the row, so a reconcile
-    back-filling a year of history in one pass would order that year by the
-    minute it ran and put 2019 at the top. `sequence_no` breaks the tie, which
-    for two deliveries with the same LastModified is registration order.
 
-    The part count comes back rather than the parts: a list of 200 deliveries
-    that each carried their members would be mostly archive members, and the
-    one caller that wants them (`by_id`) is looking at one delivery.
+def record_committed(feed: str, delivery_id: str, cob_date: date,
+                     source_system: str, rows: int | None, run_id: str,
+                     file_version: int | None = None, *, conn=None) -> dict:
+    """Record that `delivery_id` is committed to Raw on `main`. Idempotent:
+    a re-ingest of an already-committed Delivery (the `already_ingested`
+    short-circuit) writes the SAME row, never a second one and never a
+    different `committed_at` -- ON CONFLICT DO NOTHING, exactly like a
+    Transport's own `uploaded_at`.
     """
-    sql = (f"SELECT {_ARRIVAL_COLUMNS}, "
-           "  (SELECT count(*) FROM registry.delivery_part p "
-           "    WHERE p.feed = d.feed AND p.delivery_id = d.delivery_id) "
-           "  AS parts "
-           "FROM registry.delivery d")
-    args: list[Any] = []
-    if feed:
-        sql += " WHERE feed = %s"
-        args.append(feed)
-    sql += " ORDER BY received_at DESC, sequence_no DESC LIMIT %s"
-    args.append(limit)
-    with db.connect() as conn, conn.cursor() as cur:
-        cur.execute(sql, args)
-        cols = [c[0] for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    values = {"feed": feed, "delivery_id": delivery_id, "cob_date": cob_date,
+             "source_system": source_system, "file_version": file_version,
+             "rows": rows, "run_id": run_id}
+    sql = (f"INSERT INTO registry.delivery_committed ({', '.join(_COMMITTED_COLUMNS)}) "
+          f"VALUES ({', '.join('%(' + c + ')s' for c in _COMMITTED_COLUMNS)}) "
+          f"ON CONFLICT (feed, delivery_id) DO NOTHING")
+    if conn is not None:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
+    else:
+        with db.connect() as own, own.cursor() as cur:
+            cur.execute(sql, values)
+    return values
 
 
-def by_id(feed: str, delivery_id: str) -> dict[str, Any] | None:
-    """One delivery and the objects that hold its rows, or None.
+def record_committed_quietly(feed: str, delivery_id: str, cob_date: date,
+                             source_system: str, rows: int | None, run_id: str,
+                             file_version: int | None = None) -> None:
+    """`record_committed`, best-effort -- a registry outage must not turn an
+    already-successful Raw commit into a failed ingest. Same convention as
+    `register_quietly`: `delivery_committed_for` (via reconciliation-style
+    reads against Raw, see monitoring/feed_status.py) is the fallback truth."""
+    try:
+        record_committed(feed, delivery_id, cob_date, source_system, rows,
+                         run_id, file_version)
+    except Exception as exc:                                     # noqa: BLE001
+        log.warning("registry: could not record commit of %s/%s: %s",
+                    feed, delivery_id, f"{type(exc).__name__}: {exc}")
 
-    The parts are the join back to raw: `_source_file` is the PART's key, so
-    this is what turns a row in the raw table into the delivery it arrived in.
+
+def recent_cob_dates(limit: int = 30) -> list[date]:
+    """The most recent distinct COB dates with a registered delivery.
+
+    For the COB Status date picker (`ui/app.py`) -- an operator's most
+    useful starting list, not an exhaustive one. Deliberately reads
+    `registry.delivery` alone rather than unioning in `transport_receipt`:
+    a date with a receipt but no Delivery yet (still WAITING/RECEIVED) is
+    exactly as pickable by typing the date directly, and today's still-empty
+    COB date is the one the operator opens this page FOR -- it belongs in
+    the picker as much as any settled one, so the caller always prepends
+    today rather than relying on this list containing it.
     """
     with db.connect() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT {_ARRIVAL_COLUMNS} FROM registry.delivery "
-                    "WHERE feed = %s AND delivery_id = %s",
-                    (feed, delivery_id))
-        row = cur.fetchone()
-        if row is None:
-            return None
-        out = dict(zip([c[0] for c in cur.description], row))
-        cur.execute("SELECT part_no, object_key, bytes "
-                    "FROM registry.delivery_part "
-                    "WHERE feed = %s AND delivery_id = %s ORDER BY part_no",
-                    (feed, delivery_id))
-        out["parts"] = [{"part_no": r[0], "object_key": r[1], "bytes": r[2]}
-                        for r in cur.fetchall()]
-    return out
+        cur.execute(
+            "SELECT DISTINCT cob_date FROM registry.delivery "
+            "ORDER BY cob_date DESC LIMIT %s", (limit,))
+        return [r[0] for r in cur.fetchall()]
 
 
-def deliveries_on(cob_date: date, feed: str | None = None
-                  ) -> list[dict[str, Any]]:
-    """Every registered delivery for one COB date. Used by REQ-602."""
-    sql = ("SELECT feed, delivery_id, source_object, cob_date, "
-           "       received_at, md5, bytes "
-           "FROM registry.delivery WHERE cob_date = %s")
+def committed_for_cob_date(cob_date: date, feed: str | None = None
+                           ) -> list[dict[str, Any]]:
+    """Every Delivery known to have committed to Raw for one COB date."""
+    sql = ("SELECT feed, delivery_id, cob_date, source_system, file_version, "
+          "       rows, run_id, committed_at "
+          "FROM registry.delivery_committed WHERE cob_date = %s")
     args: list[Any] = [cob_date]
     if feed:
         sql += " AND feed = %s"
         args.append(feed)
     with db.connect() as conn, conn.cursor() as cur:
-        cur.execute(sql + " ORDER BY feed, delivery_id", args)
+        cur.execute(sql + " ORDER BY feed, committed_at", args)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-
-def deliveries_by_id(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
-    """The registered deliveries named by (feed, delivery_id). REQ-602/REQ-400.
-
-    What `deliveries_on` is for a COB date, this is for a RUN's recorded
-    input set -- the exact deliveries a published run read, rather than every
-    delivery that happened to arrive for the date its tag names.
-
-    A pair with no row is NOT dropped silently: it comes back with
-    `registered: False`, because `run_input` carries no foreign key to
-    `delivery` (see registry/db.py) and a run naming a delivery the registry
-    cannot describe is exactly the finding this is asked for.
-    """
-    if not pairs:
-        return []
-    wanted = sorted(set(pairs))
-    sql = ("SELECT feed, delivery_id, source_object, cob_date, "
-           "       received_at, md5, bytes "
-           "FROM registry.delivery WHERE (feed, delivery_id) IN %s")
-    with db.connect() as conn, conn.cursor() as cur:
-        cur.execute(sql, (tuple(wanted),))
-        cols = [d[0] for d in cur.description]
-        found = {(r[0], r[1]): dict(zip(cols, r)) for r in cur.fetchall()}
-    out = []
-    for feed, delivery_id in wanted:
-        row = found.get((feed, delivery_id))
-        if row:
-            out.append({**row, "registered": True})
-        else:
-            out.append({"feed": feed, "delivery_id": delivery_id,
-                        "source_object": None, "cob_date": None,
-                        "received_at": None, "md5": None, "bytes": None,
-                        "registered": False})
-    return out
 
 
 def reconcile_all(*, normalize_first: bool = True) -> dict[str, Any]:

@@ -1,10 +1,101 @@
 # Quick start
 
-Clone to a published `reporting` layer, in nine commands.
+Clone to a published `reporting` layer.
 
-This is the short path. [`README.md`](../README.md)'s numbered walkthrough is
-the long one and explains *why* at each step — read that when you want to
-understand the platform rather than start it.
+This page has two paths. **[Transport path](#transport-path-the-current-primary-path)**
+is the current, primary architecture — a producer hands off a Transport,
+generic Airflow orchestration takes it the rest of the way. **[Legacy
+path](#legacy-path-nine-commands)** exercises the older `landing` →
+`ready` v1 → `raw` compatibility path (still how most feeds in this local
+stack run today) and is the longer-established, more thoroughly exercised
+route through this stack.
+
+[`README.md`](../README.md)'s numbered walkthrough is the long form of the
+legacy path and explains *why* at each step — read that when you want to
+understand the platform rather than start it. [`AIRFLOW-ORCHESTRATION.md`](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
+has the equivalent depth for the Transport path.
+
+---
+
+## Transport path (the current, primary path)
+
+Same prerequisites and stack start as [step 0](#0-prerequisites) and
+[step 1](#1-start-the-stack) below. Once the stack is up and DAGs are
+unpaused (step 5's unpause loop applies here too — Transport DAGs are paused
+at creation like every other DAG), simulate a DCM handoff and watch the
+generic orchestration take it to `reporting`:
+
+```bash
+docker compose exec -T airflow airflow connections get aws_default
+docker compose exec -T feed-ui python -m scripts.simulate_dcm_transport \
+  --legacy-feed-id qa-happy-position --producer-run-id quickstart-1 \
+  --cob-date 2026-09-14 --source-system QA \
+  --source-observed-at 2026-09-17T05:42:17Z \
+  --data /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.csv \
+  --control /opt/platform/tests/fixtures/happy_path/qa_happy_position_20260914.ctl
+```
+
+`--producer-run-id` is DCM's own execution identity: the TransportID
+(`dcm-qa-happy-position-quickstart-1`) is derived from it, not supplied
+directly -- see [docs/TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md).
+
+That is the whole trigger — no DAG to unpause per feed, no `land`/`bulk_ingest`
+step. `transport_watch`'s deferrable sensor picks the completed Transport up
+within its next 1-minute cycle and runs
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+-> report_drift -> record_snapshot`; `ingest_raw` emits the Raw Asset that fires `prepared_build`, which on success fires
+`reporting_build`. Watch it happen:
+
+```bash
+docker compose exec -T airflow airflow dags list-runs -d transport_watch -o plain
+docker compose exec -T airflow airflow dags list-runs -d transport_ingest -o plain
+docker compose exec -T airflow airflow dags list-runs -d prepared_build -o plain
+docker compose exec -T airflow airflow dags list-runs -d reporting_build -o plain
+```
+
+Then query what published, the same way as the legacy path:
+
+```bash
+docker compose exec -T airflow python -m scripts.duckdb_console \
+  "select * from lakehouse.reporting.qa_happy_position_summary"
+```
+
+**The command above (Contract v2's CLI shape) is live-verified** through a
+committed Raw row: `transport_watch` found the published marker and
+`transport_ingest`'s `validate_transport -> create_delivery ->
+normalize_delivery -> ingest_raw` all succeeded, landing real rows in
+`raw.qa_happy_position` with `_source_file` pointing at the v2
+`cob_date=.../source_system=.../` path. **The `prepared_build ->
+reporting_build` hop was not re-confirmed in that same run** — it failed on
+OTHER feeds this particular dev stack had never ingested (unrelated to
+Transport Contract v2), which blocked the whole shared write-audit-publish
+merge, including the otherwise-successful `qa_happy_position` branch. See
+[AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
+for the full detail, including the actual bug this run caught (a missing
+`docker-compose.yml` volume mount for the new `reporting_transport/`
+package, now fixed) and what to check on a freshly seeded stack.
+
+Repeating the same command (same `--producer-run-id`, hence the same derived
+TransportID) is an idempotent retry: `transport_watch`
+finds the same TransportID again every cycle, but `trigger_discovered` dedupes
+it via `DagRunAlreadyExists` — no duplicate Raw rows.
+
+Retry a Transport that `transport_watch` missed without waiting: trigger
+`transport_reconcile` by hand.
+
+```bash
+docker compose exec -T airflow airflow dags trigger transport_reconcile -r qs_reconcile
+```
+
+For a Feed configured with `migration.mode: dual_run` (like
+`qa_happy_position` above), `migration_reconcile` also compares this output
+against a legacy adapter and records evidence in
+`registry.migration_comparison` — see [MIGRATION.md](MIGRATION.md). That
+comparison is diagnostic; it does not gate publication.
+
+---
+
+## Legacy path (nine commands)
 
 **Budget about 40 minutes for a cold start**, almost all of it the ingest.
 Measured end to end from `docker compose down -v` with every gitignored
@@ -38,8 +129,20 @@ PowerShell mangles the quoting and the DAG `--conf` flags will not parse. Plain
 ```bash
 git clone <repo> reporting-platform && cd reporting-platform
 cp .env.example .env
+python3 scripts/doctor.py     # or: make doctor
 docker compose up -d --build
 ```
+
+`doctor` is the first thing to run, not `docker compose up`: a new clone's
+first failures are almost always environmental -- a missing `.env`, an
+`AIRFLOW_UID` that doesn't match your uid, too little memory given to Docker
+Desktop, a port this stack wants that something else already holds -- and
+none of them produce a message that says so. `doctor` checks all four (plus
+the Git Bash `MSYS_NO_PATHCONV` trap on Windows) against this repo's own
+`docker-compose.yml`, states the exact fix for whatever fails, and exits
+non-zero if anything did. It needs Python 3 on the host -- nothing else here
+does (see the prerequisites table above) -- so skip it if that's not
+available and read the platform's own error text instead.
 
 `.env` holds no real credentials — it is copied verbatim from
 `.env.example`. Check everything came up:
@@ -344,6 +447,7 @@ docker compose down -v      # destroys all data and volumes
 |---|---|
 | [`README.md`](../README.md) | The same journey, step by step, with the reasoning. Section 14 covers the scheduler in more depth. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, write-audit-publish, why Spark is the only build engine, how Cosmos renders the builds |
+| [`STANDALONE-PIPELINE.md`](STANDALONE-PIPELINE.md) | The same pipeline as four commands, with no Airflow and no Spark cluster, against local or deployed S3/Nessie/Postgres |
 | [`ADDING-A-FEED.md`](ADDING-A-FEED.md) | Onboard a new feed — six files, no DAG edit |
 | [`ADDING-A-MODEL.md`](ADDING-A-MODEL.md) | Add a dbt model — two files, no DAG edit |
 | [`ADDING-A-COLUMN.md`](ADDING-A-COLUMN.md) | Add a column to a feed that already delivers — three files, and the one command that is easy to forget |

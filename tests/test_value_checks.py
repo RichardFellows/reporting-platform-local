@@ -79,6 +79,24 @@ def test_a_negative_row_floor_is_refused_by_the_form():
     assert "negative" in _form_raises(expected_min_rows=-5)
 
 
+# ------------------------------------------------------- expected_max_rows
+# Not console-editable, like `raw_namespace`/`ready_prefix`/`landing_prefix`
+# -- BLOCK_ORDER (reporting_platform/ui/registry.py) lists what the form
+# writes, and this is not in it. So there is no console-vs-loader asymmetry
+# to guard here: a value the form never writes cannot be a value the form
+# wrongly accepts.
+def test_a_negative_row_ceiling_is_refused_at_load():
+    """Symmetric with the floor: a negative ceiling can never NOT fire, so it
+    is refused rather than accepted as an always-blocking config."""
+    msg = _load_raises("    expected_max_rows: -5\n")
+    assert "negative" in msg and "Omit the key" in msg, msg
+
+
+def test_expected_max_rows_defaults_to_no_ceiling():
+    registry, _ = feeds_from(synthetic())
+    assert registry["t_one"].expected_max_rows is None
+
+
 # --------------------------------------------------- delimiter / quote_char
 def test_a_multi_character_delimiter_is_refused_at_load():
     """It becomes Spark's `sep`, which takes one character. A longer one
