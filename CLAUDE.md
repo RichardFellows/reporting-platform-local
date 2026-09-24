@@ -426,7 +426,11 @@ them.
   pins `snapshot/<feed>/<bd>/<run_id>`; the **reporting build** cuts
   `published/<report>/<bd>/<run_id>`, one per report, when it merges. A
   **report is a dbt EXPOSURE**, derived by `context.reports()` — not a config
-  block. (`#an-ingest-is-not-a-publication`)
+  block. (`#an-ingest-is-not-a-publication`) The snapshot tag names the
+  commit the ingest's MERGE made (`result["commit"]`), never `main`'s head,
+  which by tagging time may hold later merges. Every way into raw (both DAGs,
+  `ingest ingest`, `ingest transport`) ends in `steps.after_ingest`.
+  (`#a-snapshot-tag-names-its-merge-commit`)
 - **A feed's evidence window is its RETENTION CLASS**, named in `feeds.yml`,
   sized in `retention.yml` per environment, refused at LOAD if undeclared.
   Classes govern `landing/` and `quarantine/` **only** — a per-feed raw window

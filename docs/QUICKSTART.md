@@ -42,8 +42,8 @@ directly -- see [docs/TRANSPORT-CONTRACT.md](TRANSPORT-CONTRACT.md).
 That is the whole trigger — no DAG to unpause per feed, no `land`/`bulk_ingest`
 step. `transport_watch`'s deferrable sensor picks the completed Transport up
 within its next 1-minute cycle and runs
-`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw`,
-which emits the Raw Asset that fires `prepared_build`, which on success fires
+`validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+-> report_drift -> record_snapshot`; `ingest_raw` emits the Raw Asset that fires `prepared_build`, which on success fires
 `reporting_build`. Watch it happen:
 
 ```bash

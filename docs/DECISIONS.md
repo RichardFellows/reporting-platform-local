@@ -200,6 +200,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [an-incomplete-keep-set-refuses](#an-incomplete-keep-set-refuses) | **A short answer is a deletion order.** Nothing deleted is not nothing to delete |
 | [published-tags-are-the-reproducibility-window](#published-tags-are-the-reproducibility-window) | A tag is **data** retention, sized in years, not by the table keep-set |
 | [an-ingest-is-not-a-publication](#an-ingest-is-not-a-publication) | They cut different tags, and conflating them kept ingests for ten years |
+| [a-snapshot-tag-names-its-merge-commit](#a-snapshot-tag-names-its-merge-commit) | A tag cut from `main`'s head named later merges; the Transport path cut none |
 | [retention-classes-name-the-obligation](#retention-classes-name-the-obligation) | The class is a feed property; the window is per-environment policy |
 | [the-evidence-interlock-is-two-halves](#the-evidence-interlock-is-two-halves) | A configuration check and a per-delivery check, neither sufficient alone |
 | [reproducibility-is-exercised-not-asserted](#reproducibility-is-exercised-not-asserted) | The pin is read against the real catalog |
@@ -3758,6 +3759,55 @@ reproduced from a snapshot. Nothing claims a snapshot's evidence is still in
 pins, and a sweep that fails to recognise something skips it forever rather
 than judging it — the same rule `clean_working_branches` follows for `hold/`.
 
+
+## a-snapshot-tag-names-its-merge-commit
+
+Two problems with `snapshot/<feed>/<bd>/<run_id>`, found together.
+
+**The Transport path cut no tag, and logged no drift.** `transport_ingest`
+ended at `ingest_raw`. `ingest_<feed>` ends with `report_drift` and
+`record_snapshot`, and the Transport DAG and the runner's `ingest transport`
+had neither. On the development stack, `qa_happy_position` had 7 Transport
+deliveries in raw and no snapshot tags.
+
+**The inbox path's tag named `main`'s head, not the ingest's state.**
+`record_snapshot` called `create_tag(from_ref="main")` when it ran. In
+Airflow that is a separate task after the ingest has released the
+`lakehouse_write` pool, so another feed's merge could land first, and the
+tag then pinned both ingests. The batch command (`ingest ingest`, and
+`steps.ingest`) was worse: it merges a whole chunk of up to ten deliveries,
+then tags each one, so every tag in the chunk named the chunk's last merge.
+
+**Decision.**
+- `_ingest_manifest` returns `commit`: the `resultantTargetHash` from
+  Nessie's merge response, the commit that merge made.
+- `record_snapshot` tags that commit (`create_tag(..., hash=commit)`).
+- A result with no commit is not tagged at the head as a fallback, because
+  the head is the wrong answer this replaced. It returns `tag_error` saying
+  why.
+- A delivery raw already held (`already_ingested`) merged nothing and gets
+  no tag.
+- `steps.after_ingest` (drift report, then tag) is the one function every
+  way into raw calls: `steps.ingest`, `transport_steps.ingest_transport`, and
+  the matching last two tasks of both DAGs, which call its two halves.
+
+The tag can then be cut at any time after the merge, outside the pool,
+without naming anyone else's write.
+
+**No backfill.** Past Transport ingests have no tag, and the tags cut from a
+later head still include the ingest they are named for (a superset). Nothing
+is reproduced from a snapshot tag, and the development stack's data is
+disposable.
+
+Live-verified on the development stack. In every case the tag's hash on
+Nessie equals the commit the ingest reported:
+- The Airflow `transport_ingest` run, now six tasks, all green: tag at
+  `e8e64fe2...`.
+- The runner's `ingest transport`: tag at `313a729b...`.
+- `ingest ingest ref_rating`, the batch command over 36 pending deliveries
+  in four chunks: 36 tags at 36 distinct commits, each its own merge's. The
+  old code would have produced about four distinct commits, one per chunk.
+- An Airflow `ingest_fo_trade` run: tag at `523b887f...`.
 ## a-run-is-the-first-thing-the-registry-cannot-rebuild
 
 REQ-400, REQ-401, REQ-404. `registry.run`, `registry.run_input`,

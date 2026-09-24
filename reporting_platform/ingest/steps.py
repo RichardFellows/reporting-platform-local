@@ -3,10 +3,14 @@
     land(paths)            files -> the inbox gate -> landing/ (+ control files)
     ingest(feed)           every pending delivery of a feed -> raw, each on its
                            own branch, merged to main; a snapshot tag per ingest
+    after_ingest(feed, r)  the drift report and the snapshot tag, for ANY
+                           ingest: this path's, and a Transport's
 
 The same functions the `ingest_<feed>` DAGs reach: `record_snapshot` and
 `drift_warnings` were the bodies of two of its tasks, and the ingest itself is
 the `ingest-batch` Spark op, launched by `spark_task.run` like every other.
+`transport_ingest`'s two matching tasks and `transport_steps.ingest_transport`
+call them too, so both ways into raw pin and report the same way.
 What the DAG adds is a trigger per arrival; what this adds is a way to run the
 same thing with nothing listening. CLI: `python -m reporting_platform.ingest`.
 """
@@ -69,10 +73,17 @@ def ingest(feed_name: str, keys: list[str] | None = None) -> list[dict]:
                           result["object_key"], result["error"][:500])
                 out.append(result)
                 continue
-            for message in drift_warnings(feed_name, result):
-                log.warning("%s", message)
-            out.append(record_snapshot(feed_name, result))
+            out.append(after_ingest(feed_name, result))
     return out
+
+
+def after_ingest(feed_name: str, result: dict) -> dict:
+    """What follows every ingest into raw, whichever way it arrived: log the
+    drift report, then pin the state the ingest left. Returns `result` with
+    `tag` (and `tag_error` if the tag could not be cut)."""
+    for message in drift_warnings(feed_name, result):
+        log.warning("%s", message)
+    return record_snapshot(feed_name, result)
 
 
 def record_snapshot(feed_name: str, result: dict) -> dict:
@@ -84,13 +95,33 @@ def record_snapshot(feed_name: str, result: dict) -> dict:
     worth pinning: raw is where retention deletes COB dates, so the state each
     ingest left is exactly what someone may need to read back.
     See docs/DECISIONS.md#an-ingest-is-not-a-publication
+
+    AT THE COMMIT THE INGEST'S MERGE MADE (`result["commit"]`), never at
+    `main`'s head. This used to read the head, which is the ingest's state
+    only until the next merge: in Airflow this runs after the ingest let go
+    of the write pool, so another feed could merge first, and a batch tagged
+    every delivery after merging all of them, so each tag named the LAST.
+    A result without a commit is not tagged at the head as a fallback --
+    that is the wrong answer this replaced. `tag_error` says so instead.
+    See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+
+    A delivery raw already held (`already_ingested`) merged nothing and gets
+    no tag: there is no state of its own to pin.
     """
     from reporting_platform.common.context import Nessie, snapshot_tag
 
+    if result.get("already_ingested"):
+        return {**result, "tag": None}
     tag = snapshot_tag(feed_name, date.fromisoformat(str(result["cob_date"])),
                        result["run_id"])
+    commit = result.get("commit")
+    if not commit:
+        return {**result, "tag": tag,
+                "tag_error": "the ingest reported no merge commit, so there is "
+                             "no state of its own to pin; main's head may "
+                             "already hold later merges"}
     try:
-        Nessie().create_tag(tag, from_ref="main")
+        Nessie().create_tag(tag, from_ref="main", hash=commit)
     except Exception as exc:          # tag already exists on a rerun
         return {**result, "tag": tag, "tag_error": str(exc)}
     return {**result, "tag": tag}

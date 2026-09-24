@@ -4,7 +4,8 @@
     deliver(marker)         -> immutable DeliveryManifest (create-once)
     normalize(delivery)     -> NormalizationManifest v2 (create-once)
     ingest_raw(norm, id)    -> raw, on its own Nessie branch, merged on success
-    ingest_transport(marker)   all four, in order
+    ingest_transport(marker)   all four, in order, then `steps.after_ingest`
+                               (drift report + snapshot tag), as the DAG does
     pending(cob_dates)      marker keys of every Transport not yet in raw
 
 THE `transport_ingest` DAG'S TASKS WERE THESE BODIES. Each task now calls one
@@ -279,7 +280,11 @@ def ingest_transport(marker_key: str, *, run_id: str | None = None) -> dict:
             if refused else "", stage, _reason(exc)[:500])
         return {**out, "stage": stage, "refused": refused,
                 "error": _reason(exc)}
-    return {**out, **result}
+    # The same drift report and snapshot tag the inbox path's ingest gets,
+    # from the same function. See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+    from reporting_platform.ingest.steps import after_ingest
+
+    return {**out, **after_ingest(result["feed"], result)}
 
 
 def window_cob_dates(days: int, *, today: date | None = None) -> list[str]:

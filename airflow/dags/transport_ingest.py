@@ -6,6 +6,7 @@ is resolved from the Transport's declared external feed id
 (`docs/DELIVERY-CONTRACT.md`), not from DAG topology.
 
     validate_transport -> create_delivery -> normalize_delivery -> ingest_raw
+        -> report_drift -> record_snapshot
 
 Every task is one call into `reporting_platform/ingest/transport_steps.py`
 -- the same steps `python -m reporting_platform.ingest transport` runs with
@@ -192,7 +193,9 @@ def _dag():
         # on a duplicate/retried run as on the one that did the write.
         context["outlet_events"][RAW_ASSET_ALIAS].add(Asset(result["asset_uri"]))
 
-        # A reference/summary, not the row data ingest_raw read or wrote.
+        # A reference/summary, not the row data ingest_raw read or wrote:
+        # identifiers, counts, the merge commit, and column NAMES for the
+        # drift report -- what the two tasks after this need, and no more.
         return {
             "feed": result["feed"],
             "delivery_id": result["delivery_id"],
@@ -200,12 +203,45 @@ def _dag():
             "rows": result["rows"],
             "already_ingested": result["already_ingested"],
             "asset_uri": result["asset_uri"],
+            "run_id": result["run_id"],
+            "commit": result.get("commit"),
+            **{k: result.get(k, []) for k in (
+                "missing_columns", "extra_columns", "columns_added",
+                "columns_orphaned")},
         }
+
+    # THE SAME TWO TASKS `ingest_<feed>` ENDS WITH, calling the same
+    # functions: a Transport ingest is reported and pinned exactly as an
+    # inbox one is. Outside the write pool, which is safe because the tag
+    # names the merge commit, not main's head.
+    # See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+
+    @task(task_id="report_drift")
+    def report_drift(result: dict) -> dict:
+        """Schema drift is reported, never fatal. See
+        `ingest.steps.drift_warnings`."""
+        import logging
+
+        from reporting_platform.ingest.steps import drift_warnings
+
+        for message in drift_warnings(result["feed"], result):
+            logging.getLogger("airflow.task").warning("%s", message)
+        return result
+
+    @task(task_id="record_snapshot")
+    def record_snapshot(result: dict) -> dict:
+        """Pin the commit this ingest's merge made:
+        `snapshot/<feed>/<bd>/<run_id>`. No tag when raw already held the
+        Delivery. See `ingest.steps.record_snapshot`."""
+        from reporting_platform.ingest.steps import record_snapshot as pin
+
+        return pin(result["feed"], result)
 
     marker = validate_transport()
     delivery_manifest = create_delivery_task(marker)
     normalization_manifest = normalize_delivery_task(delivery_manifest)
-    ingest_raw_task(normalization_manifest)
+    ingested = ingest_raw_task(normalization_manifest)
+    report_drift(ingested) >> record_snapshot(ingested)
 
 
 transport_ingest = _dag()

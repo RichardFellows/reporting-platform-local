@@ -813,6 +813,9 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             "schema_version": manifest["schema_version"],
             "source_system": contract_fd.source_system,
             "already_ingested": True,
+            # Nothing merged, so no commit of this run's to pin -- and
+            # `steps.record_snapshot` cuts no tag for it.
+            "commit": None,
             "columns_added": [],
             "columns_orphaned": [],
             "missing_columns": [],
@@ -1022,13 +1025,19 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
                     f"inspection; main is untouched."
                 )
 
+        commit = None
         if dry_run:
             log.info("dry run: would append %s rows to %s", row_count, raw_at_branch)
         else:
             df.writeTo(raw_at_branch).append()
-            nessie.merge(branch, into="main")
+            # THE COMMIT THIS MERGE MADE, which is what a snapshot tag must
+            # name. `main`'s head is that commit only until the next merge
+            # lands, and the tag is cut later, outside the write pool.
+            # See docs/DECISIONS.md#a-snapshot-tag-names-its-merge-commit
+            commit = nessie.merge(branch, into="main").get("resultantTargetHash")
             nessie.delete_reference(branch)
-            log.info("merged %s into main and deleted branch", branch)
+            log.info("merged %s into main at %s and deleted branch", branch,
+                     (commit or "?")[:12])
 
         result = {
             "feed": fd.name,
@@ -1049,6 +1058,7 @@ def _ingest_manifest(fd, contract_fd, manifest: dict, object_key: str,
             "schema_version": manifest.get("schema_version", contract_fd.schema_version),
             "source_system": contract_fd.source_system,
             "already_ingested": False,
+            "commit": commit,
             # What this ingest did to the TABLE, a different event from what
             # it found in the FILE (`missing_columns` / `extra_columns`
             # below). A contract change shows up here on the first delivery
