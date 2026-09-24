@@ -36,6 +36,10 @@ k8s-smoke: ## The platform in a local kind cluster, from the chart: ingest + pre
 test: ## Config-level tests (no stack needed, ~1s). See tests/README.md
 	python -m tests.run
 
+.PHONY: doctor
+doctor: ## Check this host is set up right BEFORE `make up` -- .env, uid, memory, ports
+	python3 scripts/doctor.py
+
 .PHONY: down
 down: ## Stop the stack, keep volumes
 	$(COMPOSE) down
