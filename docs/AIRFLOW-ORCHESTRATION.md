@@ -144,6 +144,9 @@ branch name, `AirflowFailException` for a refusal, and the raw asset event.
 `tests/test_transport_steps.py` fails if a task grows its own copy of a step.
 No step reimplements Transport parsing, Feed resolution, control parsing, or
 manifest creation.
+Which task writes which `registry.transport_receipt` stage, and how `failed`
+and a retry move it, is drawn in
+[OPERATIONAL-CONTROL-PLANE.md §6](OPERATIONAL-CONTROL-PLANE.md#6-transportreceipt-semantics).
 Failure attribution therefore matches the Phase 6 brief's list exactly: an
 invalid Transport fails `validate_transport`, an unknown Feed id or identity
 conflict fails `create_delivery`, an unsafe archive fails

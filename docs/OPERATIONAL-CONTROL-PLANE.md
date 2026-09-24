@@ -96,6 +96,59 @@ Feed.expected_by + monitoring.lateness     -- has the deadline passed?
 Transport for the same (feed, cob_date), so a correction is never reported
 FAILED because of what it corrected.
 
+This is a decision, not a lifecycle: the chart is the order of the `if`s in
+`status_of`, and nothing moves from one box to another. Ask again after a new
+fact lands and the answer is recomputed from scratch.
+
+```mermaid
+flowchart TD
+    start(["feed_status.status_of(): one feed, one COB date<br/>computed on every request, stored nowhere"])
+    q1{"expected?<br/>is_expected(): delivery_expected, cadence"}
+    q2{"committed?<br/>any registry.delivery_committed row"}
+    q3{"has_delivery?<br/>any registry.delivery row<br/>(written at normalize)"}
+    q4{"latest receipt's status is failed?<br/>registry.transport_receipt, rows with a feed,<br/>latest by updated_at"}
+    q5{"any such receipt?"}
+    q6{"expected_by set and<br/>now > lateness.deadline()?"}
+    NE[NOT_EXPECTED]
+    C[COMPLETE]
+    P[PROCESSING]
+    F[FAILED]
+    R[RECEIVED]
+    M[MISSING]
+    W[WAITING]
+    start --> q1
+    q1 -- no --> NE
+    q1 -- yes --> q2
+    q2 -- "yes: even if a Transport for<br/>this date failed and was superseded" --> C
+    q2 -- no --> q3
+    q3 -- yes --> P
+    q3 -- no --> q4
+    q4 -- yes --> F
+    q4 -- no --> q5
+    q5 -- yes --> R
+    q5 -- no --> q6
+    q6 -- yes --> M
+    q6 -- "no: including no expected_by at all,<br/>which is WAITING forever, never MISSING" --> W
+```
+
+*Read from the code*: the branches are `monitoring/feed_status.status_of`,
+in its order. The inputs are assembled by `feed_entry` and `build_report`.
+`build_report` drops any receipt whose `feed` is still NULL, and `feed_entry`
+passes only the latest receipt's status, by `updated_at`. Three consequences
+follow, and none of them is obvious from the vocabulary:
+
+- **A receipt has no `feed` until `create_delivery`.** A Transport that is
+  only `discovered` or `validated`, or that failed `validate_transport`, is
+  invisible here. The feed reads `WAITING` or `MISSING`, not `RECEIVED` or
+  `FAILED`. `create_delivery` fills the feed in on failure too, best effort.
+- **`registry.delivery` is written at normalize**, so from
+  `normalize_delivery` onwards the feed reads `PROCESSING` until
+  `delivery_committed` has a row. That includes an `ingest_raw` that failed
+  or was refused.
+- **A Delivery ingested before `_delivery_id` existed on its raw table
+  reads `PROCESSING` until that table is rebuilt** or the date ages out.
+  `reconcile-committed` cannot find the column to backfill from (§11).
+
 **`LATE` is not a status.** A feed that arrived after its deadline is exactly
 as `COMPLETE`/`PROCESSING` as one that arrived on time; lateness and
 processing state are different questions, the same separation
@@ -134,7 +187,56 @@ each stage *produced*, not that a particular attempt is in flight.
   (identity/date conflict) can occur *after* the Feed itself was resolved,
   and a `FAILED` row with no feed attached would never surface on that
   feed's COB Status row, which is exactly the case an operator most needs to
-  see (`airflow/dags/transport_ingest.py::create_delivery_task`).
+  see (`ingest/transport_steps.py::deliver`, which `create_delivery`
+  calls).
+
+This one *is* a state diagram, because `status` is a stored, mutable
+column. Each edge is labelled with what writes it: a `transport_ingest`
+task id, or the discovery path.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> discovered: record_discovered (insert-once)<br/>transport_watch trigger_discovered<br/>transport_reconcile sync_receipts<br/>validate_transport (self-heal)
+    discovered --> validated: validate_transport
+    validated --> delivered: create_delivery<br/>sets feed, delivery_id
+    delivered --> normalized: normalize_delivery
+    discovered --> normalized: transport_reconcile sync_receipts<br/>(sync_from_progress)
+    discovered --> failed: validate_transport<br/>(only when conf carries transport_id)
+    validated --> failed: create_delivery<br/>(feed best effort)
+    delivered --> failed: normalize_delivery
+    normalized --> failed: ingest_raw<br/>(row found by feed, delivery_id)
+    failed --> validated: retry succeeds
+    failed --> delivered: retry succeeds
+    failed --> normalized: retry succeeds
+    note right of normalized
+        Last stage. ingest_raw writes nothing here on success:
+        reaching Raw is registry.delivery_committed,
+        written by ingest_feed._ingest_manifest.
+        A failed ingest_raw retried to success
+        therefore leaves this row at failed.
+    end note
+    note left of discovered
+        stage_rank: a write ranked below the row is dropped,
+        so a stale or racing retry cannot move status back.
+        failed is always written and keeps stage_rank;
+        a failed row accepts any stage.
+    end note
+```
+
+*Read from the code*: the stages and the rank rule are
+`registry/transports.py` (`STAGES`, `FAILED`, and `record_stage`'s `WHERE`
+clause). The writers are `ingest/transport_steps.py` (`validate`,
+`deliver`, `normalize`, `ingest_raw`), which the task ids in
+`airflow/dags/transport_ingest.py` call. Discovery writes come from
+`airflow/dags/transport_watch.py` and from `transport_reconcile`'s
+`sync_receipts` task (`sync_from_progress`). That task records a Transport
+found past its NormalizationManifest as `normalized` directly. No stage says
+the Delivery reached Raw: `ingest_raw` writes the receipt only when it
+fails. Whether the Delivery reached Raw is answered by
+`registry.delivery_committed` (§7). So a row left at `failed` by an
+`ingest_raw` attempt stays `failed` after a retry succeeds, and COB Status
+still reads `COMPLETE`, because `committed` outranks the receipt.
 
 ## 7. Delivery persistence: `delivery_committed`
 
