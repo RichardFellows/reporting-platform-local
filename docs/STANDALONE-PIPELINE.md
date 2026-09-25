@@ -57,7 +57,7 @@ compose up` never starts it. It needs only MinIO (or S3), Nessie and Postgres:
 
 ```bash
 docker compose --profile standalone run --rm runner check    # resolve + reach every store
-docker compose --profile standalone run --rm runner setup    # registry schema, dbt deps
+docker compose --profile standalone run --rm runner setup    # registry schema, raw tables, dbt deps
 
 # the whole pipeline over some files (the path is inside the container)
 docker compose --profile standalone run --rm runner run \

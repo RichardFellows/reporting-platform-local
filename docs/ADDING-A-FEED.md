@@ -56,6 +56,14 @@ One file per feed. It creates the raw table, the Airflow DAG, the asset that
 triggers `prepared_build`, and the retention/maintenance entries. Nothing else
 in the platform needs to learn the feed's name.
 
+The raw table is created EMPTY before the first delivery, by
+`python -m reporting_platform.ingest.migrate_raw` — which `airflow-init`
+and the chart's init hook run at deploy, and `platform_housekeeping` runs
+nightly. Until it exists, this feed's prepared model fails every
+`prepared_build`, and no feed publishes. A feed added from the console
+between deploys has no deploy: run that command, or deliver the feed. See
+[DECISIONS.md](DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers).
+
 **The filename is the name**, and the `name:` inside must match it — a check
 at load, because that one string reaches five places and a file copied to
 start a new feed is how the two come apart.

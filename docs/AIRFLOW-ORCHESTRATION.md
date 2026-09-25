@@ -504,6 +504,11 @@ problem, which is why it could observe the merge and the final `reporting`
 row. Re-run on a freshly seeded stack (or after landing/bulk-ingesting the
 other feeds) to re-confirm that last hop for v2.
 
+> **Since fixed (todo 25).** A declared feed that has never delivered no
+> longer blocks the others: every declared feed's raw table is created,
+> empty, at deploy time, so its model builds against zero rows. See
+> [DECISIONS.md](DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers).
+
 **Original Contract v1 run, for reference** (superseded above for the
 Transport→Raw portion, not repeated for prepared/reporting since a fresh
 stack was not available this session):

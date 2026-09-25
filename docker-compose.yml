@@ -372,7 +372,7 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    # Runs once; everything else waits on it COMPLETING. Five steps, each of
+    # Runs once; everything else waits on it COMPLETING. Six steps, each of
     # which once broke the platform silently when skipped.
     #
     # The registry schema is here so a cold stack has its tables before any
@@ -380,6 +380,12 @@ services:
     # is not redundant: `inbox`, `feed-ui` and `watchdog` share this image but
     # not this container's `depends_on`, so they can be up and recording
     # deliveries while this has never run.
+    #
+    # The raw tables are here so a feed declared but not yet delivered does
+    # not fail every prepared build. EMBEDDED, a local[1] Spark in this
+    # container: this does not wait for the Spark cluster, and a standalone
+    # master with no worker registered yet queues a job forever instead of
+    # failing it. See docs/DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers
     # See docs/DECISIONS.md#airflow-init-load-bearing-steps
     command: >
       bash -euc "
@@ -387,6 +393,7 @@ services:
       { airflow users create --username admin --password admin --firstname Platform --lastname Admin --role Admin --email admin@example.invalid || true; } &&
       { airflow pools set lakehouse_write ${LAKEHOUSE_WRITE_SLOTS:-1} 'serialise all Iceberg writers, incl. maintenance' || true; } &&
       python -m reporting_platform.registry schema &&
+      PLATFORM_EXECUTION=embedded SPARK_MASTER='local[1]' python -m reporting_platform.ingest.migrate_raw &&
       dbt deps --project-dir /opt/platform/dbt --profiles-dir /opt/platform/dbt
       "
     restart: "no"

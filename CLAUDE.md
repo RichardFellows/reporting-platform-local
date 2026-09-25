@@ -183,11 +183,20 @@ to run something for the first time, expect it to fail and read what it says.
   `release` too — `tests/test_release_image.py` fails otherwise. `make
   release-image` prints `PLATFORM_CODE_REF` (the image digest) and
   `DBT_PROJECT_DIGEST`. (`#the-release-image-carries-the-code`)
-- **`airflow-init` does five things**: db migrate, admin user, `pools set
+- **`airflow-init` does six things**: db migrate, admin user, `pools set
   lakehouse_write ${LAKEHOUSE_WRITE_SLOTS:-1}` (above 1 it EXCLUDES NOTHING,
-  `#one-shared-write-pool`), the registry schema, `dbt deps`. Without packages,
-  `dbt ls` cannot compile a `dbt_utils` test and the two build DAGs do not
-  *import*. (`#airflow-init-load-bearing-steps`)
+  `#one-shared-write-pool`), the registry schema, the raw tables, `dbt deps`.
+  Without packages, `dbt ls` cannot compile a `dbt_utils` test and the two
+  build DAGs do not *import*. (`#airflow-init-load-bearing-steps`)
+- **EVERY DECLARED FEED HAS A RAW TABLE BEFORE IT DELIVERS**, or its prepared
+  model fails every `prepared_build` with `TABLE_OR_VIEW_NOT_FOUND` and NO
+  feed publishes until it arrives. `ingest.migrate_raw` creates the absent
+  ones, empty, from `ensure_raw_table`'s contract: in `airflow-init` and the
+  chart's `platform-init` hook (EMBEDDED, `local[1]` -- neither waits for the
+  cluster), in the runner's `setup`, and first in `platform_housekeeping`,
+  which is what reaches a feed saved from the console between deploys. So an
+  empty raw table no longer means "never delivered"; the registry does.
+  (`#a-declared-feed-has-a-raw-table-before-it-delivers`)
 - **dbt's three working directories live under `/opt/platform/run`, not the
   `./dbt` bind mount** (`DBT_LOG_PATH`, `DBT_TARGET_PATH`,
   `packages-install-path`): a bind mount keeps host ownership, so `dbt deps`
@@ -414,9 +423,12 @@ them.
   reference refuses the sweep, an empty live set against a non-empty warehouse
   refuses too, and a refusal exits non-zero. Prefix depth is derived from
   `REPORTING_WAREHOUSE`. (`#an-incomplete-keep-set-refuses`)
-- **The completeness check has THREE answers, not two**: `no data` (empty
-  table), `no table` (`TABLE_OR_VIEW_NOT_FOUND` — a feed that has never
-  delivered), `unreadable` (anything else, and it fails `--fail-on-gap`).
+- **The completeness check has FOUR answers for a feed with no dates**:
+  `never delivered` (empty table, no `registry.delivery` row), `no data`
+  (empty table, deliveries recorded -- or the registry could not be asked,
+  which the entry says), `no table` (`TABLE_OR_VIEW_NOT_FOUND` -- declared
+  since the last deploy, and blocking every build until `migrate_raw` runs),
+  `unreadable` (anything else, and it fails `--fail-on-gap`).
 - **A dry run may write to the index; it may not write anything a later step
   reads to decide what to delete.** `registry_reconcile` writes rows but not
   manifests under `dry_run`, and reports `would_normalize` — skipping the task

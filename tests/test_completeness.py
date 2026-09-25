@@ -158,10 +158,11 @@ def test_unreadable_feeds_is_always_present_so_a_reader_can_rely_on_it():
     assert find_gaps({}, lookback=0)["unreadable_feeds"] == []
 
 
-def test_a_feed_that_has_never_delivered_has_no_table_and_that_is_not_a_defect():
-    """THREE ANSWERS, NOT TWO. Spark names this case exactly
-    (`TABLE_OR_VIEW_NOT_FOUND`), and it is the ordinary state of a feed
-    declared in `feeds.yml` that has not arrived yet -- not a broken monitor.
+def test_a_missing_table_is_not_a_defect_of_this_check():
+    """Spark names this case exactly (`TABLE_OR_VIEW_NOT_FOUND`), so it is
+    told apart from `unreadable` and does not fail the check. It is no longer
+    how a new feed looks -- deploy creates its table -- but a feed declared
+    since the last deploy still reads this way until `migrate_raw` runs.
     """
     report = find_gaps({"a": _d("2026-08-03")}, lookback=0,
                        absent={"brand_new": "TABLE_OR_VIEW_NOT_FOUND ..."})
@@ -176,3 +177,50 @@ def test_the_two_absences_are_counted_apart():
                        absent={"brand_new": "not found"})
     assert report["unreadable_feeds"] == ["broken"]
     assert report["feeds_without_a_table"] == ["brand_new"]
+
+
+# ------------------------------- never delivered comes from the registry now
+def test_an_empty_table_the_registry_never_saw_a_delivery_for_is_never_delivered():
+    """THE ANSWER THAT USED TO BE `no table`. Every declared feed gets an
+    empty raw table at deploy time, so one undelivered feed no longer fails
+    every prepared build -- and the table can no longer say whether the feed
+    ever delivered. The registry can.
+    """
+    report = find_gaps({"a": _d("2026-08-03"), "brand_new": set()},
+                       lookback=0, never_delivered={"brand_new"})
+    assert _feed(report, "brand_new")["status"] == "never delivered"
+    assert report["feeds_never_delivered"] == ["brand_new"]
+    assert report["feeds_without_a_table"] == []
+    assert report["unreadable_feeds"] == []
+    assert report["total_missing"] == 0
+
+
+def test_an_empty_table_the_registry_has_deliveries_for_is_no_data():
+    """Landed, recorded, not in raw yet: not the same as never delivered."""
+    report = find_gaps({"a": _d("2026-08-03"), "landed": set()},
+                       lookback=0, never_delivered=set())
+    assert _feed(report, "landed")["status"] == "no data"
+    assert report["feeds_never_delivered"] == []
+
+
+def test_a_registry_that_could_not_be_asked_is_said_not_guessed():
+    """Neither answer is assumed. The entry stays `no data` -- the table was
+    read and IS empty -- and carries why the rest is unknown.
+    """
+    report = find_gaps({"a": _d("2026-08-03"), "empty": set()}, lookback=0,
+                       registry_error="connection refused")
+    entry = _feed(report, "empty")
+    assert entry["status"] == "no data"
+    assert "connection refused" in entry["error"]
+    assert report["feeds_never_delivered"] == []
+
+
+def test_never_delivered_only_ever_names_an_empty_table():
+    """A feed with dates is judged on its dates whatever the registry says;
+    a registry row missing for a feed raw holds is the registry's problem to
+    reconcile, not this check's to report as never delivered.
+    """
+    report = find_gaps({"a": _d("2026-08-03")}, lookback=0,
+                       never_delivered={"a"})
+    assert _feed(report, "a")["status"] == "complete"
+    assert report["feeds_never_delivered"] == []

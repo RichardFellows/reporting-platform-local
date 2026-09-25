@@ -51,7 +51,7 @@ by the commit that added the entry citing them.
 
 ## Contents
 
-102 entries. They are grouped here by subject; the file itself is in the order
+103 entries. They are grouped here by subject; the file itself is in the order
 they were written, which is roughly the order they were learned. **Anchors are
 stable** — the code links to them by name — so if you rename one, grep for it
 first.
@@ -126,7 +126,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [raw-is-a-source](#raw-is-a-source) | `models/raw/` contains no models on purpose |
 | [no-unused-config-paths](#no-unused-config-paths) | No `seeds:` block, and why an unused config path is a trap |
 | [identifiers-in-macros](#identifiers-in-macros) | Which macros call `ident()`, and why that is a decision |
-| [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps) | Migrate, admin user, the pool, the registry schema, `dbt deps` — miss the last and two DAGs do not import |
+| [airflow-init-load-bearing-steps](#airflow-init-load-bearing-steps) | Migrate, admin user, the pool, the registry schema, the raw tables, `dbt deps` — miss the last and two DAGs do not import |
 | [the-release-image-carries-the-code](#the-release-image-carries-the-code) | `Dockerfile.airflow` has a `release` stage with the code and dbt packages baked in; compose builds `dev` and mounts the code |
 | [assets-are-or-not-and](#assets-are-or-not-and) | A bare schedule list is **AND**, which is almost never what you meant |
 | [retry-delay](#retry-delay) | Seconds, not the five minutes it used to be |
@@ -167,6 +167,7 @@ anchor; this page is for when you do not yet know what you are looking for.
 | [source-column-names](#source-column-names) | A column may be named differently in the file than in the platform |
 | [a-declared-column-migrates-itself](#a-declared-column-migrates-itself) | **The directions are not symmetrical**: declared columns are added, undeclared ones are never dropped |
 | [provenance-is-added-not-backfilled](#provenance-is-added-not-backfilled) | The migration is lazy, and one un-migrated feed fails *every* prepared model |
+| [a-declared-feed-has-a-raw-table-before-it-delivers](#a-declared-feed-has-a-raw-table-before-it-delivers) | **One feed that had not delivered yet stopped every feed publishing**; its raw table is now created empty at deploy, and "never delivered" comes from the registry |
 | [supersession-is-declared-not-assumed](#supersession-is-declared-not-assumed) | The value is the refusal: a delta feed deduped as a snapshot loses keys silently |
 | [a-snapshot-re-delivery-restates-the-whole-date](#a-snapshot-re-delivery-restates-the-whole-date) | **A key the newest delivery omits is absent** — the rank was per key, a MERGE never deletes, and an SCD2 version the replaced delivery began is retracted in the merge |
 | [as-of-is-a-var-not-a-second-model](#as-of-is-a-var-not-a-second-model) | Same models, a dbt var, and a refusal to run incrementally |
@@ -595,7 +596,7 @@ that the release stage does not copy, or if compose stops pinning `dev`.
 ## airflow-init-load-bearing-steps
 
 `airflow-init` runs once and everything else waits on it *completing*, so no
-component races the database into existence. It does five things, each of which
+component races the database into existence. It does six things, each of which
 was once a manual step that silently broke the platform when skipped.
 
 THE ANCHOR NO LONGER COUNTS THEM, and that is the point of the rename: it was
@@ -617,7 +618,11 @@ bearing is that every step is.
    first connect, and that is not redundant: `inbox`, `feed-ui` and `watchdog`
    share this image but not this container's `depends_on`, so they can be up
    and recording deliveries while this has never run.
-5. `dbt deps` — no longer merely "the build fails until you run it". Cosmos
+5. `migrate_raw` — a raw table for every declared feed, so a feed that has
+   not delivered yet does not fail every prepared build. Embedded Spark, not
+   the cluster: see
+   [a-declared-feed-has-a-raw-table-before-it-delivers](#a-declared-feed-has-a-raw-table-before-it-delivers).
+6. `dbt deps` — no longer merely "the build fails until you run it". Cosmos
    renders `prepared_build` and `reporting_build` by running `dbt ls`, which
    cannot compile a `dbt_utils` test without the package, so on a fresh clone
    those two DAGs would not **import**. Installing here makes the clone
@@ -3557,6 +3562,10 @@ commits nothing when they are current, and runs first in
 `platform_housekeeping`. Run it by hand when deploying a new provenance
 column, BEFORE the next ingest.
 
+It creates a feed's raw table too, where there is none, which it once
+deliberately did not — see
+[a-declared-feed-has-a-raw-table-before-it-delivers](#a-declared-feed-has-a-raw-table-before-it-delivers).
+
 It covers the FEEDS' own columns too, by the same code —
 [a-declared-column-migrates-itself](#a-declared-column-migrates-itself).
 
@@ -4836,13 +4845,16 @@ a table with nothing in it are the same value, and the module goes to some
 length to enumerate its own blind spots without this one among them. A monitor
 that goes green on a table it never read is worse than no monitor.
 
-There are **three** answers, not two, and the third is why this does not
-simply fail on every error:
+There were **three** answers, not two, and the third is why this does not
+simply fail on every error. There are four now, because "never delivered"
+stopped being readable off the table
+([a-declared-feed-has-a-raw-table-before-it-delivers](#a-declared-feed-has-a-raw-table-before-it-delivers)):
 
 | answer | what it means | counted |
 |---|---|---|
-| `no data` | the table exists and is empty | no |
-| `no table` | Spark said `TABLE_OR_VIEW_NOT_FOUND` — a feed declared in `feeds.yml` that has never delivered | no |
+| `never delivered` | the table exists and is empty, and `registry.delivery` has no row for the feed | no |
+| `no data` | the table exists and is empty, and the registry has deliveries for it — or could not be asked, which the entry says | no |
+| `no table` | Spark said `TABLE_OR_VIEW_NOT_FOUND` — a feed declared since the last deploy, blocking every prepared build until `migrate_raw` runs | no |
 | `unreadable` | anything else: catalog down, branch gone, permissions | **yes**, and it fails `--fail-on-gap` |
 
 Matched on the error CLASS rather than on the prose, and an error class that
@@ -5794,3 +5806,97 @@ extras, and imports every module. The static test cannot see a module-level
 import of an undeclared third-party package or a file the staging missed;
 this does, and removing `requests` from core's `requires` fails it on
 `common/airflow_api.py`, measured.
+
+## a-declared-feed-has-a-raw-table-before-it-delivers
+
+**Every declared feed has a raw table before its first delivery, created
+empty by `ingest.migrate_raw` at deploy time.** Until this, nothing created a
+raw table except an ingest, and `migrate_raw` skipped a feed with no table on
+purpose — "the first ingest creates it", and an empty table would put a
+namespace and table on `main` for a feed that had never delivered.
+
+That reasoning held for raw and broke one layer up. `prepared_build` builds
+every prepared model on every run (`select="path:models/prepared"`), the model
+of a feed with no raw table fails with `TABLE_OR_VIEW_NOT_FOUND`, and
+write-audit-publish then keeps the branch and publishes nothing — **for every
+feed, not just the new one**, and `reporting_build` never fires because the
+prepared asset never updates. So from the moment a feed and its model were
+declared until its first delivery, no feed published. The README said the
+opposite ("A late feed does not block the feeds that did arrive"). The build
+tier did not see it because its seed delivers every feed.
+
+Measured on a local stack with only `fo_trade` delivered: `dbt build` on a
+branch, `PASS=9 ERROR=6 SKIP=71`, all six errors `TABLE_OR_VIEW_NOT_FOUND`
+on the five undelivered feeds' raw tables. After `airflow-init` created them,
+the same build built every model. With the four seeded feeds delivered and
+the two `qa_` feeds declared and never delivered — exactly the state this
+entry is about — `PASS=85 ERROR=0`, and a triggered `ingest_fo_trade` fired
+`prepared_build` and then `reporting_build`, both `dataset_triggered__` runs,
+both published.
+
+### Three options, and why this one
+
+1. **Create the tables at deploy time** — this one.
+2. **Guard in the model or source**, skipping or empty-selecting an absent
+   relation. The prepared table is then missing instead, and every reporting
+   model that `ref()`s it fails the same way one layer down.
+3. **Build only what the triggering asset feeds.** Closest to the stated
+   design, but `any_of()` does not tell a run which asset fired, and the
+   publish gate and the run's input set both assume one build per layer.
+   Much the larger change; not ruled out for later.
+
+### Where it runs
+
+- **`airflow-init`** and the chart's **`platform-init`** hook, with
+  `PLATFORM_EXECUTION=embedded SPARK_MASTER='local[1]'` for that one command.
+  Neither waits for the Spark cluster — `airflow-init` depends on Postgres,
+  Nessie and MinIO only — and a standalone master with no worker registered
+  QUEUES a job forever rather than failing it, which in an init container
+  blocks the whole stack with nothing to say why. In the chart it also means
+  the hook's service account needs no right to create driver pods. Costs one
+  JVM start per `docker compose up`, about half a minute.
+- The standalone runner's **`setup`**, which is already embedded.
+- **First in `platform_housekeeping`**, on the cluster, as it already ran for
+  the column migration. That is what reaches a feed saved from the console
+  between deploys: the console writes config live and `feeds()` picks it up
+  on mtime, so there is no deploy for such a feed until the next night. Until
+  then its model fails the builds as before — run `migrate_raw` by hand after
+  adding a feed from the console, or deliver it.
+
+Created by `ensure_raw_table`, the DDL `ingest()` runs, so there is one
+contract. On a branch and merged, the namespace on `main` first
+([namespace-before-branch](#namespace-before-branch)); on a catalog whose
+`main` has no commits yet, straight onto `main` through the same one-time
+bootstrap the first ingest uses, because Nessie cannot merge into its "no
+ancestor" sentinel. `_exists` now raises on anything but
+`TABLE_OR_VIEW_NOT_FOUND`: it used to read ANY error as "absent", harmless
+while absent meant skip, and a catalog that is down must not read as a feed
+to create.
+
+### What it costs: an empty table no longer means "never delivered"
+
+This is, on purpose, the confusion CLAUDE.md warns about — a subject that
+could not be READ reported as one that is EMPTY — applied to "never
+delivered" and "delivered nothing". So nothing may read the first off the
+table any more. **The registry says it**: `registry.delivery` gets a row at
+normalize time for every delivery on both the legacy and the Transport path,
+so a feed with none has never delivered. `monitoring/completeness.py` asks it
+for each empty table and reports `never delivered`; if the registry cannot be
+asked, the entry stays `no data` and carries why, rather than guessing either
+way. `no table` still exists, and now means a feed declared since the last
+deploy — the state that blocks every build.
+
+The other readers were checked, not assumed:
+
+- **COB Feed Status** derives from the registry and `delivery_committed`
+  already, never from the table.
+- **Lineage** reads more, not less: the models that used to be `not derivable`
+  on a stack missing a feed are built.
+- **The migration harness** (`migration/new_side.py`) pairs legacy and new
+  evidence before it reads the table, and a feed that never delivered has no
+  new-side evidence to pair, so it is `NOT_COMPARABLE` either way.
+- **A data test can still refuse**, correctly. With `fo_trade` delivered and
+  `ref_counterparty` not, the build fails `relationships` from
+  `fo_trade.counterparty_id` — 1200 trades referencing counterparties that
+  were never delivered. That is a feed that genuinely depends on the missing
+  one, not the missing table blocking unrelated feeds.

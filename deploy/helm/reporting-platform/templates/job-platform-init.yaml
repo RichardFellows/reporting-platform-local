@@ -1,5 +1,5 @@
 {{- /*
-The two platform-specific steps of `airflow-init` that the official chart's
+The three platform-specific steps of `airflow-init` that the official chart's
 own `migrateDatabaseJob`/`createUserJob` hooks do not cover -- see
 docs/DECISIONS.md#airflow-init-load-bearing-steps. `db migrate` and `users
 create` are the subchart's job; `dbt deps` is not needed here at all, because
@@ -12,6 +12,14 @@ A post-install/post-upgrade hook, so it runs once every resource is ready.
 The subchart's migrate job is a PLAIN Job, not a hook (values.yaml says why),
 and the Airflow pods are not ready until it has finished, so the metadata
 schema `pools set` needs always exists by the time this runs.
+
+The raw tables are created with an EMBEDDED Spark in this pod
+(PLATFORM_EXECUTION=embedded, local[1], for that one command only), not a
+driver pod: this Job's service account needs no rights to create pods, and a
+post-upgrade hook must not queue behind executors. A feed declared in this
+release then has an empty raw table before its first delivery, so its prepared
+model builds instead of failing every prepared build -- see
+docs/DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers.
 */ -}}
 apiVersion: batch/v1
 kind: Job
@@ -46,7 +54,9 @@ spec:
             - >
               airflow pools set lakehouse_write "$LAKEHOUSE_WRITE_SLOTS"
               'serialise all Iceberg writers, incl. maintenance' &&
-              python -m reporting_platform.registry schema
+              python -m reporting_platform.registry schema &&
+              PLATFORM_EXECUTION=embedded SPARK_MASTER='local[1]'
+              python -m reporting_platform.ingest.migrate_raw
           envFrom:
             - configMapRef:
                 name: {{ include "reporting-platform.envConfigMap" . }}

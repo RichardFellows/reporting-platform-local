@@ -168,10 +168,16 @@ def platform_housekeeping():
 
     @task(pool="lakehouse_write")
     def migrate_raw_schema(**context) -> dict:
-        """Give every raw table the current provenance columns. Idempotent.
+        """Give every declared feed a raw table with the current columns.
+        Idempotent.
 
         FIRST IN THE CHAIN, and it is not maintenance -- it is the guard
-        against a lazy migration. `ingest` adds a missing provenance column on
+        against two things a build would otherwise trip over. A feed declared
+        since the last deploy (the console writes config live) has no raw
+        table until its first delivery, and its prepared model fails every
+        `prepared_build` until then; this creates it, empty
+        (docs/DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers).
+        And a lazy migration: `ingest` adds a missing provenance column on
         the branch it is already writing, for the one feed it is ingesting, so
         a feed that has not delivered since the column was added keeps the old
         schema. Every prepared model selects those columns, so the next build
@@ -186,6 +192,11 @@ def platform_housekeeping():
         log = logging.getLogger("airflow.task")
         mode = "dry" if context["params"].get("dry_run") else "real"
         report = _spark_subprocess("migrate-raw", mode)
+        if report.get("created"):
+            log.warning("created %d raw table(s) for feeds that have not "
+                        "delivered yet: %s", report["created"],
+                        [f["feed"] for f in report["feeds"]
+                         if f["status"] == "created"])
         if report.get("migrated"):
             log.warning("migrated %d raw table(s) to the current provenance "
                         "schema: %s", report["migrated"],
