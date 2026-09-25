@@ -147,6 +147,77 @@ An **identity** failure is quarantined; an **integrity** failure lands and
 fails at ingest. That asymmetry is deliberate: landing is the evidence copy,
 and a bad delivery is exactly what it exists to prove.
 
+### What the gate does with one file
+
+The diagram above shows two ways out of the gate. The code has more, and the two
+it leaves out are the two that confuse someone watching a file sit in
+`inbox/`: **the file is not stable yet**, or **it is `Waiting`** for its
+control file. Neither is an error, and neither moves the file. Every name
+below is taken from `ingest/inbox.py` (`sweep`, `route`, `_promote`) and
+`ingest/conform.py` (`ARRIVAL_SHAPES` and its four outcome classes):
+
+```mermaid
+flowchart TD
+  F["a file in inbox/<br/><i>one sweep() pass</i>"]
+  S{"size + mtime unchanged<br/>for STABLE_POLLS more polls?"}
+  UNSTABLE(["<b>not yet stable</b><br/>nothing happens;<br/>looked at again next poll"])
+  RT{"route(filename)<br/><i>checked in this order</i>"}
+  UN["quarantine/ + registry.rejection<br/><i>unroutable, or ambiguous</i>"]
+  HELD(["<b>held (control file)</b><br/>left in place until its<br/>data file consumes it"])
+  UP["put_landing under its OWN name"]
+  PL{"conform.plan_arrival<br/>ARRIVAL_SHAPES: file or archive<br/><i>one outcome per delivery</i>"}
+  P["<b>Planned</b><br/>landing/: control file, data,<br/>then .meta.json"]
+  D["<b>Duplicate</b><br/>same bytes already landed<br/>for that COB date:<br/>nothing written"]
+  R["<b>Refused</b><br/>identity failure:<br/>quarantine/ + registry.rejection"]
+  W["<b>Waiting</b><br/>control file not here yet<br/><i>plain file only</i>"]
+  WHERE{"where the inbox copy goes,<br/>from ALL its outcomes"}
+  STAY(["<b>left in place</b><br/>planned again next poll"])
+  PROC["inbox/.processed/&lt;feed&gt;/<br/>with its consumed control file"]
+  REJ["inbox/.rejected/"]
+  TRIG["trigger ingest_&lt;feed&gt;<br/><i>after the move; a Duplicate<br/>triggers nothing</i>"]
+
+  F --> S
+  S -->|"changed, or not yet<br/>seen often enough"| UNSTABLE
+  S -->|"stable"| RT
+  RT -->|"1 filename_pattern<br/><i>already conformant</i>"| UP
+  RT -->|"2 arrival.source_pattern"| PL
+  RT -->|"3 arrival.control.pattern"| HELD
+  RT -->|"4 delivery.control.pattern"| UP
+  RT -->|"no feed, or more than one"| UN
+  UN --> REJ
+  UP -->|"uploaded"| PROC
+  UP -->|"upload failed"| STAY
+  PL --> P
+  PL --> D
+  PL --> R
+  PL --> W
+  P --> WHERE
+  D --> WHERE
+  R --> WHERE
+  W --> WHERE
+  WHERE -->|"the file itself Refused:<br/>its control file goes too,<br/>quarantined with it"| REJ
+  WHERE -->|"any Planned written,<br/>or any Duplicate"| PROC
+  WHERE -->|"otherwise: Waiting,<br/>every write failed,<br/>every archive member Refused<br/><i>(todo 55)</i>"| STAY
+  PROC --> TRIG
+```
+
+Four things the picture encodes that the prose elsewhere does not:
+
+- **Stability comes before routing.** A file is not even routed until its size
+  and mtime have held still for `STABLE_POLLS` further polls. Until then
+  `sweep` records the observation and returns no result for the file.
+- **One inbox file can have many outcomes.** An `arrival.archive` container
+  yields one outcome per member, so the inbox copy's destination is decided
+  from all of them together, in the order shown: `.rejected/` only if the file
+  *itself* was refused, `.processed/` if anything at all landed or was already
+  there, otherwise it stays put.
+- **`Waiting` exists only for a plain file.** A member whose control file is
+  missing from its container is `Refused`, because a container arrives
+  complete and waiting for it could never end.
+- **A `Duplicate` is not a rejection.** Nothing is written and nothing is
+  triggered, but the inbox copy still moves to `.processed/`, because the
+  delivery it names is already landed.
+
 ## The manifest
 
 Normalization writes one JSON manifest per delivery into `ready/<feed>/`:

@@ -25,8 +25,8 @@ than worked.
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
 | [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
-| [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
 | [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and inside reconcile's window its receipt is reset | medium | ½–1 day |
+| [55](55-an-archive-with-every-member-refused-is-requarantined-every-poll.md) | An `arrival.archive` container whose every member is refused is re-quarantined on every poll | medium | 1–2 hours |
 
 ## Where to start
 
@@ -48,11 +48,14 @@ decision before code, and the item lays out the three options.
 
 **25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
 bugs, reproduced before they were written down (26 was too, and is fixed).
-28, 30 and 31 are diagrams, independent of each other and of everything else
-(29 is done).
+28 and 30 are diagrams, independent of each other and of everything else
+(29 and 31 are done).
 
 **50** was found drawing 29's COB Status flowchart. It is reasoned from the
 code, with `status_of` called directly; reproduce it live first.
+
+**55** was found drawing 31's diagram and reproduced with
+`tests/test_inbox.py`'s harness before it was written down.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
@@ -61,6 +64,27 @@ first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**31, diagram the inbox gate's outcomes.** `docs/DELIVERY-SHAPES.md` has a new
+section, "What the gate does with one file". It holds one `flowchart`: a file
+in `inbox/` passes the `STABLE_POLLS` stability wait, then `route()` in its
+four-claimant order, then `conform.plan_arrival` over `ARRIVAL_SHAPES`
+(`file` / `archive`), then one of `Planned` / `Duplicate` / `Refused` /
+`Waiting`. It ends at `_promote`'s destination decision: `.rejected/`,
+`.processed/<feed>/` then trigger, or left in place. Every label was read out
+of `ingest/inbox.py` and `ingest/conform.py`, not the prose. Four bullets under
+it spell out what no other diagram shows. The existing two-way diagram is
+unchanged.
+*Verified* by rendering the block as committed (extracted from the doc) with
+`@mermaid-js/mermaid-cli@11` and `@10`, and looking at both PNGs.
+`python -m tests.run` passes.
+*What the item got wrong.* It gave `Duplicate` as "do nothing" and listed
+"move to `.processed/`" as a separate outcome. In fact a `Duplicate` writes
+and triggers nothing but still moves the inbox copy to `.processed/`, because
+it counts as `written`. Drawing the destination decision turned up a real
+defect: a container whose every member is `Refused` is neither refused itself
+nor `written`, so it stays in `inbox/` and is quarantined again on every poll.
+That is now todo 55, and the diagram labels that edge `(todo 55)`.
 
 **29, the Transport receipt's stages and COB Feed Status derivation were not
 drawn** — `docs/OPERATIONAL-CONTROL-PLANE.md` now has both diagrams. §5 has a
