@@ -157,6 +157,11 @@ row count or md5 that does not match -- fail the task once, with
 time. The legacy `ingest` task does the same. See
 `docs/DECISIONS.md#a-refusal-is-not-retried`.
 
+Which task writes which `registry.transport_receipt` stage, and how
+`failed` is later overwritten (by a retry, or by `transport_reconcile`), is
+drawn in
+[OPERATIONAL-CONTROL-PLANE.md §6](OPERATIONAL-CONTROL-PLANE.md#6-transportreceipt-semantics).
+
 `transport_ingest` itself is triggered only -- `schedule=None` -- by
 `transport_watch`, `transport_reconcile`, or a manual replay. It never
 decides for itself when a Transport is due.

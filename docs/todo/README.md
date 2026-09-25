@@ -22,11 +22,10 @@ than worked.
 | [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
 | [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
-| [26](26-tests-run-on-a-host-fails-without-reporting-config-dir.md) | `python -m tests.run` on a host fails 12 tests unless `REPORTING_CONFIG_DIR` is set | medium | 1 hour |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
 | [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
-| [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
+| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and inside reconcile's window its receipt is reset | medium | ½–1 day |
 | [55](55-an-archive-with-every-member-refused-is-requarantined-every-poll.md) | An `arrival.archive` container whose every member is refused is re-quarantined on every poll | medium | 1–2 hours |
 
 ## Where to start
@@ -47,9 +46,13 @@ first.
 every other feed publishing until the new one first delivers. It needs a
 decision before code, and the item lays out the three options.
 
-**25–30** were found reviewing the README on 2026-09-24. 25–27 are bugs,
-reproduced before they were written down. 28–30 are diagrams, independent of
-each other and of everything else.
+**25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
+bugs, reproduced before they were written down (26 was too, and is fixed).
+28 and 30 are diagrams, independent of each other and of everything else
+(29 and 31 are done).
+
+**50** was found drawing 29's COB Status flowchart. It is reasoned from the
+code, with `status_of` called directly; reproduce it live first.
 
 **55** was found drawing 31's diagram and reproduced with
 `tests/test_inbox.py`'s harness before it was written down.
@@ -82,6 +85,60 @@ it counts as `written`. Drawing the destination decision turned up a real
 defect: a container whose every member is `Refused` is neither refused itself
 nor `written`, so it stays in `inbox/` and is quarantined again on every poll.
 That is now todo 55, and the diagram labels that edge `(todo 55)`.
+
+**29, the Transport receipt's stages and COB Feed Status derivation were not
+drawn** — `docs/OPERATIONAL-CONTROL-PLANE.md` now has both diagrams. §5 has a
+decision `flowchart` of `feed_status.status_of`, in the order the code checks
+it. Its two surprising edges are labelled: a commit hides any failure for
+the date, before or after it (`COMPLETE`), and no `expected_by` is `WAITING` forever. §6 has a
+`stateDiagram-v2` of `registry.transport_receipt`, with each stage write
+labelled by its writer, and `failed` reachable from every stage: the `transport_ingest` task ids, `transport_watch`'s
+`trigger_discovered`, and `transport_reconcile`'s `sync_receipts`. It shows
+the `stage_rank` rule and says reaching Raw is `delivery_committed`, not a
+stage. `AIRFLOW-ORCHESTRATION.md` links to §6. Every name was taken from
+`registry/transports.py`, `ingest/transport_steps.py`, the three DAG files
+and `monitoring/feed_status.py`, and the captions cite them. §6's
+`create_delivery_task` citation now points at `transport_steps.deliver`,
+where that code moved. §9's claim that every task self-heals the row and
+§10's claim that only a successful attempt clears `failed` are corrected.
+*Verified* by rendering each block out of the doc itself with mermaid-cli 11
+and 10, and looking at the PNGs. `python -m tests.run`: 1000
+passed, 1 skipped (fastapi).
+*What the item got wrong.* It said a successful retry moves a `failed`
+receipt on again. That is roughly right, but inside reconcile's window it is
+usually `transport_reconcile`'s `sync_receipts` that does it, with no retry
+([§6](../OPERATIONAL-CONTROL-PLANE.md#a-failed-receipt-is-reset-by-reconcile)).
+A successful `ingest_raw` retry writes nothing at all. The item also
+treated `RECEIVED` as "any receipt". Receipts without a `feed` are dropped
+first, so a `discovered` or `validated` Transport never reads `RECEIVED`.
+Drawing this exposed todo 50.
+
+**26, `python -m tests.run` on a host failed 12 tests unless
+`REPORTING_CONFIG_DIR` was set** — `tests/__init__.py` now defaults it
+(unset or empty) to the checkout's `reporting_platform/config`. The package
+`__init__` runs before any `tests.*` module, so a direct import or `pytest`
+gets the default too, not only `tests/run.py`. `settings.py`'s container
+default and `layout.feed_paths`' refusal are untouched: only the suite
+defaults it. Because that default is the working tree, `tests/run.py` digests
+the directory's registry files (`.yml`/`.yaml`, through
+`context._tree_digest`) before and after the run and fails if they changed,
+so a test that forgets `config_dir()` cannot rewrite the checkout silently.
+Its first version digested every file and failed a fresh clone on the
+`.pyc` files `test_settings` writes by importing `config.__main__`.
+`.github/workflows/config.yml` no longer sets
+`REPORTING_CONFIG_DIR`/`DBT_PROJECT_DIR` for the whole job, only on the
+`config check` step, so the test step runs the fresh-clone case. A new
+`test_ci_pins` case fails if either variable reaches the suite again through
+an `env:` map, the test step's `run:` text, or a `$GITHUB_ENV` write in an
+earlier step. It fails against `main`'s workflow. Reproduced on `main` with
+nothing set: `988 passed, 12 failed, 1 skipped`, all twelve `no feed
+registry at /opt/platform/...`. On the branch, in a fresh-clone state
+(every `__pycache__` under `reporting_platform/config` deleted first):
+`1001 passed, 0 failed, 1 skipped` unset, set, and set empty. The PR template and
+`tests/README.md` no longer tell anyone to set it.
+*What the item got wrong*: only its counts, which the suite has outgrown
+(929 then, 988 now). It did not mention that CI also set `DBT_PROJECT_DIR`
+job-wide; the suite turned out not to need that either, so both moved.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the
