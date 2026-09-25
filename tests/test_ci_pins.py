@@ -74,13 +74,18 @@ def _dockerfile() -> str:
     return text
 
 
-def _steps() -> list[dict]:
-    workflow = yaml.safe_load(repo_file(WORKFLOW).read_text(encoding="utf-8"))
+def _workflow_job(path: pathlib.Path, name: str) -> tuple[dict, dict]:
+    """(workflow, its one job `name`), or a named assertion saying why not."""
+    workflow = yaml.safe_load(repo_file(path).read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
-    assert len(jobs) == 1, (
-        f"{WORKFLOW.name} has grown a second job ({', '.join(sorted(jobs))}); "
-        f"this module assumes the parse tier is one job")
-    return list(jobs["parse"]["steps"])
+    assert list(jobs) == [name], (
+        f"{path.name} has jobs {', '.join(sorted(jobs))}; this module assumes "
+        f"it is the one job `{name}`")
+    return workflow, jobs[name]
+
+
+def _steps() -> list[dict]:
+    return list(_workflow_job(WORKFLOW, "parse")[1]["steps"])
 
 
 def _commands() -> list[str]:
@@ -229,3 +234,52 @@ def test_the_dbt_smoke_test_runs_in_ci():
     assert later, (
         "no step after the cosmos install runs `dbt --version`, so the "
         "--no-deps trap is unguarded again")
+
+
+# THE CHEAP TIER RUNS THE SUITE AS A FRESH CLONE DOES -- with neither of
+# these set. `config.yml` used to set them for the whole job, so the twelve
+# tests that read the real registry passed in CI and failed on every laptop,
+# and nothing said so (todo 26). `tests/__init__.py` defaults the config
+# directory for the suite now; this is what stops CI quietly taking the unset
+# case back out. An `env:` map at workflow, job or test-step level is one way
+# to set them; the `run:` text is the other -- an inline `VAR=...` or an
+# `export` in the test step itself, or a write to `$GITHUB_ENV` in ANY step
+# before it, which every later step inherits. (`config check`'s own step-level
+# `env:` is fine: it reaches no other step.)
+CONFIG_WORKFLOW = pathlib.Path(".github/workflows/config.yml")
+_UNSET_FOR_TESTS = ("REPORTING_CONFIG_DIR", "DBT_PROJECT_DIR")
+_SUITE = re.compile(r"\btests\.run\b")
+
+
+def test_the_config_tier_runs_the_suite_with_the_config_variables_unset():
+    workflow, job = _workflow_job(CONFIG_WORKFLOW, "config")
+    steps = list(job["steps"])
+    at = [i for i, s in enumerate(steps) if _SUITE.search(str(s.get("run", "")))]
+    assert at, (f"{CONFIG_WORKFLOW} no longer runs `python -m tests.run` "
+                f"in any step")
+    problems = []
+    for where, env in [("workflow `env:`", workflow.get("env") or {}),
+                       ("job `env:`", job.get("env") or {})]:
+        for var in sorted(set(env) & set(_UNSET_FOR_TESTS)):
+            problems.append(f"{var} in the {where}")
+    for i, step in enumerate(steps[:at[-1] + 1]):
+        name = step.get("name") or f"step {i}"
+        text = str(step.get("run", ""))
+        for var in _UNSET_FOR_TESTS:
+            if i in at:
+                if var in (step.get("env") or {}):
+                    problems.append(f"{var} in `{name}`'s `env:`")
+                # SETTING it, not naming it: `env -u VAR` or `unset VAR`
+                # strengthens the invariant and must stay allowed. An
+                # assignment (`VAR=...`, inline, `export`ed or `env VAR=`)
+                # or a bare `export VAR` is what sets it.
+                if (re.search(rf"(?<![\w-]){var}=", text)
+                        or re.search(rf"\bexport\s+{var}\b", text)):
+                    problems.append(f"{var} set in `{name}`'s `run:`")
+            elif "GITHUB_ENV" in text and re.search(rf"\b{var}\b", text):
+                problems.append(f"{var} written to $GITHUB_ENV by `{name}`, "
+                                f"which runs before the suite")
+    assert not problems, (
+        f"{CONFIG_WORKFLOW} runs the suite with a config variable a fresh "
+        f"clone does not have: {'; '.join(problems)}. Set it on the "
+        f"`config check` step's `env:` only.")

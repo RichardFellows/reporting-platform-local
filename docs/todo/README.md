@@ -20,12 +20,12 @@ than worked.
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
 | [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
-| [26](26-tests-run-on-a-host-fails-without-reporting-config-dir.md) | `python -m tests.run` on a host fails 12 tests unless `REPORTING_CONFIG_DIR` is set | medium | 1 hour |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
-| [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
-| [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
-| [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
+| [45](45-published-tags-are-cut-at-mains-head.md) | A reporting publication tags `main`'s head, not the commit its merge made | medium | 1–2 hours |
+| [46](46-ingest-attempt-id-slices-mid-token.md) | `ingest_attempt_id` cuts a `manual__` or hand-set run id mid-token (inbox and console runs are fine) | low, cosmetic | 1 hour |
+| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and inside reconcile's window its receipt is reset | medium | ½–1 day |
+| [55](55-an-archive-with-every-member-refused-is-requarantined-every-poll.md) | An `arrival.archive` container whose every member is refused is re-quarantined on every poll | medium | 1–2 hours |
 
 ## Where to start
 
@@ -40,9 +40,18 @@ its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
 
-**25–31** were found reviewing the README on 2026-09-24. 25–27 are bugs,
-reproduced before they were written down. 28–31 are diagrams, independent of
-each other and of everything else.
+**25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
+bugs, reproduced before they were written down (26 was too, and is fixed).
+30 is a diagram, independent of everything else (28, 29 and 31 are done).
+
+**50** was found drawing 29's COB Status flowchart. It is reasoned from the
+code, with `status_of` called directly; reproduce it live first.
+
+**55** was found drawing 31's diagram and reproduced with
+`tests/test_inbox.py`'s harness before it was written down.
+
+**45–46** were found drawing todo 28's ref graph. 45 is reasoned from the
+code and says so. Reproduce it first.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** is reasoned from the code and says so — reproduce
@@ -86,6 +95,121 @@ reasoned. Recorded in
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
 *What the item got wrong.* Nothing material; its `--full-refresh` claim,
 reasoned from the code, reproduced exactly.
+
+**28, write-audit-publish as a Nessie commit graph.** `docs/ARCHITECTURE.md`
+now has a `### The ref graph` subsection under "Nessie: write-audit-publish".
+It holds a Mermaid `gitGraph` of one COB date processed in Airflow:
+- two inbox-triggered ingests, each tagged `snapshot/…` on its merge commit
+  (`fo_trade`, and `ref_counterparty`, whose `-a1` is kept after its driver
+  dies and whose `-a2` merges);
+- a `build/prepared/…` that fails `dbt_test` and is kept with `main`
+  unmoved;
+- a passing prepared build, which cuts no tag;
+- a `build/reporting/…` merged and tagged `published/…` once per exposure.
+
+The caption covers deletion (merged branches are deleted, and failed ones
+are kept), the 48 h / 120 h sweep, `hold/`, and the snapshot and published
+tag windows. Below it is a table of every ref pattern and the function that
+makes it. The table covers both run-id paths: Airflow's `<run>-a<n>`, and
+the fresh `new_run_id()` with no `-a<n>` that `bulk_ingest`, the `ingest`
+CLI, the runner and `transform --label` use. The README's write-audit-publish
+section links to it, and `context.branch_name`'s docstring now points at it
+and says which branches it names. The ASCII sketch it replaced was removed,
+along with two claims in it. It gave one naming scheme for every branch,
+but build branches are `build/<purpose>/<utc date>/<slug>`. It also said
+tags were `published/<cob_date>/<run_id>`, which is the retired shape that
+ingests used to cut.
+*Verified.* Every example name was produced by calling the code
+(`context.branch_name`, `ingest_attempt_id`, `new_run_id`, `snapshot_tag`,
+`published_tag`, `wap.branch_name`, `wap.run_key`) on the run ids each path
+really uses. Inbox and console runs use `console__…`
+(`airflow_api.trigger`), and build runs use `dataset_triggered__…`. The
+exposure names are from `dbt/models/reporting/_reporting.yml`. The shapes
+match the live catalog's refs (read-only `api/v2/trees`). The block,
+extracted from the committed file, renders with mermaid-cli 11 and 10.
+`python -m tests.run`: 1000 passed.
+*What the item got wrong.* It asked for two `published/` tags on one
+commit. Mermaid 11 renders that, and Mermaid 10 refuses the second `tag:`
+with a parse error. GitHub's renderer version was not checked, so the merge
+carries one abbreviated `published/{a,b}/…` label, and the caption names
+both refs in full. The item also presented `<run>-a<n>` as the only ingest
+naming scheme, but it applies to Airflow only. Drawing the graph found
+todo 45 and todo 46.
+
+**31, diagram the inbox gate's outcomes.** `docs/DELIVERY-SHAPES.md` has a new
+section, "What the gate does with one file". It holds one `flowchart`: a file
+in `inbox/` passes the `STABLE_POLLS` stability wait, then `route()` in its
+four-claimant order, then `conform.plan_arrival` over `ARRIVAL_SHAPES`
+(`file` / `archive`), then one of `Planned` / `Duplicate` / `Refused` /
+`Waiting`. It ends at `_promote`'s destination decision: `.rejected/`,
+`.processed/<feed>/` then trigger, or left in place. Every label was read out
+of `ingest/inbox.py` and `ingest/conform.py`, not the prose. Four bullets under
+it spell out what no other diagram shows. The existing two-way diagram is
+unchanged.
+*Verified* by rendering the block as committed (extracted from the doc) with
+`@mermaid-js/mermaid-cli@11` and `@10`, and looking at both PNGs.
+`python -m tests.run` passes.
+*What the item got wrong.* It gave `Duplicate` as "do nothing" and listed
+"move to `.processed/`" as a separate outcome. In fact a `Duplicate` writes
+and triggers nothing but still moves the inbox copy to `.processed/`, because
+it counts as `written`. Drawing the destination decision turned up a real
+defect: a container whose every member is `Refused` is neither refused itself
+nor `written`, so it stays in `inbox/` and is quarantined again on every poll.
+That is now todo 55, and the diagram labels that edge `(todo 55)`.
+
+**29, the Transport receipt's stages and COB Feed Status derivation were not
+drawn** — `docs/OPERATIONAL-CONTROL-PLANE.md` now has both diagrams. §5 has a
+decision `flowchart` of `feed_status.status_of`, in the order the code checks
+it. Its two surprising edges are labelled: a commit hides any failure for
+the date, before or after it (`COMPLETE`), and no `expected_by` is `WAITING` forever. §6 has a
+`stateDiagram-v2` of `registry.transport_receipt`, with each stage write
+labelled by its writer, and `failed` reachable from every stage: the `transport_ingest` task ids, `transport_watch`'s
+`trigger_discovered`, and `transport_reconcile`'s `sync_receipts`. It shows
+the `stage_rank` rule and says reaching Raw is `delivery_committed`, not a
+stage. `AIRFLOW-ORCHESTRATION.md` links to §6. Every name was taken from
+`registry/transports.py`, `ingest/transport_steps.py`, the three DAG files
+and `monitoring/feed_status.py`, and the captions cite them. §6's
+`create_delivery_task` citation now points at `transport_steps.deliver`,
+where that code moved. §9's claim that every task self-heals the row and
+§10's claim that only a successful attempt clears `failed` are corrected.
+*Verified* by rendering each block out of the doc itself with mermaid-cli 11
+and 10, and looking at the PNGs. `python -m tests.run`: 1000
+passed, 1 skipped (fastapi).
+*What the item got wrong.* It said a successful retry moves a `failed`
+receipt on again. That is roughly right, but inside reconcile's window it is
+usually `transport_reconcile`'s `sync_receipts` that does it, with no retry
+([§6](../OPERATIONAL-CONTROL-PLANE.md#a-failed-receipt-is-reset-by-reconcile)).
+A successful `ingest_raw` retry writes nothing at all. The item also
+treated `RECEIVED` as "any receipt". Receipts without a `feed` are dropped
+first, so a `discovered` or `validated` Transport never reads `RECEIVED`.
+Drawing this exposed todo 50.
+
+**26, `python -m tests.run` on a host failed 12 tests unless
+`REPORTING_CONFIG_DIR` was set** — `tests/__init__.py` now defaults it
+(unset or empty) to the checkout's `reporting_platform/config`. The package
+`__init__` runs before any `tests.*` module, so a direct import or `pytest`
+gets the default too, not only `tests/run.py`. `settings.py`'s container
+default and `layout.feed_paths`' refusal are untouched: only the suite
+defaults it. Because that default is the working tree, `tests/run.py` digests
+the directory's registry files (`.yml`/`.yaml`, through
+`context._tree_digest`) before and after the run and fails if they changed,
+so a test that forgets `config_dir()` cannot rewrite the checkout silently.
+Its first version digested every file and failed a fresh clone on the
+`.pyc` files `test_settings` writes by importing `config.__main__`.
+`.github/workflows/config.yml` no longer sets
+`REPORTING_CONFIG_DIR`/`DBT_PROJECT_DIR` for the whole job, only on the
+`config check` step, so the test step runs the fresh-clone case. A new
+`test_ci_pins` case fails if either variable reaches the suite again through
+an `env:` map, the test step's `run:` text, or a `$GITHUB_ENV` write in an
+earlier step. It fails against `main`'s workflow. Reproduced on `main` with
+nothing set: `988 passed, 12 failed, 1 skipped`, all twelve `no feed
+registry at /opt/platform/...`. On the branch, in a fresh-clone state
+(every `__pycache__` under `reporting_platform/config` deleted first):
+`1001 passed, 0 failed, 1 skipped` unset, set, and set empty. The PR template and
+`tests/README.md` no longer tell anyone to set it.
+*What the item got wrong*: only its counts, which the suite has outgrown
+(929 then, 988 now). It did not mention that CI also set `DBT_PROJECT_DIR`
+job-wide; the suite turned out not to need that either, so both moved.
 
 **15, `next_file_version` read an unreadable raw table as version 1** — its
 `except Exception: return 1` is gone. Any read failure now raises, naming the
