@@ -24,9 +24,9 @@ than worked.
 | [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
 | [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
-| [29](29-diagram-transport-receipt-and-cob-status.md) | *Nice to have:* diagram the Transport receipt stages and COB Feed Status derivation | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
 | [31](31-diagram-the-inbox-gate-outcomes.md) | *Nice to have:* diagram the inbox gate's four outcomes | low | 1 hour |
+| [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and inside reconcile's window its receipt is reset | medium | ½–1 day |
 
 ## Where to start
 
@@ -48,7 +48,11 @@ decision before code, and the item lays out the three options.
 
 **25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
 bugs, reproduced before they were written down (26 was too, and is fixed).
-28–31 are diagrams, independent of each other and of everything else.
+28, 30 and 31 are diagrams, independent of each other and of everything else
+(29 is done).
+
+**50** was found drawing 29's COB Status flowchart. It is reasoned from the
+code, with `status_of` called directly; reproduce it live first.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
@@ -57,6 +61,33 @@ first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**29, the Transport receipt's stages and COB Feed Status derivation were not
+drawn** — `docs/OPERATIONAL-CONTROL-PLANE.md` now has both diagrams. §5 has a
+decision `flowchart` of `feed_status.status_of`, in the order the code checks
+it. Its two surprising edges are labelled: a commit hides any failure for
+the date, before or after it (`COMPLETE`), and no `expected_by` is `WAITING` forever. §6 has a
+`stateDiagram-v2` of `registry.transport_receipt`, with each stage write
+labelled by its writer, and `failed` reachable from every stage: the `transport_ingest` task ids, `transport_watch`'s
+`trigger_discovered`, and `transport_reconcile`'s `sync_receipts`. It shows
+the `stage_rank` rule and says reaching Raw is `delivery_committed`, not a
+stage. `AIRFLOW-ORCHESTRATION.md` links to §6. Every name was taken from
+`registry/transports.py`, `ingest/transport_steps.py`, the three DAG files
+and `monitoring/feed_status.py`, and the captions cite them. §6's
+`create_delivery_task` citation now points at `transport_steps.deliver`,
+where that code moved. §9's claim that every task self-heals the row and
+§10's claim that only a successful attempt clears `failed` are corrected.
+*Verified* by rendering each block out of the doc itself with mermaid-cli 11
+and 10, and looking at the PNGs. `python -m tests.run`: 1000
+passed, 1 skipped (fastapi).
+*What the item got wrong.* It said a successful retry moves a `failed`
+receipt on again. That is roughly right, but inside reconcile's window it is
+usually `transport_reconcile`'s `sync_receipts` that does it, with no retry
+([§6](../OPERATIONAL-CONTROL-PLANE.md#a-failed-receipt-is-reset-by-reconcile)).
+A successful `ingest_raw` retry writes nothing at all. The item also
+treated `RECEIVED` as "any receipt". Receipts without a `feed` are dropped
+first, so a `discovered` or `validated` Transport never reads `RECEIVED`.
+Drawing this exposed todo 50.
 
 **26, `python -m tests.run` on a host failed 12 tests unless
 `REPORTING_CONFIG_DIR` was set** — `tests/__init__.py` now defaults it
