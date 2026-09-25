@@ -29,8 +29,9 @@ import shutil
 import sys
 import tempfile
 
+from tests import CONFIG_DEFAULT as CONFIG  # one definition, so no drift
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
-CONFIG = REPO / "reporting_platform" / "config"
 
 # THE DAG FILES ARE NOT UNDER `REPO` IN THE CONTAINER. Several tests read a
 # DAG's source to pin something it must keep doing -- the publish gate's
@@ -103,6 +104,10 @@ def repo_file(relative: str | pathlib.Path) -> pathlib.Path:
             f"deleted and this test reads it.")
     raise Skipped(f"{relative} is not here: /opt/platform holds the package, "
                   f"not the repo")
+
+# `REPORTING_CONFIG_DIR` is defaulted to `CONFIG` by `tests/__init__.py`,
+# which runs before this module, so `_ORIGINAL_ENV` below captures the
+# default and `reset()` restores to it. See that docstring for why there.
 
 # What these variables were before any test touched them, captured once at
 # import. `None` means "was not set", which is a different thing to restore to
