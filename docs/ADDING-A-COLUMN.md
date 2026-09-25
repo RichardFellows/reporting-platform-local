@@ -172,7 +172,8 @@ For a current-state dimension that is usually not what you want, so decide
 deliberately:
 
 ```powershell
-# only if history has to carry the value
+# only if history has to carry the value -- refuses if retention has pruned
+# raw since ref_rating's own history began (--vars scd2_rebuild_from_pruned_raw: true overrides)
 docker compose exec -T airflow dbt build --project-dir /opt/platform/dbt `
   --profiles-dir /opt/platform/dbt --target spark_local --full-refresh `
   --select ref_rating --vars "{nessie_ref: $branch}"

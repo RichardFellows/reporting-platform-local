@@ -83,6 +83,22 @@ class _Column:
         self.quoted = f"`{name}`"
 
 
+class _QueryResult:
+    """A stand-in for the `agate.Table` real dbt's `run_query()` returns:
+    `.rows` iterable and indexable per row, like `agate.Row`. Plain tuples
+    from DuckDB already support positional indexing, so no row wrapper is
+    needed beyond this."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+
 class _Adapter:
     def __init__(self, con):
         self.con = con
@@ -90,6 +106,19 @@ class _Adapter:
     def get_columns_in_relation(self, relation):
         return [_Column(r[0]) for r in
                 self.con.execute(f"describe {relation}").fetchall()]
+
+    def get_relation(self, database, schema, identifier):
+        """`None` for a relation that does not exist -- the same signal real
+        dbt gives `scd2_refuse_full_refresh_over_pruned_raw` for a first
+        build. `database`/`schema` are accepted and ignored: DuckDB in this
+        harness has one schema and no database level."""
+        exists = self.con.execute(
+            "select count(*) from information_schema.tables "
+            "where table_name = ?", [identifier]).fetchone()[0]
+        return identifier if exists else None
+
+    def run_query(self, sql):
+        return _QueryResult(self.con.execute(sql).fetchall())
 
 
 class _DbtSpark:
@@ -259,6 +288,14 @@ def _overlaps(con, table, keys):
         f"and a.effective_to >= b.effective_from").fetchall()
 
 
+def _markers(con, table):
+    """A retraction marker (`scd2_retracted()`, DATE '0001-01-01') left behind
+    in the target -- the MERGE is supposed to delete every one it emits, in
+    the same statement, so none should ever be visible afterwards."""
+    return con.execute(
+        f"select * from {table} where effective_to = date '{DELETED}'").fetchall()
+
+
 # -------------------------------------------------------------------- tests
 def _scenario(first_date: str):
     """The review's sequence. B is X from `first_date`; the 09-02 delivery
@@ -360,21 +397,20 @@ def test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too():
         assert not _open_versions(con, INC, keys) and not _overlaps(con, INC, keys)
 
 
-def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
-    """Absence of evidence is not a retraction.
+def test_a_version_whose_cob_date_raw_no_longer_holds_is_seeded_from_the_target():
+    """RENAMED from `..._is_never_retracted`: that name described the LOUD
+    failure this pinned before the fix (a second open version, which the SCD2
+    tests refuse) -- true, but not the point any more. `scd2_pruned_seed` now
+    carries such a version forward from the target instead of leaving the
+    replay unable to re-derive it, so the build is CORRECT, not merely loud.
 
     Retention prunes raw to month-ends, so a version's COB date can vanish
-    from raw while the version is still right. The replay then cannot
-    re-derive it -- and a retraction keyed on "not re-derived" alone would
-    delete it and silently re-date the key to the next delivery raw still
-    holds. After step 2, both of B's version dates are pruned from raw
-    (08-03, where the replay starts, and 09-02, inside the window) and 09-03
-    is delivered. Both versions must still be in the target.
-
-    What the build does instead is the pre-existing failure of replaying from
-    pruned raw, which is LOUD: a second open version, which the SCD2 tests
-    refuse. Pinned too, so a later change cannot make it quiet by accident.
-    """
+    from raw while the version is still right. After step 2, both of B's
+    version dates are pruned from raw (08-03, where the replay starts, and
+    09-02, inside the window) and 09-03 re-delivers B UNCHANGED (still Y).
+    Both of B's versions must survive with their original values and
+    boundaries, exactly one current, and the unchanged re-delivery must not
+    open a third."""
     for name, keys, attr, constants in MODELS:
         con = _connect()
         for _, deliveries in _scenario("2026-08-03")[:2]:
@@ -386,10 +422,131 @@ def test_a_version_whose_cob_date_raw_no_longer_holds_is_never_retracted():
         _deliver(con, keys, attr, constants, "2026-09-03", 1,
                  {"A": "a", "B": "Y"}, "2026-09-04 06:00")
         _build(con, name, INC, incremental=True)
-        b = {(r[len(keys)], r[len(keys) + 1]) for r in _state(con, INC, keys, attr)
-             if r[0] == "B"}
-        assert {("X", "2026-08-03"), ("Y", "2026-09-02")} <= b, (name, sorted(b))
-        assert _open_versions(con, INC, keys), (name, sorted(b))
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-03", "2026-09-01", False),
+                     ("Y", "2026-09-02", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_only_the_replay_start_date_is_pruned():
+    """The narrower case: 08-03 (where the replay starts) is pruned but 09-02
+    (inside the window) is still in raw. B's 09-02 version must still be
+    RE-DERIVED from raw as before -- an unchanged re-delivery of it must not
+    open a spurious new version -- while 08-03 is seeded."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for _, deliveries in _scenario("2026-08-03")[:2]:
+            for cob_date, version, rows, ts in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+            _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        _deliver(con, keys, attr, constants, "2026-09-03", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-04 06:00")
+        _build(con, name, INC, incremental=True)
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-03", "2026-09-01", False),
+                     ("Y", "2026-09-02", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_a_retained_redelivery_still_retracts_a_version_seeded_at_its_start():
+    """The interaction the design direction calls out explicitly: the
+    replay-start version is pruned (seeded, not re-derived), and a LATER,
+    still-retained date is then re-delivered dropping the key entirely. That
+    re-delivery must still retract the version it began (09-02, Y) and reopen
+    the one before it (08-03, X) -- even though 08-03 itself is only in the
+    replay because it was seeded, not because raw still holds it. C, whose
+    only version was 09-02, has nothing left to seed or re-derive and is
+    retracted outright."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for _, deliveries in _scenario("2026-08-03")[:2]:
+            for cob_date, version, rows, ts in deliveries:
+                _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+            _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        _deliver(con, keys, attr, constants, "2026-09-02", 2,
+                 {"A": "a"}, "2026-09-03 09:00")
+        _build(con, name, INC, incremental=True)
+        # A's attribute value is case-folded by ref_rating's cleaning
+        # (`upper(clean_string('rating'))`) but not by ref_counterparty's, so
+        # only the dates and is_current -- not the value -- are compared.
+        a = [r[len(keys) + 1:] for r in _state(con, INC, keys, attr) if r[0] == "A"]
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        c = con.execute(f"select * from {INC} where {keys[0]} = 'C'").fetchall()
+        assert a == [("2026-08-03", "9999-12-31", True)], (name, a)
+        assert b == [("X", "2026-08-03", "9999-12-31", True)], (name, b)
+        assert c == [], (name, c)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_a_key_unchanged_for_weeks_survives_daily_pruning():
+    """A `full_snapshot` feed re-delivers B unchanged every day and retention
+    keeps only a short rolling window of raw -- the estate's actual shape,
+    per CLAUDE.md: `full_snapshot` touches every key every day, and reference
+    versions are mostly old. Once B's origin date (08-01) is pruned,
+    `scd2_pruned_seed` is the only thing keeping its single open version
+    alive at all; before this fix, every rebuild after that point stranded a
+    second copy beside it. The target must end with exactly the one version
+    it always had, audit columns aside."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for day in range(1, 21):
+            cob_date = f"2026-08-{day:02d}"
+            _deliver(con, keys, attr, constants, cob_date, 1,
+                     {"A": "a", "B": "X"}, f"{cob_date} 06:00")
+            _build(con, name, INC, incremental=True)
+            # nightly retention: keep only the newest 6 COB dates in raw.
+            con.execute("delete from raw_src where _cob_date < "
+                        "(select max(_cob_date) from raw_src) - interval 5 day")
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-01", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
+
+
+def test_a_pruned_version_subsumed_by_a_retained_redelivery_is_retracted():
+    """A pruned-date version that `scd2_pruned_seed` re-emits can still be
+    made redundant by a RETAINED date's re-delivery, and that must retract
+    it -- not strand it as a second current row.
+
+    B is X from 08-03 (08-31 also delivers X, unchanged); 09-02 changes B to
+    Y. Retention then prunes 08-03 and 09-02, keeping only the month-end
+    08-31. 08-31 is re-delivered (v2) restating B as Y -- upstream's own
+    correction, arriving at a date raw still holds -- and 09-04 repeats Y.
+    The 09-02 version is now identical to what 08-31 v2 says: it must merge
+    away, leaving X[08-03..08-30] then Y[08-31..] current, not a stranded
+    third row at 09-02."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        for cob_date, version, rows, ts in [
+                ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
+                ("2026-08-31", 1, {"A": "a", "B": "X"}, "2026-09-01 06:00")]:
+            _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+        _build(con, name, INC, incremental=True)
+        _deliver(con, keys, attr, constants, "2026-09-02", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-03 06:00")
+        _build(con, name, INC, incremental=True)
+        con.execute("delete from raw_src where _cob_date in "
+                    "(date '2026-08-03', date '2026-09-02')")
+        _deliver(con, keys, attr, constants, "2026-08-31", 2,
+                 {"A": "a", "B": "Y"}, "2026-09-05 06:00")
+        _deliver(con, keys, attr, constants, "2026-09-04", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-05 06:05")
+        _build(con, name, INC, incremental=True)
+        b = [r[len(keys):] for r in _state(con, INC, keys, attr) if r[0] == "B"]
+        assert b == [("X", "2026-08-03", "2026-08-30", False),
+                     ("Y", "2026-08-31", "9999-12-31", True)], (name, b)
+        assert not _open_versions(con, INC, keys), (name, b)
+        assert not _overlaps(con, INC, keys), (name, b)
+        assert not _markers(con, INC), (name, "marker row left in target")
 
 
 # ------------------------------------------- the final review's two findings
@@ -506,14 +663,24 @@ REPLAYED = "select cob_date::varchar, counterparty_id, source_file_version from 
 
 
 def test_scd2_incremental_replay_drops_a_key_the_newest_delivery_omitted():
+    """`this_table`'s two anchor dates (A's current version from 09-10, B's
+    only version from 06-01) have no matching delivery anywhere in this
+    fixture's `raw_src` -- indistinguishable, to `scd2_pruned_seed`, from a
+    date retention has since pruned. Both are therefore seeded from
+    `this_table` rather than left unrepresented: `source_file_version` reads
+    NULL because `this_table`'s minimal schema (effective_from, is_current,
+    the key) has no such column, exactly as `in_target` intends for a column
+    the seed source lacks."""
     for name, keys, attr, constants in MODELS:
         con = _connect()
         text = _replay_case(con, name, keys, attr, constants)
         sql = _duck(_render(text, incremental=True, adapter=_Adapter(con)))
         got = _run(con, sql, "replayed", REPLAYED)
         assert (D1, "B", 1) not in got, (name, got)
-        assert got == [(D2, "A", 1), (D2, "B", 1),
-                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1)], (name, got)
+        assert got == [("2026-06-01", "B", None),
+                       (D2, "A", 1), (D2, "B", 1),
+                       ("2026-09-08", "A", 1), ("2026-09-08", "B", 1),
+                       ("2026-09-10", "A", None)], (name, got)
 
 
 def test_scd2_full_refresh_replay_agrees():
@@ -689,3 +856,86 @@ def test_the_seed_reads_null_for_a_column_the_target_does_not_have_yet():
         w = con.execute(f"select {dropped} from {INC} where counterparty_id = 'B' "
                         f"and effective_from = date '2026-07-01'").fetchall()
         assert w == [(None,)], (name, w)
+
+
+# ------------------------------------- --full-refresh over pruned raw (REQ)
+# scd2_refuse_full_refresh_over_pruned_raw, called from scd2_replay's
+# non-incremental branch. Renders the real model file directly (not through
+# _build) so the guard's RuntimeError -- raised at RENDER time, before any
+# SQL runs -- can be asserted on without needing the rendered SQL to be
+# valid or executed.
+
+def _target_with_history(con, name, keys, attr, constants):
+    """B is X from 08-03, Y from 09-02 -- built the ordinary incremental way,
+    into INC, which is the "target table name that exists" the guard needs
+    to have something to check."""
+    for cob_date, version, rows, ts in [
+            ("2026-08-03", 1, {"A": "a", "B": "X"}, "2026-08-04 06:00"),
+            ("2026-09-02", 1, {"A": "a", "B": "Y"}, "2026-09-03 06:00")]:
+        _deliver(con, keys, attr, constants, cob_date, version, rows, ts)
+        _build(con, name, INC, incremental=True)
+
+
+def test_full_refresh_refuses_when_raw_no_longer_explains_the_target():
+    """(a) An existing target plus a pruned origin date refuses, naming the
+    override var."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        try:
+            _render(_pointed_at_src(name), this=INC, adapter=_Adapter(con))
+        except RuntimeError as e:
+            assert "scd2_rebuild_from_pruned_raw" in str(e), (name, e)
+            assert "2026-08-03" in str(e), (name, e)
+        else:
+            raise AssertionError(
+                f"{name}: --full-refresh over pruned raw did not refuse")
+
+
+def test_full_refresh_proceeds_when_the_override_var_is_set():
+    """(b) The same pruned scenario, with `scd2_rebuild_from_pruned_raw: true`
+    -- must not raise."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        _render(_pointed_at_src(name), this=INC, adapter=_Adapter(con),
+                scd2_rebuild_from_pruned_raw=True)
+
+
+def test_full_refresh_proceeds_when_raw_holds_every_version_date():
+    """(c) An existing target with raw still holding every version's origin
+    date -- nothing pruned, must not raise."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        _render(_pointed_at_src(name), this=INC, adapter=_Adapter(con))
+
+
+def test_full_refresh_proceeds_with_no_target_relation():
+    """(d) No target relation at all (a first build) -- nothing to lose,
+    must not raise, however pruned raw already is."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _deliver(con, keys, attr, constants, "2026-09-02", 1,
+                 {"A": "a", "B": "Y"}, "2026-09-03 06:00")
+        _render(_pointed_at_src(name), this="not_built_yet", adapter=_Adapter(con))
+
+
+def test_full_refresh_refuses_for_a_knowledge_time_as_of_build_too():
+    """An as-of build is always --full-refresh on a branch from main, where
+    the target exists -- and is exactly as re-dated by pruned raw as an
+    ordinary rebuild, so it gets no exemption."""
+    for name, keys, attr, constants in MODELS:
+        con = _connect()
+        _target_with_history(con, name, keys, attr, constants)
+        con.execute("delete from raw_src where _cob_date = date '2026-08-03'")
+        try:
+            _render(_pointed_at_src(name), this=INC, adapter=_Adapter(con),
+                    knowledge_time="2026-09-10")
+        except RuntimeError as e:
+            assert "scd2_rebuild_from_pruned_raw" in str(e), (name, e)
+        else:
+            raise AssertionError(
+                f"{name}: --full-refresh as-of build over pruned raw did not refuse")

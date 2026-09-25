@@ -5,8 +5,7 @@ it**, what done looks like, and a prompt to paste into a new session.
 
 Everything here was found by working on the platform rather than by reading it.
 Each item file carries the date its "What is wrong" was last verified:
-12–19 on 2026-09-14 against `main` at `fdb0784`, and 20–24 against `cea4500`. 21, and 22's `--full-refresh`
-claim, are reasoned from the code and say so. If an item looks stale, run its verification command first — the
+12–19 on 2026-09-14 against `main` at `fdb0784`, and 20–24 against `cea4500`. 21 is reasoned from the code and says so. If an item looks stale, run its verification command first — the
 platform moves, and an item that no longer reproduces should be deleted rather
 than worked.
 
@@ -19,7 +18,6 @@ than worked.
 | [17](17-docs-say-retention-removes-superseded-versions.md) | Two places say retention removes superseded versions; nothing does (README fixed; docstring left) | low–medium | 15 min |
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
-| [22](22-scd2-replay-reads-pruned-raw.md) | The SCD2 replay reads raw that retention has pruned | high | 1–2 days |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
 | [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
@@ -31,10 +29,9 @@ than worked.
 
 ## Where to start
 
-**22 first.** It breaks both SCD2 builds on the
-first build after housekeeping first prunes raw — every key is touched every
-day, so not only keys that change — and nothing has pruned raw on this estate
-yet, which is the only reason it is green.
+**25 first.** Until it is fixed, onboarding any feed stops
+every other feed publishing until the new one first delivers. It needs a
+decision before code, and the item lays out the three options.
 
 **07** is no longer blocked: 09 decided that `full_snapshot` selects the
 newest delivery per COB date, so 07's premise holds as written. It is
@@ -42,10 +39,6 @@ multi-day design work and only worth starting if a delta feed is real; read
 its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
-
-**25** ranks with 22. Until it is fixed, onboarding any feed stops
-every other feed publishing until the new one first delivers. It needs a
-decision before code, and the item lays out the three options.
 
 **25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
 bugs, reproduced before they were written down (26 was too, and is fixed).
@@ -61,12 +54,47 @@ code, with `status_of` called directly; reproduce it live first.
 code and says so. Reproduce it first.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
-they were written down; **21** and part of **22** (what `--full-refresh`
-does after pruning) are reasoned from the code and say so — reproduce them
-first. **21–24** came out of 09's reviews and live runs. The rest are
+they were written down; **21** is reasoned from the code and says so — reproduce
+it first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**22, the SCD2 replay read raw that retention had pruned** — every version
+in the replay's scope whose COB date raw no longer holds at all is now
+SEEDED FROM THE TARGET (`scd2_pruned_seed` in `scd2_replay`), never
+re-derived, so an incremental run never depends on a pruned date. 09's
+retraction of the start version is kept because the seed fires only on
+ABSENCE: a re-delivery of the start date is a row raw holds, so that date
+is replayed from raw exactly as before and can still retract it
+(`test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too`,
+the C-drop tests and the new
+`test_a_retained_redelivery_still_retracts_a_version_seeded_at_its_start`
+are green). That made `scd2_retractions`' "only where raw still holds the
+date" guard redundant, and code review found that keeping it stranded a
+seeded version a retained re-delivery had made redundant; it is gone, and
+`test_a_pruned_version_subsumed_by_a_retained_redelivery_is_retracted` pins
+it. `--full-refresh` of an SCD2 model now REFUSES once the target holds a
+version whose origin date raw has lost
+(`scd2_refuse_full_refresh_over_pruned_raw`, as-of builds included), naming
+`--vars '{scd2_rebuild_from_pruned_raw: true}'` and a restore from a Nessie
+tag as the ways past. The pinned test now asserts the build is correct.
+Eight `test_scd2_incremental` tests fail against `main`'s macros and pass
+here; `python -m tests.run`: 1009 passed.
+*Verified live* on throwaway branches, the branch's dbt project copied into
+the airflow container at `/tmp/todo22-dbt` (removed afterwards; `main`
+stayed at `523b887`). `ref_rating` full-refreshed from 36 raw dates, then
+raw before 2026-07-20 deleted: `main`'s code failed
+`mutually_exclusive_ranges` with 206 rows and left 88 keys with two open
+versions; the branch's passed every test with the table row-for-row
+unchanged. A new 2026-08-20 delivery changing one such key opened exactly
+one version. `--full-refresh` refused naming 29 pruned dates; with the
+override it rebuilt 199 versions from 1,402, all re-dated to 2026-07-20 or
+later — the destruction the guard exists to stop, now measured rather than
+reasoned. Recorded in
+[DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date).
+*What the item got wrong.* Nothing material; its `--full-refresh` claim,
+reasoned from the code, reproduced exactly.
 
 **28, write-audit-publish as a Nessie commit graph.** `docs/ARCHITECTURE.md`
 now has a `### The ref graph` subsection under "Nessie: write-audit-publish".
@@ -345,8 +373,8 @@ tests in `tests/test_scd2_incremental.py` that failed on `2ae6052`:
   `scd2_replay`: the target's version before the replay start heads the
   replayed rows, so lead() reopens or extends it, and it is never read from
   raw, whose copy of its date retention may have pruned. (The replay's START
-  version is still re-derived from raw, which retention prunes — item
-  [22](22-scd2-replay-reads-pruned-raw.md).) The tests' history
+  version was still re-derived from raw, which retention prunes — fixed by
+  todo 22, below.) The tests' history
   carries a version before that one too, whose raw date is still there, so
   a retraction scope that reached past the seed would be caught deleting it.
 - **The replay scope compared RAW keys to the target's CLEANED keys**, in

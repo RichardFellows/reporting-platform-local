@@ -139,7 +139,7 @@ ranked_rows as (
 
 ),
 
-{{ scd2_replay('ranked_rows', keys, business_columns) }}
+{{ scd2_replay('ranked_rows', keys, business_columns, source('raw', source_name)) }}
 
 versioned as (
 

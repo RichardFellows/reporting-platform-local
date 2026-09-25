@@ -3730,6 +3730,8 @@ that already exist, filtered by `known_as_of()`, driven by a dbt var:
     dbt build --full-refresh --select path:models/prepared \
       --vars '{nessie_ref: <branch>, knowledge_time: "2026-08-10"}'
 
+This selects `ref_counterparty`/`ref_rating` too, and refuses if retention has pruned raw since -- see `#a-snapshot-re-delivery-restates-the-whole-date`.
+
 **A var rather than a per-call-site argument** because the filter has to reach
 every model and a model that quietly omits it returns everything, whatever the
 caller asked for. With no `knowledge_time` set the macro compiles to `1 = 1`,
@@ -5081,22 +5083,104 @@ weighed.**
   `on_schema_change` adds it afterwards — so they are NULL literals, in an
   order `scd2_output_columns()` defines once for `ranged` and the markers
   both, because Spark 3.5 has no `UNION BY NAME`.
-- **A marker only where raw still holds a delivery for the version's COB
-  date.** A retraction means "the newest delivery for that date no longer says
-  this". A date retention has pruned says nothing — and without this guard
-  its version was deleted and the key silently re-dated to the next retained
-  delivery, every SCD2 test green (measured, by removing it).
+- **A pruned date is never, by itself, a retraction.** A retraction means
+  "the newest delivery for that date no longer says this". A date retention
+  has pruned says nothing. Item 09 enforced that with a guard on the marker
+  (only where raw still held the version's COB date); without it the
+  version was deleted and the key silently re-dated to the next retained
+  delivery, every SCD2 test green (measured, by removing it). Todo 22
+  replaced that guard with `scd2_pruned_seed`, below: the pruned version is
+  now carried forward from the target, so it is never missing from the
+  replay and never marked for lacking evidence.
 
-**The limit that remains, and it predates this change:** the replay reads
-raw from each key's replay start, and raw is pruned. Once retention has
-removed the date a replay starts from, the replay re-derives the key from its
-first retained delivery as a NEW version, beside the one it could not
-re-derive: two open versions, and the build refuses. The guard above keeps
-that failure loud rather than turning it into a deletion;
-`tests/test_scd2_incremental.py` pins both. The seed removes the dependency on
-raw for the version BEFORE the replay start, not for the start version
-itself; seeding that one from the target too would change which re-deliveries
-can retract it, and is not done here.
+**Through item 09**, the replay read raw from each key's replay start onward,
+and once retention pruned that date the replay re-derived the key from its
+first retained delivery as a NEW version beside the one it could not
+re-derive -- two open versions, kept LOUD rather than silently deleted, but
+never fixed.
+
+**`scd2_pruned_seed` (`scd2_replay`, `dbt/macros/engine.sql`) closes it.**
+Every version in the replay's scope (touched keys, from `replay_from`
+onward, including the start version itself) whose own COB date has no row
+at all in `newest_file_version` is seeded from the target exactly as
+`scd2_seed_from`'s row already was -- never re-derived, NULL for a column
+the target lacks, `source_batch_id` and this run's audit columns as before.
+A date raw DOES still hold, even a re-delivery that drops or reverts the
+key, is excluded from the seed and replayed from raw as before, so it can
+still be retracted exactly as before: the seed fires only on ABSENCE, and a
+re-delivery is by definition a row raw now holds, which is why the
+2026-09-14 concern about "which re-deliveries can retract it" does not
+apply here. A (key, cob_date) pair can never come from both branches
+(`raw_rows` only carries dates raw holds; the seed only carries dates it
+doesn't -- exact complements over one existence check), and the
+version-before-the-start seed is disjoint from this one by construction
+(`< replay_from` vs `>= replay_from`).
+
+**A seeded version can still be made redundant by a retained re-delivery,
+and that must retract it, not strand it.** `scd2_changes` collapses a
+seeded row into an adjacent kept row that repeats its value; since every
+in-scope version is now always represented before that collapse runs, a
+version's absence from the final CTE can no longer mean "raw doesn't
+explain this date" -- only that a retained delivery subsumed it. So
+`scd2_retractions`' guard dropped its `exists(newest_file_version)` clause
+and is bounded by the replay's scope alone. Two adjacent target versions
+can never share a hash (`scd2_changes`' own collapse invariant, true on
+every prior build), so two seeded rows with nothing between them can never
+spuriously collapse into each other -- only a real, retained re-delivery
+next to one can.
+
+**`--full-refresh` still re-dates history once retention has pruned raw, and
+now refuses instead of doing it silently.**
+`scd2_refuse_full_refresh_over_pruned_raw`, called from `scd2_replay`'s
+non-incremental branch, raises when the target already exists and any of
+its versions' origin dates are absent from raw -- the same date-level
+predicate as the seed, `run_query`'d directly since this path has no
+incremental CTE to join, and never treated as "nothing pruned" if the read
+itself fails. Measured: rebuilding both models after twenty days of daily
+delivery with retention keeping only the newest six `_cob_date`s each night
+gives
+
+```
+oldest raw _cob_date still present: 2026-08-15
+incremental target B: [('X', '2026-08-01', '9999-12-31', True)]
+full-refresh target B: [('X', '2026-08-15', '9999-12-31', True)]
+```
+
+for both models -- the incremental target keeps B's true origin via the
+seed, a full rebuild reopens it fourteen days later at the oldest surviving
+date. The guard now refuses that rebuild unless
+`--vars '{scd2_rebuild_from_pruned_raw: true}'` is set, naming a restore
+from a Nessie tag or commit as the alternative, and applies equally to a
+`--full-refresh knowledge_time` (as-of) build, which takes the same
+non-incremental branch and reads the same pruned raw -- an as-of rebuild
+after pruning is exactly as re-dated and gets no exemption.
+
+**Measured live** (2026-09-24, throwaway Nessie branches, `main` untouched):
+`prepared.ref_rating` full-refreshed from 36 raw COB dates (1,402 versions,
+1,328 of them beginning before 2026-07-20), then every raw row before
+2026-07-20 deleted to stand in for retention, then one incremental build.
+With the old replay, `mutually_exclusive_ranges` failed with 206 rows and 88
+keys had two open versions. With `scd2_pruned_seed`, every test passed and
+the table was row-for-row identical to before the prune; a later
+2026-08-20 delivery changing one such key closed its 2026-04-30 version at
+2026-08-19 and opened one version, nothing else moved. `--full-refresh` on
+that branch refused, naming 29 pruned origin dates; with the override it
+rebuilt 199 versions from 1,402, every one beginning on or after 2026-07-20.
+
+**Tests**, all in `tests/test_scd2_incremental.py`: the seed and the
+retraction interaction --
+`test_only_the_replay_start_date_is_pruned`,
+`test_a_version_whose_cob_date_raw_no_longer_holds_is_seeded_from_the_target`,
+`test_a_retained_redelivery_still_retracts_a_version_seeded_at_its_start`,
+`test_a_key_unchanged_for_weeks_survives_daily_pruning`,
+`test_a_pruned_version_subsumed_by_a_retained_redelivery_is_retracted`, and
+the pre-existing `test_a_redelivery_of_the_date_the_replay_starts_from_is_retracted_too`
+(unchanged, still green); the full-refresh guard --
+`test_full_refresh_refuses_when_raw_no_longer_explains_the_target`,
+`test_full_refresh_proceeds_when_the_override_var_is_set`,
+`test_full_refresh_proceeds_when_raw_holds_every_version_date`,
+`test_full_refresh_proceeds_with_no_target_relation`,
+`test_full_refresh_refuses_for_a_knowledge_time_as_of_build_too`.
 
 ### counterparty_exposure read raw with the same mistake
 
