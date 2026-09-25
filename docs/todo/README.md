@@ -23,8 +23,9 @@ than worked.
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
 | [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
-| [28](28-diagram-the-nessie-ref-graph.md) | *Nice to have:* write-audit-publish as a Nessie commit graph | medium | 1–2 hours |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
+| [45](45-published-tags-are-cut-at-mains-head.md) | A reporting publication tags `main`'s head, not the commit its merge made | medium | 1–2 hours |
+| [46](46-ingest-attempt-id-slices-mid-token.md) | `ingest_attempt_id` cuts a `manual__` or hand-set run id mid-token (inbox and console runs are fine) | low, cosmetic | 1 hour |
 | [50](50-cob-status-cannot-show-a-raw-ingest-failure.md) | A failed or refused raw ingest never reads `FAILED` on COB Status, and inside reconcile's window its receipt is reset | medium | ½–1 day |
 | [55](55-an-archive-with-every-member-refused-is-requarantined-every-poll.md) | An `arrival.archive` container whose every member is refused is re-quarantined on every poll | medium | 1–2 hours |
 
@@ -48,14 +49,16 @@ decision before code, and the item lays out the three options.
 
 **25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
 bugs, reproduced before they were written down (26 was too, and is fixed).
-28 and 30 are diagrams, independent of each other and of everything else
-(29 and 31 are done).
+30 is a diagram, independent of everything else (28, 29 and 31 are done).
 
 **50** was found drawing 29's COB Status flowchart. It is reasoned from the
 code, with `status_of` called directly; reproduce it live first.
 
 **55** was found drawing 31's diagram and reproduced with
 `tests/test_inbox.py`'s harness before it was written down.
+
+**45–46** were found drawing todo 28's ref graph. 45 is reasoned from the
+code and says so. Reproduce it first.
 
 **12–24** were found working 08–10. 12–19, 23 and 24 were reproduced before
 they were written down; **21** and part of **22** (what `--full-refresh`
@@ -64,6 +67,46 @@ first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**28, write-audit-publish as a Nessie commit graph.** `docs/ARCHITECTURE.md`
+now has a `### The ref graph` subsection under "Nessie: write-audit-publish".
+It holds a Mermaid `gitGraph` of one COB date processed in Airflow:
+- two inbox-triggered ingests, each tagged `snapshot/…` on its merge commit
+  (`fo_trade`, and `ref_counterparty`, whose `-a1` is kept after its driver
+  dies and whose `-a2` merges);
+- a `build/prepared/…` that fails `dbt_test` and is kept with `main`
+  unmoved;
+- a passing prepared build, which cuts no tag;
+- a `build/reporting/…` merged and tagged `published/…` once per exposure.
+
+The caption covers deletion (merged branches are deleted, and failed ones
+are kept), the 48 h / 120 h sweep, `hold/`, and the snapshot and published
+tag windows. Below it is a table of every ref pattern and the function that
+makes it. The table covers both run-id paths: Airflow's `<run>-a<n>`, and
+the fresh `new_run_id()` with no `-a<n>` that `bulk_ingest`, the `ingest`
+CLI, the runner and `transform --label` use. The README's write-audit-publish
+section links to it, and `context.branch_name`'s docstring now points at it
+and says which branches it names. The ASCII sketch it replaced was removed,
+along with two claims in it. It gave one naming scheme for every branch,
+but build branches are `build/<purpose>/<utc date>/<slug>`. It also said
+tags were `published/<cob_date>/<run_id>`, which is the retired shape that
+ingests used to cut.
+*Verified.* Every example name was produced by calling the code
+(`context.branch_name`, `ingest_attempt_id`, `new_run_id`, `snapshot_tag`,
+`published_tag`, `wap.branch_name`, `wap.run_key`) on the run ids each path
+really uses. Inbox and console runs use `console__…`
+(`airflow_api.trigger`), and build runs use `dataset_triggered__…`. The
+exposure names are from `dbt/models/reporting/_reporting.yml`. The shapes
+match the live catalog's refs (read-only `api/v2/trees`). The block,
+extracted from the committed file, renders with mermaid-cli 11 and 10.
+`python -m tests.run`: 1000 passed.
+*What the item got wrong.* It asked for two `published/` tags on one
+commit. Mermaid 11 renders that, and Mermaid 10 refuses the second `tag:`
+with a parse error. GitHub's renderer version was not checked, so the merge
+carries one abbreviated `published/{a,b}/…` label, and the caption names
+both refs in full. The item also presented `<run>-a<n>` as the only ingest
+naming scheme, but it applies to Airflow only. Drawing the graph found
+todo 45 and todo 46.
 
 **31, diagram the inbox gate's outcomes.** `docs/DELIVERY-SHAPES.md` has a new
 section, "What the gate does with one file". It holds one `flowchart`: a file
