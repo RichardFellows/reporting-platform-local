@@ -73,7 +73,11 @@ merge, including the otherwise-successful `qa_happy_position` branch. See
 [AIRFLOW-ORCHESTRATION.md](AIRFLOW-ORCHESTRATION.md#verifying-the-fast-path-locally)
 for the full detail, including the actual bug this run caught (a missing
 `docker-compose.yml` volume mount for the new `reporting_transport/`
-package, now fixed) and what to check on a freshly seeded stack.
+package, now fixed) and what to check on a freshly seeded stack. The
+failure itself is fixed too: every declared feed's raw table is now created,
+empty, when the stack starts, so a feed that has never delivered no longer
+blocks the others
+([DECISIONS.md](DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers)).
 
 Repeating the same command (same `--producer-run-id`, hence the same derived
 TransportID) is an idempotent retry: `transport_watch`

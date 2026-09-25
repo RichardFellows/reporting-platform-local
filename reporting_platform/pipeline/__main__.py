@@ -1,7 +1,7 @@
 """The whole pipeline, one step at a time, with no Airflow and no Spark cluster.
 
     python -m reporting_platform.pipeline check        # what it will talk to
-    python -m reporting_platform.pipeline setup        # registry schema, dbt deps
+    python -m reporting_platform.pipeline setup        # registry schema, raw tables, dbt deps
     python -m reporting_platform.pipeline run FILE...  # land -> raw -> prepared -> reporting
     python -m reporting_platform.pipeline run FILE... --through raw
     python -m reporting_platform.pipeline run --transport [MARKER...]  # Transports, not files
@@ -97,16 +97,24 @@ def check() -> dict:
 
 def setup() -> dict:
     """What `airflow-init` does that this path needs: the registry schema,
-    and dbt's packages -- without them `dbt build` cannot compile a
+    a raw table for every declared feed -- or the prepared build fails on
+    the first feed that has not delivered yet, and publishes nothing
+    (docs/DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers) --
+    and dbt's packages, without which `dbt build` cannot compile a
     `dbt_utils` test. Idempotent."""
+    from reporting_platform.ingest.migrate_raw import migrate
     from reporting_platform.registry import db
 
     db.ensure_schema()
+    raw = migrate()
     project = os.environ.get("DBT_PROJECT_DIR", "/opt/platform/dbt")
     subprocess.run(["dbt", "deps", "--project-dir", project, "--profiles-dir",
                     os.environ.get("DBT_PROFILES_DIR", project)],
                    check=True, stdout=sys.stderr)
-    return {"registry_schema": "ensured", "dbt_deps": "installed"}
+    return {"registry_schema": "ensured",
+            "raw_tables": {k: raw[k] for k in ("created", "migrated",
+                                               "already_current")},
+            "dbt_deps": "installed"}
 
 
 def run(files: list[Path], *, through: str, change_ref: str | None,
@@ -240,7 +248,8 @@ def main(argv=None) -> int:
                                 description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check", help="resolve and reach S3, Nessie, the registry")
-    sub.add_parser("setup", help="registry schema + dbt deps (idempotent)")
+    sub.add_parser("setup", help="registry schema + raw tables + dbt deps "
+                                 "(idempotent)")
     sub.add_parser("ingest", help="-> python -m reporting_platform.ingest ...")
     sub.add_parser("transform", help="-> python -m reporting_platform.transform ...")
     sub.add_parser("transport", help="-> python -m reporting_transport ... (publish)")

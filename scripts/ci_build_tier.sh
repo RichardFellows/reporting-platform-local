@@ -52,7 +52,7 @@ step "stores and Spark"
 "${C[@]}" up -d --wait minio postgres nessie spark-master spark-worker
 "${C[@]}" up minio-init --exit-code-from minio-init
 
-step "airflow-init (db, pool, registry schema, dbt deps)"
+step "airflow-init (db, pool, registry schema, raw tables, dbt deps)"
 "${C[@]}" run --rm airflow-init
 
 # One container for everything after this: dbt's compiled SQL, which the

@@ -19,7 +19,6 @@ than worked.
 | [19](19-sniffer-can-propose-a-marker-file.md) | An unpaired marker file can be the member sniffed and the member pattern proposed | low–medium | 1 hour |
 | [21](21-an-empty-redelivery-cannot-supersede.md) | A re-delivery with no rows cannot supersede anything | medium | ½–1 day |
 | [24](24-spark-workers-run-python-3-8.md) | The Spark workers run Python 3.8; every driver runs 3.11 | medium | 1–2 hours |
-| [25](25-a-feed-that-never-delivered-blocks-every-prepared-build.md) | A declared feed that has never delivered blocks every prepared build | high | ½–1 day |
 | [27](27-make-lineage-points-at-the-notebook-port.md) | `make lineage` says to serve dbt docs on the notebook's port | low | 15–30 min |
 | [30](30-diagram-the-registry-tables.md) | *Nice to have:* diagram the registry tables, rebuildable vs events | medium | 2–3 hours |
 | [45](45-published-tags-are-cut-at-mains-head.md) | A reporting publication tags `main`'s head, not the commit its merge made | medium | 1–2 hours |
@@ -29,9 +28,9 @@ than worked.
 
 ## Where to start
 
-**25 first.** Until it is fixed, onboarding any feed stops
-every other feed publishing until the new one first delivers. It needs a
-decision before code, and the item lays out the three options.
+**Nothing high-value is open** now that 22 and 25 are done, short of 07.
+The medium-value bugs are **45** and **50**; both are reasoned from the code,
+so reproduce them first.
 
 **07** is no longer blocked: 09 decided that `full_snapshot` selects the
 newest delivery per COB date, so 07's premise holds as written. It is
@@ -40,8 +39,8 @@ its banner and
 [DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date](../DECISIONS.md#a-snapshot-re-delivery-restates-the-whole-date)
 first.
 
-**25–31** were found reviewing the README on 2026-09-24. 25 and 27 are
-bugs, reproduced before they were written down (26 was too, and is fixed).
+**25–31** were found reviewing the README on 2026-09-24. 25, 26 and 27 are
+bugs, reproduced before they were written down; 25 and 26 are fixed.
 30 is a diagram, independent of everything else (28, 29 and 31 are done).
 
 **50** was found drawing 29's COB Status flowchart. It is reasoned from the
@@ -59,6 +58,47 @@ it first. **21–24** came out of 09's reviews and live runs. The rest are
 independent. (**16**, `exposure_change`'s `REMOVED`, is fixed: plan #21.)
 
 ## Done
+
+**25, a declared feed that had never delivered blocked every prepared
+build** — option 1 of the item's three: every declared feed's raw table is
+created, EMPTY, before its first delivery, by `ingest.migrate_raw`, which
+used to skip an absent table on purpose. It runs in `airflow-init` and the
+chart's `platform-init` hook, both with an embedded `local[1]` Spark for that
+one command (neither waits for the cluster, and a standalone master with no
+worker queues a job forever), in the standalone runner's `setup`, and first
+in `platform_housekeeping`, which is what reaches a feed saved from the
+console between deploys. Creation is `ensure_raw_table`'s own DDL, on a
+branch and merged, namespace on `main` first, and through the first ingest's
+bootstrap on a catalog with no commits. `_exists` now raises on anything but
+`TABLE_OR_VIEW_NOT_FOUND`, since absent now means CREATE. The cost the item
+named is paid in the completeness monitor: an empty table is not evidence of
+never having delivered, so it asks `registry.delivery` and reports `never
+delivered`, keeping `no data` for a feed with recorded deliveries (or with a
+registry it could not ask, which the entry says); `no table` now means
+declared since the last deploy. Recorded in
+[DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers](../DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers).
+*Verified live* on a fresh local stack: with only `fo_trade` delivered and
+`airflow-init` run with `main`'s five steps, a prepared+reporting `dbt build`
+on a branch gave `PASS=9 ERROR=6 SKIP=71`, every error
+`TABLE_OR_VIEW_NOT_FOUND`. `airflow-init` with the new step created the five
+tables (about 33 s for the whole init) and a re-run reported `created: 0,
+already_current: 6`. With the four seeded feeds delivered and both `qa_`
+feeds declared and never delivered: `PASS=85 ERROR=0`, and a triggered
+`ingest_fo_trade` (`verify25_ingest`) fired `prepared_build` and
+`reporting_build` as `dataset_triggered__` runs, both `success` and both
+`published`. The housekeeping op (`_spark_task migrate-raw real`, on the
+cluster) recreated a dropped table and left no `migrate/` branch. The
+completeness read path was run against the live registry: `never delivered`
+for an undelivered feed, `no data` plus the reason with the registry
+unreachable. `tests/test_migrate_raw.py` (11) and four new
+`test_completeness` cases; 14 of them fail against `main`.
+`python -m tests.run`: 1025 passed.
+*What the item got wrong.* Nothing in its diagnosis. Its expected result
+needed one qualification: with `fo_trade` delivered and `ref_counterparty`
+not, the build still fails, now on the `relationships` test (1200 trades
+referencing undelivered counterparties). That is a feed that depends on the
+missing one refusing correctly, not the missing table blocking unrelated
+feeds, so the live check was run with independent undelivered feeds.
 
 **22, the SCD2 replay read raw that retention had pruned** — every version
 in the replay's scope whose COB date raw no longer holds at all is now

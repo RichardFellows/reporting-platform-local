@@ -44,13 +44,19 @@ A gap is worse than a late feed. A late feed is visibly missing and the report
 visibly incomplete. **A gap is a report that runs, returns numbers, and is
 quietly wrong for one date, forever.**
 
-### It has three answers, not two
+### It has four answers for a feed with no dates
 
 | Status | Means | Fails `--fail-on-gap`? |
 |---|---|---|
-| `no data` | The table exists and is empty. | no |
-| `no table` | `TABLE_OR_VIEW_NOT_FOUND` — a feed that has never delivered. | no |
+| `never delivered` | The table exists and is empty, and `registry.delivery` has no row for the feed. The ordinary state of a new feed. | no |
+| `no data` | The table exists and is empty, and the registry has deliveries for it (landed, not yet in raw). If the registry could not be asked, the entry's `error` says so. | no |
+| `no table` | `TABLE_OR_VIEW_NOT_FOUND`. A feed declared since the last deploy: every prepared build fails until `python -m reporting_platform.ingest.migrate_raw` creates it. | no |
 | `unreadable` | Anything else. The table could not be read. | **yes** |
+
+"Never delivered" comes from the registry, not the table, because every
+declared feed gets an empty raw table at deploy time so that one undelivered
+feed does not stop the others publishing
+([DECISIONS.md](DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers)).
 
 **A subject it could not READ is not a subject that is EMPTY**, and reporting
 the first as the second is how a monitor goes green on a table nobody opened.

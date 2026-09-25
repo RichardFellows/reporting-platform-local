@@ -42,13 +42,28 @@ first as the second turns a broken monitor into a passing one: no gaps, no
 `--fail-on-gap`, nothing on screen but a feed that has "no data". So a read
 failure is carried through as its own status and fails the check.
 
-THREE ANSWERS, NOT TWO, and the third is why this does not simply fail on
-every error. A feed declared in `feeds.yml` that has never delivered has no
-raw table at all, and Spark says so precisely (`TABLE_OR_VIEW_NOT_FOUND`).
-That is an ordinary state of a new feed, not a broken monitor: reported as
-`no table`, counted as neither a gap nor a failure. Anything else -- a
-catalog that will not answer, a branch that is gone, a permissions error --
-is `unreadable`, and that one fails.
+FOUR ANSWERS FOR A FEED WITH NO DATES, and only one of them fails:
+
+  never delivered  the table exists and is empty, and the REGISTRY has no
+                   delivery for the feed. The ordinary state of a new feed.
+  no data          the table exists and is empty, and the registry has
+                   deliveries for it (landed, not yet in raw) -- or the
+                   registry could not be asked, which the entry says.
+  no table         Spark said `TABLE_OR_VIEW_NOT_FOUND`. Not a failure of
+                   THIS check, but no longer the normal state of anything:
+                   every declared feed gets its raw table at deploy time, so
+                   this is a feed declared since, and every prepared build
+                   fails on it until `ingest.migrate_raw` has run.
+  unreadable       anything else -- a catalog that will not answer, a branch
+                   that is gone, a permissions error. That one FAILS.
+
+"Never delivered" used to be read off the missing table. It cannot be any
+more: the table is created, empty, before the first delivery, so that one
+undelivered feed does not stop every other feed publishing
+(docs/DECISIONS.md#a-declared-feed-has-a-raw-table-before-it-delivers). An
+empty table is not evidence of never having delivered, so the registry --
+which records every delivery at normalize time, on both the legacy and the
+Transport path -- is asked instead.
 """
 from __future__ import annotations
 
@@ -78,10 +93,26 @@ def observed_dates(spark, table: str) -> set[date]:
     return {r["bd"] for r in rows}
 
 
+def delivered_feeds(names) -> set[str]:
+    """Which of `names` the delivery registry holds at least one delivery for.
+
+    Raises if the registry cannot be asked; the caller says so rather than
+    guessing either way.
+    """
+    from reporting_platform.registry import db
+
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT feed FROM registry.delivery "
+                    "WHERE feed = ANY(%s)", (sorted(names),))
+        return {row[0] for row in cur.fetchall()}
+
+
 def find_gaps(per_feed: dict[str, set[date]], lookback: int,
               cadence: dict[str, str] | None = None,
               unreadable: dict[str, str] | None = None,
-              absent: dict[str, str] | None = None) -> dict:
+              absent: dict[str, str] | None = None,
+              never_delivered: set[str] | None = None,
+              registry_error: str | None = None) -> dict:
     """Dates each feed is missing that other feeds prove were business days.
 
     Split out from the Spark reads so the interesting logic can be exercised
@@ -90,7 +121,12 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
 
     `unreadable` maps a feed to why its raw table could not be read, and
     `absent` to why it has no raw table at all -- two different answers, and
-    only the first is a defect (see the module header). Neither contributes
+    only the first is a defect (see the module header).
+
+    `never_delivered` names the feeds whose EMPTY table the registry says has
+    never had a delivery; `registry_error` is why the registry could not be
+    asked, in which case an empty table stays `no data` and says so. Neither
+    of `unreadable` and `absent` contributes
     anything to the inferred calendar: an unread feed is not evidence that a
     date was a business day, and treating it as one would let a broken read
     move the window every other feed is judged against.
@@ -113,10 +149,20 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
     for name, why in sorted(absent.items()):
         report["feeds"].append(
             {"feed": name, "status": "no table", "error": why, "missing": []})
+    never_delivered = never_delivered or set()
     for name, dates in sorted(per_feed.items()):
         if not dates:
-            report["feeds"].append(
-                {"feed": name, "status": "no data", "missing": []})
+            if name in never_delivered:
+                entry = {"feed": name, "status": "never delivered"}
+            else:
+                entry = {"feed": name, "status": "no data"}
+                if registry_error:
+                    # NOT "never delivered", and not quietly "no data"
+                    # either: the question was not answered.
+                    entry["error"] = ("the delivery registry could not be "
+                                      "asked whether this feed ever "
+                                      f"delivered: {registry_error}")
+            report["feeds"].append({**entry, "missing": []})
             continue
         # A feed is only accountable for dates inside its OWN history. Dates
         # before its first delivery are not gaps, and a date after its last is
@@ -158,6 +204,8 @@ def find_gaps(per_feed: dict[str, set[date]], lookback: int,
     # Reported beside it and NOT counted with it: a feed that has never
     # delivered is not a broken check.
     report["feeds_without_a_table"] = sorted(absent)
+    report["feeds_never_delivered"] = sorted(
+        n for n in never_delivered if n in per_feed and not per_feed[n])
     return report
 
 
@@ -193,7 +241,10 @@ def run(lookback: int | None = None) -> dict:
                 # which is the conservative direction.
                 why = str(exc)[:200]
                 if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                    log.info("%s has no raw table yet", fd.raw_table)
+                    log.warning(
+                        "%s does not exist. Every prepared build fails until "
+                        "it does: run `python -m "
+                        "reporting_platform.ingest.migrate_raw`", fd.raw_table)
                     absent[name] = why
                 else:
                     log.error("cannot read %s: %s", fd.raw_table, why)
@@ -201,7 +252,21 @@ def run(lookback: int | None = None) -> dict:
     finally:
         spark.stop()
 
-    report = find_gaps(checked, lookback, cadence, unreadable, absent)
+    # An empty table no longer means "never delivered" -- see the module
+    # header -- so ask the registry, for the empty ones only.
+    empty = [name for name, dates in checked.items() if not dates]
+    never, registry_error = set(), None
+    if empty:
+        try:
+            never = set(empty) - delivered_feeds(empty)
+        except Exception as exc:                            # noqa: BLE001
+            registry_error = str(exc)[:200]
+            log.error("cannot read the delivery registry, so %s may or may "
+                      "not ever have delivered: %s", ", ".join(empty),
+                      registry_error)
+
+    report = find_gaps(checked, lookback, cadence, unreadable, absent,
+                       never, registry_error)
     report["skipped_feeds"] = skipped
     for name in report["unreadable_feeds"]:
         log.error("feed %s was NOT CHECKED: its raw table could not be read. "
